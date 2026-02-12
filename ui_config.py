@@ -27,10 +27,30 @@ CSS_DATA = """
 .card-bar { 
     background-color: @headerbar_bg_color; 
     border-top: 1px solid alpha(currentColor, 0.12); 
-    padding: 12px 16px; 
+    padding: 5px 16px; 
+    /* 添加以下代码 */
+    margin: 0px 25px 25px 25px;
+    border-radius: 12px;  /* 既然悬浮了，加个圆角会更好看 */
+    border: 1px solid alpha(currentColor, 0.1); /* 增加四周边缘线 */
 }
 
-.pill { padding: 10px; min-width: 48px; min-height: 48px; border-radius: 99px; }
+
+.card-bar scale.horizontal {
+    margin-top: 0;
+    margin-bottom: 0;
+    padding-top: 0;
+    padding-bottom: 0;
+    valign: center; /* 这里的 center 确保内容区居中 */
+}
+
+.card-bar scale trough {
+    min-height: 4px;     /* 减小轨道高度 */
+    max-width: 100px;
+}
+
+
+
+.pill { margin: 10px; padding: 10px; min-width: 25px; min-height: 25px; border-radius: 99px; }
 
 /* 绝对扁平化卡片 */
 flowboxchild { background-color: transparent; padding: 0; margin: 0; }
@@ -79,7 +99,7 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
 .section-title { 
     font-size: 20px; 
     font-weight: 700; 
-    margin: 24px 24px 12px 24px; 
+    margin: 12px 12px 12px 12px; 
 }
 
 .tech-label { 
@@ -88,8 +108,15 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
     font-weight: bold; 
     color: @accent_color; 
     background-color: alpha(@accent_bg_color, 0.12); 
-    padding: 3px 6px; 
+    padding: 3px 3px; 
     border-radius: 4px; 
+    margin-top: 0;
+}
+
+.card-bar box > box > image,
+.card-bar box > box > label.tech-label {
+    margin-top: 5px;
+    margin-bottom: 5px;
 }
 
 .settings-container { padding: 40px; }
