@@ -91,4 +91,18 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
     padding: 3px 6px; 
     border-radius: 4px; 
 }
+
+.settings-container { padding: 40px; }
+.settings-group {
+    background-color: alpha(currentColor, 0.05);
+    border-radius: 12px;
+    padding: 6px;
+    margin-bottom: 24px;
+}
+.settings-row {
+    padding: 12px 16px;
+    border-bottom: 1px solid alpha(currentColor, 0.05);
+}
+.settings-row:last-child { border-bottom: none; }
+.settings-label { font-weight: 600; }
 """
