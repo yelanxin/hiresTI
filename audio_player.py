@@ -10,7 +10,7 @@ class AudioPlayer:
         self.current_sink = Gst.ElementFactory.make("autoaudiosink", "audio_sink")
         self.player.set_property("audio-sink", self.current_sink)
 
-        # [PRESERVED] Initialize 10-Band Equalizer
+        # [EQ] Initialize 10-Band Equalizer
         self.equalizer = Gst.ElementFactory.make("equalizer-10bands", "equalizer")
         if self.equalizer:
             self.player.set_property("audio-filter", self.equalizer)
@@ -37,33 +37,39 @@ class AudioPlayer:
         self.monitor.add_filter("Audio/Sink", None)
         self.monitor.start()
         
-        # [NEW] Start deep polling for hardware stats
         GLib.timeout_add(500, self._poll_leaf_sink_caps)
 
-    # --- [NEW] Bit-Perfect Logic ---
+    # --- [修正] Bit-Perfect Logic ---
     def toggle_bit_perfect(self, enable):
-        """Smart Switch: Auto-lock to USB DAC or Hardware ALSA device"""
+        """Smart Switch: Auto-lock to USB DAC and BYPASS EQ"""
         if not enable:
-            self.set_output("Auto")
+            # [Fix] 关闭时只恢复 EQ，不要强制设置 Auto
+            # 让上层 UI (main.py) 决定切回哪个驱动
+            if self.equalizer:
+                self.player.set_property("audio-filter", self.equalizer)
+                print("[Audio] EQ Restored.")
             return None
 
-        print("[Audio] Engaging Bit-Perfect Mode...")
+        print("[Audio] Engaging Bit-Perfect Mode (Bypassing EQ)...")
+        
+        # 1. Bypass EQ (Crucial for Bit-Perfect)
+        self.player.set_property("audio-filter", None)
+        
+        # 2. Find Hardware
         devices = self.get_devices_for_driver("ALSA")
         target_dev = None
         target_name = ""
 
-        # 1. Priority: USB Hardware (hw:X,Y)
+        # Priority: USB Hardware > Other Hardware
         for d in devices:
             if "hw:" in d["name"] and "USB" in d["name"]:
                 target_dev = d["device_id"]; target_name = d["name"]; break
         
-        # 2. Fallback: Any non-HDMI Hardware
         if not target_dev:
             for d in devices:
                 if "hw:" in d["name"] and "HDMI" not in d["name"]:
                     target_dev = d["device_id"]; target_name = d["name"]; break
         
-        # 3. Last Resort: Any Hardware
         if not target_dev:
             for d in devices:
                  if "hw:" in d["name"]:
@@ -75,10 +81,12 @@ class AudioPlayer:
             return target_name
         else:
             print("[Audio] No suitable DAC found.")
+            # Restore EQ if fail
+            if self.equalizer: self.player.set_property("audio-filter", self.equalizer)
             self.set_output("Auto")
             return None
 
-    # --- [NEW] Deep Drill Logic (Source -> Output) ---
+    # --- Deep Drill Logic ---
     def _get_leaf_sink(self, bin_element):
         if not isinstance(bin_element, Gst.Bin): return bin_element
         iterator = bin_element.iterate_sinks()
@@ -94,7 +102,6 @@ class AudioPlayer:
         try:
             leaf_sink = self._get_leaf_sink(self.current_sink)
             if leaf_sink:
-                # Infer driver name if in Auto mode
                 if self.is_auto:
                     factory = leaf_sink.get_factory()
                     if factory:
@@ -105,7 +112,6 @@ class AudioPlayer:
                         elif "wasapi" in fname: self.current_driver = "WASAPI (Auto)"
                         elif "osx" in fname: self.current_driver = "CoreAudio (Auto)"
                 
-                # Read Caps
                 pad = leaf_sink.get_static_pad("sink")
                 if pad:
                     caps = pad.get_current_caps()
@@ -151,7 +157,6 @@ class AudioPlayer:
         devices = []
         self.monitor.start()
         detected = self.monitor.get_devices()
-        # print(f"\n[Audio] Probing for: {driver_label}")
         for d in detected:
             if d.get_device_class() != "Audio/Sink": continue
             name = d.get_display_name(); props = d.get_properties()
@@ -178,7 +183,6 @@ class AudioPlayer:
         was_playing = (state == Gst.State.PLAYING)
         self.player.set_state(Gst.State.NULL)
         
-        # Update driver tracking
         if "PipeWire" in driver_label:
             self.current_driver = "PipeWire"
             self.is_auto = False
@@ -234,19 +238,14 @@ class AudioPlayer:
     def set_volume(self, val): self.player.set_property("volume", val)
 
     def get_format_string(self):
-        """Format: Source -> Driver -> Output"""
         s_bits = self.stream_info.get("bits", "-")
         s_rate = self.stream_info.get("rate", "-")
         o_bits = self.stream_info.get("output_bits", "-")
         o_rate = self.stream_info.get("output_rate", "-")
-        
-        # Fallback if source is unknown but output is known
         if s_rate == "-" and o_rate != "-": s_rate = o_rate
         if s_bits == "-" and o_bits != "-": s_bits = o_bits
-        
         src_str = f"{s_bits}/{s_rate}" if s_rate != "-" else s_bits
         out_str = f"{o_bits}/{o_rate}" if o_rate != "-" else o_bits
-        
         if src_str == "-" and out_str == "-": return "-"
         return f"{src_str} -> {self.current_driver} | {out_str}"
 
@@ -254,36 +253,22 @@ class AudioPlayer:
         t = message.type
         if t == Gst.MessageType.EOS:
             if self.on_eos_callback: GLib.idle_add(self.on_eos_callback)
-            
         elif t == Gst.MessageType.TAG:
             taglist = message.parse_tag()
             is_lossy = False
-            
-            # Codec
             success, codec = taglist.get_string("audio-codec")
-            if not success and hasattr(Gst, "TAG_AUDIO_CODEC"):
-                success, codec = taglist.get_string(Gst.TAG_AUDIO_CODEC)
+            if not success and hasattr(Gst, "TAG_AUDIO_CODEC"): success, codec = taglist.get_string(Gst.TAG_AUDIO_CODEC)
             if success and codec:
                 c_upper = codec.upper()
                 if "FLAC" in c_upper: self.stream_info["codec"] = "FLAC"
-                elif "MPEG-4 AAC" in c_upper or "MP4A" in c_upper:
-                    self.stream_info["codec"] = "AAC"; is_lossy = True
+                elif "MPEG-4 AAC" in c_upper or "MP4A" in c_upper: self.stream_info["codec"] = "AAC"; is_lossy = True
                 else: self.stream_info["codec"] = codec.split()[0]
-            
-            # Bitrate
             success, bitrate = taglist.get_uint("bitrate")
-            if not success and hasattr(Gst, "TAG_BITRATE"):
-                success, bitrate = taglist.get_uint(Gst.TAG_BITRATE)
+            if not success and hasattr(Gst, "TAG_BITRATE"): success, bitrate = taglist.get_uint(Gst.TAG_BITRATE)
             if success and bitrate: self.stream_info["bitrate"] = bitrate
-            
-            # Rate
             for key in ["rate", "sample-rate", "audio-sample-rate"]:
                 success, rate = taglist.get_uint(key)
-                if success and rate > 0:
-                    self.stream_info["rate"] = f"{rate/1000:.1f}kHz"
-                    break
-
-            # Bits
+                if success and rate > 0: self.stream_info["rate"] = f"{rate/1000:.1f}kHz"; break
             success, bits = taglist.get_uint("audio-device-bits")
             if not success: success, bits = taglist.get_uint("bits-per-sample")
             if success and bits: self.stream_info["bits"] = f"{bits}bit"
@@ -292,37 +277,24 @@ class AudioPlayer:
                 br = self.stream_info.get("bitrate", 0)
                 if br > 1200000: self.stream_info["bits"] = "24bit"
                 elif br > 0: self.stream_info["bits"] = "16bit"
-            
             if self.on_tag_callback: GLib.idle_add(self.on_tag_callback, self.stream_info)
-            
         elif t == Gst.MessageType.ERROR:
             err, debug = message.parse_error()
             print(f"GStreamer Error: {err.message}")
 
-    # --- [PRESERVED] Equalizer Controls ---
+    # --- EQ Controls ---
     def set_eq_band(self, band_idx, gain_db):
         if not self.equalizer: return
         if 0 <= band_idx <= 9:
-            prop_name = f"band{band_idx}"
             try:
                 gain_db = max(-24.0, min(12.0, float(gain_db)))
-                self.equalizer.set_property(prop_name, gain_db)
-            except Exception as e:
-                print(f"[EQ] Error setting band {band_idx}: {e}")
+                self.equalizer.set_property(f"band{band_idx}", gain_db)
+            except: pass
 
     def reset_eq(self):
         if not self.equalizer: return
-        for i in range(10):
-            self.set_eq_band(i, 0.0)
-        print("[EQ] Reset to Flat.")
+        for i in range(10): self.set_eq_band(i, 0.0)
 
     def get_eq_bands(self):
-        gains = []
         if not self.equalizer: return [0.0]*10
-        for i in range(10):
-            try:
-                val = self.equalizer.get_property(f"band{i}")
-                gains.append(val)
-            except:
-                gains.append(0.0)
-        return gains
+        return [self.equalizer.get_property(f"band{i}") for i in range(10)]

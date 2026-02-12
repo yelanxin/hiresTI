@@ -19,7 +19,6 @@ class TidalApp(Adw.Application):
         super().__init__(application_id="com.hiresti.player")
         self.backend = TidalBackend()
         self.settings_file = os.path.expanduser("~/.cache/hiresti/settings.json")
-        # [MODIFIED] Added bit_perfect default
         self.settings = {
             "driver": "Auto (Default)", 
             "device": "Default Device",
@@ -64,21 +63,22 @@ class TidalApp(Adw.Application):
         self._build_body(main_vbox)
         self._build_player_bar(main_vbox)
 
-        # [NEW] Restore Audio Settings
+        # [RESTORE SETTINGS]
         if self.settings.get("bit_perfect", False):
             print("[Init] Restoring Bit-Perfect Mode...")
             found = self.player.toggle_bit_perfect(True)
             if hasattr(self, 'bp_switch'): self.bp_switch.set_active(True)
+            if hasattr(self, 'eq_btn'): self.eq_btn.set_sensitive(False) # Disable EQ
+            # [NEW] Show the icon
+            if hasattr(self, 'bp_icon'): self.bp_icon.set_visible(True)
+            
             if found:
                 if hasattr(self, 'driver_dd'): self.driver_dd.set_sensitive(False)
                 if hasattr(self, 'device_dd'): self.device_dd.set_sensitive(False)
         else:
-             # Restore manual settings if not bit-perfect
              saved_drv = self.settings.get("driver", "Auto (Default)")
              if saved_drv != "Auto (Default)":
                  self.player.set_output(saved_drv)
-                 # We trigger UI update in _build_settings_page via idle_add, 
-                 # so the specific device restore happens there
 
         if self.backend.try_load_session(): self.on_login_success()
         self.win.present()
@@ -151,7 +151,6 @@ class TidalApp(Adw.Application):
         
         settings_vbox.append(Gtk.Label(label="Settings", xalign=0, css_classes=["album-title-large"], margin_bottom=10))
 
-        # --- Quality Settings ---
         group_q = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["settings-group"])
         row_q = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
         row_q.append(Gtk.Label(label="Streaming Quality", hexpand=True, xalign=0))
@@ -161,11 +160,9 @@ class TidalApp(Adw.Application):
         group_q.append(row_q)
         settings_vbox.append(group_q)
 
-        # --- Audio Output Settings ---
         settings_vbox.append(Gtk.Label(label="Audio Output", xalign=0, css_classes=["section-title"], margin_top=10))
         group_out = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["settings-group"])
         
-        # [NEW] Bit-Perfect Switch
         row_bp = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
         bp_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
         bp_info.append(Gtk.Label(label="Bit-Perfect Mode", xalign=0, css_classes=["settings-label"]))
@@ -178,25 +175,19 @@ class TidalApp(Adw.Application):
         row_bp.append(self.bp_switch)
         group_out.append(row_bp)
 
-        # Driver Selector
         row_drv = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
         row_drv.append(Gtk.Label(label="Audio Driver", hexpand=True, xalign=0))
         drivers = self.player.get_drivers()
         self.driver_dd = Gtk.DropDown(model=Gtk.StringList.new(drivers))
-        
-        # Restore saved driver (UI only, logic handled in on_driver_changed)
         saved_drv = self.settings.get("driver")
         if saved_drv in drivers:
              for i, d in enumerate(drivers):
                  if d == saved_drv:
-                     self.driver_dd.set_selected(i)
-                     break
-        
+                     self.driver_dd.set_selected(i); break
         self.driver_dd.connect("notify::selected-item", self.on_driver_changed)
         row_drv.append(self.driver_dd)
         group_out.append(row_drv)
 
-        # Device Selector
         row_dev = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
         row_dev.append(Gtk.Label(label="Output Device", hexpand=True, xalign=0))
         self.device_dd = Gtk.DropDown(model=Gtk.StringList.new(["Default"]))
@@ -208,7 +199,6 @@ class TidalApp(Adw.Application):
         settings_vbox.append(group_out)
         self.right_stack.add_named(settings_scroll, "settings")
         
-        # Trigger initial driver load (unless bit-perfect is on)
         if not self.settings.get("bit_perfect", False):
             GLib.idle_add(lambda: self.on_driver_changed(self.driver_dd, None))
 
@@ -239,23 +229,34 @@ class TidalApp(Adw.Application):
 
     def _build_player_bar(self, container):
         self.bottom_bar = Gtk.Box(spacing=24, css_classes=["card-bar"]); container.append(self.bottom_bar)
-
         self.info_area = Gtk.Box(spacing=14, valign=Gtk.Align.CENTER)
         self.art_img = Gtk.Image(width_request=64, height_request=64, css_classes=["playback-art"])
         gest = Gtk.GestureClick(); gest.connect("pressed", self.on_player_art_clicked); self.art_img.add_controller(gest)
         m = Gtk.EventControllerMotion(); m.connect("enter", lambda c,x,y: utils.set_pointer_cursor(self.art_img, True)); m.connect("leave", lambda c: utils.set_pointer_cursor(self.art_img, False)); self.art_img.add_controller(m)
         t = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER); self.lbl_title = Gtk.Label(xalign=0, css_classes=["heading"], ellipsize=3); t.append(self.lbl_title)
         self.info_area.append(self.art_img); self.info_area.append(t); self.bottom_bar.append(self.info_area)
-
+        
         c_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, hexpand=True, valign=Gtk.Align.CENTER)
         ctrls = Gtk.Box(spacing=12, halign=Gtk.Align.CENTER); ctrls.append(Gtk.Button(icon_name="media-skip-backward-symbolic", css_classes=["flat"]))
         self.play_btn = Gtk.Button(icon_name="media-playback-start-symbolic", css_classes=["pill", "suggested-action"]); self.play_btn.connect("clicked", self.on_play_pause); ctrls.append(self.play_btn)
         ctrls.append(Gtk.Button(icon_name="media-skip-forward-symbolic", css_classes=["flat"])); c_box.append(ctrls)
         self.scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1); self.scale.set_hexpand(True); self.scale.connect("value-changed", self.on_seek); c_box.append(self.scale)
         
-        # [MODIFIED] Tech Label Centered Below Seekbar
-        self.lbl_tech = Gtk.Label(label="-", css_classes=["tech-label"], halign=Gtk.Align.CENTER, margin_top=4)
-        c_box.append(self.lbl_tech)
+        # [NEW] Center Tech Info with Icon
+        tech_box = Gtk.Box(spacing=8, halign=Gtk.Align.CENTER, margin_top=4)
+        
+        # The Bit-Perfect Icon (Hidden by default)
+        self.bp_icon = Gtk.Image(icon_name="audio-card-symbolic") # Represents 'Hardware'
+        self.bp_icon.set_tooltip_text("Bit-Perfect Mode (Exclusive Hardware Access)")
+        self.bp_icon.set_visible(False)
+        # Optional: Add a CSS class if you want to color it
+        # self.bp_icon.add_css_class("accent-color") 
+        tech_box.append(self.bp_icon)
+        
+        self.lbl_tech = Gtk.Label(label="-", css_classes=["tech-label"])
+        tech_box.append(self.lbl_tech)
+        
+        c_box.append(tech_box)
         self.bottom_bar.append(c_box)
 
         r_box = Gtk.Box(spacing=12, valign=Gtk.Align.CENTER)
@@ -264,9 +265,14 @@ class TidalApp(Adw.Application):
         self.vol = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 5); self.vol.set_value(80); self.vol.set_size_request(120, -1); self.vol.connect("value-changed", lambda s: self.player.set_volume(s.get_value()/100.0)); r_box.append(self.vol)
         self.bottom_bar.append(r_box)
 
-    # --- Handlers ---
     def on_bit_perfect_toggled(self, switch, state):
         found = self.player.toggle_bit_perfect(state)
+        # Disable EQ button and Show Icon
+        self.eq_btn.set_sensitive(not state)
+        if state: self.eq_pop.popdown()
+        
+        if hasattr(self, 'bp_icon'): self.bp_icon.set_visible(state)
+        
         if state:
             if found:
                 self.driver_dd.set_sensitive(False)
@@ -281,11 +287,9 @@ class TidalApp(Adw.Application):
         self.save_settings()
 
     def update_tech_label(self, info):
-        # [MODIFIED] Use get_format_string
-        fmt_str = self.player.get_format_string()
-        codec = info.get('codec', '-')
-        bitrate = info.get('bitrate', 0)
-        self.lbl_tech.set_text(f"{codec} | {fmt_str} | {bitrate//1000}kbps")
+        fmt = self.player.get_format_string()
+        txt = f"{info.get('codec','-')} | {fmt} | {info.get('bitrate',0)//1000}kbps"
+        self.lbl_tech.set_text(txt)
 
     def on_login_clicked(self, btn):
         u, f = self.backend.start_oauth(); webbrowser.open(u)
@@ -316,43 +320,30 @@ class TidalApp(Adw.Application):
                 GLib.timeout_add(100, lambda: self.player.seek(pos))
 
     def on_driver_changed(self, dd, p):
-        # Prevent manual changes if bit-perfect is active
         if self.settings.get("bit_perfect", False): return
-
         selected = dd.get_selected_item()
         if not selected: return
         driver_name = selected.get_string()
         self.settings["driver"] = driver_name
         self.save_settings()
-        
-        print(f"[Settings] Selected driver: {driver_name}")
         self.player.set_output(driver_name)
-        
         def refresh_devices():
             self.ignore_device_change = True
             devices = self.player.get_devices_for_driver(driver_name)
             self.current_device_list = devices 
             names = [d["name"] for d in devices]
             self.device_dd.set_model(Gtk.StringList.new(names))
-            
             saved_dev = self.settings.get("device")
-            sel_idx = 0
-            found_saved = False
+            sel_idx = 0; found_saved = False
             if saved_dev:
                 for i, name in enumerate(names):
-                    if name == saved_dev:
-                        sel_idx = i; found_saved = True; break
-            
+                    if name == saved_dev: sel_idx = i; found_saved = True; break
             self.device_dd.set_sensitive(len(names) > 1)
             self.device_dd.set_selected(sel_idx)
             self.ignore_device_change = False
-            
             if found_saved:
-                if sel_idx < len(self.current_device_list):
-                    device_info = self.current_device_list[sel_idx]
-                    self.player.set_output(driver_name, device_info['device_id'])
-            else:
-                 GLib.idle_add(lambda: self.on_device_changed(self.device_dd, None))
+                if sel_idx < len(self.current_device_list): self.player.set_output(driver_name, self.current_device_list[sel_idx]['device_id'])
+            else: GLib.idle_add(lambda: self.on_device_changed(self.device_dd, None))
         Thread(target=lambda: GLib.idle_add(refresh_devices), daemon=True).start()
 
     def on_device_changed(self, dd, p):
@@ -363,7 +354,6 @@ class TidalApp(Adw.Application):
             self.settings["device"] = device_info['name']
             self.save_settings()
             driver_label = self.driver_dd.get_selected_item().get_string()
-            print(f"[Settings] Switching to device: {device_info['name']}")
             self.player.set_output(driver_label, device_info['device_id'])
 
     def on_album_selected(self, flow, child):
@@ -378,9 +368,7 @@ class TidalApp(Adw.Application):
         def detail_task():
             ts = self.backend.get_tracks(alb)
             if not hasattr(alb, 'release_date') or not alb.release_date:
-                try: 
-                    full = self.backend.session.album(str(alb.id))
-                    GLib.idle_add(self._update_meta, full)
+                try: full = self.backend.session.album(str(alb.id)); GLib.idle_add(self._update_meta, full)
                 except: pass
             else: GLib.idle_add(self._update_meta, alb)
             GLib.idle_add(self.populate_tracks, ts)
