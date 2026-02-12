@@ -270,14 +270,13 @@ class TidalApp(Adw.Application):
         
         # EQ Button
         self.eq_btn = Gtk.Button(css_classes=["flat"])
-        eq_icon_path = os.path.join(os.path.dirname(__file__), "icons", "eq_icon.jpg")
+        eq_icon_path = os.path.join(os.path.dirname(__file__), "icons", "eq_icon.svg")
         
         # Use custom image if exists, otherwise fallback to system icon
         if os.path.exists(eq_icon_path):
             try:
-                # Create Pixbuf from file, scale to 24x24
-                pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(eq_icon_path, 24, 24, True)
-                img = Gtk.Image.new_from_pixbuf(pixbuf)
+                # Load SVG as texture/image
+                img = Gtk.Image.new_from_file(eq_icon_path)
                 self.eq_btn.set_child(img)
             except Exception as e:
                 print(f"Error loading custom EQ icon: {e}")
