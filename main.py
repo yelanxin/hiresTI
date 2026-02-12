@@ -3,7 +3,7 @@ gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
 from gi.repository import Gtk, Adw, GLib, Gdk
 
-import os, webbrowser, hashlib
+import os, webbrowser, hashlib, json
 from threading import Thread
 from tidal_backend import TidalBackend
 from audio_player import AudioPlayer
@@ -18,6 +18,14 @@ class TidalApp(Adw.Application):
     def __init__(self):
         super().__init__(application_id="com.hiresti.player")
         self.backend = TidalBackend()
+        self.settings_file = os.path.expanduser("~/.cache/hiresti/settings.json")
+        self.settings = {"driver": "Auto (Default)", "device": "Default Device"}
+        if os.path.exists(self.settings_file):
+            try:
+                with open(self.settings_file, 'r') as f:
+                    self.settings.update(json.load(f))
+            except: pass
+
         self.player = AudioPlayer(on_eos_callback=self.on_next_track, on_tag_callback=self.update_tech_label)
         self.history_mgr = HistoryManager()
         self.cache_dir = os.path.expanduser("~/.cache/hiresti/covers")
@@ -25,6 +33,12 @@ class TidalApp(Adw.Application):
         self.current_track_list = []; self.current_index = -1
         self.window_created = False; self.is_programmatic_update = False
         self.current_device_list = [] # Store detected devices
+
+    def save_settings(self):
+        try:
+            with open(self.settings_file, 'w') as f:
+                json.dump(self.settings, f)
+        except: pass
 
     def do_activate(self):
         if self.window_created: self.win.present(); return
@@ -132,6 +146,15 @@ class TidalApp(Adw.Application):
         row_drv.append(Gtk.Label(label="Audio Driver", hexpand=True, xalign=0))
         drivers = self.player.get_drivers()
         self.driver_dd = Gtk.DropDown(model=Gtk.StringList.new(drivers))
+        
+        # Restore saved driver
+        saved_drv = self.settings.get("driver")
+        if saved_drv in drivers:
+             for i, d in enumerate(drivers):
+                 if d == saved_drv:
+                     self.driver_dd.set_selected(i)
+                     break
+        
         self.driver_dd.connect("notify::selected-item", self.on_driver_changed)
         row_drv.append(self.driver_dd)
         group_out.append(row_drv)
@@ -246,7 +269,9 @@ class TidalApp(Adw.Application):
         r_box = Gtk.Box(spacing=12, valign=Gtk.Align.CENTER)
         
         # EQ Button
-        self.eq_btn = Gtk.Button(icon_name="audio-speakers-symbolic", css_classes=["flat"])
+        self.eq_btn = Gtk.Button(icon_name="audio-equalizer-symbolic", css_classes=["flat"])
+        if not Gtk.IconTheme.get_for_display(Gdk.Display.get_default()).has_icon("audio-equalizer-symbolic"):
+             self.eq_btn.set_icon_name("preferences-system-symbolic") # Fallback to sliders icon
         self.eq_btn.set_tooltip_text("Equalizer")
         self.eq_pop = self._build_eq_popover()
         self.eq_pop.set_parent(self.eq_btn)
@@ -298,6 +323,9 @@ class TidalApp(Adw.Application):
         selected = dd.get_selected_item()
         if not selected: return
         driver_name = selected.get_string()
+        self.settings["driver"] = driver_name
+        self.save_settings()
+        
         print(f"[Settings] Selected driver: {driver_name}")
         self.player.set_output(driver_name)
         
@@ -306,8 +334,22 @@ class TidalApp(Adw.Application):
             self.current_device_list = devices 
             names = [d["name"] for d in devices]
             self.device_dd.set_model(Gtk.StringList.new(names))
+            
+            # Restore saved device
+            saved_dev = self.settings.get("device")
+            sel_idx = 0
+            if saved_dev:
+                for i, name in enumerate(names):
+                    if name == saved_dev:
+                        sel_idx = i
+                        break
+            
             self.device_dd.set_sensitive(len(names) > 1)
-            self.device_dd.set_selected(0)
+            self.device_dd.set_selected(sel_idx)
+            
+            # Force trigger on_device_changed to apply settings
+            # because set_selected might not trigger if value is 0 (already 0)
+            GLib.idle_add(lambda: self.on_device_changed(self.device_dd, None))
             
         Thread(target=lambda: GLib.idle_add(refresh_devices), daemon=True).start()
 
@@ -315,6 +357,9 @@ class TidalApp(Adw.Application):
         idx = dd.get_selected()
         if hasattr(self, 'current_device_list') and idx < len(self.current_device_list):
             device_info = self.current_device_list[idx]
+            self.settings["device"] = device_info['name']
+            self.save_settings()
+            
             driver_label = self.driver_dd.get_selected_item().get_string()
             print(f"[Settings] Switching to device: {device_info['name']}")
             self.player.set_output(driver_label, device_info['device_id'])
