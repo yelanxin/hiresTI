@@ -342,6 +342,9 @@ class TidalApp(Adw.Application):
         self.player.set_output(driver_name)
         
         def refresh_devices():
+            # Prevent on_device_changed from saving "Default" while we load
+            self.ignore_device_change = True
+            
             devices = self.player.get_devices_for_driver(driver_name)
             self.current_device_list = devices 
             names = [d["name"] for d in devices]
@@ -350,25 +353,46 @@ class TidalApp(Adw.Application):
             # Restore saved device
             saved_dev = self.settings.get("device")
             sel_idx = 0
+            found_saved = False
+            
+            print(f"[Settings] Restoring device: {saved_dev} (from {len(names)} candidates)")
+            
             if saved_dev:
                 for i, name in enumerate(names):
                     if name == saved_dev:
                         sel_idx = i
+                        found_saved = True
                         break
             
             self.device_dd.set_sensitive(len(names) > 1)
             self.device_dd.set_selected(sel_idx)
             
-            # Force trigger on_device_changed to apply settings
-            # because set_selected might not trigger if value is 0 (already 0)
-            GLib.idle_add(lambda: self.on_device_changed(self.device_dd, None))
+            # Re-enable saving
+            self.ignore_device_change = False
+            
+            # Apply the selection (backend switch)
+            # We call this manually because we blocked the signal logic above
+            # But we pass a flag or just call the logic directly
+            if found_saved:
+                print(f"[Settings] Auto-restored device index: {sel_idx}")
+                # Manually trigger the backend switch without saving (since we just read from save)
+                if sel_idx < len(self.current_device_list):
+                    device_info = self.current_device_list[sel_idx]
+                    self.player.set_output(driver_name, device_info['device_id'])
+            else:
+                 # If not found or default, trigger normal change to update backend
+                 GLib.idle_add(lambda: self.on_device_changed(self.device_dd, None))
             
         Thread(target=lambda: GLib.idle_add(refresh_devices), daemon=True).start()
 
     def on_device_changed(self, dd, p):
+        if getattr(self, 'ignore_device_change', False): return
+        
         idx = dd.get_selected()
         if hasattr(self, 'current_device_list') and idx < len(self.current_device_list):
             device_info = self.current_device_list[idx]
+            
+            # Only save if it's a real user interaction (or valid restore)
             self.settings["device"] = device_info['name']
             self.save_settings()
             
