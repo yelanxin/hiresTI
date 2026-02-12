@@ -1,66 +1,294 @@
 import gi
 gi.require_version('Gst', '1.0')
 from gi.repository import Gst, GLib
-import logging
 
 class AudioPlayer:
     def __init__(self, on_eos_callback=None, on_tag_callback=None):
         Gst.init(None)
+        
         self.player = Gst.ElementFactory.make("playbin", "player")
+        self.current_sink = Gst.ElementFactory.make("autoaudiosink", "audio_sink")
+        self.player.set_property("audio-sink", self.current_sink)
+
+        # [EQ] Initialize 10-Band Equalizer
+        self.equalizer = Gst.ElementFactory.make("equalizer-10bands", "equalizer")
+        if self.equalizer:
+            self.player.set_property("audio-filter", self.equalizer)
+            print("[Audio] Equalizer-10bands initialized and attached.")
+        else:
+            print("[Audio] Warning: equalizer-10bands not found. EQ disabled.")
+        
         self.bus = self.player.get_bus()
         self.bus.add_signal_watch()
         self.bus.connect("message", self._on_message)
+        
         self.on_eos_callback = on_eos_callback
         self.on_tag_callback = on_tag_callback
-        self.stream_info = {"codec": "-", "bits": "-", "bitrate": 0}
+        
+        self.stream_info = {
+            "codec": "-", "bitrate": 0, "bits": "-", "rate": "-", 
+            "output_bits": "-", "output_rate": "-"
+        }
+        
+        self.current_driver = "Auto"
+        self.is_auto = True # [新增] 标记当前是否为自动模式
+        
+        self.monitor = Gst.DeviceMonitor()
+        self.monitor.add_filter("Audio/Sink", None)
+        self.monitor.start()
+        
+        GLib.timeout_add(500, self._poll_leaf_sink_caps)
+
+    def _get_leaf_sink(self, bin_element):
+        if not isinstance(bin_element, Gst.Bin): return bin_element
+        iterator = bin_element.iterate_sinks()
+        while True:
+            result, elem = iterator.next()
+            if result != Gst.IteratorResult.OK: break
+            leaf = self._get_leaf_sink(elem)
+            if leaf: return leaf
+        return None
+
+    def _poll_leaf_sink_caps(self):
+        if self.player.get_state(0).state != Gst.State.PLAYING: return True
+        try:
+            leaf_sink = self._get_leaf_sink(self.current_sink)
+            if leaf_sink:
+                # [核心新增] 如果是自动模式，从底层 Sink 推断真实驱动名
+                if self.is_auto:
+                    factory = leaf_sink.get_factory()
+                    if factory:
+                        fname = factory.get_name()
+                        if "pulse" in fname: self.current_driver = "PulseAudio (Auto)"
+                        elif "pipewire" in fname: self.current_driver = "PipeWire (Auto)"
+                        elif "alsa" in fname: self.current_driver = "ALSA (Auto)"
+                        elif "wasapi" in fname: self.current_driver = "WASAPI (Auto)"
+                        elif "osx" in fname: self.current_driver = "CoreAudio (Auto)"
+                
+                # 读取 Caps
+                pad = leaf_sink.get_static_pad("sink")
+                if pad:
+                    caps = pad.get_current_caps()
+                    if caps: self._parse_caps(caps)
+        except: pass
+        return True
+
+    def _parse_caps(self, caps):
+        try:
+            struct = caps.get_structure(0)
+            fmt = struct.get_value("format")
+            out_bits = "-"
+            if fmt:
+                if "S16" in fmt: out_bits = "16bit"
+                elif "S24" in fmt: out_bits = "24bit"
+                elif "S32" in fmt or "F32" in fmt: out_bits = "32bit"
+                elif "F64" in fmt: out_bits = "64bit"
+            
+            out_rate = "-"
+            if struct.has_field("rate"):
+                r = struct.get_value("rate")
+                if r: out_rate = f"{r/1000:.1f}kHz"
+            
+            if out_bits != "-" and out_rate != "-":
+                changed = (out_bits != self.stream_info["output_bits"]) or \
+                          (out_rate != self.stream_info["output_rate"])
+                if changed:
+                    self.stream_info["output_bits"] = out_bits
+                    self.stream_info["output_rate"] = out_rate
+                    if self.on_tag_callback:
+                        GLib.idle_add(self.on_tag_callback, self.stream_info)
+        except: pass
+
+    def get_drivers(self):
+        drivers = ["Auto (Default)"]
+        sinks = [("pipewiresink", "PipeWire"), ("pulsesink", "PulseAudio"), ("alsasink", "ALSA")]
+        for factory_name, label in sinks:
+            if Gst.ElementFactory.find(factory_name): drivers.append(label)
+        return drivers
+
+    def get_devices_for_driver(self, driver_label):
+        if "Auto" in driver_label: return [{"name": "System Default", "device_id": None}]
+        devices = []
+        self.monitor.start()
+        detected = self.monitor.get_devices()
+        print(f"\n[Audio] Probing for: {driver_label}")
+        for d in detected:
+            if d.get_device_class() != "Audio/Sink": continue
+            name = d.get_display_name(); props = d.get_properties()
+            api = props.get_string("device.api") if props.has_field("device.api") else "unknown"
+            is_match = False; hw_string = ""
+            if "ALSA" in driver_label:
+                if api == "alsa" or props.has_field("alsa.card"):
+                    is_match = True
+                    if props.has_field("device.str"): hw_string = props.get_string("device.str")
+                    if not hw_string and props.has_field("alsa.card") and props.has_field("alsa.device"):
+                        try: hw_string = f"hw:{props.get_value('alsa.card')},{props.get_value('alsa.device')}"
+                        except: pass
+            elif "Pulse" in driver_label:
+                if api == "pulse" or "Pulse" in name: is_match = True
+            elif "PipeWire" in driver_label: is_match = True
+            if is_match:
+                lbl = f"{name} ({hw_string})" if hw_string else name
+                devices.append({"name": lbl, "device_id": d})
+        devices.insert(0, {"name": "Default Device", "device_id": None})
+        return devices
+
+    def set_output(self, driver_label, device_obj=None):
+        state = self.player.get_state(0).state
+        was_playing = (state == Gst.State.PLAYING)
+        self.player.set_state(Gst.State.NULL)
+        
+        # [更新逻辑] 根据选择设置是否为 Auto
+        if "PipeWire" in driver_label:
+            self.current_driver = "PipeWire"
+            self.is_auto = False
+        elif "Pulse" in driver_label:
+            self.current_driver = "PulseAudio"
+            self.is_auto = False
+        elif "ALSA" in driver_label:
+            self.current_driver = "ALSA"
+            self.is_auto = False
+        else:
+            self.current_driver = "Auto"
+            self.is_auto = True
+        
+        factory_name = "autoaudiosink"
+        if "PipeWire" in driver_label: factory_name = "pipewiresink"
+        elif "Pulse" in driver_label: factory_name = "pulsesink"
+        elif "ALSA" in driver_label: factory_name = "alsasink"
+        
+        print(f"[Audio] Switching to: {factory_name}")
+        try:
+            new_sink = None
+            if device_obj and isinstance(device_obj, Gst.Device):
+                new_sink = device_obj.create_element("audio_sink")
+            else:
+                new_sink = Gst.ElementFactory.make(factory_name, "audio_sink")
+            if new_sink:
+                self.player.set_property("audio-sink", new_sink)
+                self.current_sink = new_sink
+            else:
+                self.current_sink = Gst.ElementFactory.make("autoaudiosink", "audio_sink")
+                self.player.set_property("audio-sink", self.current_sink)
+        except: pass
+        if was_playing: self.player.set_state(Gst.State.PLAYING)
 
     def load(self, url):
-        if not url: return
         self.player.set_state(Gst.State.NULL)
-        self.stream_info = {"codec": "-", "bits": "-", "bitrate": 0}
         self.player.set_property("uri", url)
+        self.stream_info = {"codec": "-", "bitrate": 0, "bits": "-", "rate": "-", "output_bits": "-", "output_rate": "-"}
+        if self.on_tag_callback: GLib.idle_add(self.on_tag_callback, self.stream_info)
 
     def play(self): self.player.set_state(Gst.State.PLAYING)
     def pause(self): self.player.set_state(Gst.State.PAUSED)
-    def stop(self): self.player.set_state(Gst.State.NULL)
-    
-    def is_playing(self):
-        _, state, _ = self.player.get_state(0)
-        return state == Gst.State.PLAYING
-
-    def seek(self, seconds):
-        if seconds < 0: seconds = 0
-        self.player.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT, int(seconds * Gst.SECOND))
-
-    def set_volume(self, value):
-        self.player.set_property("volume", value)
-
+    def is_playing(self): return self.player.get_state(0).state == Gst.State.PLAYING
     def get_position(self):
         try:
-            _, dur = self.player.query_duration(Gst.Format.TIME)
-            _, pos = self.player.query_position(Gst.Format.TIME)
-            return (pos / Gst.SECOND if _ else 0), (dur / Gst.SECOND if _ else 0)
-        except: return 0, 0
+            succ, pos = self.player.query_position(Gst.Format.TIME)
+            succ2, dur = self.player.query_duration(Gst.Format.TIME)
+            if succ and succ2: return (pos / Gst.SECOND, dur / Gst.SECOND)
+        except: pass
+        return (0, 0)
+    def seek(self, seconds):
+        self.player.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT, int(seconds * Gst.SECOND))
+    def set_volume(self, val): self.player.set_property("volume", val)
 
-    def get_current_bits(self):
-        bits = self.stream_info.get("bits", "-")
-        if bits != "-": return bits
-        codec = str(self.stream_info.get("codec", "")).upper()
-        if "FLAC" in codec:
-            # 智能推断：>1.5Mbps 视为 24-bit，否则 16-bit
-            return "24-bit" if self.stream_info.get("bitrate", 0) > 1500000 else "16-bit"
-        return "-"
+    def get_format_string(self):
+        s_bits = self.stream_info.get("bits", "-")
+        s_rate = self.stream_info.get("rate", "-")
+        o_bits = self.stream_info.get("output_bits", "-")
+        o_rate = self.stream_info.get("output_rate", "-")
+        
+        if s_rate == "-" and o_rate != "-": s_rate = o_rate
+        if s_bits == "-" and o_bits != "-": s_bits = o_bits
+        
+        src_str = f"{s_bits}/{s_rate}" if s_rate != "-" else s_bits
+        out_str = f"{o_bits}/{o_rate}" if o_rate != "-" else o_bits
+        
+        if src_str == "-" and out_str == "-": return "-"
+        return f"{src_str} -> {self.current_driver} | {out_str}"
 
     def _on_message(self, bus, message):
         t = message.type
         if t == Gst.MessageType.EOS:
             if self.on_eos_callback: GLib.idle_add(self.on_eos_callback)
+            
         elif t == Gst.MessageType.TAG:
             taglist = message.parse_tag()
-            _, codec = taglist.get_string(Gst.TAG_AUDIO_CODEC)
-            if codec: self.stream_info["codec"] = "FLAC" if "FLAC" in codec.upper() else "AAC"
-            _, bitrate = taglist.get_uint(Gst.TAG_BITRATE)
-            if bitrate: self.stream_info["bitrate"] = bitrate
-            _, bits = taglist.get_uint("audio-device-bits")
-            if bits: self.stream_info["bits"] = f"{bits}-bit"
+            is_lossy = False
+            
+            # Codec
+            success, codec = taglist.get_string("audio-codec")
+            if not success and hasattr(Gst, "TAG_AUDIO_CODEC"):
+                success, codec = taglist.get_string(Gst.TAG_AUDIO_CODEC)
+            if success and codec:
+                c_upper = codec.upper()
+                if "FLAC" in c_upper: self.stream_info["codec"] = "FLAC"
+                elif "MPEG-4 AAC" in c_upper or "MP4A" in c_upper:
+                    self.stream_info["codec"] = "AAC"; is_lossy = True
+                else: self.stream_info["codec"] = codec.split()[0]
+            
+            # Bitrate
+            success, bitrate = taglist.get_uint("bitrate")
+            if not success and hasattr(Gst, "TAG_BITRATE"):
+                success, bitrate = taglist.get_uint(Gst.TAG_BITRATE)
+            if success and bitrate: self.stream_info["bitrate"] = bitrate
+            
+            # Rate (轮询修复)
+            for key in ["rate", "sample-rate", "audio-sample-rate"]:
+                success, rate = taglist.get_uint(key)
+                if success and rate > 0:
+                    self.stream_info["rate"] = f"{rate/1000:.1f}kHz"
+                    break
+            
+            # Bits
+            success, bits = taglist.get_uint("audio-device-bits")
+            if not success: success, bits = taglist.get_uint("bits-per-sample")
+            if success and bits: self.stream_info["bits"] = f"{bits}bit"
+            elif is_lossy: self.stream_info["bits"] = "16bit"
+            elif self.stream_info["codec"] == "FLAC":
+                br = self.stream_info.get("bitrate", 0)
+                if br > 1200000: self.stream_info["bits"] = "24bit"
+                elif br > 0: self.stream_info["bits"] = "16bit"
+            
             if self.on_tag_callback: GLib.idle_add(self.on_tag_callback, self.stream_info)
+            
+        elif t == Gst.MessageType.ERROR:
+            err, debug = message.parse_error()
+            print(f"GStreamer Error: {err.message}")
+
+    # --- Equalizer Controls ---
+    def set_eq_band(self, band_idx, gain_db):
+        """
+        Set gain for a specific band (0-9).
+        gain_db: Float between -24.0 and +12.0
+        """
+        if not self.equalizer: return
+        if 0 <= band_idx <= 9:
+            prop_name = f"band{band_idx}"
+            try:
+                # Clamp value
+                gain_db = max(-24.0, min(12.0, float(gain_db)))
+                self.equalizer.set_property(prop_name, gain_db)
+                # print(f"[EQ] Band {band_idx} set to {gain_db:.1f}dB")
+            except Exception as e:
+                print(f"[EQ] Error setting band {band_idx}: {e}")
+
+    def reset_eq(self):
+        """Reset all bands to 0dB (Flat)"""
+        if not self.equalizer: return
+        for i in range(10):
+            self.set_eq_band(i, 0.0)
+        print("[EQ] Reset to Flat.")
+
+    def get_eq_bands(self):
+        """Return list of current gains for UI sync"""
+        gains = []
+        if not self.equalizer: return [0.0]*10
+        for i in range(10):
+            try:
+                val = self.equalizer.get_property(f"band{i}")
+                gains.append(val)
+            except:
+                gains.append(0.0)
+        return gains
