@@ -19,7 +19,12 @@ class TidalApp(Adw.Application):
         super().__init__(application_id="com.hiresti.player")
         self.backend = TidalBackend()
         self.settings_file = os.path.expanduser("~/.cache/hiresti/settings.json")
-        self.settings = {"driver": "Auto (Default)", "device": "Default Device"}
+        # [MODIFIED] Added bit_perfect default
+        self.settings = {
+            "driver": "Auto (Default)", 
+            "device": "Default Device",
+            "bit_perfect": False 
+        }
         if os.path.exists(self.settings_file):
             try:
                 with open(self.settings_file, 'r') as f:
@@ -32,7 +37,7 @@ class TidalApp(Adw.Application):
         os.makedirs(self.cache_dir, exist_ok=True)
         self.current_track_list = []; self.current_index = -1
         self.window_created = False; self.is_programmatic_update = False
-        self.current_device_list = [] # Store detected devices
+        self.current_device_list = [] 
 
     def save_settings(self):
         try:
@@ -43,7 +48,6 @@ class TidalApp(Adw.Application):
     def do_activate(self):
         if self.window_created: self.win.present(); return
         
-        # [NEW] Add icons folder to theme search path
         icon_theme = Gtk.IconTheme.get_for_display(Gdk.Display.get_default())
         icons_path = os.path.join(os.path.dirname(__file__), "icons")
         if os.path.exists(icons_path):
@@ -60,6 +64,22 @@ class TidalApp(Adw.Application):
         self._build_body(main_vbox)
         self._build_player_bar(main_vbox)
 
+        # [NEW] Restore Audio Settings
+        if self.settings.get("bit_perfect", False):
+            print("[Init] Restoring Bit-Perfect Mode...")
+            found = self.player.toggle_bit_perfect(True)
+            if hasattr(self, 'bp_switch'): self.bp_switch.set_active(True)
+            if found:
+                if hasattr(self, 'driver_dd'): self.driver_dd.set_sensitive(False)
+                if hasattr(self, 'device_dd'): self.device_dd.set_sensitive(False)
+        else:
+             # Restore manual settings if not bit-perfect
+             saved_drv = self.settings.get("driver", "Auto (Default)")
+             if saved_drv != "Auto (Default)":
+                 self.player.set_output(saved_drv)
+                 # We trigger UI update in _build_settings_page via idle_add, 
+                 # so the specific device restore happens there
+
         if self.backend.try_load_session(): self.on_login_success()
         self.win.present()
         self.win.connect("notify::default-width", self.update_layout_proportions)
@@ -73,7 +93,6 @@ class TidalApp(Adw.Application):
         self.search_entry = Gtk.Entry(placeholder_text="Search...", width_request=300, valign=Gtk.Align.CENTER)
         self.search_entry.connect("activate", self.on_search); header.set_title_widget(self.search_entry)
         
-        # Header Right Section: Login + Settings Button
         box_right = Gtk.Box(spacing=6)
         self.login_btn = Gtk.Button(label="Login", css_classes=["flat"])
         self.login_btn.connect("clicked", self.on_login_clicked)
@@ -91,7 +110,6 @@ class TidalApp(Adw.Application):
         self.sidebar_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.nav_list = Gtk.ListBox(css_classes=["navigation-sidebar"], margin_top=10); self.nav_list.connect("row-activated", self.on_nav_selected)
         
-        # Navigation Items
         for nid, icon, txt in [("home", "user-bookmarks-symbolic", "My Collection"), ("history", "document-open-recent-symbolic", "History")]:
             r = Gtk.ListBoxRow(); r.nav_id = nid; b = Gtk.Box(spacing=12, margin_start=12, margin_top=8, margin_bottom=8)
             b.append(Gtk.Image.new_from_icon_name(icon)); b.append(Gtk.Label(label=txt)); r.set_child(b); self.nav_list.append(r)
@@ -102,7 +120,6 @@ class TidalApp(Adw.Application):
 
         self.right_stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.SLIDE_LEFT_RIGHT); self.paned.set_end_child(self.right_stack)
         
-        # Build Pages
         self._build_albums_grid()
         self._build_tracks_view()
         self._build_settings_page()
@@ -148,13 +165,26 @@ class TidalApp(Adw.Application):
         settings_vbox.append(Gtk.Label(label="Audio Output", xalign=0, css_classes=["section-title"], margin_top=10))
         group_out = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["settings-group"])
         
+        # [NEW] Bit-Perfect Switch
+        row_bp = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
+        bp_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
+        bp_info.append(Gtk.Label(label="Bit-Perfect Mode", xalign=0, css_classes=["settings-label"]))
+        bp_info.append(Gtk.Label(label="Exclusive hardware lock", xalign=0, css_classes=["dim-label"]))
+        row_bp.append(bp_info)
+        row_bp.append(Gtk.Box(hexpand=True))
+        
+        self.bp_switch = Gtk.Switch(valign=Gtk.Align.CENTER)
+        self.bp_switch.connect("state-set", self.on_bit_perfect_toggled)
+        row_bp.append(self.bp_switch)
+        group_out.append(row_bp)
+
         # Driver Selector
         row_drv = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
         row_drv.append(Gtk.Label(label="Audio Driver", hexpand=True, xalign=0))
         drivers = self.player.get_drivers()
         self.driver_dd = Gtk.DropDown(model=Gtk.StringList.new(drivers))
         
-        # Restore saved driver
+        # Restore saved driver (UI only, logic handled in on_driver_changed)
         saved_drv = self.settings.get("driver")
         if saved_drv in drivers:
              for i, d in enumerate(drivers):
@@ -177,122 +207,86 @@ class TidalApp(Adw.Application):
         
         settings_vbox.append(group_out)
         self.right_stack.add_named(settings_scroll, "settings")
-        GLib.idle_add(lambda: self.on_driver_changed(self.driver_dd, None))
+        
+        # Trigger initial driver load (unless bit-perfect is on)
+        if not self.settings.get("bit_perfect", False):
+            GLib.idle_add(lambda: self.on_driver_changed(self.driver_dd, None))
 
     def _build_eq_popover(self):
         pop = Gtk.Popover()
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
-        
-        # Header
         hb = Gtk.Box(spacing=12)
         hb.append(Gtk.Label(label="10-Band Equalizer", css_classes=["title-4"]))
         reset = Gtk.Button(label="Reset", css_classes=["flat"])
         reset.connect("clicked", lambda b: (self.player.reset_eq(), [s.set_value(0) for s in self.sliders]))
         hb.append(reset)
         vbox.append(hb)
-
-        # Sliders
         hbox = Gtk.Box(spacing=8)
         freqs = ["30", "60", "120", "240", "480", "1k", "2k", "4k", "8k", "16k"]
         self.sliders = []
-        
         for i, f in enumerate(freqs):
             vb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-            # Slider: range -24 to +12, default 0
             scale = Gtk.Scale.new_with_range(Gtk.Orientation.VERTICAL, -24, 12, 1)
-            scale.set_inverted(True) # High gain at top
+            scale.set_inverted(True)
             scale.set_size_request(-1, 150)
             scale.set_value(0)
             scale.add_mark(0, Gtk.PositionType.RIGHT, None)
-            # Capture 'i' in lambda
             scale.connect("value-changed", lambda s, idx=i: self.player.set_eq_band(idx, s.get_value()))
             self.sliders.append(scale)
-            
-            vb.append(scale)
-            vb.append(Gtk.Label(label=f, css_classes=["caption"]))
-            hbox.append(vb)
-            
-        vbox.append(hbox)
-        pop.set_child(vbox)
+            vb.append(scale); vb.append(Gtk.Label(label=f, css_classes=["caption"])); hbox.append(vb)
+        vbox.append(hbox); pop.set_child(vbox)
         return pop
 
     def _build_player_bar(self, container):
-        # 创建底部播放条容器
-        self.bottom_bar = Gtk.Box(spacing=24, css_classes=["card-bar"])
-        container.append(self.bottom_bar)
+        self.bottom_bar = Gtk.Box(spacing=24, css_classes=["card-bar"]); container.append(self.bottom_bar)
 
-        # --- LEFT: Info Area (Art + Title) ---
         self.info_area = Gtk.Box(spacing=14, valign=Gtk.Align.CENTER)
-
-        # 封面图
         self.art_img = Gtk.Image(width_request=64, height_request=64, css_classes=["playback-art"])
-        gest = Gtk.GestureClick()
-        gest.connect("pressed", self.on_player_art_clicked)
-        self.art_img.add_controller(gest)
+        gest = Gtk.GestureClick(); gest.connect("pressed", self.on_player_art_clicked); self.art_img.add_controller(gest)
+        m = Gtk.EventControllerMotion(); m.connect("enter", lambda c,x,y: utils.set_pointer_cursor(self.art_img, True)); m.connect("leave", lambda c: utils.set_pointer_cursor(self.art_img, False)); self.art_img.add_controller(m)
+        t = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER); self.lbl_title = Gtk.Label(xalign=0, css_classes=["heading"], ellipsize=3); t.append(self.lbl_title)
+        self.info_area.append(self.art_img); self.info_area.append(t); self.bottom_bar.append(self.info_area)
 
-        # 鼠标悬停效果
-        m = Gtk.EventControllerMotion()
-        m.connect("enter", lambda c,x,y: utils.set_pointer_cursor(self.art_img, True))
-        m.connect("leave", lambda c: utils.set_pointer_cursor(self.art_img, False))
-        self.art_img.add_controller(m)
-
-        # 标题区 (现在只放标题，更清爽)
-        t = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
-        self.lbl_title = Gtk.Label(xalign=0, css_classes=["heading"], ellipsize=3)
-        t.append(self.lbl_title)
-
-        self.info_area.append(self.art_img)
-        self.info_area.append(t)
-        self.bottom_bar.append(self.info_area)
-
-        # --- CENTER: Controls + Seek + Tech Info ---
         c_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, hexpand=True, valign=Gtk.Align.CENTER)
-
-        # 1. 播放控制按钮 (上一首/播放/下一首)
-        ctrls = Gtk.Box(spacing=12, halign=Gtk.Align.CENTER)
-        ctrls.append(Gtk.Button(icon_name="media-skip-backward-symbolic", css_classes=["flat"]))
-
-        self.play_btn = Gtk.Button(icon_name="media-playback-start-symbolic", css_classes=["pill", "suggested-action"])
-        self.play_btn.connect("clicked", self.on_play_pause)
-        ctrls.append(self.play_btn)
-
-        ctrls.append(Gtk.Button(icon_name="media-skip-forward-symbolic", css_classes=["flat"]))
-        c_box.append(ctrls)
-
-        # 2. 进度条
-        self.scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
-        self.scale.set_hexpand(True)
-        self.scale.connect("value-changed", self.on_seek)
-        c_box.append(self.scale)
-
-        # 3. [移到这里] 技术参数标签 (Codec | 16/44.1 -> 32/44.1 | Bitrate)
-        # 增加 margin_top 让它和进度条保持距离，halign=CENTER 居中
+        ctrls = Gtk.Box(spacing=12, halign=Gtk.Align.CENTER); ctrls.append(Gtk.Button(icon_name="media-skip-backward-symbolic", css_classes=["flat"]))
+        self.play_btn = Gtk.Button(icon_name="media-playback-start-symbolic", css_classes=["pill", "suggested-action"]); self.play_btn.connect("clicked", self.on_play_pause); ctrls.append(self.play_btn)
+        ctrls.append(Gtk.Button(icon_name="media-skip-forward-symbolic", css_classes=["flat"])); c_box.append(ctrls)
+        self.scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1); self.scale.set_hexpand(True); self.scale.connect("value-changed", self.on_seek); c_box.append(self.scale)
+        
+        # [MODIFIED] Tech Label Centered Below Seekbar
         self.lbl_tech = Gtk.Label(label="-", css_classes=["tech-label"], halign=Gtk.Align.CENTER, margin_top=4)
         c_box.append(self.lbl_tech)
-
         self.bottom_bar.append(c_box)
 
-        # --- RIGHT: EQ + Volume ---
         r_box = Gtk.Box(spacing=12, valign=Gtk.Align.CENTER)
-        
-        # EQ Button
-        self.eq_btn = Gtk.Button(icon_name="eq-icon-symbolic", css_classes=["flat"])
-        self.eq_btn.set_tooltip_text("Equalizer")
-        self.eq_pop = self._build_eq_popover()
-        self.eq_pop.set_parent(self.eq_btn)
-        self.eq_btn.connect("clicked", lambda b: self.eq_pop.popup())
-        r_box.append(self.eq_btn)
-
-        # Volume
-        self.vol = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 5)
-        self.vol.set_value(80)
-        self.vol.set_size_request(120, -1)
-        self.vol.connect("value-changed", lambda s: self.player.set_volume(s.get_value()/100.0))
-        r_box.append(self.vol)
-        
+        self.eq_btn = Gtk.Button(icon_name="eq-icon-symbolic", css_classes=["flat"]); self.eq_btn.set_tooltip_text("Equalizer")
+        self.eq_pop = self._build_eq_popover(); self.eq_pop.set_parent(self.eq_btn); self.eq_btn.connect("clicked", lambda b: self.eq_pop.popup()); r_box.append(self.eq_btn)
+        self.vol = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 5); self.vol.set_value(80); self.vol.set_size_request(120, -1); self.vol.connect("value-changed", lambda s: self.player.set_volume(s.get_value()/100.0)); r_box.append(self.vol)
         self.bottom_bar.append(r_box)
 
     # --- Handlers ---
+    def on_bit_perfect_toggled(self, switch, state):
+        found = self.player.toggle_bit_perfect(state)
+        if state:
+            if found:
+                self.driver_dd.set_sensitive(False)
+                self.device_dd.set_sensitive(False)
+            else:
+                switch.set_active(False); return True
+        else:
+            self.driver_dd.set_sensitive(True)
+            self.device_dd.set_sensitive(True)
+            self.on_driver_changed(self.driver_dd, None)
+        self.settings["bit_perfect"] = state
+        self.save_settings()
+
+    def update_tech_label(self, info):
+        # [MODIFIED] Use get_format_string
+        fmt_str = self.player.get_format_string()
+        codec = info.get('codec', '-')
+        bitrate = info.get('bitrate', 0)
+        self.lbl_tech.set_text(f"{codec} | {fmt_str} | {bitrate//1000}kbps")
+
     def on_login_clicked(self, btn):
         u, f = self.backend.start_oauth(); webbrowser.open(u)
         Thread(target=lambda: self.backend.finish_login(f) and GLib.idle_add(self.on_login_success), daemon=True).start()
@@ -305,7 +299,6 @@ class TidalApp(Adw.Application):
         self.right_stack.set_visible_child_name("settings")
         self.grid_title_label.set_text("Settings")
         self.back_btn.set_sensitive(True)
-        # Deselect sidebar items
         self.nav_list.select_row(None)
         self.artist_list.select_row(None)
 
@@ -315,16 +308,17 @@ class TidalApp(Adw.Application):
         label = selected.get_string()
         print(f"[Settings] Quality switched to: {label}")
         self.backend.set_quality_mode(label)
-        # Reload current track if playing
         if self.player.is_playing() and 0 <= self.current_index < len(self.current_track_list):
             pos, _ = self.player.get_position()
             new_url = self.backend.get_stream_url(self.current_track_list[self.current_index])
             if new_url:
-                self.player.load(new_url)
-                self.player.play()
+                self.player.load(new_url); self.player.play()
                 GLib.timeout_add(100, lambda: self.player.seek(pos))
 
     def on_driver_changed(self, dd, p):
+        # Prevent manual changes if bit-perfect is active
+        if self.settings.get("bit_perfect", False): return
+
         selected = dd.get_selected_item()
         if not selected: return
         driver_name = selected.get_string()
@@ -335,60 +329,39 @@ class TidalApp(Adw.Application):
         self.player.set_output(driver_name)
         
         def refresh_devices():
-            # Prevent on_device_changed from saving "Default" while we load
             self.ignore_device_change = True
-            
             devices = self.player.get_devices_for_driver(driver_name)
             self.current_device_list = devices 
             names = [d["name"] for d in devices]
             self.device_dd.set_model(Gtk.StringList.new(names))
             
-            # Restore saved device
             saved_dev = self.settings.get("device")
             sel_idx = 0
             found_saved = False
-            
-            print(f"[Settings] Restoring device: {saved_dev} (from {len(names)} candidates)")
-            
             if saved_dev:
                 for i, name in enumerate(names):
                     if name == saved_dev:
-                        sel_idx = i
-                        found_saved = True
-                        break
+                        sel_idx = i; found_saved = True; break
             
             self.device_dd.set_sensitive(len(names) > 1)
             self.device_dd.set_selected(sel_idx)
-            
-            # Re-enable saving
             self.ignore_device_change = False
             
-            # Apply the selection (backend switch)
-            # We call this manually because we blocked the signal logic above
-            # But we pass a flag or just call the logic directly
             if found_saved:
-                print(f"[Settings] Auto-restored device index: {sel_idx}")
-                # Manually trigger the backend switch without saving (since we just read from save)
                 if sel_idx < len(self.current_device_list):
                     device_info = self.current_device_list[sel_idx]
                     self.player.set_output(driver_name, device_info['device_id'])
             else:
-                 # If not found or default, trigger normal change to update backend
                  GLib.idle_add(lambda: self.on_device_changed(self.device_dd, None))
-            
         Thread(target=lambda: GLib.idle_add(refresh_devices), daemon=True).start()
 
     def on_device_changed(self, dd, p):
-        if getattr(self, 'ignore_device_change', False): return
-        
+        if getattr(self, 'ignore_device_change', False) or self.settings.get("bit_perfect", False): return
         idx = dd.get_selected()
         if hasattr(self, 'current_device_list') and idx < len(self.current_device_list):
             device_info = self.current_device_list[idx]
-            
-            # Only save if it's a real user interaction (or valid restore)
             self.settings["device"] = device_info['name']
             self.save_settings()
-            
             driver_label = self.driver_dd.get_selected_item().get_string()
             print(f"[Settings] Switching to device: {device_info['name']}")
             self.player.set_output(driver_label, device_info['device_id'])
@@ -485,19 +458,6 @@ class TidalApp(Adw.Application):
 
     def on_seek(self, s): 
         if not self.is_programmatic_update: self.player.seek(s.get_value())
-
-
-
-    def update_tech_label(self, info):
-        # fmt_str = "16bit/44.1kHz -> ALSA | 32bit/44.1kHz"
-        fmt_str = self.player.get_format_string()
-
-        codec = info.get('codec', '-')
-        bitrate = info.get('bitrate', 0)
-
-        # 拼接: Codec | fmt_str | Bitrate
-        self.lbl_tech.set_text(f"{codec} | {fmt_str} | {bitrate//1000}kbps")
-
 
     def update_ui_loop(self):
         p, d = self.player.get_position()
