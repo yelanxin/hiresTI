@@ -269,9 +269,22 @@ class TidalApp(Adw.Application):
         r_box = Gtk.Box(spacing=12, valign=Gtk.Align.CENTER)
         
         # EQ Button
-        self.eq_btn = Gtk.Button(icon_name="view-list-symbolic", css_classes=["flat"])
-        if not Gtk.IconTheme.get_for_display(Gdk.Display.get_default()).has_icon("view-list-symbolic"):
-             self.eq_btn.set_icon_name("preferences-system-symbolic") 
+        self.eq_btn = Gtk.Button(css_classes=["flat"])
+        eq_icon_path = os.path.join(os.path.dirname(__file__), "icons", "eq_icon.jpg")
+        
+        # Use custom image if exists, otherwise fallback to system icon
+        if os.path.exists(eq_icon_path):
+            try:
+                # Create Pixbuf from file, scale to 24x24
+                pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(eq_icon_path, 24, 24, True)
+                img = Gtk.Image.new_from_pixbuf(pixbuf)
+                self.eq_btn.set_child(img)
+            except Exception as e:
+                print(f"Error loading custom EQ icon: {e}")
+                self.eq_btn.set_icon_name("view-list-symbolic")
+        else:
+             self.eq_btn.set_icon_name("view-list-symbolic")
+
         self.eq_btn.set_tooltip_text("Equalizer")
         self.eq_pop = self._build_eq_popover()
         self.eq_pop.set_parent(self.eq_btn)
