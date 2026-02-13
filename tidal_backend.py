@@ -11,15 +11,82 @@ class TidalBackend:
         self.session = tidalapi.Session()
         self.token_file = os.path.expanduser("~/.cache/hiresti_token.pkl")
         self.user = None
+        
+        # [修改] 初始化时尝试同步 Config
         self.quality = self._get_best_quality()
+        self._apply_global_config() 
+        
         self.fav_album_ids = set()
 
     def _get_best_quality(self):
+        # 优先检测 HI_RES (Max), 其次 MASTER (MQA), 最后 LOSSLESS (HiFi)
         for q in ['HI_RES', 'MASTER', 'LOSSLESS']:
             if hasattr(tidalapi.Quality, q):
                 val = getattr(tidalapi.Quality, q)
                 if not callable(val): return val
-        return 'LOSSLESS'
+        return getattr(tidalapi.Quality, 'LOSSLESS', 'LOSSLESS')
+
+    # [新增] 强制将音质应用到全局 Session Config
+    # 这是修复旧版库 "Always AAC" 问题的关键
+    def _apply_global_config(self):
+        try:
+            if hasattr(self.session, 'config'):
+                print(f"[Backend] Applying global quality setting: {self.quality}")
+                self.session.config.quality = self.quality
+        except Exception as e:
+            print(f"[Backend] Warning: Could not set session config: {e}")
+
+    def start_oauth(self):
+        # 重新创建 session 时也要应用配置
+        self.session = tidalapi.Session()
+        self._apply_global_config()
+        login_url, future = self.session.login_oauth()
+        return login_url, future
+
+    def finish_login(self, future):
+        try:
+            future.result()
+            if self.session.check_login():
+                self.user = self.session.user
+                self.save_session()
+                self.refresh_favorite_ids()
+                # 登录成功后再次确保配置正确
+                self._apply_global_config()
+                return True
+        except Exception as e:
+            print(f"Login Failed: {e}")
+        return False
+
+    def check_login(self):
+        return self.session.check_login()
+
+    def save_session(self):
+        os.makedirs(os.path.dirname(self.token_file), exist_ok=True)
+        with open(self.token_file, 'wb') as f:
+            data = {
+                'token_type': self.session.token_type,
+                'access_token': self.session.access_token,
+                'refresh_token': self.session.refresh_token,
+                'expiry_time': self.session.expiry_time
+            }
+            pickle.dump(data, f)
+
+    def try_load_session(self):
+        if os.path.exists(self.token_file):
+            try:
+                with open(self.token_file, 'rb') as f:
+                    d = pickle.load(f)
+                    self.session.load_oauth_session(
+                        d['token_type'], d['access_token'], d['refresh_token'], d['expiry_time']
+                    )
+                if self.session.check_login():
+                    self.user = self.session.user
+                    self.refresh_favorite_ids()
+                    self._apply_global_config() # 这里的也加上
+                    return True
+            except Exception as e:
+                print(f"Session Load Error: {e}")
+        return False
 
     def refresh_favorite_ids(self):
         try:
@@ -39,153 +106,25 @@ class TidalBackend:
             return any(str(a.id) == str(artist_id) for a in res)
         except: return False
 
-    def toggle_artist_favorite(self, artist_id, is_add):
+    def toggle_album_favorite(self, album_id, add=True):
         try:
-            if is_add: self.user.favorites.add_artist(artist_id)
+            if add:
+                self.user.favorites.add_album(album_id)
+                self.fav_album_ids.add(str(album_id))
+            else:
+                self.user.favorites.remove_album(album_id)
+                self.fav_album_ids.discard(str(album_id))
+            return True
+        except Exception as e:
+            print(f"Toggle Fav Error: {e}")
+            return False
+
+    def toggle_artist_favorite(self, artist_id, add=True):
+        try:
+            if add: self.user.favorites.add_artist(artist_id)
             else: self.user.favorites.remove_artist(artist_id)
             return True
         except: return False
-
-    def toggle_album_favorite(self, album_id, is_add):
-        try:
-            if is_add: self.user.favorites.add_album(album_id); self.fav_album_ids.add(str(album_id))
-            else: self.user.favorites.remove_album(album_id); self.fav_album_ids.discard(str(album_id))
-            return True
-        except: return False
-
-    def get_artwork_url(self, obj, size=640):
-        if not obj: return None
-        if hasattr(obj, 'cover_url') and obj.cover_url: return str(obj.cover_url)
-        try:
-            if hasattr(obj, 'picture'):
-                try: return obj.picture(width=size, height=size)
-                except: pass
-            if hasattr(obj, 'image'):
-                try: return obj.image(size=size)
-                except:
-                    try: return obj.image(width=size, height=size)
-                    except: return obj.image()
-            if hasattr(obj, 'album') and obj.album:
-                return self.get_artwork_url(obj.album, size)
-        except: pass
-        return None
-
-    def get_tracks(self, alb):
-        try:
-            if hasattr(alb, 'get_tracks') or hasattr(alb, 'tracks'):
-                res = alb.get_tracks() if hasattr(alb, 'get_tracks') else alb.tracks
-                return res() if callable(res) else res
-            else:
-                full_album = self.session.album(str(alb.id))
-                return full_album.tracks()
-        except: return []
-
-
-    def set_quality_mode(self, label):
-        """
-        可靠的音质切换逻辑：同时兼容大小写常量，并强制同步 Session
-        """
-        import tidalapi
-
-        # 1. 定义目标优先级队列
-        if "Hi-Res" in label:
-            # 优先找母带/高解析，没有就找无损
-            candidates = ['HI_RES', 'hi_res', 'MASTER', 'master', 'LOSSLESS', 'lossless']
-        else:
-            # 默认标准音质
-            candidates = ['HIGH', 'high']
-
-        target_quality = None
-
-        # 2. 穷举查找存在的常量
-        for c in candidates:
-            if hasattr(tidalapi.Quality, c):
-                val = getattr(tidalapi.Quality, c)
-                # 排除掉方法，只取属性
-                if not callable(val):
-                    target_quality = val
-                    logger.info(f"匹配到音质常量: tidalapi.Quality.{c}")
-                    break
-
-        # 3. 兜底策略：如果都没找到（极少见），回退到默认
-        if target_quality is None:
-            # 尝试硬编码 fallback
-            if "Hi-Res" in label:
-                 # 假设是一个较新的版本，尝试直接赋值字符串（某些版本允许）
-                 target_quality = 'HI_RES'
-            else:
-                 target_quality = 'HIGH'
-            logger.warning(f"未找到标准常量，使用 Fallback: {target_quality}")
-
-        self.quality = target_quality
-
-        # 4. 强制应用到 Session
-        try:
-            self.session.audio_quality = self.quality
-            if hasattr(self.session, 'config'):
-                self.session.config.quality = self.quality
-        except Exception as e:
-            logger.error(f"应用音质设置失败: {e}")
-
-    def get_stream_url(self, track):
-        try:
-            # 双重保险：获取链接前再次强制声明质量
-            self.session.audio_quality = self.quality
-            if hasattr(self.session, 'config'):
-                self.session.config.quality = self.quality
-
-            url = track.get_url()
-            return url() if callable(url) else url
-        except: return ""
-
-
-    def start_oauth(self):
-        """
-        启动 OAuth 流程（修复版：适配新版 tidalapi 返回结构）
-        """
-        # 1. 调用登录接口
-        if hasattr(self.session, 'login_oauth_64'):
-            res = self.session.login_oauth_64()
-        else:
-            res = self.session.login_oauth()
-
-        # 2. 打印调试信息（可选，方便排查）
-        print(f"[DEBUG] OAuth 返回结构长度: {len(res)}")
-
-        # 3. 核心修复：
-        # 新版 tidalapi 返回的是 (DeviceCode, Future)
-        # res[0] -> DeviceCode 对象 (包含 verification_uri_complete)
-        # res[1] -> Future 对象 (用于等待登录完成)
-
-        device_code = res[0]
-        future = res[1]
-
-        # 获取完整验证链接
-        login_url = device_code.verification_uri_complete
-
-        return str(login_url), future
-
-    def finish_login(self, fut):
-        try:
-            fut.result()
-            if self.session.check_login():
-                self.user = self.session.user; self.save_session(); self.refresh_favorite_ids(); return True
-        except: pass
-        return False
-
-    def save_session(self):
-        os.makedirs(os.path.dirname(self.token_file), exist_ok=True)
-        with open(self.token_file, 'wb') as f:
-            pickle.dump({'token_type': self.session.token_type, 'access_token': self.session.access_token, 'refresh_token': self.session.refresh_token, 'expiry_time': self.session.expiry_time}, f)
-
-    def try_load_session(self):
-        if os.path.exists(self.token_file):
-            try:
-                with open(self.token_file, 'rb') as f:
-                    d = pickle.load(f); self.session.load_oauth_session(d['token_type'], d['access_token'], d['refresh_token'], d['expiry_time'])
-                if self.session.check_login(): self.user = self.session.user; self.refresh_favorite_ids(); return True
-            except: pass
-        return False
 
     def get_favorites(self):
         try: 
@@ -205,6 +144,112 @@ class TidalBackend:
             return res() if callable(res) else res
         except: return []
 
-    def search_artist(self, q):
-        try: return self.session.search(q, models=[tidalapi.Artist]).get('artists', [])
+    def get_tracks(self, album):
+        try:
+            if hasattr(album, 'id') and not (hasattr(album, 'tracks') and callable(album.tracks)):
+                print(f"[Backend] Fetching tracks for history album ID: {album.id}")
+                real_album = self.session.album(album.id)
+                if real_album:
+                    res = real_album.tracks()
+                    return res() if callable(res) else res
+            
+            if hasattr(album, 'tracks') and callable(album.tracks):
+                res = album.tracks()
+                return res() if callable(res) else res
+            
+            return []
+        except Exception as e:
+            print(f"Get Tracks Error: {e}")
+            return []
+
+    def get_artwork_url(self, obj, size=320):
+        if not obj: return None
+        if hasattr(obj, 'album') and obj.album: obj = obj.album
+            
+        if hasattr(obj, 'picture'):
+            if callable(obj.picture): return obj.picture(width=size, height=size)
+            elif isinstance(obj.picture, str): 
+                try: return f"https://resources.tidal.com/images/{obj.picture.replace('-', '/')}/{size}x{size}.jpg"
+                except: pass
+
+        if hasattr(obj, 'cover'):
+            if callable(obj.cover): return obj.cover(width=size, height=size)
+            elif isinstance(obj.cover, str):
+                try: return f"https://resources.tidal.com/images/{obj.cover.replace('-', '/')}/{size}x{size}.jpg"
+                except: pass
+            
+        if hasattr(obj, 'cover_url'): return obj.cover_url
+        return None
+
+    # ==========================================
+    # [兼容性修复] 获取流媒体链接
+    # ==========================================
+    def get_stream_url(self, track):
+        # 旧版库 get_url() 不接受参数，必须依赖 session.config.quality
+        # 我们这里依然尝试传参，但更重要的是依赖 _apply_global_config 的效果
+        try:
+            return self.session.track(track.id).get_url(audio_quality=self.quality)
+        except TypeError:
+            pass # 参数名错误
+        except Exception:
+            pass
+
+        try:
+            return self.session.track(track.id).get_url(quality=self.quality)
+        except TypeError:
+            pass
+        except Exception:
+            pass
+        
+        # 保底：不传参数 (此时会使用 session.config.quality 的全局值)
+        try:
+            print("[Backend] Using default get_url() (relying on global config)")
+            return self.session.track(track.id).get_url()
+        except Exception as e:
+            print(f"Stream URL Error: {e}")
+            return None
+    
+    # [修复] 切换音质时，同步更新全局配置
+    def set_quality_mode(self, mode_str):
+        mapping = {
+            "Hi-Res (FLAC)": 'HI_RES',   
+            "Standard (AAC)": 'HIGH'     
+        }
+        
+        target_val = mapping.get(mode_str, 'LOSSLESS')
+        
+        if hasattr(tidalapi.Quality, target_val):
+            self.quality = getattr(tidalapi.Quality, target_val)
+            print(f"[Tidal] Quality set to: {self.quality} ({mode_str})")
+        else:
+            print(f"[Tidal] Warning: Quality {target_val} not found, using LOSSLESS.")
+            self.quality = getattr(tidalapi.Quality, 'LOSSLESS', 'LOSSLESS')
+            
+        # 立即应用到全局配置
+        self._apply_global_config()
+
+    def search_artist(self, query):
+        try:
+            return self.session.search(query, models=[tidalapi.models.Artist], limit=10).artists
         except: return []
+
+    def search_items(self, query):
+        print(f"[Backend] Searching for: {query}")
+        results = {'artists': [], 'albums': [], 'tracks': []}
+        try:
+            res = self.session.search(query, limit=50)
+            if hasattr(res, 'artists'):
+                raw = res.artists; results['artists'] = (raw() if callable(raw) else raw)[:6]
+            elif isinstance(res, dict) and 'artists' in res: results['artists'] = res['artists'][:6]
+
+            if hasattr(res, 'albums'):
+                raw = res.albums; results['albums'] = (raw() if callable(raw) else raw)[:6]
+            elif isinstance(res, dict) and 'albums' in res: results['albums'] = res['albums'][:6]
+
+            if hasattr(res, 'tracks'):
+                raw = res.tracks; results['tracks'] = (raw() if callable(raw) else raw)[:30]
+            elif isinstance(res, dict) and 'tracks' in res: results['tracks'] = res['tracks'][:30]
+            return results
+        except Exception as e:
+            print(f"[Search Error]: {e}")
+            return results

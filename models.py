@@ -1,4 +1,3 @@
-# models.py
 import os
 import time
 import json
@@ -7,7 +6,7 @@ class LocalAlbum:
     def __init__(self, data):
         self.id = data.get('id')
         self.name = data.get('name')
-        # 伪装成 Tidal 的 Artist 对象
+        # 伪装成 Tidal 的 Artist 对象，防止 main.py 报错
         self.artist = type('obj', (object,), {'name': data.get('artist', 'Unknown')})
         self.cover_url = data.get('cover_url')
         self.release_date = None
@@ -44,8 +43,9 @@ class HistoryManager:
         try:
             with open(self.path, 'r') as f:
                 return json.load(f)
-        except:
-            return []
+        except: return []
 
+    # [必须确保有这个方法]
     def get_albums(self):
-        return [LocalAlbum(x) for x in self.load_raw()]
+        raw = self.load_raw()
+        return [LocalAlbum(item) for item in raw]

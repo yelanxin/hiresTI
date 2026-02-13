@@ -40,12 +40,10 @@ CSS_DATA = """
     margin-bottom: 0;
     padding-top: 0;
     padding-bottom: 0;
-    valign: center; /* 这里的 center 确保内容区居中 */
 }
 
 .card-bar scale trough {
     min-height: 4px;     /* 减小轨道高度 */
-    max-width: 100px;
 }
 
 
