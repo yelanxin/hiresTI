@@ -7,7 +7,8 @@ import subprocess
 import time
 
 gi.require_version('Gst', '1.0')
-from gi.repository import Gst, GLib
+gi.require_version('GstPbutils', '1.0') 
+from gi.repository import Gst, GLib, GstPbutils
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -24,6 +25,13 @@ class AudioPlayer:
         bus.add_signal_watch()
         bus.connect("message", self.on_message)
         
+        # 初始化 Discoverer
+        try:
+            self.discoverer = GstPbutils.Discoverer.new(1 * Gst.SECOND)
+        except Exception as e:
+            print(f"[Init Warning] Failed to create Discoverer: {e}")
+            self.discoverer = None
+        
         self.on_eos_callback = on_eos_callback
         self.on_tag_callback = on_tag_callback
         
@@ -32,26 +40,48 @@ class AudioPlayer:
         
         self.bit_perfect_mode = False
         self.exclusive_lock_mode = False 
+        self.active_rate_switch = False
         
         self.current_driver = "Auto"
         self.current_device_id = None
         self.stream_info = {"codec": "-", "bitrate": 0, "rate": 0, "depth": 0}
         self.probe_id = None
-        
         self.borrowed_pa_card = None
 
         self._set_auto_sink()
 
     def cleanup(self):
-        """程序退出时调用"""
         print("[AudioPlayer] Cleaning up resources...")
         self.stop()
         self._restore_pa_device()
+        self._set_pipewire_clock(0)
 
     def load(self, uri):
         self.stop()
+        
+        if self.active_rate_switch and not self.exclusive_lock_mode and self.discoverer:
+            self._pre_adjust_pipewire_rate(uri)
+
         self.pipeline.set_property("uri", uri)
         self.stream_info = {"codec": "Loading...", "bitrate": 0}
+
+    def _pre_adjust_pipewire_rate(self, uri):
+        try:
+            info = self.discoverer.discover_uri(uri)
+            audio_streams = info.get_audio_streams()
+            if audio_streams:
+                target_rate = audio_streams[0].get_sample_rate()
+                if target_rate > 0:
+                    print(f"[Rate Switcher] Source is {target_rate}Hz. Adjusting PipeWire clock...")
+                    self._set_pipewire_clock(target_rate)
+        except Exception as e:
+            print(f"[Rate Switcher] Discovery failed (continuing anyway): {e}")
+
+    def _set_pipewire_clock(self, rate):
+        try:
+            cmd = ["pw-metadata", "-n", "settings", "0", "clock.force-rate", str(rate)]
+            subprocess.run(cmd, check=False, stderr=subprocess.DEVNULL)
+        except: pass
 
     def play(self):
         self.pipeline.set_state(Gst.State.PLAYING)
@@ -91,9 +121,7 @@ class AudioPlayer:
             for i in range(10):
                 self.equalizer.set_property(f"band{i}", 0.0)
 
-    # ==========================================
-    # 辅助：获取 PulseAudio/PipeWire 设备列表
-    # ==========================================
+    # ... 设备扫描 ...
     def _get_pulseaudio_devices(self):
         devices = []
         try:
@@ -112,26 +140,20 @@ class AudioPlayer:
         except: pass
         return devices
 
-    # ==========================================
-    # 设备扫描
-    # ==========================================
     def get_drivers(self):
         return ["Auto (Default)", "PipeWire", "PulseAudio", "ALSA"]
 
     def get_devices_for_driver(self, driver):
         devices = []
-        
         if driver == "Auto (Default)":
             devices.append({"name": "Default Output", "device_id": None})
             return devices
-
         if driver == "PulseAudio" or driver == "PipeWire":
             label = "Default System Output"
             devices.append({"name": label, "device_id": None})
             pa_devs = self._get_pulseaudio_devices()
             devices.extend(pa_devs)
             return devices
-
         if driver == "ALSA":
             try:
                 with open("/proc/asound/cards", "r") as f:
@@ -148,18 +170,12 @@ class AudioPlayer:
                 print(f"[ALSA Scan Error] {e}")
             devices.sort(key=lambda x: "USB" not in x["name"])
             return devices
-            
         return []
 
-    # ==========================================
-    # 声音服务器管理
-    # ==========================================
+    # ... 独占管理 ...
     def _release_pa_device(self, alsa_card_index):
-        if not self.exclusive_lock_mode:
-            return False
-
+        if not self.exclusive_lock_mode: return False
         try:
-            print(f"[Device Manager] Exclusive Lock ON: Releasing PA Card {alsa_card_index}...")
             subprocess.run(["fuser", "-k", f"/dev/snd/pcmC{alsa_card_index}D0p"], stderr=subprocess.DEVNULL)
             output = subprocess.check_output(["pactl", "list", "cards"], text=True)
             target_pa_name = None
@@ -178,7 +194,6 @@ class AudioPlayer:
 
     def _restore_pa_device(self):
         if self.borrowed_pa_card:
-            print(f"[Device Manager] Restoring Card: {self.borrowed_pa_card}")
             try:
                 res = subprocess.run(["pactl", "set-card-profile", self.borrowed_pa_card, "pro-audio"], capture_output=True)
                 if res.returncode != 0:
@@ -190,8 +205,6 @@ class AudioPlayer:
     # 输出设置
     # ==========================================
     def set_output(self, driver, device_id=None):
-        print(f"[AudioPlayer] Setting Output -> Driver: {driver}, Device: {device_id}")
-        
         was_playing = self.is_playing()
         self.pipeline.set_state(Gst.State.NULL)
         
@@ -212,6 +225,11 @@ class AudioPlayer:
                 sink.set_property("buffer-time", 100000)
                 sink.set_property("latency-time", 10000)
                 self.pipeline.set_property("audio-sink", sink)
+                ret = self.pipeline.set_state(Gst.State.READY)
+                if ret == Gst.StateChangeReturn.FAILURE:
+                    print(f"[AudioPlayer] ALSA Device {device_id} is BUSY! Falling back.")
+                    self.pipeline.set_state(Gst.State.NULL)
+                    self._set_auto_sink()
             else:
                 self._set_auto_sink()
 
@@ -245,12 +263,15 @@ class AudioPlayer:
     def toggle_bit_perfect(self, enabled, exclusive_lock=False):
         self.bit_perfect_mode = enabled
         self.exclusive_lock_mode = exclusive_lock 
+        self.active_rate_switch = enabled and not exclusive_lock
         
         if enabled:
             self.pipeline.set_property("audio-filter", None)
         else:
             self._restore_pa_device()
+            self._set_pipewire_clock(0)
             self.exclusive_lock_mode = False 
+            self.active_rate_switch = False
             if self.equalizer:
                 self.pipeline.set_property("audio-filter", self.equalizer)
             self._set_auto_sink()
@@ -284,12 +305,8 @@ class AudioPlayer:
             if self.on_tag_callback: GLib.idle_add(self.on_tag_callback, self.stream_info)
         return Gst.PadProbeReturn.OK
 
-    # ==========================================
-    # [核心修复] 消息处理与自动救援
-    # ==========================================
     def on_message(self, bus, message):
         t = message.type
-        
         if t == Gst.MessageType.EOS:
             if self.on_eos_callback: GLib.idle_add(self.on_eos_callback)
             
@@ -297,26 +314,26 @@ class AudioPlayer:
             err, debug = message.parse_error()
             debug_info = str(debug) if debug else ""
             print(f"[GStreamer Error] Code={err.code}, Msg={err.message}")
-            print(f"Debug Info: {debug_info}")
-
-            # 1. 检查是否是 'Device busy' 错误 (Code 4 = RESOURCE_BUSY)
             is_busy = err.code == 4 or "Device is being used" in debug_info or "busy" in debug_info
-            
-            # 2. 如果发生了 Busy 错误，且我们并没有强制独占
-            # 说明用户想开 Bit-Perfect 但设备被系统占了
-            # 我们应该做 "Soft Fallback"
             if is_busy and not self.exclusive_lock_mode:
                 print("[Auto-Recovery] Hardware is BUSY. Switching to System Fallback...")
-                
-                # 必须先停止 pipeline 才能换 sink
                 self.pipeline.set_state(Gst.State.NULL)
-                
-                # 换回 Auto Sink
                 self._set_auto_sink()
-                
-                # 尝试重新播放
-                # 注意：如果在初始化阶段就出错，这里可能需要延时
                 GLib.timeout_add(100, lambda: self.pipeline.set_state(Gst.State.PLAYING))
+        
+        # [核心修复] 恢复 TAG 解析逻辑，获取比特率
+        elif t == Gst.MessageType.TAG:
+            tags = message.parse_tag()
+            # 优先尝试读取 BITRATE
+            res, rate = tags.get_uint(Gst.TAG_BITRATE)
+            if not res:
+                # 如果没有，尝试 NOMINAL_BITRATE
+                res, rate = tags.get_uint(Gst.TAG_NOMINAL_BITRATE)
+            
+            if res:
+                self.stream_info["bitrate"] = rate
+                if self.on_tag_callback:
+                    GLib.idle_add(self.on_tag_callback, self.stream_info)
                 
         elif t == Gst.MessageType.STATE_CHANGED:
             old, new, pending = message.parse_state_changed()
