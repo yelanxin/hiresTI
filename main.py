@@ -206,7 +206,7 @@ class TidalApp(Adw.Application):
         row_ex = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
         ex_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
         ex_info.append(Gtk.Label(label="Force Hardware Exclusive", xalign=0, css_classes=["settings-label"]))
-        ex_info.append(Gtk.Label(label="Kill system audio service (Extreme)", xalign=0, css_classes=["dim-label"]))
+        ex_info.append(Gtk.Label(label="Bypass and release system audio control for this device", xalign=0, css_classes=["dim-label"]))
         row_ex.append(ex_info); row_ex.append(Gtk.Box(hexpand=True))
         self.ex_switch = Gtk.Switch(valign=Gtk.Align.CENTER, sensitive=False) 
         self.ex_switch.connect("state-set", self.on_exclusive_toggled)
