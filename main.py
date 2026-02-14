@@ -82,28 +82,28 @@ class TidalApp(Adw.Application):
         is_bp = self.settings.get("bit_perfect", False)
         is_ex = self.settings.get("exclusive_lock", False)
         
-        # 1. 恢复 Bit-Perfect (软件层)
+        # 1. 恢复 Bit-Perfect
         if is_bp:
             print("[Init] Restoring Bit-Perfect Mode...")
             self.player.toggle_bit_perfect(True, exclusive_lock=is_ex)
             if hasattr(self, 'bp_switch'): self.bp_switch.set_active(True)
             if hasattr(self, 'eq_btn'): self.eq_btn.set_sensitive(False)
-            if hasattr(self, 'bp_icon'): self.bp_icon.set_visible(True)
+            
+            # [修改] 恢复文字标签显示
+            if hasattr(self, 'bp_label'): self.bp_label.set_visible(True)
+            
             self._lock_volume_controls(True)
         
-        # 2. 恢复 Exclusive Lock (硬件层)
+        # 2. 恢复 Exclusive Lock
         if hasattr(self, 'ex_switch'):
-             self.ex_switch.set_sensitive(is_bp) # 只有开了 BP 才能开 Ex
+             self.ex_switch.set_sensitive(is_bp)
              self.ex_switch.set_active(is_ex)
         
         # 3. 恢复 Driver
-        # 如果开启了 Exclusive，我们强制切到 ALSA
-        # 如果没开 Exclusive，即使开了 BP，也恢复用户选择的 Driver (比如 PulseAudio)
         saved_drv = self.settings.get("driver", "Auto (Default)")
-        
         if is_ex:
-            saved_drv = "ALSA" # 独占模式必须是 ALSA
-            self.driver_dd.set_sensitive(False) # 锁定
+            saved_drv = "ALSA"
+            self.driver_dd.set_sensitive(False)
         
         print(f"[Init] Restoring Driver: {saved_drv}")
         drivers = self.player.get_drivers()
@@ -166,15 +166,53 @@ class TidalApp(Adw.Application):
         alb_scroll = Gtk.ScrolledWindow(vexpand=True); alb_scroll.set_child(self.main_flow); grid_vbox.append(alb_scroll)
         self.right_stack.add_named(grid_vbox, "grid_view")
 
+
     def _build_tracks_view(self):
-        trk_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL); trk_scroll = Gtk.ScrolledWindow(vexpand=True); trk_content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        trk_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        trk_scroll = Gtk.ScrolledWindow(vexpand=True)
+        trk_content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+
         self.album_header_box = Gtk.Box(spacing=24, css_classes=["album-header-box"])
         self.header_art = Gtk.Image(width_request=160, height_request=160, css_classes=["header-art"])
+
         info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER, hexpand=True)
-        self.header_title = Gtk.Label(xalign=0, wrap=True, css_classes=["album-title-large"]); self.header_artist = Gtk.Label(xalign=0, css_classes=["album-artist-medium"]); self.header_meta = Gtk.Label(xalign=0, css_classes=["album-meta"])
-        info.append(self.header_title); info.append(self.header_artist); info.append(self.header_meta); self.fav_btn = Gtk.Button(css_classes=["heart-btn"], icon_name="emblem-favorite-symbolic", valign=Gtk.Align.CENTER); self.fav_btn.connect("clicked", self.on_fav_clicked)
-        self.album_header_box.append(self.header_art); self.album_header_box.append(info); self.album_header_box.append(self.fav_btn); trk_content.append(self.album_header_box)
-        self.track_list = Gtk.ListBox(css_classes=["boxed-list"], margin_start=32, margin_end=32); self.track_list.connect("row-activated", self.on_track_selected); trk_content.append(self.track_list); trk_scroll.set_child(trk_content); trk_vbox.append(trk_scroll)
+        self.header_title = Gtk.Label(xalign=0, wrap=True, css_classes=["album-title-large"])
+
+        # [修改] 歌手名标签：添加点击和悬停效果
+        self.header_artist = Gtk.Label(xalign=0, css_classes=["album-artist-medium"])
+
+        # 1. 点击事件
+        tap = Gtk.GestureClick()
+        tap.connect("pressed", self.on_header_artist_clicked)
+        self.header_artist.add_controller(tap)
+
+        # 2. 鼠标悬停变手型
+        motion = Gtk.EventControllerMotion()
+        motion.connect("enter", lambda c,x,y: utils.set_pointer_cursor(self.header_artist, True))
+        motion.connect("leave", lambda c: utils.set_pointer_cursor(self.header_artist, False))
+        self.header_artist.add_controller(motion)
+
+        self.header_meta = Gtk.Label(xalign=0, css_classes=["album-meta"])
+
+        info.append(self.header_title)
+        info.append(self.header_artist)
+        info.append(self.header_meta)
+
+        self.fav_btn = Gtk.Button(css_classes=["heart-btn"], icon_name="emblem-favorite-symbolic", valign=Gtk.Align.CENTER)
+        self.fav_btn.connect("clicked", self.on_fav_clicked)
+
+        self.album_header_box.append(self.header_art)
+        self.album_header_box.append(info)
+        self.album_header_box.append(self.fav_btn)
+        trk_content.append(self.album_header_box)
+
+        # 列表保留之前的 margin 优化
+        self.track_list = Gtk.ListBox(css_classes=["boxed-list"], margin_start=32, margin_end=32, margin_bottom=32)
+        self.track_list.connect("row-activated", self.on_track_selected)
+        trk_content.append(self.track_list)
+
+        trk_scroll.set_child(trk_content)
+        trk_vbox.append(trk_scroll)
         self.right_stack.add_named(trk_vbox, "tracks")
 
     def _build_settings_page(self):
@@ -242,23 +280,96 @@ class TidalApp(Adw.Application):
         vbox.append(hbox); pop.set_child(vbox); return pop
 
     def _build_player_bar(self, container):
-        self.bottom_bar = Gtk.Box(spacing=24, css_classes=["card-bar"]); container.append(self.bottom_bar)
+        self.bottom_bar = Gtk.Box(spacing=24, css_classes=["card-bar"])
+        container.append(self.bottom_bar)
+        
+        # === 1. 左侧：封面与信息 ===
         self.info_area = Gtk.Box(spacing=14, valign=Gtk.Align.CENTER)
-        self.art_img = Gtk.Image(width_request=84, height_request=84, css_classes=["playback-art"])
-        gest = Gtk.GestureClick(); gest.connect("pressed", self.on_player_art_clicked); self.art_img.add_controller(gest)
-        m = Gtk.EventControllerMotion(); m.connect("enter", lambda c,x,y: utils.set_pointer_cursor(self.art_img, True)); m.connect("leave", lambda c: utils.set_pointer_cursor(self.art_img, False)); self.art_img.add_controller(m)
-        t = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER); self.lbl_title = Gtk.Label(xalign=0, css_classes=["heading"], ellipsize=3); t.append(self.lbl_title)
-        self.info_area.append(self.art_img); self.info_area.append(t); self.bottom_bar.append(self.info_area)
+        
+        # 封面图
+        self.art_img = Gtk.Image(width_request=72, height_request=72, css_classes=["playback-art"])
+        
+        # 封面点击手势
+        gest = Gtk.GestureClick()
+        gest.connect("pressed", self.on_player_art_clicked)
+        self.art_img.add_controller(gest)
+        
+        # 封面鼠标指针
+        m = Gtk.EventControllerMotion()
+        m.connect("enter", lambda c,x,y: utils.set_pointer_cursor(self.art_img, True))
+        m.connect("leave", lambda c: utils.set_pointer_cursor(self.art_img, False))
+        self.art_img.add_controller(m)
+        
+        # 文字区域：垂直布局
+        t = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER, spacing=0)
+        
+        # 第一行：歌名 (大号字体)
+        self.lbl_title = Gtk.Label(xalign=0, css_classes=["player-title"], ellipsize=3)
+        
+        # 第二行：艺术家 (高亮色)
+        self.lbl_artist = Gtk.Label(xalign=0, css_classes=["player-artist"], ellipsize=3)
+        
+        # 第三行：专辑名 (灰色小字)
+        self.lbl_album = Gtk.Label(xalign=0, css_classes=["player-album"], ellipsize=3)
+        
+        t.append(self.lbl_title)
+        t.append(self.lbl_artist)
+        t.append(self.lbl_album)
+        
+        self.info_area.append(self.art_img)
+        self.info_area.append(t)
+        self.bottom_bar.append(self.info_area)
+        
+        # === 2. 中间：控制按钮与进度条 ===
+        # [关键] 必须定义 c_box，否则后面会报错
         c_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, hexpand=True, valign=Gtk.Align.CENTER)
-        ctrls = Gtk.Box(spacing=12, halign=Gtk.Align.CENTER); ctrls.append(Gtk.Button(icon_name="media-skip-backward-symbolic", css_classes=["flat"]))
-        self.play_btn = Gtk.Button(icon_name="media-playback-start-symbolic", css_classes=["pill", "suggested-action"]); self.play_btn.connect("clicked", self.on_play_pause); ctrls.append(self.play_btn)
-        ctrls.append(Gtk.Button(icon_name="media-skip-forward-symbolic", css_classes=["flat"])); c_box.append(ctrls)
-        self.scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1); self.scale.set_hexpand(True); self.scale.connect("value-changed", self.on_seek); c_box.append(self.scale)
-        self.scale.set_size_request(400, -1); self.scale.set_halign(Gtk.Align.CENTER)
-        tech_box = Gtk.Box(spacing=8, halign=Gtk.Align.CENTER, margin_top=4); self.bp_icon = Gtk.Image(icon_name="audio-card-symbolic"); self.bp_icon.set_tooltip_text("Bit-Perfect Mode"); self.bp_icon.set_visible(False); tech_box.append(self.bp_icon)
-        self.lbl_tech = Gtk.Label(label="-", css_classes=["tech-label"], ellipsize=3); tech_box.append(self.lbl_tech); c_box.append(tech_box); self.bottom_bar.append(c_box)
-        r_box = Gtk.Box(spacing=12, valign=Gtk.Align.CENTER); self.eq_btn = Gtk.Button(icon_name="eq-icon-symbolic", css_classes=["flat"]); self.eq_btn.set_tooltip_text("Equalizer"); self.eq_pop = self._build_eq_popover(); self.eq_pop.set_parent(self.eq_btn); self.eq_btn.connect("clicked", lambda b: self.eq_pop.popup()); r_box.append(self.eq_btn)
-        self.vol = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 5); self.vol.set_value(80); self.vol.set_size_request(120, -1); self.vol.connect("value-changed", lambda s: self.player.set_volume(s.get_value()/100.0)); r_box.append(self.vol); self.bottom_bar.append(r_box)
+        
+        ctrls = Gtk.Box(spacing=12, halign=Gtk.Align.CENTER)
+        ctrls.append(Gtk.Button(icon_name="media-skip-backward-symbolic", css_classes=["flat"]))
+        
+        self.play_btn = Gtk.Button(icon_name="media-playback-start-symbolic", css_classes=["pill", "suggested-action"])
+        self.play_btn.connect("clicked", self.on_play_pause)
+        ctrls.append(self.play_btn)
+        
+        ctrls.append(Gtk.Button(icon_name="media-skip-forward-symbolic", css_classes=["flat"]))
+        c_box.append(ctrls)
+        
+        self.scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
+        self.scale.set_hexpand(True)
+        self.scale.connect("value-changed", self.on_seek)
+        c_box.append(self.scale)
+        self.scale.set_size_request(400, -1)
+        self.scale.set_halign(Gtk.Align.CENTER)
+        
+        # 技术参数标签区域 (包含发光的 Bit-Perfect 文字)
+        tech_box = Gtk.Box(spacing=8, halign=Gtk.Align.CENTER, margin_top=4)
+        
+        self.bp_label = Gtk.Label(label="BIT PERFECT", css_classes=["bp-text-glow"])
+        self.bp_label.set_tooltip_text("Bit-Perfect Mode Active")
+        self.bp_label.set_visible(False)
+        tech_box.append(self.bp_label)
+        
+        self.lbl_tech = Gtk.Label(label="-", css_classes=["tech-label"], ellipsize=3)
+        tech_box.append(self.lbl_tech)
+        
+        c_box.append(tech_box) # 这里就是报错的地方，现在 c_box 已经定义了
+        self.bottom_bar.append(c_box)
+        
+        # === 3. 右侧：音量与EQ ===
+        r_box = Gtk.Box(spacing=12, valign=Gtk.Align.CENTER)
+        self.eq_btn = Gtk.Button(icon_name="eq-icon-symbolic", css_classes=["flat"])
+        self.eq_btn.set_tooltip_text("Equalizer")
+        self.eq_pop = self._build_eq_popover()
+        self.eq_pop.set_parent(self.eq_btn)
+        self.eq_btn.connect("clicked", lambda b: self.eq_pop.popup())
+        r_box.append(self.eq_btn)
+        
+        self.vol = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 5)
+        self.vol.set_value(80)
+        self.vol.set_size_request(120, -1)
+        self.vol.connect("value-changed", lambda s: self.player.set_volume(s.get_value()/100.0))
+        r_box.append(self.vol)
+        self.bottom_bar.append(r_box)
 
     def _lock_volume_controls(self, locked):
         if not hasattr(self, 'vol'): return
@@ -267,7 +378,6 @@ class TidalApp(Adw.Application):
         else:
             self.vol.set_sensitive(True)
 
-    # [核心修改] 普通 Bit-Perfect 不再强制 ALSA
     def on_bit_perfect_toggled(self, switch, state):
         self.settings["bit_perfect"] = state
         self.save_settings()
@@ -275,28 +385,27 @@ class TidalApp(Adw.Application):
         
         # 激活 Exclusive 开关
         self.ex_switch.set_sensitive(state)
-        
-        # 如果关闭 BP，必须同时关闭 Exclusive
         if not state:
-            self.ex_switch.set_active(False) # 这会触发 on_exclusive_toggled
+            self.ex_switch.set_active(False)
         
-        # 传递状态
+        # 传递状态给播放器
         is_ex = self.ex_switch.get_active()
         self.player.toggle_bit_perfect(state, exclusive_lock=is_ex)
         
         self.eq_btn.set_sensitive(not state)
         if state: self.eq_pop.popdown()
-        if hasattr(self, 'bp_icon'): self.bp_icon.set_visible(state)
+        
+        # [修改] 控制文字标签的显示/隐藏
+        if hasattr(self, 'bp_label'): 
+            self.bp_label.set_visible(state)
 
-        # 只有在开了 Exclusive 的情况下，才强制锁定 Driver
+        # 驱动锁定逻辑
         if is_ex:
             self._force_driver_selection("ALSA")
             self.driver_dd.set_sensitive(False)
             self.on_driver_changed(self.driver_dd, None)
         else:
-            # 普通 BP 模式：允许切换驱动！
             self.driver_dd.set_sensitive(True)
-            # 不主动触发 driver change，保持用户当前选择
 
     # [新增] 独占开关逻辑
     def on_exclusive_toggled(self, switch, state):
@@ -417,24 +526,43 @@ class TidalApp(Adw.Application):
             self.on_artist_clicked(child.artist_obj)
 
     def show_album_details(self, alb):
+        # 1. 记录导航历史
         current_view = self.right_stack.get_visible_child_name()
-        if current_view: self.nav_history.append(current_view)
+        if current_view and current_view != "tracks": 
+            self.nav_history.append(current_view)
 
         self.current_album = alb
         self.right_stack.set_visible_child_name("tracks")
         self.back_btn.set_sensitive(True)
+        
+        # 2. 安全地设置标题和艺术家
         self.header_title.set_text(alb.name)
-        self.header_artist.set_text(getattr(alb.artist, 'name', 'Unknown'))
+        artist_name = "Unknown Artist"
+        if hasattr(alb, 'artist') and alb.artist:
+            artist_name = alb.artist.name if hasattr(alb.artist, 'name') else str(alb.artist)
+        self.header_artist.set_text(artist_name)
+        
+        # 3. 加载封面
         utils.load_img(self.header_art, lambda: self.backend.get_artwork_url(alb, 640), self.cache_dir, 160)
-        self.fav_btn.add_css_class("active") if self.backend.is_favorite(alb.id) else self.fav_btn.remove_css_class("active")
+        
+        # 4. [修改] 设置收藏状态图标
+        is_fav = self.backend.is_favorite(alb.id)
+        self._update_fav_icon(self.fav_btn, is_fav)
+        
+        # 5. 清空列表并开始加载
         while c := self.track_list.get_first_child(): self.track_list.remove(c)
+        
         def detail_task():
             ts = self.backend.get_tracks(alb)
             if not hasattr(alb, 'release_date') or not alb.release_date:
-                try: full = self.backend.session.album(str(alb.id)); GLib.idle_add(self._update_meta, full)
+                try: 
+                    full = self.backend.session.album(str(alb.id))
+                    GLib.idle_add(self._update_meta, full)
                 except: pass
-            else: GLib.idle_add(self._update_meta, alb)
+            else: 
+                GLib.idle_add(self._update_meta, alb)
             GLib.idle_add(self.populate_tracks, ts)
+            
         Thread(target=detail_task, daemon=True).start()
 
     def _update_meta(self, obj):
@@ -443,17 +571,55 @@ class TidalApp(Adw.Application):
 
     def populate_tracks(self, tracks):
         self.current_track_list = tracks
+        
+        # [新增] 尝试在新的列表中找到当前正在播放的歌曲，并更新 index
+        # 这样当你点击封面进入专辑页后，按“下一首”能正确播放专辑里的下一首
+        if self.playing_track_id:
+            found_idx = -1
+            for i, t in enumerate(tracks):
+                if t.id == self.playing_track_id:
+                    found_idx = i
+                    break
+            if found_idx != -1:
+                self.current_index = found_idx
+
+        # 渲染列表 UI
         for i, t in enumerate(tracks):
             b = Gtk.Box(spacing=16, margin_top=10, margin_bottom=10)
             stack = Gtk.Stack(); stack.set_size_request(30, -1)
-            lbl = Gtk.Label(label=str(i+1), css_classes=["dim-label"]); stack.add_named(lbl, "num")
-            icon = Gtk.Image(icon_name="media-playback-start-symbolic"); stack.add_named(icon, "icon")
             
-            if self.playing_track_id and t.id == self.playing_track_id: stack.set_visible_child_name("icon")
-            else: stack.set_visible_child_name("num")
+            lbl = Gtk.Label(label=str(i+1), css_classes=["dim-label"])
+            stack.add_named(lbl, "num")
             
-            b.append(stack); b.append(Gtk.Label(label=t.name, xalign=0, hexpand=True, ellipsize=3))
+            icon = Gtk.Image(icon_name="media-playback-start-symbolic")
+            stack.add_named(icon, "icon")
+            
+            # 高亮当前播放歌曲
+            if self.playing_track_id and t.id == self.playing_track_id: 
+                stack.set_visible_child_name("icon")
+            else: 
+                stack.set_visible_child_name("num")
+            
+            b.append(stack)
+            b.append(Gtk.Label(label=t.name, xalign=0, hexpand=True, ellipsize=3))
             self.track_list.append(b)
+
+    def on_header_artist_clicked(self, gest, n, x, y):
+        # 确保当前处于详情页且有专辑信息
+        if hasattr(self, 'current_album') and self.current_album:
+            # 尝试获取 artist 对象
+            artist_obj = None
+            if hasattr(self.current_album, 'artist') and self.current_album.artist:
+                artist_obj = self.current_album.artist
+            
+            # 如果是本地历史记录加载的专辑，可能只有 artist 名字字符串
+            # 这里做一个简单的兼容判断，只有真正的对象才跳转，防止报错
+            if artist_obj and not isinstance(artist_obj, str) and hasattr(artist_obj, 'id'):
+                print(f"[Nav] Jumping to artist from header: {artist_obj.name}")
+                self.on_artist_clicked(artist_obj)
+            else:
+                print("[Nav] Cannot jump: Artist data incomplete (History item?)")
+
 
     def on_artist_clicked(self, artist):
         current_view = self.right_stack.get_visible_child_name()
@@ -463,8 +629,14 @@ class TidalApp(Adw.Application):
         self.right_stack.set_visible_child_name("grid_view")
         self.grid_title_label.set_text(f"Albums by {artist.name}")
         self.back_btn.set_sensitive(True)
+        
+        # 显示收藏按钮
         self.artist_fav_btn.set_visible(True)
-        self.artist_fav_btn.add_css_class("active") if self.backend.is_artist_favorite(artist.id) else self.artist_fav_btn.remove_css_class("active")
+        
+        # [修改] 更新歌手收藏按钮的图标状态
+        is_fav = self.backend.is_artist_favorite(artist.id)
+        self._update_fav_icon(self.artist_fav_btn, is_fav)
+
         while c := self.main_flow.get_first_child(): self.main_flow.remove(c)
         Thread(target=lambda: GLib.idle_add(self.batch_load_albums, list(self.backend.get_albums(artist))), daemon=True).start()
 
@@ -512,14 +684,36 @@ class TidalApp(Adw.Application):
 
     def on_track_selected(self, box, row):
         if not row: return
-        idx = row.get_index(); track = self.current_track_list[idx]; self.current_index = idx
+        idx = row.get_index()
+        track = self.current_track_list[idx]
+        self.current_index = idx
+
+        # 保存当前播放对象
+        self.playing_track = track
         self.playing_track_id = track.id
-        self.lbl_title.set_text(track.name); cover_url = self.backend.get_artwork_url(track, 1280)
-        utils.load_img(self.art_img, cover_url, self.cache_dir, 140)
+
+        # 1. 设置歌名
+        self.lbl_title.set_text(track.name)
+
+        # 2. [新增] 设置艺术家 (第二行，高亮)
+        art_name = getattr(track.artist, 'name', 'Unknown Artist')
+        self.lbl_artist.set_text(art_name)
+
+        # 3. [新增] 设置专辑名 (第三行，灰色)
+        alb_name = track.album.name if hasattr(track, 'album') and track.album else "Unknown Album"
+        self.lbl_album.set_text(alb_name)
+
+        # 加载封面
+        cover_url = self.backend.get_artwork_url(track, 1280)
+        utils.load_img(self.art_img, cover_url, self.cache_dir, 72)
+
+        # 记录历史
         Thread(target=lambda: self.history_mgr.add(track, cover_url), daemon=True).start()
+
         def play():
             url = self.backend.get_stream_url(track)
-            if url: GLib.idle_add(lambda: (self.player.load(url), self.player.play(), self.play_btn.set_icon_name("media-playback-pause-symbolic")))
+            if url:
+                GLib.idle_add(lambda: (self.player.load(url), self.player.play(), self.play_btn.set_icon_name("media-playback-pause-symbolic")))
         Thread(target=play, daemon=True).start()
 
     def on_play_pause(self, btn):
@@ -541,20 +735,45 @@ class TidalApp(Adw.Application):
         s_px = max(int(self.win.get_width() * ui_config.SIDEBAR_RATIO), 240)
         self.paned.set_position(s_px); self.info_area.set_size_request(s_px, -1)
 
+    def _update_fav_icon(self, btn, is_active):
+        """
+        辅助函数：统一管理收藏按钮的图标和状态
+        未收藏 = 空心星形 (non-starred-symbolic) + 灰色
+        已收藏 = 实心爱心 (emblem-favorite-symbolic) + 红色
+        """
+        if is_active:
+            btn.set_icon_name("emblem-favorite-symbolic") # 实心爱心
+            btn.add_css_class("active")
+        else:
+            # 你也可以改成 "list-add-symbolic" (加号) 如果你觉得星变心太奇怪
+            btn.set_icon_name("non-starred-symbolic")     # 空心星形
+            btn.remove_css_class("active")
+
     def on_fav_clicked(self, btn):
         if not hasattr(self, 'current_album'): return
-        is_add = "active" not in btn.get_css_classes()
+        
+        # 检查当前是否已经是 active 状态
+        is_currently_active = "active" in btn.get_css_classes()
+        # 如果当前是 active，那么这次点击就是要取消 (is_add=False)
+        is_add = not is_currently_active
+        
         def do():
             if self.backend.toggle_album_favorite(self.current_album.id, is_add):
-                GLib.idle_add(lambda: btn.add_css_class("active") if is_add else btn.remove_css_class("active"))
+                # [修改] 使用辅助函数更新图标
+                GLib.idle_add(lambda: self._update_fav_icon(btn, is_add))
         Thread(target=do, daemon=True).start()
 
     def on_artist_fav_clicked(self, btn):
         if not hasattr(self, 'current_selected_artist'): return
-        art = self.current_selected_artist; is_add = "active" not in btn.get_css_classes()
+        
+        art = self.current_selected_artist
+        is_currently_active = "active" in btn.get_css_classes()
+        is_add = not is_currently_active
+        
         def do():
             if self.backend.toggle_artist_favorite(art.id, is_add):
-                GLib.idle_add(lambda: (btn.add_css_class("active") if is_add else btn.remove_css_class("active"), None))
+                # [修改] 使用辅助函数更新图标
+                GLib.idle_add(lambda: self._update_fav_icon(btn, is_add))
         Thread(target=do, daemon=True).start()
 
     def _build_search_view(self):
@@ -649,13 +868,33 @@ class TidalApp(Adw.Application):
             self.current_track_list = self.search_track_data
             self.current_index = idx
             track = self.current_track_list[idx]
+
+            # 保存当前播放对象
+            self.playing_track = track
             self.playing_track_id = track.id
-            self.lbl_title.set_text(track.name); cover_url = self.backend.get_artwork_url(track, 1280)
-            if cover_url: utils.load_img(self.art_img, cover_url, self.cache_dir, 140)
-            else: self.art_img.set_from_icon_name("audio-x-generic-symbolic")
+
+            # 1. 设置歌名
+            self.lbl_title.set_text(track.name)
+
+            # 2. [新增] 设置艺术家
+            art_name = getattr(track.artist, 'name', 'Unknown Artist')
+            self.lbl_artist.set_text(art_name)
+
+            # 3. [新增] 设置专辑名
+            alb_name = track.album.name if hasattr(track, 'album') and track.album else "Unknown Album"
+            self.lbl_album.set_text(alb_name)
+
+            # 加载封面
+            cover_url = self.backend.get_artwork_url(track, 1280)
+            if cover_url:
+                utils.load_img(self.art_img, cover_url, self.cache_dir, 72)
+            else:
+                self.art_img.set_from_icon_name("audio-x-generic-symbolic")
+
             def play():
                 url = self.backend.get_stream_url(track)
-                if url: GLib.idle_add(lambda: (self.player.load(url), self.player.play(), self.play_btn.set_icon_name("media-playback-pause-symbolic")))
+                if url:
+                    GLib.idle_add(lambda: (self.player.load(url), self.player.play(), self.play_btn.set_icon_name("media-playback-pause-symbolic")))
             Thread(target=play, daemon=True).start()
 
     def on_back_clicked(self, btn):
@@ -686,7 +925,21 @@ class TidalApp(Adw.Application):
                  child = child.get_next_sibling()
 
     def on_player_art_clicked(self, gest, n, x, y):
-        if 0 <= self.current_index < len(self.current_track_list): self.show_album_details(self.current_track_list[self.current_index].album)
+        """
+        点击底部播放栏封面：跳转到正在播放歌曲的专辑页
+        """
+        # [核心修复] 直接使用 self.playing_track，不再查表
+        if hasattr(self, 'playing_track') and self.playing_track:
+            track = self.playing_track
+
+            # 检查是否有专辑信息
+            if hasattr(track, 'album') and track.album:
+                print(f"[Nav] Jumping to playing album: {track.album.name}")
+                self.show_album_details(track.album)
+            else:
+                print("[Nav] Cannot jump: Track has no album info")
+        else:
+            print("[Nav] No track playing")
 
 if __name__ == "__main__":
     TidalApp().run(None)

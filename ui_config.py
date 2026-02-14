@@ -25,7 +25,8 @@ CSS_DATA = """
 
 /* 底部播放栏 */
 .card-bar { 
-    background-color: @headerbar_bg_color; 
+    background-color: alpha(@headerbar_bg_color, 0.5);
+    backdrop-filter: blur(20px);
     border-top: 1px solid alpha(currentColor, 0.12); 
     padding: 5px 16px; 
     /* 添加以下代码 */
@@ -70,6 +71,11 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
 .album-header-box { padding: 32px; margin-bottom: 10px; }
 .album-title-large { font-size: 28px; font-weight: 800; margin-bottom: 4px; }
 .album-artist-medium { font-size: 16px; font-weight: 600; color: @accent_color; margin-bottom: 8px; }
+.album-artist-medium:hover {
+    text-decoration: underline;
+    opacity: 0.8;
+    cursor: pointer; /* 某些环境可能需要显式声明 */
+}
 .album-meta { font-size: 13px; opacity: 0.7; }
 
 /* 大爱心按钮样式 */
@@ -130,4 +136,34 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
 }
 .settings-row:last-child { border-bottom: none; }
 .settings-label { font-weight: 600; }
+
+.player-title {
+    font-size: 20px;   /* <--- 这里调整大小，之前大约是 13-14px */
+    font-weight: 800;  /* 800 是特粗，会让标题更醒目 */
+    margin-bottom: 10px;
+}
+
+.player-artist {
+    color: @accent_color;
+    font-weight: 600;
+    font-size: 12px;
+    margin-bottom: 5px;
+}
+
+/* [新增] 播放栏：专辑名字 (第三行，灰色) */
+.player-album {
+    color: alpha(currentColor, 0.5);
+    font-size: 12px;
+}
+.bp-text-glow {
+    color: #489A54;  /* 金色 */
+    font-size: 10px;  /* 小而精致 */
+    letter-spacing: 1px;
+    margin-right: 3px;
+
+    /* 关键：文字阴影模拟发光效果 (颜色为金色的半透明版) */
+    text-shadow: 0 0 2px alpha(#FFD700, 0.6),
+                 0 0 5px alpha(#FFD700, 0.3);
+}
+
 """

@@ -40,8 +40,19 @@ class TidalBackend:
         # 重新创建 session 时也要应用配置
         self.session = tidalapi.Session()
         self._apply_global_config()
-        login_url, future = self.session.login_oauth()
-        return login_url, future
+
+        # 获取 OAuth 链接和 future
+        login_url_obj, future = self.session.login_oauth()
+
+        # [关键修复] 显式转换并检查 URL
+        # 有些版本需要访问 login_url_obj.verification_uri_complete
+        if hasattr(login_url_obj, 'verification_uri_complete'):
+            url = login_url_obj.verification_uri_complete
+        else:
+            url = str(login_url_obj)
+
+        print(f"[Backend] OAuth URL: {url}") # 在终端打印出来，方便手动复制
+        return url, future
 
     def finish_login(self, future):
         try:
