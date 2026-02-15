@@ -1,4 +1,5 @@
-# hiresTI Music Player 🎵
+# hiresTI Music Player 
+![Logo](icons/hicolor/64x64/apps/hiresti.png)
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![GTK4](https://img.shields.io/badge/UI-GTK4%20%2B%20Libadwaita-green)
