@@ -9,7 +9,7 @@
 
 Designed for audiophiles, it prioritizes sound quality above all else, featuring a dedicated **Bit-Perfect Mode** and **Hardware Exclusive Locking** to bypass the OS mixer and deliver pure, unaltered audio to your DAC.
 
-![Main Interface](screenshots/main.png)
+![Main Interface](screenshots/1.png)
 
 ## ✨ Key Features
 
@@ -33,9 +33,9 @@ Designed for audiophiles, it prioritizes sound quality above all else, featuring
 
 ## 📸 Screenshots
 
-| Album Detail | Search & Dark Mode |
+| Album Detai | Setting |
 |:---:|:---:|
-| ![Detail](screenshots/playing.png) | ![Search](screenshots/search.png) |
+| ![Detail](screenshots/2.png) | ![Search](screenshots/3.png) |
 
 ## 🛠️ Installation
 
