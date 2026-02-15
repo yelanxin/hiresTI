@@ -42,7 +42,7 @@ Designed for audiophiles, it prioritizes sound quality above all else, featuring
 We provide pre-built packages for major Linux distributions. No need to manually install Python libraries!
 
 ### 🐧 Debian / Ubuntu / Linux Mint / Deepin 
-Download the latest `.deb` release from the [Releases Page](../../releases).
+Download the latest `.deb or .rpm` release from the [Releases Page](../../releases).
 
 ```bash
 # Install the package
