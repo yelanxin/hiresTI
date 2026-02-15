@@ -38,7 +38,6 @@ Designed for audiophiles, it prioritizes sound quality above all else, featuring
 | ![Detail](screenshots/2.png) | ![Search](screenshots/3.png) |
 
 ## 🛠️ Installation
-## 📥 Installation
 
 We provide pre-built packages for major Linux distributions. No need to manually install Python libraries!
 
