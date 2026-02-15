@@ -26,7 +26,6 @@ CSS_DATA = """
 /* 底部播放栏 */
 .card-bar { 
     background-color: alpha(@headerbar_bg_color, 0.5);
-    backdrop-filter: blur(20px);
     border-top: 1px solid alpha(currentColor, 0.12); 
     padding: 5px 16px; 
     /* 添加以下代码 */
@@ -74,7 +73,6 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
 .album-artist-medium:hover {
     text-decoration: underline;
     opacity: 0.8;
-    cursor: pointer; /* 某些环境可能需要显式声明 */
 }
 .album-meta { font-size: 13px; opacity: 0.7; }
 
@@ -138,7 +136,7 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
 .settings-label { font-weight: 600; }
 
 .player-title {
-    font-size: 20px;   /* <--- 这里调整大小，之前大约是 13-14px */
+    font-size: 14px;   /* <--- 这里调整大小，之前大约是 13-14px */
     font-weight: 800;  /* 800 是特粗，会让标题更醒目 */
     margin-bottom: 10px;
 }

@@ -26,15 +26,17 @@ class TidalBackend:
                 if not callable(val): return val
         return getattr(tidalapi.Quality, 'LOSSLESS', 'LOSSLESS')
 
-    # [新增] 强制将音质应用到全局 Session Config
-    # 这是修复旧版库 "Always AAC" 问题的关键
     def _apply_global_config(self):
         try:
             if hasattr(self.session, 'config'):
-                print(f"[Backend] Applying global quality setting: {self.quality}")
+                # 某些版本需要直接修改属性
                 self.session.config.quality = self.quality
+                # 某些版本可能需要通过 set 方法
+                if hasattr(self.session.config, 'set_quality'):
+                    self.session.config.set_quality(self.quality)
+                print(f"[Backend] Global session config updated to: {self.quality}")
         except Exception as e:
-            print(f"[Backend] Warning: Could not set session config: {e}")
+            print(f"[Backend] Config Sync Warning: {e}")
 
     def start_oauth(self):
         # 重新创建 session 时也要应用配置
@@ -192,51 +194,60 @@ class TidalBackend:
         if hasattr(obj, 'cover_url'): return obj.cover_url
         return None
 
-    # ==========================================
-    # [兼容性修复] 获取流媒体链接
-    # ==========================================
+    # [tidal_backend.py] 恢复稳健版
     def get_stream_url(self, track):
-        # 旧版库 get_url() 不接受参数，必须依赖 session.config.quality
-        # 我们这里依然尝试传参，但更重要的是依赖 _apply_global_config 的效果
+        """
+        恢复最稳健的 URL 获取逻辑。
+        不再显式传递参数，而是依赖全局 Session 配置。
+        """
         try:
-            return self.session.track(track.id).get_url(audio_quality=self.quality)
-        except TypeError:
-            pass # 参数名错误
-        except Exception:
-            pass
+            # 1. 确保在获取 URL 之前，Session 的配置是最新的
+            self._apply_global_config()
+            
+            # 2. 获取真正的 Track 对象
+            full_track = self.session.track(track.id)
+            
+            # 3. 使用最原始的 get_url()。
+            # 这是最兼容的方式，由库根据 self.session.config.quality 自动决定请求参数。
+            url = full_track.get_url()
+            
+            print(f"[Backend] Successfully fetched URL for {track.name} using quality: {self.quality}")
+            return url
 
-        try:
-            return self.session.track(track.id).get_url(quality=self.quality)
-        except TypeError:
-            pass
-        except Exception:
-            pass
-        
-        # 保底：不传参数 (此时会使用 session.config.quality 的全局值)
-        try:
-            print("[Backend] Using default get_url() (relying on global config)")
-            return self.session.track(track.id).get_url()
         except Exception as e:
-            print(f"Stream URL Error: {e}")
+            print(f"[Backend] Stream URL Error: {e}")
+            # 如果报错 401，通常是会话失效，建议重新登录
             return None
-    
-    # [修复] 切换音质时，同步更新全局配置
+
     def set_quality_mode(self, mode_str):
+        # [修改] 官方三档映射逻辑
+        # Max -> HI_RES (或 MASTER)
+        # High -> LOSSLESS
+        # Low -> HIGH (AAC 320)
         mapping = {
-            "Hi-Res (FLAC)": 'HI_RES',   
-            "Standard (AAC)": 'HIGH'     
+            "Max (Up to 24-bit, 192 kHz)": ['HI_RES', 'MASTER'], 
+            "High (16-bit, 44.1 kHz)": ['LOSSLESS'],             
+            "Low (320 kbps)": ['HIGH', 'LOW']                    
         }
         
-        target_val = mapping.get(mode_str, 'LOSSLESS')
+        # 默认回退到 HIGH (即 320k AAC)，保证基本播放
+        target_keys = mapping.get(mode_str, ['HIGH'])
+        found_quality = None
         
-        if hasattr(tidalapi.Quality, target_val):
-            self.quality = getattr(tidalapi.Quality, target_val)
-            print(f"[Tidal] Quality set to: {self.quality} ({mode_str})")
-        else:
-            print(f"[Tidal] Warning: Quality {target_val} not found, using LOSSLESS.")
-            self.quality = getattr(tidalapi.Quality, 'LOSSLESS', 'LOSSLESS')
+        # 自动适配不同版本的 tidalapi 枚举值
+        for key in target_keys:
+            if hasattr(tidalapi.Quality, key):
+                found_quality = getattr(tidalapi.Quality, key)
+                break
+        
+        # 如果枚举值里没找到，尝试直接使用字符串（部分旧库支持）
+        if found_quality is None:
+            found_quality = target_keys[0]
+
+        self.quality = found_quality
+        print(f"[Backend] Quality resolved to: {self.quality} for {mode_str}")
             
-        # 立即应用到全局配置
+        # 立即同步到全局 Session 配置
         self._apply_global_config()
 
     def search_artist(self, query):
@@ -264,3 +275,18 @@ class TidalBackend:
         except Exception as e:
             print(f"[Search Error]: {e}")
             return results
+
+    def logout(self):
+        print("[Backend] Logging out...")
+        # 1. 删除本地 Token 文件
+        if os.path.exists(self.token_file):
+            try: os.remove(self.token_file)
+            except: pass
+
+        # 2. 重置 Session 和 User
+        self.user = None
+        self.session = tidalapi.Session()
+        self.fav_album_ids = set()
+
+        # 3. 重新应用配置 (防止 session 重置后音质设置丢失)
+        self._apply_global_config()

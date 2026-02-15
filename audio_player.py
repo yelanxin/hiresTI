@@ -295,14 +295,25 @@ class AudioPlayer:
             structure = caps.get_structure(0)
             fmt = structure.get_value("format")
             rate = structure.get_value("rate")
+            
+            # 计算位深
             depth = "16bit"
             if "S24" in str(fmt): depth = "24bit"
             elif "S32" in str(fmt) or "F32" in str(fmt): depth = "32bit"
+            
+            # 计算采样率字符串
             khz = f"{rate//1000}kHz" if rate else "?"
-            self.stream_info["codec"] = "FLAC/PCM"
+            
+            # [核心修复] 不要在这里硬编码 "FLAC/PCM"！
+            # Codec 信息应该由 on_message 从 TAG 中提取，或者根据 bitrate 推断。
+            # self.stream_info["codec"] = "FLAC/PCM" <--- 删除这行
+            
             self.stream_info["rate"] = rate
             self.stream_info["fmt_str"] = f"{khz} | {depth}"
-            if self.on_tag_callback: GLib.idle_add(self.on_tag_callback, self.stream_info)
+            
+            if self.on_tag_callback: 
+                GLib.idle_add(self.on_tag_callback, self.stream_info)
+                
         return Gst.PadProbeReturn.OK
 
     def on_message(self, bus, message):
@@ -314,6 +325,7 @@ class AudioPlayer:
             err, debug = message.parse_error()
             debug_info = str(debug) if debug else ""
             print(f"[GStreamer Error] Code={err.code}, Msg={err.message}")
+            # 忙碌恢复逻辑
             is_busy = err.code == 4 or "Device is being used" in debug_info or "busy" in debug_info
             if is_busy and not self.exclusive_lock_mode:
                 print("[Auto-Recovery] Hardware is BUSY. Switching to System Fallback...")
@@ -321,19 +333,34 @@ class AudioPlayer:
                 self._set_auto_sink()
                 GLib.timeout_add(100, lambda: self.pipeline.set_state(Gst.State.PLAYING))
         
-        # [核心修复] 恢复 TAG 解析逻辑，获取比特率
         elif t == Gst.MessageType.TAG:
             tags = message.parse_tag()
-            # 优先尝试读取 BITRATE
-            res, rate = tags.get_uint(Gst.TAG_BITRATE)
-            if not res:
-                # 如果没有，尝试 NOMINAL_BITRATE
-                res, rate = tags.get_uint(Gst.TAG_NOMINAL_BITRATE)
             
-            if res:
-                self.stream_info["bitrate"] = rate
-                if self.on_tag_callback:
-                    GLib.idle_add(self.on_tag_callback, self.stream_info)
+            # 1. 获取比特率
+            res, rate = tags.get_uint(Gst.TAG_BITRATE)
+            if not res: res, rate = tags.get_uint(Gst.TAG_NOMINAL_BITRATE)
+            if res: self.stream_info["bitrate"] = rate
+
+            # 2. [新增] 尝试获取真实的 Codec 标签
+            res, codec_tag = tags.get_string(Gst.TAG_AUDIO_CODEC)
+            if res: 
+                # 简化显示，比如 "MPEG-4 AAC" -> "AAC"
+                if "AAC" in codec_tag: self.stream_info["codec"] = "AAC"
+                elif "FLAC" in codec_tag: self.stream_info["codec"] = "FLAC"
+                else: self.stream_info["codec"] = codec_tag
+
+            # 3. [保底逻辑] 如果 TAG 没给 Codec，根据比特率智能推断
+            # 防止显示 "Loading..." 或 "-"
+            current_codec = self.stream_info.get("codec", "-")
+            if current_codec in ["-", "Loading..."] and "bitrate" in self.stream_info:
+                br = self.stream_info["bitrate"]
+                if br > 0 and br < 500000: # 小于 500kbps 认为是 AAC
+                    self.stream_info["codec"] = "AAC"
+                elif br >= 500000:         # 大于 500kbps 认为是 FLAC
+                    self.stream_info["codec"] = "FLAC"
+
+            if self.on_tag_callback:
+                GLib.idle_add(self.on_tag_callback, self.stream_info)
                 
         elif t == Gst.MessageType.STATE_CHANGED:
             old, new, pending = message.parse_state_changed()
