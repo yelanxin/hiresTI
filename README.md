@@ -38,13 +38,16 @@ Designed for audiophiles, it prioritizes sound quality above all else, featuring
 | ![Detail](screenshots/2.png) | ![Search](screenshots/3.png) |
 
 ## 🛠️ Installation
+## 📥 Installation
 
-### Prerequisites
+We provide pre-built packages for major Linux distributions. No need to manually install Python libraries!
 
-**Fedora 43 (Recommended)**
+### 🐧 Debian / Ubuntu / Linux Mint / Deepin
+Download the latest `.deb` release from the [Releases Page](../../releases).
+
 ```bash
-sudo dnf install python3-gobject gtk4 libadwaita gstreamer1 \
-    gstreamer1-plugins-base gstreamer1-plugins-good \
-    gstreamer1-plugins-bad-free gstreamer1-plugins-ugly-free \
-    gstreamer1-libav pipewire-utils pulseaudio-utils psmisc \
-    python3-pip python3-devel gcc
+# Install the package
+sudo dpkg -i hiresti_1.0.0_all.deb
+
+# Install with dnf (recommended handles dependencies automatically)
+sudo dnf install ./hiresti-1.0.0-1.x86_64.rpm
