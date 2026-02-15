@@ -164,4 +164,36 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
                  0 0 5px alpha(#FFD700, 0.3);
 }
 
+
+.signal-card {
+    background-color: alpha(currentColor, 0.05);
+    border-radius: 12px;
+    padding: 16px;
+    margin: 0 8px;
+    border: 1px solid alpha(currentColor, 0.08);
+}
+
+.signal-icon {
+    color: @accent_color;
+    -gtk-icon-size: 24px;
+}
+
+.signal-connector {
+    color: alpha(currentColor, 0.2);
+    font-size: 24px;
+    font-weight: 800;
+    margin: -4px 0; /* 让箭头紧凑一点 */
+    halign: center;
+}
+
+.stat-value {
+    font-family: "Monospace";
+    font-weight: bold;
+    font-size: 13px;
+}
+
+.success-text {
+    color: #26a269; /* GTK Success Green */
+}
+
 """

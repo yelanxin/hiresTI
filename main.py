@@ -5,7 +5,7 @@ os.environ["MESA_LOG_LEVEL"] = "error"
 import gi
 gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
-from gi.repository import Gtk, Adw, GLib, Gdk
+from gi.repository import Gtk, Adw, GLib, Gdk, Pango  # [新增] 引入 Pango 处理字体特性
 
 import webbrowser
 import json
@@ -13,6 +13,7 @@ from threading import Thread
 from tidal_backend import TidalBackend
 from audio_player import AudioPlayer
 from models import HistoryManager
+from signal_path import AudioSignalPathWindow
 import utils
 import ui_config
 
@@ -99,7 +100,6 @@ class TidalApp(Adw.Application):
         is_bp = self.settings.get("bit_perfect", False)
         is_ex = self.settings.get("exclusive_lock", False)
         
-        # 1. 恢复 Bit-Perfect
         if is_bp:
             print("[Init] Restoring Bit-Perfect Mode...")
             self.player.toggle_bit_perfect(True, exclusive_lock=is_ex)
@@ -108,12 +108,10 @@ class TidalApp(Adw.Application):
             if hasattr(self, 'bp_label'): self.bp_label.set_visible(True)
             self._lock_volume_controls(True)
         
-        # 2. 恢复 Exclusive Lock
         if hasattr(self, 'ex_switch'):
              self.ex_switch.set_sensitive(is_bp)
              self.ex_switch.set_active(is_ex)
         
-        # 3. 恢复 Driver
         saved_drv = self.settings.get("driver", "Auto (Default)")
         if is_ex:
             saved_drv = "ALSA"
@@ -128,11 +126,10 @@ class TidalApp(Adw.Application):
                     break
         self.on_driver_changed(self.driver_dd, None)
 
-        # [修改] 检查登录状态并更新 UI
         if self.backend.try_load_session(): 
             self.on_login_success()
         else:
-            self._toggle_login_view(False) # 未登录状态
+            self._toggle_login_view(False) 
 
         self.win.present()
         self.win.connect("notify::default-width", self.update_layout_proportions)
@@ -148,22 +145,26 @@ class TidalApp(Adw.Application):
         
         box_right = Gtk.Box(spacing=6)
         
-        # 登录按钮
         self.login_btn = Gtk.Button(label="Login", css_classes=["flat"])
         self.login_btn.connect("clicked", self.on_login_clicked)
         
-        # [新增] 创建弹出菜单并设置父控件
         self.user_popover = self._build_user_popover()
         self.user_popover.set_parent(self.login_btn)
+        
+        self.info_btn = Gtk.Button(icon_name="utilities-system-monitor-symbolic", css_classes=["flat"])
+        self.info_btn.set_tooltip_text("Signal Path / Tech Info")
+        self.info_btn.connect("clicked", self.on_tech_info_clicked)
         
         self.settings_btn = Gtk.Button(icon_name="emblem-system-symbolic", css_classes=["flat"])
         self.settings_btn.set_tooltip_text("Settings")
         self.settings_btn.connect("clicked", self.on_settings_clicked)
         
-        box_right.append(self.login_btn); box_right.append(self.settings_btn); header.pack_end(box_right)
+        box_right.append(self.login_btn)
+        box_right.append(self.info_btn)
+        box_right.append(self.settings_btn)
+        header.pack_end(box_right)
 
     def _build_user_popover(self):
-        """创建包含 Logout 的弹出菜单"""
         pop = Gtk.Popover()
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin_top=6, margin_bottom=6, margin_start=6, margin_end=6)
         btn = Gtk.Button(label="Logout", css_classes=["flat", "destructive-action"])
@@ -171,6 +172,10 @@ class TidalApp(Adw.Application):
         vbox.append(btn)
         pop.set_child(vbox)
         return pop
+    
+    def on_tech_info_clicked(self, btn):
+        win = AudioSignalPathWindow(self)
+        win.present()
 
     def _build_body(self, container):
         self.paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL, vexpand=True); container.append(self.paned)
@@ -201,14 +206,12 @@ class TidalApp(Adw.Application):
     def _build_grid_view(self):
         grid_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         
-        # 1. 标题区域
         t_box = Gtk.Box(spacing=12, margin_start=32, margin_end=32, margin_top=32, margin_bottom=12)
         self.grid_title_label = Gtk.Label(label="My Collection", xalign=0, css_classes=["section-title"])
         self.artist_fav_btn = Gtk.Button(css_classes=["heart-btn"], icon_name="emblem-favorite-symbolic", visible=False)
         self.artist_fav_btn.connect("clicked", self.on_artist_fav_clicked)
         t_box.append(self.grid_title_label); t_box.append(self.artist_fav_btn); grid_vbox.append(t_box)
 
-        # 2. [新增] 未登录提示区域
         self.login_prompt_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=20, valign=Gtk.Align.CENTER, vexpand=True)
         self.login_prompt_box.set_visible(False)
         
@@ -222,7 +225,6 @@ class TidalApp(Adw.Application):
         self.login_prompt_box.append(prompt_btn)
         grid_vbox.append(self.login_prompt_box)
 
-        # 3. 专辑列表区域
         self.main_flow = Gtk.FlowBox(valign=Gtk.Align.START, max_children_per_line=30, selection_mode=Gtk.SelectionMode.NONE, column_spacing=24, row_spacing=28, margin_start=32, margin_end=32, margin_bottom=32)
         self.main_flow.connect("child-activated", self.on_grid_item_activated)
         
@@ -232,12 +234,7 @@ class TidalApp(Adw.Application):
         
         self.right_stack.add_named(grid_vbox, "grid_view")
 
-
     def _toggle_login_view(self, logged_in):
-        """
-        根据登录状态切换界面显示。
-        [最终修复] 从 profile_metadata 中提取名字，解决 first_name 为空的问题。
-        """
         self.login_prompt_box.set_visible(not logged_in)
         self.alb_scroll.set_visible(logged_in)
         
@@ -247,38 +244,20 @@ class TidalApp(Adw.Application):
         else:
             display_name = "User"
             user = self.backend.user
-            
             if user:
-                # 1. 优先尝试从 profile_metadata 里挖名字
-                # 这是 Tidal 新版 API 存放用户自定义名字的地方
                 meta = getattr(user, 'profile_metadata', None)
                 if meta:
-                    # 如果 meta 是字典
-                    if isinstance(meta, dict):
-                        display_name = meta.get('name') or meta.get('firstName') or display_name
-                    # 如果 meta 是对象
-                    else:
-                        display_name = getattr(meta, 'name', None) or getattr(meta, 'first_name', None) or display_name
+                    if isinstance(meta, dict): display_name = meta.get('name') or meta.get('firstName') or display_name
+                    else: display_name = getattr(meta, 'name', None) or getattr(meta, 'first_name', None) or display_name
 
-                # 2. 如果元数据里也没找到，或者还是默认值，再尝试标准字段
                 if display_name == "User" or display_name is None:
-                    candidates = [
-                        getattr(user, 'first_name', None),
-                        getattr(user, 'name', None),
-                        getattr(user, 'firstname', None),
-                    ]
+                    candidates = [getattr(user, 'first_name', None), getattr(user, 'name', None), getattr(user, 'firstname', None)]
                     for c in candidates:
-                        if c and isinstance(c, str) and c.strip():
-                            display_name = c
-                            break
+                        if c and isinstance(c, str) and c.strip(): display_name = c; break
 
-                # 3. 最后的兜底：用邮箱前缀
                 if (not display_name or display_name == "User") and hasattr(user, 'username') and user.username:
-                    try:
-                        # yelanxin@gmail.com -> Yelanxin
-                        display_name = user.username.split('@')[0].capitalize()
-                    except:
-                        display_name = user.username
+                    try: display_name = user.username.split('@')[0].capitalize()
+                    except: display_name = user.username
 
             self.login_btn.set_label(f"Hi, {display_name}")
             self.grid_title_label.set_text("My Collection")
@@ -294,7 +273,6 @@ class TidalApp(Adw.Application):
         info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER, hexpand=True)
         self.header_title = Gtk.Label(xalign=0, wrap=True, css_classes=["album-title-large"])
 
-        # 歌手名标签
         self.header_artist = Gtk.Label(xalign=0, css_classes=["album-artist-medium"])
         tap = Gtk.GestureClick(); tap.connect("pressed", self.on_header_artist_clicked); self.header_artist.add_controller(tap)
         motion = Gtk.EventControllerMotion()
@@ -325,7 +303,6 @@ class TidalApp(Adw.Application):
         settings_scroll.set_child(settings_vbox)
         settings_vbox.append(Gtk.Label(label="Settings", xalign=0, css_classes=["album-title-large"], margin_bottom=10))
 
-        # === Streaming Quality ===
         group_q = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["settings-group"])
         row_q = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
         row_q.append(Gtk.Label(label="Audio Quality", hexpand=True, xalign=0))
@@ -338,11 +315,9 @@ class TidalApp(Adw.Application):
         self.quality_dd.connect("notify::selected-item", self.on_quality_changed)
         row_q.append(self.quality_dd); group_q.append(row_q); settings_vbox.append(group_q)
 
-        # === Audio Output ===
         settings_vbox.append(Gtk.Label(label="Audio Output", xalign=0, css_classes=["section-title"], margin_top=10))
         group_out = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["settings-group"])
 
-        # 1. Bit-Perfect 开关
         row_bp = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
         bp_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
         bp_info.append(Gtk.Label(label="Bit-Perfect Mode", xalign=0, css_classes=["settings-label"]))
@@ -351,24 +326,14 @@ class TidalApp(Adw.Application):
         self.bp_switch = Gtk.Switch(valign=Gtk.Align.CENTER); self.bp_switch.connect("state-set", self.on_bit_perfect_toggled)
         row_bp.append(self.bp_switch); group_out.append(row_bp)
 
-        # 2. Exclusive Lock 开关 (带点击提示)
         row_ex = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
-
         ex_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
-
         title_box = Gtk.Box(spacing=6, orientation=Gtk.Orientation.HORIZONTAL)
         title_box.append(Gtk.Label(label="Force Hardware Exclusive", xalign=0, css_classes=["settings-label"]))
 
-        # [修改] 点击显示帮助气泡
         help_btn = Gtk.Button(icon_name="dialog-question-symbolic", css_classes=["flat", "circular"])
-        help_btn.set_tooltip_text("Click for details") # 简单的悬停提示
-
-        # 创建气泡
-        help_pop = Gtk.Popover()
-        help_pop.set_parent(help_btn)
-        help_pop.set_autohide(True) # 点击外部自动关闭
-
-        # 气泡内容
+        help_btn.set_tooltip_text("Click for details") 
+        help_pop = Gtk.Popover(); help_pop.set_parent(help_btn); help_pop.set_autohide(True)
         pop_content = Gtk.Label(wrap=True, max_width_chars=40, xalign=0)
         pop_content.set_markup(
             "<b>Exclusive Mode Control</b>\n\n"
@@ -380,12 +345,8 @@ class TidalApp(Adw.Application):
             "• <b>Warning:</b> Other apps (YouTube, etc.) cannot play sound while this is on."
         )
         pop_box = Gtk.Box(margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
-        pop_box.append(pop_content)
-        help_pop.set_child(pop_box)
-
-        # 绑定点击事件 (移除会导致死循环的 hover 代码)
+        pop_box.append(pop_content); help_pop.set_child(pop_box)
         help_btn.connect("clicked", lambda x: help_pop.popup())
-
         title_box.append(help_btn)
 
         ex_info.append(title_box)
@@ -398,7 +359,6 @@ class TidalApp(Adw.Application):
         self.ex_switch.connect("state-set", self.on_exclusive_toggled)
         row_ex.append(self.ex_switch); group_out.append(row_ex)
 
-        # 3. Drivers
         row_drv = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
         row_drv.append(Gtk.Label(label="Audio Driver", hexpand=True, xalign=0))
         drivers = self.player.get_drivers()
@@ -459,16 +419,37 @@ class TidalApp(Adw.Application):
         ctrls.append(Gtk.Button(icon_name="media-skip-forward-symbolic", css_classes=["flat"]))
         c_box.append(ctrls)
         
+        # [修改] 进度条容器：当前时间 - 进度条 - 总时间
+        timeline_box = Gtk.Box(spacing=12, orientation=Gtk.Orientation.HORIZONTAL)
+        
+        # 启用 tnum (Tabular Numbers) 防止数字跳动
+        attr_list = Pango.AttrList.from_string("font-features 'tnum=1'")
+        
+        self.lbl_current_time = Gtk.Label(label="0:00", css_classes=["dim-label"])
+        self.lbl_current_time.set_attributes(attr_list)
+        
+        self.lbl_total_time = Gtk.Label(label="0:00", css_classes=["dim-label"])
+        self.lbl_total_time.set_attributes(attr_list)
+
         self.scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
-        self.scale.set_hexpand(True); self.scale.connect("value-changed", self.on_seek)
-        c_box.append(self.scale); self.scale.set_size_request(400, -1); self.scale.set_halign(Gtk.Align.CENTER)
+        self.scale.set_hexpand(True)
+        self.scale.connect("value-changed", self.on_seek)
+        
+        timeline_box.append(self.lbl_current_time)
+        timeline_box.append(self.scale)
+        timeline_box.append(self.lbl_total_time)
+        
+        # 限制进度条区域宽度，防止拉得太长
+        timeline_box.set_size_request(450, -1)
+        timeline_box.set_halign(Gtk.Align.CENTER)
+        
+        c_box.append(timeline_box)
         
         # 技术参数标签区域
         tech_box = Gtk.Box(spacing=8, halign=Gtk.Align.CENTER, margin_top=4)
         self.bp_label = Gtk.Label(label="BIT PERFECT", css_classes=["bp-text-glow"])
         self.bp_label.set_tooltip_text("Bit-Perfect Mode Active"); self.bp_label.set_visible(False); tech_box.append(self.bp_label)
         
-        # [修改] 初始化时默认隐藏技术标签，防止显示 "-" 或 "Loading..."
         self.lbl_tech = Gtk.Label(label="", css_classes=["tech-label"], ellipsize=3)
         self.lbl_tech.set_visible(False) 
         
@@ -490,7 +471,6 @@ class TidalApp(Adw.Application):
         else:
             self.vol.set_sensitive(True)
 
-    # 登录/登出逻辑
     def on_login_clicked(self, btn):
         if self.backend.user:
             self.user_popover.popup()
@@ -513,7 +493,6 @@ class TidalApp(Adw.Application):
         self._toggle_login_view(True)
         Thread(target=lambda: GLib.idle_add(self.batch_load_albums, list(self.backend.get_recent_albums())), daemon=True).start()
 
-    # 设置相关逻辑
     def on_bit_perfect_toggled(self, switch, state):
         self.settings["bit_perfect"] = state; self.save_settings()
         self._lock_volume_controls(state)
@@ -543,22 +522,16 @@ class TidalApp(Adw.Application):
             if keyword in model.get_item(i).get_string(): self.driver_dd.set_selected(i); break
 
     def update_tech_label(self, info):
-        # [核心修复] 逻辑放宽：只要有 fmt_str (采样率/位深信息)，说明就在播放，必须显示！
-        # 不要死等 codec 标签，否则刚开始播放时会因为没有 codec 而被隐藏。
         fmt = info.get('fmt_str', '')
         codec = info.get('codec', '-')
         
-        # 只有当“既没有格式信息，也没有编码信息”时，才认为是停止状态并隐藏
         if not fmt and (not codec or codec in ["-", "Loading..."]):
             self.lbl_tech.set_visible(False)
             return
 
-        # 获取设备名
         dev_name = getattr(self, 'current_device_name', 'Default')
         if len(dev_name) > 30: dev_name = dev_name[:28] + ".."
         
-        # 如果 Codec 暂时还没识别出来，但已经在播放了，就显示 "PCM" 或 "Streaming"
-        # 这样用户能立刻看到 44.1kHz | 16bit 这些关键信息
         display_codec = codec
         if not display_codec or display_codec in ["-", "Loading..."]:
             display_codec = "PCM" 
@@ -575,7 +548,6 @@ class TidalApp(Adw.Application):
         mode_str = selected.get_string()
         self.backend.set_quality_mode(mode_str)
         
-        # 强制重载逻辑
         if self.player.is_playing() and self.current_index >= 0:
             pos, _ = self.player.get_position()
             track = self.current_track_list[self.current_index]
@@ -667,15 +639,53 @@ class TidalApp(Adw.Application):
                 if t.id == self.playing_track_id: found_idx = i; break
             if found_idx != -1: self.current_index = found_idx
 
+        while c := self.track_list.get_first_child(): self.track_list.remove(c)
+
         for i, t in enumerate(tracks):
+            row = Gtk.ListBoxRow()
+            row.track_id = t.id
+            
             b = Gtk.Box(spacing=16, margin_top=10, margin_bottom=10)
             stack = Gtk.Stack(); stack.set_size_request(30, -1)
-            lbl = Gtk.Label(label=str(i+1), css_classes=["dim-label"]); stack.add_named(lbl, "num")
-            icon = Gtk.Image(icon_name="media-playback-start-symbolic"); stack.add_named(icon, "icon")
+            
+            lbl = Gtk.Label(label=str(i+1), css_classes=["dim-label"])
+            stack.add_named(lbl, "num")
+            
+            icon = Gtk.Image(icon_name="media-playback-start-symbolic")
+            icon.add_css_class("accent")
+            stack.add_named(icon, "icon")
+            
             if self.playing_track_id and t.id == self.playing_track_id: stack.set_visible_child_name("icon")
             else: stack.set_visible_child_name("num")
-            b.append(stack); b.append(Gtk.Label(label=t.name, xalign=0, hexpand=True, ellipsize=3))
-            self.track_list.append(b)
+            
+            b.append(stack)
+            b.append(Gtk.Label(label=t.name, xalign=0, hexpand=True, ellipsize=3))
+            
+            # [新增] 播放列表显示时长
+            dur_sec = getattr(t, 'duration', 0)
+            if dur_sec:
+                m, s = divmod(dur_sec, 60)
+                dur_str = f"{m}:{s:02d}"
+                lbl_dur = Gtk.Label(label=dur_str, css_classes=["dim-label"])
+                # 开启等宽数字对齐
+                lbl_dur.set_attributes(Pango.AttrList.from_string("font-features 'tnum=1'"))
+                lbl_dur.set_margin_end(24)
+                b.append(lbl_dur)
+
+            row.set_child(b)
+            self.track_list.append(row)
+
+    def _update_track_list_icon(self):
+        row = self.track_list.get_first_child()
+        while row:
+            if hasattr(row, 'track_id'):
+                box = row.get_child()
+                if box:
+                    stack = box.get_first_child()
+                    if isinstance(stack, Gtk.Stack):
+                        if row.track_id == self.playing_track_id: stack.set_visible_child_name("icon")
+                        else: stack.set_visible_child_name("num")
+            row = row.get_next_sibling()
 
     def on_header_artist_clicked(self, gest, n, x, y):
         if hasattr(self, 'current_album') and self.current_album:
@@ -743,6 +753,9 @@ class TidalApp(Adw.Application):
         self.current_index = idx
         self.playing_track = track
         self.playing_track_id = track.id
+        
+        self._update_track_list_icon()
+
         self.lbl_title.set_text(track.name)
         art_name = getattr(track.artist, 'name', 'Unknown Artist')
         self.lbl_artist.set_text(art_name)
@@ -761,14 +774,27 @@ class TidalApp(Adw.Application):
         else: self.player.play(); btn.set_icon_name("media-playback-pause-symbolic")
 
     def on_next_track(self):
-        if self.current_index < len(self.current_track_list)-1: self.current_index += 1; self.on_track_selected(None, self.track_list.get_row_at_index(self.current_index))
+        if self.current_index < len(self.current_track_list)-1: 
+            self.current_index += 1
+            next_row = self.track_list.get_row_at_index(self.current_index)
+            if next_row:
+                self.track_list.select_row(next_row)
+                self.on_track_selected(self.track_list, next_row)
 
     def on_seek(self, s): 
         if not self.is_programmatic_update: self.player.seek(s.get_value())
 
     def update_ui_loop(self):
         p, d = self.player.get_position()
-        if d > 0: self.is_programmatic_update = True; self.scale.set_range(0, d); self.scale.set_value(p); self.is_programmatic_update = False
+        if d > 0: 
+            self.is_programmatic_update = True
+            self.scale.set_range(0, d)
+            self.scale.set_value(p)
+            self.is_programmatic_update = False
+            
+            # [新增] 更新播放条上的时间文本
+            self.lbl_current_time.set_text(f"{int(p//60)}:{int(p%60):02d}")
+            self.lbl_total_time.set_text(f"{int(d//60)}:{int(d%60):02d}")
         return True
 
     def update_layout_proportions(self, w, p):
