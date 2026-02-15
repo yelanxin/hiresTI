@@ -22,6 +22,8 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 class TidalApp(Adw.Application):
     def __init__(self):
         super().__init__(application_id="com.hiresti.player")
+        GLib.set_application_name("HiresTI")
+        GLib.set_prgname("HiresTI")
         self.backend = TidalBackend()
         self.settings_file = os.path.expanduser("~/.cache/hiresti/settings.json")
         
