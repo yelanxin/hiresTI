@@ -42,12 +42,16 @@ Designed for audiophiles, it prioritizes sound quality above all else, featuring
 
 We provide pre-built packages for major Linux distributions. No need to manually install Python libraries!
 
-### 🐧 Debian / Ubuntu / Linux Mint / Deepin
+### 🐧 Debian / Ubuntu / Linux Mint / Deepin 
 Download the latest `.deb` release from the [Releases Page](../../releases).
 
 ```bash
 # Install the package
-sudo dpkg -i hiresti_1.0.0_all.deb
+sudo dpkg -i hiresti_1.0.0_all.deg
+```
 
+### 🎩 Fedora / RedHat / CentOS / openSUSE
+```bash
 # Install with dnf (recommended handles dependencies automatically)
 sudo dnf install ./hiresti-1.0.0-1.x86_64.rpm
+```
