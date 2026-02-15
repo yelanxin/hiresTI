@@ -1,10 +1,11 @@
 # hiresTI Music Player 
-![Logo](icons/hicolor/64x64/apps/hiresti.png)
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![GTK4](https://img.shields.io/badge/UI-GTK4%20%2B%20Libadwaita-green)
 ![License](https://img.shields.io/badge/License-MIT-purple)
 ![Status](https://img.shields.io/badge/Status-v1.0-orange)
+
+![Logo](icons/hicolor/64x64/apps/hiresti.png)
 
 **hiresTI** is a modern, high-fidelity TIDAL client for Linux, built with **GTK4**, **Libadwaita**, and **GStreamer**. 
 
