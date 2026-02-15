@@ -151,7 +151,6 @@ class TidalBackend:
         ALLOWED_KEYWORDS = [
             "mix",              # 1. custom mixes
             "spotlight",        # 2. Spotlighted
-            "recent",           # 3. Recently played
             "suggested new",    # 4. suggested new albums
             "because",          # 5. because you liked
             "recommended new",  # 6. recommended new tracks
