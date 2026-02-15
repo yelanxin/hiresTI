@@ -1,4 +1,4 @@
-# hiresTI Desktop 🎵
+# hiresTI Music Player 🎵
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![GTK4](https://img.shields.io/badge/UI-GTK4%20%2B%20Libadwaita-green)
