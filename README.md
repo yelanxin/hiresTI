@@ -1,4 +1,4 @@
-# hiresTI Music Player | [中文](README_CN.MD)
+# hiresTI Music Player | [中文](README_CN.md)
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![GTK4](https://img.shields.io/badge/UI-GTK4%20%2B%20Libadwaita-green)
