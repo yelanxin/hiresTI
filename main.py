@@ -323,23 +323,23 @@ class TidalApp(Adw.Application):
         settings_scroll.set_child(settings_vbox)
         settings_vbox.append(Gtk.Label(label="Settings", xalign=0, css_classes=["album-title-large"], margin_bottom=10))
 
+        # === Streaming Quality ===
         group_q = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["settings-group"])
         row_q = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
         row_q.append(Gtk.Label(label="Audio Quality", hexpand=True, xalign=0))
-        
-        # [修改] 官方三档选项
+
         self.quality_dd = Gtk.DropDown(model=Gtk.StringList.new([
-            "Max (Up to 24-bit, 192 kHz)", 
-            "High (16-bit, 44.1 kHz)", 
+            "Max (Up to 24-bit, 192 kHz)",
+            "High (16-bit, 44.1 kHz)",
             "Low (320 kbps)"
         ]))
-        
         self.quality_dd.connect("notify::selected-item", self.on_quality_changed)
         row_q.append(self.quality_dd); group_q.append(row_q); settings_vbox.append(group_q)
 
+        # === Audio Output ===
         settings_vbox.append(Gtk.Label(label="Audio Output", xalign=0, css_classes=["section-title"], margin_top=10))
         group_out = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["settings-group"])
-        
+
         # 1. Bit-Perfect 开关
         row_bp = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
         bp_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
@@ -349,13 +349,50 @@ class TidalApp(Adw.Application):
         self.bp_switch = Gtk.Switch(valign=Gtk.Align.CENTER); self.bp_switch.connect("state-set", self.on_bit_perfect_toggled)
         row_bp.append(self.bp_switch); group_out.append(row_bp)
 
-        # 2. Exclusive Lock 开关
+        # 2. Exclusive Lock 开关 (带点击提示)
         row_ex = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
+
         ex_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
-        ex_info.append(Gtk.Label(label="Force Hardware Exclusive", xalign=0, css_classes=["settings-label"]))
+
+        title_box = Gtk.Box(spacing=6, orientation=Gtk.Orientation.HORIZONTAL)
+        title_box.append(Gtk.Label(label="Force Hardware Exclusive", xalign=0, css_classes=["settings-label"]))
+
+        # [修改] 点击显示帮助气泡
+        help_btn = Gtk.Button(icon_name="dialog-question-symbolic", css_classes=["flat", "circular"])
+        help_btn.set_tooltip_text("Click for details") # 简单的悬停提示
+
+        # 创建气泡
+        help_pop = Gtk.Popover()
+        help_pop.set_parent(help_btn)
+        help_pop.set_autohide(True) # 点击外部自动关闭
+
+        # 气泡内容
+        pop_content = Gtk.Label(wrap=True, max_width_chars=40, xalign=0)
+        pop_content.set_markup(
+            "<b>Exclusive Mode Control</b>\n\n"
+            "<b>⚠️ Recommendation:</b>\n"
+            "Only enable this for <b>External USB DACs</b>.\n"
+            "Internal sound cards (PCI/SoC) often fail in this mode.\n\n"
+            "• <b>Benefits:</b> Ensures true Bit-Perfect playback (sample rate follows the music).\n"
+            "• <b>Limitations:</b> System volume control will be <span color='red'>DISABLED</span> (use your amp/DAC volume).\n"
+            "• <b>Warning:</b> Other apps (YouTube, etc.) cannot play sound while this is on."
+        )
+        pop_box = Gtk.Box(margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
+        pop_box.append(pop_content)
+        help_pop.set_child(pop_box)
+
+        # 绑定点击事件 (移除会导致死循环的 hover 代码)
+        help_btn.connect("clicked", lambda x: help_pop.popup())
+
+        title_box.append(help_btn)
+
+        ex_info.append(title_box)
         ex_info.append(Gtk.Label(label="Bypass and release system audio control for this device", xalign=0, css_classes=["dim-label"]))
-        row_ex.append(ex_info); row_ex.append(Gtk.Box(hexpand=True))
-        self.ex_switch = Gtk.Switch(valign=Gtk.Align.CENTER, sensitive=False) 
+
+        row_ex.append(ex_info)
+        row_ex.append(Gtk.Box(hexpand=True))
+
+        self.ex_switch = Gtk.Switch(valign=Gtk.Align.CENTER, sensitive=False)
         self.ex_switch.connect("state-set", self.on_exclusive_toggled)
         row_ex.append(self.ex_switch); group_out.append(row_ex)
 
@@ -395,7 +432,6 @@ class TidalApp(Adw.Application):
         # === 1. 左侧：封面与信息 ===
         self.info_area = Gtk.Box(spacing=14, valign=Gtk.Align.CENTER)
         
-        # 封面图
         self.art_img = Gtk.Image(width_request=72, height_request=72, css_classes=["playback-art"])
         gest = Gtk.GestureClick(); gest.connect("pressed", self.on_player_art_clicked); self.art_img.add_controller(gest)
         m = Gtk.EventControllerMotion()
@@ -403,7 +439,6 @@ class TidalApp(Adw.Application):
         m.connect("leave", lambda c: utils.set_pointer_cursor(self.art_img, False))
         self.art_img.add_controller(m)
         
-        # 文字区域：三行布局
         t = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER, spacing=0)
         self.lbl_title = Gtk.Label(xalign=0, css_classes=["player-title"], ellipsize=3)
         self.lbl_artist = Gtk.Label(xalign=0, css_classes=["player-artist"], ellipsize=3)
@@ -430,7 +465,12 @@ class TidalApp(Adw.Application):
         tech_box = Gtk.Box(spacing=8, halign=Gtk.Align.CENTER, margin_top=4)
         self.bp_label = Gtk.Label(label="BIT PERFECT", css_classes=["bp-text-glow"])
         self.bp_label.set_tooltip_text("Bit-Perfect Mode Active"); self.bp_label.set_visible(False); tech_box.append(self.bp_label)
-        self.lbl_tech = Gtk.Label(label="-", css_classes=["tech-label"], ellipsize=3); tech_box.append(self.lbl_tech); c_box.append(tech_box)
+        
+        # [修改] 初始化时默认隐藏技术标签，防止显示 "-" 或 "Loading..."
+        self.lbl_tech = Gtk.Label(label="", css_classes=["tech-label"], ellipsize=3)
+        self.lbl_tech.set_visible(False) 
+        
+        tech_box.append(self.lbl_tech); c_box.append(tech_box)
         self.bottom_bar.append(c_box)
         
         # === 3. 右侧：音量与EQ ===
@@ -501,9 +541,28 @@ class TidalApp(Adw.Application):
             if keyword in model.get_item(i).get_string(): self.driver_dd.set_selected(i); break
 
     def update_tech_label(self, info):
-        fmt = self.player.get_format_string(); dev_name = getattr(self, 'current_device_name', 'Default')
+        # [核心修复] 逻辑放宽：只要有 fmt_str (采样率/位深信息)，说明就在播放，必须显示！
+        # 不要死等 codec 标签，否则刚开始播放时会因为没有 codec 而被隐藏。
+        fmt = info.get('fmt_str', '')
+        codec = info.get('codec', '-')
+        
+        # 只有当“既没有格式信息，也没有编码信息”时，才认为是停止状态并隐藏
+        if not fmt and (not codec or codec in ["-", "Loading..."]):
+            self.lbl_tech.set_visible(False)
+            return
+
+        # 获取设备名
+        dev_name = getattr(self, 'current_device_name', 'Default')
         if len(dev_name) > 30: dev_name = dev_name[:28] + ".."
-        self.lbl_tech.set_text(f"{info.get('codec','-')} | {fmt} | {info.get('bitrate',0)//1000}kbps | {dev_name}")
+        
+        # 如果 Codec 暂时还没识别出来，但已经在播放了，就显示 "PCM" 或 "Streaming"
+        # 这样用户能立刻看到 44.1kHz | 16bit 这些关键信息
+        display_codec = codec
+        if not display_codec or display_codec in ["-", "Loading..."]:
+            display_codec = "PCM" 
+        
+        self.lbl_tech.set_text(f"{display_codec} | {fmt} | {info.get('bitrate',0)//1000}kbps | {dev_name}")
+        self.lbl_tech.set_visible(True)
 
     def on_settings_clicked(self, btn):
         self.right_stack.set_visible_child_name("settings"); self.grid_title_label.set_text("Settings"); self.back_btn.set_sensitive(True); self.nav_list.select_row(None)
