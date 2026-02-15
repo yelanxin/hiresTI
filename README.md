@@ -33,7 +33,7 @@ Designed for audiophiles, it prioritizes sound quality above all else, featuring
 
 ## 📸 Screenshots
 
-| Album Detai | Setting |
+| Album Detail | Setting |
 |:---:|:---:|
 | ![Detail](screenshots/2.png) | ![Search](screenshots/3.png) |
 
