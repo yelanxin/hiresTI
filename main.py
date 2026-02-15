@@ -96,28 +96,22 @@ class TidalApp(Adw.Application):
         self._build_body(main_vbox)
         self._build_player_bar(main_vbox)
 
-        # [启动恢复逻辑]
+        # 恢复设置
         is_bp = self.settings.get("bit_perfect", False)
         is_ex = self.settings.get("exclusive_lock", False)
-        
         if is_bp:
-            print("[Init] Restoring Bit-Perfect Mode...")
             self.player.toggle_bit_perfect(True, exclusive_lock=is_ex)
             if hasattr(self, 'bp_switch'): self.bp_switch.set_active(True)
             if hasattr(self, 'eq_btn'): self.eq_btn.set_sensitive(False)
             if hasattr(self, 'bp_label'): self.bp_label.set_visible(True)
             self._lock_volume_controls(True)
-        
         if hasattr(self, 'ex_switch'):
              self.ex_switch.set_sensitive(is_bp)
              self.ex_switch.set_active(is_ex)
-        
         saved_drv = self.settings.get("driver", "Auto (Default)")
         if is_ex:
             saved_drv = "ALSA"
             self.driver_dd.set_sensitive(False)
-        
-        print(f"[Init] Restoring Driver: {saved_drv}")
         drivers = self.player.get_drivers()
         if saved_drv in drivers:
             for i, d in enumerate(drivers):
@@ -184,7 +178,6 @@ class TidalApp(Adw.Application):
         self.sidebar_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.nav_list = Gtk.ListBox(css_classes=["navigation-sidebar"], margin_top=10); self.nav_list.connect("row-activated", self.on_nav_selected)
         
-        # [修改] 新增 Home，重命名 Collection
         nav_items = [
             ("home", "go-home-symbolic", "Home"),
             ("collection", "user-bookmarks-symbolic", "My Collection"),
@@ -230,24 +223,7 @@ class TidalApp(Adw.Application):
         grid_vbox.append(self.login_prompt_box)
 
         self.alb_scroll = Gtk.ScrolledWindow(vexpand=True)
-        
-        self.collection_content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24, margin_start=32, margin_end=32, margin_bottom=32)
-        
-        self.mixes_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        self.mixes_container.append(Gtk.Label(label="For You", xalign=0, css_classes=["title-4", "dim-label"]))
-        self.mix_flow = Gtk.FlowBox(valign=Gtk.Align.START, max_children_per_line=30, selection_mode=Gtk.SelectionMode.NONE, column_spacing=24, row_spacing=28)
-        self.mix_flow.connect("child-activated", self.on_grid_item_activated)
-        self.mixes_container.append(self.mix_flow)
-        
-        self.albums_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        self.albums_container.append(Gtk.Label(label="Albums", xalign=0, css_classes=["title-4", "dim-label"]))
-        self.main_flow = Gtk.FlowBox(valign=Gtk.Align.START, max_children_per_line=30, selection_mode=Gtk.SelectionMode.NONE, column_spacing=24, row_spacing=28)
-        self.main_flow.connect("child-activated", self.on_grid_item_activated)
-        self.albums_container.append(self.main_flow)
-        
-        self.collection_content_box.append(self.mixes_container)
-        self.collection_content_box.append(self.albums_container)
-        
+        self.collection_content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=32, margin_start=32, margin_end=32, margin_bottom=32)
         self.alb_scroll.set_child(self.collection_content_box)
         grid_vbox.append(self.alb_scroll)
         
@@ -256,7 +232,6 @@ class TidalApp(Adw.Application):
     def _toggle_login_view(self, logged_in):
         self.login_prompt_box.set_visible(not logged_in)
         self.alb_scroll.set_visible(logged_in)
-        
         if not logged_in:
             self.login_btn.set_label("Login")
             self.grid_title_label.set_text("Welcome")
@@ -268,18 +243,14 @@ class TidalApp(Adw.Application):
                 if meta:
                     if isinstance(meta, dict): display_name = meta.get('name') or meta.get('firstName') or display_name
                     else: display_name = getattr(meta, 'name', None) or getattr(meta, 'first_name', None) or display_name
-
                 if display_name == "User" or display_name is None:
                     candidates = [getattr(user, 'first_name', None), getattr(user, 'name', None), getattr(user, 'firstname', None)]
                     for c in candidates:
                         if c and isinstance(c, str) and c.strip(): display_name = c; break
-
                 if (not display_name or display_name == "User") and hasattr(user, 'username') and user.username:
                     try: display_name = user.username.split('@')[0].capitalize()
                     except: display_name = user.username
-
             self.login_btn.set_label(f"Hi, {display_name}")
-            # 默认标题设为 Home
             self.grid_title_label.set_text("Home")
 
     def _build_tracks_view(self):
@@ -311,6 +282,7 @@ class TidalApp(Adw.Application):
         trk_content.append(self.album_header_box)
 
         self.track_list = Gtk.ListBox(css_classes=["boxed-list"], margin_start=32, margin_end=32, margin_bottom=32)
+        # [关键修复] 这里的 self.on_track_selected 现在可以被正确引用了
         self.track_list.connect("row-activated", self.on_track_selected)
         trk_content.append(self.track_list)
 
@@ -350,31 +322,18 @@ class TidalApp(Adw.Application):
         ex_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
         title_box = Gtk.Box(spacing=6, orientation=Gtk.Orientation.HORIZONTAL)
         title_box.append(Gtk.Label(label="Force Hardware Exclusive", xalign=0, css_classes=["settings-label"]))
-
         help_btn = Gtk.Button(icon_name="dialog-question-symbolic", css_classes=["flat", "circular"])
         help_btn.set_tooltip_text("Click for details") 
         help_pop = Gtk.Popover(); help_pop.set_parent(help_btn); help_pop.set_autohide(True)
         pop_content = Gtk.Label(wrap=True, max_width_chars=40, xalign=0)
-        pop_content.set_markup(
-            "<b>Exclusive Mode Control</b>\n\n"
-            "<b>⚠️ Recommendation:</b>\n"
-            "Only enable this for <b>External USB DACs</b>.\n"
-            "Internal sound cards (PCI/SoC) often fail in this mode.\n\n"
-            "• <b>Benefits:</b> Ensures true Bit-Perfect playback (sample rate follows the music).\n"
-            "• <b>Limitations:</b> System volume control will be <span color='red'>DISABLED</span> (use your amp/DAC volume).\n"
-            "• <b>Warning:</b> Other apps (YouTube, etc.) cannot play sound while this is on."
-        )
+        pop_content.set_markup("<b>Exclusive Mode Control</b>\n\n<b>⚠️ Recommendation:</b>\nOnly enable this for <b>External USB DACs</b>.\n\n• <b>Benefits:</b> Ensures true Bit-Perfect playback.\n• <b>Limitations:</b> System volume DISABLED.")
         pop_box = Gtk.Box(margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
         pop_box.append(pop_content); help_pop.set_child(pop_box)
         help_btn.connect("clicked", lambda x: help_pop.popup())
         title_box.append(help_btn)
-
         ex_info.append(title_box)
         ex_info.append(Gtk.Label(label="Bypass and release system audio control for this device", xalign=0, css_classes=["dim-label"]))
-
-        row_ex.append(ex_info)
-        row_ex.append(Gtk.Box(hexpand=True))
-
+        row_ex.append(ex_info); row_ex.append(Gtk.Box(hexpand=True))
         self.ex_switch = Gtk.Switch(valign=Gtk.Align.CENTER, sensitive=False)
         self.ex_switch.connect("state-set", self.on_exclusive_toggled)
         row_ex.append(self.ex_switch); group_out.append(row_ex)
@@ -412,19 +371,16 @@ class TidalApp(Adw.Application):
         container.append(self.bottom_bar)
         
         self.info_area = Gtk.Box(spacing=14, valign=Gtk.Align.CENTER)
-        
         self.art_img = Gtk.Image(width_request=72, height_request=72, css_classes=["playback-art"])
         gest = Gtk.GestureClick(); gest.connect("pressed", self.on_player_art_clicked); self.art_img.add_controller(gest)
         m = Gtk.EventControllerMotion()
         m.connect("enter", lambda c,x,y: utils.set_pointer_cursor(self.art_img, True))
         m.connect("leave", lambda c: utils.set_pointer_cursor(self.art_img, False))
         self.art_img.add_controller(m)
-        
         t = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER, spacing=0)
         self.lbl_title = Gtk.Label(xalign=0, css_classes=["player-title"], ellipsize=3)
         self.lbl_artist = Gtk.Label(xalign=0, css_classes=["player-artist"], ellipsize=3)
         self.lbl_album = Gtk.Label(xalign=0, css_classes=["player-album"], ellipsize=3)
-        
         t.append(self.lbl_title); t.append(self.lbl_artist); t.append(self.lbl_album)
         self.info_area.append(self.art_img); self.info_area.append(t); self.bottom_bar.append(self.info_area)
         
@@ -443,7 +399,6 @@ class TidalApp(Adw.Application):
         self.lbl_total_time = Gtk.Label(label="0:00", css_classes=["dim-label"]); self.lbl_total_time.set_attributes(attr_list)
         self.scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
         self.scale.set_hexpand(True); self.scale.connect("value-changed", self.on_seek)
-        
         timeline_box.append(self.lbl_current_time); timeline_box.append(self.scale); timeline_box.append(self.lbl_total_time)
         timeline_box.set_size_request(450, -1); timeline_box.set_halign(Gtk.Align.CENTER)
         c_box.append(timeline_box)
@@ -451,10 +406,7 @@ class TidalApp(Adw.Application):
         tech_box = Gtk.Box(spacing=8, halign=Gtk.Align.CENTER, margin_top=4)
         self.bp_label = Gtk.Label(label="BIT PERFECT", css_classes=["bp-text-glow"])
         self.bp_label.set_tooltip_text("Bit-Perfect Mode Active"); self.bp_label.set_visible(False); tech_box.append(self.bp_label)
-        
-        self.lbl_tech = Gtk.Label(label="", css_classes=["tech-label"], ellipsize=3)
-        self.lbl_tech.set_visible(False) 
-        
+        self.lbl_tech = Gtk.Label(label="", css_classes=["tech-label"], ellipsize=3); self.lbl_tech.set_visible(False) 
         tech_box.append(self.lbl_tech); c_box.append(tech_box)
         self.bottom_bar.append(c_box)
         
@@ -486,14 +438,12 @@ class TidalApp(Adw.Application):
         self.user_popover.popdown()
         self.backend.logout()
         self._toggle_login_view(False)
-        while c := self.main_flow.get_first_child(): self.main_flow.remove(c)
-        while c := self.mix_flow.get_first_child(): self.mix_flow.remove(c)
+        while c := self.collection_content_box.get_first_child(): self.collection_content_box.remove(c)
         print("[UI] User logged out.")
 
     def on_login_success(self):
         print("[UI] Login successful!")
         self._toggle_login_view(True)
-        # 登录后自动选中 Home (第一个选项)，触发 on_nav_selected 加载内容
         child = self.nav_list.get_first_child()
         while child:
             if hasattr(child, 'nav_id') and child.nav_id == 'home':
@@ -533,18 +483,14 @@ class TidalApp(Adw.Application):
     def update_tech_label(self, info):
         fmt = info.get('fmt_str', '')
         codec = info.get('codec', '-')
-        
         if not fmt and (not codec or codec in ["-", "Loading..."]):
             self.lbl_tech.set_visible(False)
             return
-
         dev_name = getattr(self, 'current_device_name', 'Default')
         if len(dev_name) > 30: dev_name = dev_name[:28] + ".."
-        
         display_codec = codec
         if not display_codec or display_codec in ["-", "Loading..."]:
             display_codec = "PCM" 
-        
         self.lbl_tech.set_text(f"{display_codec} | {fmt} | {info.get('bitrate',0)//1000}kbps | {dev_name}")
         self.lbl_tech.set_visible(True)
 
@@ -556,7 +502,6 @@ class TidalApp(Adw.Application):
         if not selected: return
         mode_str = selected.get_string()
         self.backend.set_quality_mode(mode_str)
-        
         if self.player.is_playing() and self.current_index >= 0:
             pos, _ = self.player.get_position()
             track = self.current_track_list[self.current_index]
@@ -577,7 +522,6 @@ class TidalApp(Adw.Application):
         if self.ex_switch.get_active() and driver_name != "ALSA": return 
         self.settings["driver"] = driver_name; self.save_settings()
         self.current_device_name = "Default"; self.update_tech_label(self.player.stream_info)
-        
         def refresh_devices():
             self.ignore_device_change = True
             devices = self.player.get_devices_for_driver(driver_name)
@@ -610,119 +554,97 @@ class TidalApp(Adw.Application):
             driver_label = self.driver_dd.get_selected_item().get_string()
             self.player.set_output(driver_label, device_info['device_id'])
 
+    # [统一点击入口]
     def on_grid_item_activated(self, flow, child):
         if not child: return
-        if hasattr(child, 'album_obj'): self.show_album_details(child.album_obj)
-        elif hasattr(child, 'artist_obj'): self.on_artist_clicked(child.artist_obj)
-        elif hasattr(child, 'mix_obj'): self.show_album_details(child.mix_obj) # 复用 Album Detail 界面
+        data = getattr(child, 'data_item', None)
+        if not data: return
+        obj = data.get('obj')
+        
+        if data['type'] == 'Track':
+            self._play_single_track(obj)
+            return
+        if data['type'] == 'Artist':
+            self.on_artist_clicked(obj)
+            return
+        self.show_album_details(obj)
+
+    def _play_single_track(self, track):
+        self.current_track_list = [track]
+        self.current_index = 0
+        self.playing_track = track
+        self.playing_track_id = track.id
+        self._update_track_list_icon()
+        self.lbl_title.set_text(track.name)
+        art_name = getattr(track.artist, 'name', 'Unknown Artist')
+        self.lbl_artist.set_text(art_name)
+        alb_name = track.album.name if hasattr(track, 'album') and track.album else "Unknown Album"
+        self.lbl_album.set_text(alb_name)
+        cover_url = self.backend.get_artwork_url(track, 1280)
+        utils.load_img(self.art_img, cover_url, self.cache_dir, 72)
+        Thread(target=lambda: self.history_mgr.add(track, cover_url), daemon=True).start()
+        def play():
+            url = self.backend.get_stream_url(track)
+            if url: GLib.idle_add(lambda: (self.player.load(url), self.player.play(), self.play_btn.set_icon_name("media-playback-pause-symbolic")))
+        Thread(target=play, daemon=True).start()
 
     def show_album_details(self, alb):
         current_view = self.right_stack.get_visible_child_name()
         if current_view and current_view != "tracks": self.nav_history.append(current_view)
         self.current_album = alb
         self.right_stack.set_visible_child_name("tracks"); self.back_btn.set_sensitive(True)
-        
-        # 处理 Mix/Playlist 没有 artist 属性的情况
         title = getattr(alb, 'title', getattr(alb, 'name', 'Unknown'))
         self.header_title.set_text(title)
-        
         artist_name = "Various Artists"
         if hasattr(alb, 'artist') and alb.artist: 
             artist_name = alb.artist.name if hasattr(alb.artist, 'name') else str(alb.artist)
         self.header_artist.set_text(artist_name)
-        
         utils.load_img(self.header_art, lambda: self.backend.get_artwork_url(alb, 640), self.cache_dir, 160)
-        
         is_fav = self.backend.is_favorite(getattr(alb, 'id', '')); self._update_fav_icon(self.fav_btn, is_fav)
-        
         while c := self.track_list.get_first_child(): self.track_list.remove(c)
-        
         def detail_task():
-            # 这里会自动判断是 Album 还是 Mix
             ts = self.backend.get_tracks(alb)
-            
-            # 更新元数据 (Mix 对象可能没有 release_date)
             desc = ""
             if hasattr(alb, 'release_date') and alb.release_date:
                 desc += str(alb.release_date.year)
             elif hasattr(alb, 'last_updated'):
                 desc += "Updated Recently"
-            
             count = len(ts) if ts else 0
             if count > 0: desc += f"  •  {count} Tracks"
-            
             GLib.idle_add(lambda: self.header_meta.set_text(desc.strip(' • ')))
             GLib.idle_add(self.populate_tracks, ts)
-        
         Thread(target=detail_task, daemon=True).start()
 
-    def _update_meta(self, obj):
-        y = str(obj.release_date.year) if hasattr(obj, 'release_date') and obj.release_date else ""
-        c = getattr(obj, 'num_tracks', '?'); self.header_meta.set_text(f"{y}  •  {c} Tracks".strip(' • '))
-
     def populate_tracks(self, tracks):
-        """
-        [修改] 列表现在展示 5 列：
-        [Num] [Title (Expanded)] [Artist (Fixed)] [Album (Fixed)] [Duration]
-        """
         self.current_track_list = tracks
         if self.playing_track_id:
             found_idx = -1
             for i, t in enumerate(tracks):
                 if t.id == self.playing_track_id: found_idx = i; break
             if found_idx != -1: self.current_index = found_idx
-
         while c := self.track_list.get_first_child(): self.track_list.remove(c)
-
         for i, t in enumerate(tracks):
-            row = Gtk.ListBoxRow()
-            row.track_id = t.id
+            row = Gtk.ListBoxRow(); row.track_id = t.id
             b = Gtk.Box(spacing=16, margin_top=10, margin_bottom=10)
-            
-            # 1. Num / Icon
             stack = Gtk.Stack(); stack.set_size_request(30, -1)
-            lbl = Gtk.Label(label=str(i+1), css_classes=["dim-label"])
-            stack.add_named(lbl, "num")
-            icon = Gtk.Image(icon_name="media-playback-start-symbolic")
-            icon.add_css_class("accent")
-            stack.add_named(icon, "icon")
-            
+            lbl = Gtk.Label(label=str(i+1), css_classes=["dim-label"]); stack.add_named(lbl, "num")
+            icon = Gtk.Image(icon_name="media-playback-start-symbolic"); icon.add_css_class("accent"); stack.add_named(icon, "icon")
             if self.playing_track_id and t.id == self.playing_track_id: stack.set_visible_child_name("icon")
             else: stack.set_visible_child_name("num")
             b.append(stack)
-            
-            # 2. Title (Expanded)
-            lbl_title = Gtk.Label(label=t.name, xalign=0, hexpand=True, ellipsize=3)
-            b.append(lbl_title)
-            
-            # 3. Artist (Fixed 160px, max 20 chars)
+            lbl_title = Gtk.Label(label=t.name, xalign=0, hexpand=True, ellipsize=3); b.append(lbl_title)
             art_name = getattr(t.artist, 'name', '-') if hasattr(t, 'artist') else '-'
             lbl_art = Gtk.Label(label=art_name, xalign=0, ellipsize=3, css_classes=["dim-label"])
-            lbl_art.set_size_request(160, -1)
-            lbl_art.set_max_width_chars(20)
-            lbl_art.set_margin_end(12) 
-            b.append(lbl_art)
-
-            # 4. Album (Fixed 160px, max 20 chars)
+            lbl_art.set_size_request(160, -1); lbl_art.set_max_width_chars(20); lbl_art.set_margin_end(12); b.append(lbl_art)
             alb_name = t.album.name if hasattr(t, 'album') and t.album else "-"
             lbl_alb = Gtk.Label(label=alb_name, xalign=0, ellipsize=3, css_classes=["dim-label"])
-            lbl_alb.set_size_request(200, -1)
-            lbl_alb.set_max_width_chars(20)
-            lbl_alb.set_margin_end(12)
-            b.append(lbl_alb)
-            
-            # 5. Duration
+            lbl_alb.set_size_request(260, -1); lbl_alb.set_max_width_chars(20); lbl_alb.set_margin_end(12); b.append(lbl_alb)
             dur_sec = getattr(t, 'duration', 0)
             if dur_sec:
-                m, s = divmod(dur_sec, 60)
-                dur_str = f"{m}:{s:02d}"
+                m, s = divmod(dur_sec, 60); dur_str = f"{m}:{s:02d}"
                 lbl_dur = Gtk.Label(label=dur_str, css_classes=["dim-label"])
-                lbl_dur.set_attributes(Pango.AttrList.from_string("font-features 'tnum=1'"))
-                lbl_dur.set_margin_end(24) 
-                b.append(lbl_dur)
-
-            row.set_child(b)
-            self.track_list.append(row)
+                lbl_dur.set_attributes(Pango.AttrList.from_string("font-features 'tnum=1'")); lbl_dur.set_margin_end(24); b.append(lbl_dur)
+            row.set_child(b); self.track_list.append(row)
 
     def _update_track_list_icon(self):
         row = self.track_list.get_first_child()
@@ -751,8 +673,10 @@ class TidalApp(Adw.Application):
         self.back_btn.set_sensitive(True)
         self.artist_fav_btn.set_visible(True)
         is_fav = self.backend.is_artist_favorite(artist.id); self._update_fav_icon(self.artist_fav_btn, is_fav)
-        while c := self.main_flow.get_first_child(): self.main_flow.remove(c)
-        while c := self.mix_flow.get_first_child(): self.mix_flow.remove(c)
+        while c := self.collection_content_box.get_first_child(): self.collection_content_box.remove(c)
+        self.main_flow = Gtk.FlowBox(valign=Gtk.Align.START, max_children_per_line=30, selection_mode=Gtk.SelectionMode.NONE, column_spacing=24, row_spacing=28)
+        self.main_flow.connect("child-activated", self.on_grid_item_activated)
+        self.collection_content_box.append(self.main_flow)
         Thread(target=lambda: GLib.idle_add(self.batch_load_albums, list(self.backend.get_albums(artist))), daemon=True).start()
 
     def batch_load_albums(self, albs, batch=6):
@@ -763,30 +687,10 @@ class TidalApp(Adw.Application):
             img = Gtk.Image(pixel_size=130, css_classes=["album-cover-img"])
             utils.load_img(img, lambda a=alb: self.backend.get_artwork_url(a, 640), self.cache_dir, 130)
             v.append(img); v.append(Gtk.Label(label=alb.name, ellipsize=3, halign=Gtk.Align.CENTER, wrap=True, max_width_chars=16))
-            c = Gtk.FlowBoxChild(); c.set_child(v); c.album_obj = alb; self.main_flow.append(c)
+            c = Gtk.FlowBoxChild(); c.set_child(v)
+            c.data_item = {'obj': alb, 'type': 'Album'}
+            self.main_flow.append(c)
         if rem: GLib.timeout_add(50, self.batch_load_albums, rem, batch)
-        return False
-
-    def batch_load_mixes(self, mixes, batch=6):
-        if not mixes: 
-            if not self.mix_flow.get_first_child():
-                self.mixes_container.set_visible(False)
-            return False
-            
-        self.mixes_container.set_visible(True)
-        curr, rem = mixes[:batch], mixes[batch:]
-        for mix in curr:
-            v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, css_classes=["card"])
-            img = Gtk.Image(pixel_size=130, css_classes=["album-cover-img"])
-            title = getattr(mix, 'title', getattr(mix, 'name', 'Mix'))
-            
-            utils.load_img(img, lambda m=mix: self.backend.get_artwork_url(m, 640), self.cache_dir, 130)
-            v.append(img)
-            v.append(Gtk.Label(label=title, ellipsize=3, halign=Gtk.Align.CENTER, wrap=True, max_width_chars=16))
-            
-            c = Gtk.FlowBoxChild(); c.set_child(v); c.mix_obj = mix; self.mix_flow.append(c)
-            
-        if rem: GLib.timeout_add(50, self.batch_load_mixes, rem, batch)
         return False
 
     def batch_load_artists(self, artists, batch=10):
@@ -797,87 +701,68 @@ class TidalApp(Adw.Application):
             img = Gtk.Image(pixel_size=120, css_classes=["circular-avatar"])
             utils.load_img(img, lambda a=art: self.backend.get_artwork_url(a, 320), self.cache_dir, 120)
             v.append(img); v.append(Gtk.Label(label=art.name, ellipsize=2, halign=Gtk.Align.CENTER, wrap=True, max_width_chars=14, css_classes=["heading"]))
-            c = Gtk.FlowBoxChild(); c.set_child(v); c.artist_obj = art; self.main_flow.append(c)
+            c = Gtk.FlowBoxChild(); c.set_child(v)
+            c.data_item = {'obj': art, 'type': 'Artist'}
+            self.main_flow.append(c)
         if rem: GLib.timeout_add(50, self.batch_load_artists, rem, batch)
         return False
 
-    # [核心逻辑修改] 导航栏点击切换
+    def batch_load_home(self, sections):
+        if not sections: return
+        for sec in sections:
+            self.collection_content_box.append(Gtk.Label(label=sec['title'], xalign=0, css_classes=["title-4", "dim-label"]))
+            flow = Gtk.FlowBox(valign=Gtk.Align.START, max_children_per_line=30, selection_mode=Gtk.SelectionMode.NONE, column_spacing=24, row_spacing=28)
+            flow.connect("child-activated", self.on_grid_item_activated)
+            self.collection_content_box.append(flow)
+            for item_data in sec['items']:
+                v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, css_classes=["card"])
+                img_size = 130; img_cls = "album-cover-img"
+                if item_data['type'] == 'Artist' or 'Radio' in item_data['name']:
+                    img_size = 120; img_cls = "circular-avatar"
+                img = Gtk.Image(pixel_size=img_size, css_classes=[img_cls])
+                if item_data['image_url']: utils.load_img(img, item_data['image_url'], self.cache_dir, img_size)
+                else: img.set_from_icon_name("audio-x-generic-symbolic")
+                v.append(img)
+                v.append(Gtk.Label(label=item_data['name'], ellipsize=2, halign=Gtk.Align.CENTER, wrap=True, max_width_chars=16, css_classes=["heading"]))
+                if item_data['sub_title']:
+                    v.append(Gtk.Label(label=item_data['sub_title'], ellipsize=1, halign=Gtk.Align.CENTER, css_classes=["caption", "dim-label"]))
+                c = Gtk.FlowBoxChild(); c.set_child(v); c.data_item = item_data
+                flow.append(c)
+
     def on_nav_selected(self, box, row):
         if not row: return
         self.nav_history.clear()
         self.artist_fav_btn.set_visible(False)
         self.right_stack.set_visible_child_name("grid_view")
         self.back_btn.set_sensitive(False)
-        
-        # 1. Home (只显示 Mixes)
+        while c := self.collection_content_box.get_first_child(): self.collection_content_box.remove(c)
         if row.nav_id == "home":
             self.grid_title_label.set_text("Home")
-            self.mixes_container.set_visible(True)
-            self.albums_container.set_visible(False)
-            
-            # 清空旧数据防止重复
-            while c := self.mix_flow.get_first_child(): self.mix_flow.remove(c)
-            
             if self.backend.user: 
-                Thread(target=lambda: GLib.idle_add(self.batch_load_mixes, list(self.backend.get_mixes()))).start()
-
-        # 2. My Collection (只显示 Albums)
+                Thread(target=lambda: GLib.idle_add(self.batch_load_home, self.backend.get_home_page())).start()
         elif row.nav_id == "collection":
             self.grid_title_label.set_text("My Collection")
-            self.mixes_container.set_visible(False)
-            self.albums_container.set_visible(True)
-            
-            while c := self.main_flow.get_first_child(): self.main_flow.remove(c)
-            
-            if self.backend.user: 
-                Thread(target=lambda: GLib.idle_add(self.batch_load_albums, list(self.backend.get_recent_albums()))).start()
-                
-        # 3. History
+            self.create_album_flow()
+            if self.backend.user: Thread(target=lambda: GLib.idle_add(self.batch_load_albums, list(self.backend.get_recent_albums()))).start()
         elif row.nav_id == "history":
             self.grid_title_label.set_text("History")
-            self.mixes_container.set_visible(False)
-            self.albums_container.set_visible(True)
-            
-            while c := self.main_flow.get_first_child(): self.main_flow.remove(c)
-            
+            self.create_album_flow()
             Thread(target=lambda: GLib.idle_add(self.batch_load_albums, self.history_mgr.get_albums())).start()
-            
-        # 4. Artists
         elif row.nav_id == "artists":
             self.grid_title_label.set_text("Favorite Artists")
-            self.mixes_container.set_visible(False)
-            self.albums_container.set_visible(True)
-            
-            while c := self.main_flow.get_first_child(): self.main_flow.remove(c)
-            
+            self.create_album_flow()
             if self.backend.user: Thread(target=lambda: GLib.idle_add(self.batch_load_artists, self.backend.get_favorites())).start()
 
-    def on_track_selected(self, box, row):
-        if not row: return
-        idx = row.get_index()
-        track = self.current_track_list[idx]
-        self.current_index = idx
-        self.playing_track = track
-        self.playing_track_id = track.id
-        self._update_track_list_icon()
-
-        self.lbl_title.set_text(track.name)
-        art_name = getattr(track.artist, 'name', 'Unknown Artist')
-        self.lbl_artist.set_text(art_name)
-        alb_name = track.album.name if hasattr(track, 'album') and track.album else "Unknown Album"
-        self.lbl_album.set_text(alb_name)
-        cover_url = self.backend.get_artwork_url(track, 1280)
-        utils.load_img(self.art_img, cover_url, self.cache_dir, 72)
-        Thread(target=lambda: self.history_mgr.add(track, cover_url), daemon=True).start()
-        def play():
-            url = self.backend.get_stream_url(track)
-            if url: GLib.idle_add(lambda: (self.player.load(url), self.player.play(), self.play_btn.set_icon_name("media-playback-pause-symbolic")))
-        Thread(target=play, daemon=True).start()
+    def create_album_flow(self):
+        self.main_flow = Gtk.FlowBox(valign=Gtk.Align.START, max_children_per_line=30, selection_mode=Gtk.SelectionMode.NONE, column_spacing=24, row_spacing=28)
+        self.main_flow.connect("child-activated", self.on_grid_item_activated)
+        self.collection_content_box.append(self.main_flow)
 
     def on_play_pause(self, btn):
         if self.player.is_playing(): self.player.pause(); btn.set_icon_name("media-playback-start-symbolic")
         else: self.player.play(); btn.set_icon_name("media-playback-pause-symbolic")
 
+    # [已修复] 补全 on_next_track
     def on_next_track(self):
         if self.current_index < len(self.current_track_list)-1: 
             self.current_index += 1
@@ -969,14 +854,18 @@ class TidalApp(Adw.Application):
             img = Gtk.Image(pixel_size=100, css_classes=["circular-avatar"])
             utils.load_img(img, lambda a=art: self.backend.get_artwork_url(a, 320), self.cache_dir, 100)
             v.append(img); v.append(Gtk.Label(label=art.name, ellipsize=2, wrap=True, max_width_chars=12, css_classes=["heading"]))
-            c = Gtk.FlowBoxChild(); c.set_child(v); c.artist_obj = art; self.res_art_flow.append(c)
+            c = Gtk.FlowBoxChild(); c.set_child(v);
+            c.data_item = {'obj': art, 'type': 'Artist'}
+            self.res_art_flow.append(c)
         self.res_alb_box.set_visible(bool(albums))
         for alb in albums:
             v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, css_classes=["card"])
             img = Gtk.Image(pixel_size=110, css_classes=["album-cover-img"])
             utils.load_img(img, lambda a=alb: self.backend.get_artwork_url(a, 320), self.cache_dir, 110)
             v.append(img); v.append(Gtk.Label(label=alb.name, ellipsize=2, wrap=True, max_width_chars=14))
-            c = Gtk.FlowBoxChild(); c.set_child(v); c.album_obj = alb; self.res_alb_flow.append(c)
+            c = Gtk.FlowBoxChild(); c.set_child(v)
+            c.data_item = {'obj': alb, 'type': 'Album'}
+            self.res_alb_flow.append(c)
         self.res_trk_box.set_visible(bool(tracks)); self.search_track_data = tracks
         for i, t in enumerate(tracks):
             row = Gtk.Box(spacing=16, margin_top=8, margin_bottom=8, margin_start=12)
@@ -1010,6 +899,30 @@ class TidalApp(Adw.Application):
                 if url: GLib.idle_add(lambda: (self.player.load(url), self.player.play(), self.play_btn.set_icon_name("media-playback-pause-symbolic")))
             Thread(target=play, daemon=True).start()
 
+    # [已修复] 补全 on_track_selected
+    def on_track_selected(self, box, row):
+        if not row: return
+        idx = row.get_index()
+        track = self.current_track_list[idx]
+        self.current_index = idx
+        self.playing_track = track
+        self.playing_track_id = track.id
+        self._update_track_list_icon()
+
+        self.lbl_title.set_text(track.name)
+        art_name = getattr(track.artist, 'name', 'Unknown Artist')
+        self.lbl_artist.set_text(art_name)
+        alb_name = track.album.name if hasattr(track, 'album') and track.album else "Unknown Album"
+        self.lbl_album.set_text(alb_name)
+        cover_url = self.backend.get_artwork_url(track, 1280)
+        utils.load_img(self.art_img, cover_url, self.cache_dir, 72)
+        Thread(target=lambda: self.history_mgr.add(track, cover_url), daemon=True).start()
+        def play():
+            url = self.backend.get_stream_url(track)
+            if url: GLib.idle_add(lambda: (self.player.load(url), self.player.play(), self.play_btn.set_icon_name("media-playback-pause-symbolic")))
+        Thread(target=play, daemon=True).start()
+
+    # [已修复] 补全 on_back_clicked
     def on_back_clicked(self, btn):
         if self.nav_history:
             target_view = self.nav_history.pop()

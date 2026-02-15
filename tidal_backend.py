@@ -11,10 +11,8 @@ class TidalBackend:
         self.session = tidalapi.Session()
         self.token_file = os.path.expanduser("~/.cache/hiresti_token.pkl")
         self.user = None
-        
         self.quality = self._get_best_quality()
         self._apply_global_config() 
-        
         self.fav_album_ids = set()
 
     def _get_best_quality(self):
@@ -30,7 +28,6 @@ class TidalBackend:
                 self.session.config.quality = self.quality
                 if hasattr(self.session.config, 'set_quality'):
                     self.session.config.set_quality(self.quality)
-                print(f"[Backend] Global session config updated to: {self.quality}")
         except Exception as e:
             print(f"[Backend] Config Sync Warning: {e}")
 
@@ -38,12 +35,10 @@ class TidalBackend:
         self.session = tidalapi.Session()
         self._apply_global_config()
         login_url_obj, future = self.session.login_oauth()
-        
         if hasattr(login_url_obj, 'verification_uri_complete'):
             url = login_url_obj.verification_uri_complete
         else:
             url = str(login_url_obj)
-
         print(f"[Backend] OAuth URL: {url}")
         return url, future
 
@@ -118,9 +113,7 @@ class TidalBackend:
                 self.user.favorites.remove_album(album_id)
                 self.fav_album_ids.discard(str(album_id))
             return True
-        except Exception as e:
-            print(f"Toggle Fav Error: {e}")
-            return False
+        except: return False
 
     def toggle_artist_favorite(self, artist_id, add=True):
         try:
@@ -147,87 +140,184 @@ class TidalBackend:
             return res() if callable(res) else res
         except: return []
 
-    def get_mixes(self):
+    # ==========================================
+    # [核心修改] 带过滤功能的 get_home_page
+    # ==========================================
+    def get_home_page(self):
+        """
+        获取 Tidal 首页，并根据用户需求过滤栏目。
+        """
+        # 定义您想要显示的关键词 (不区分大小写)
+        ALLOWED_KEYWORDS = [
+            "mix",              # 1. custom mixes
+            "spotlight",        # 2. Spotlighted
+            "recent",           # 3. Recently played
+            "suggested new",    # 4. suggested new albums
+            "because",          # 5. because you liked
+            "recommended new",  # 6. recommended new tracks
+            "new tracks",       # 6. (备用)
+            "radio",            # 7. Personal radio stations
+            "station",          # 7. (备用)
+            "uploads",          # 8. uploads for you
+            "for you",          # 8. (备用: mixes for you, etc)
+            "albums you",       # 9. Albums you'll love
+            "albums for you"    # 9. (备用)
+        ]
+
+        home_sections = []
         try:
-            if hasattr(self.session, 'mixes'):
-                res = self.session.mixes()
-                return res() if callable(res) else res
-            elif hasattr(self.user, 'mixes'):
-                res = self.user.mixes()
-                return res() if callable(res) else res
-            return []
+            if hasattr(self.session, 'home'):
+                print("[Backend] Fetching session.home()...")
+                home = self.session.home()
+                if hasattr(home, 'categories'):
+                    for category in home.categories:
+                        title = category.title
+                        title_lower = title.lower()
+                        
+                        # [过滤逻辑] 检查标题是否包含任一关键词
+                        is_allowed = any(k in title_lower for k in ALLOWED_KEYWORDS)
+                        
+                        if is_allowed:
+                            section = {
+                                'title': title,
+                                'items': []
+                            }
+                            if hasattr(category, 'items'):
+                                for item in category.items:
+                                    processed_item = self._process_generic_item(item)
+                                    if processed_item:
+                                        section['items'].append(processed_item)
+                            
+                            if section['items']:
+                                home_sections.append(section)
+                        else:
+                            # 可以在这里打印被过滤掉的栏目，方便调试
+                            # print(f"[Backend] Filtered out: {title}")
+                            pass
+            else:
+                # 回退模式
+                print("[Backend] session.home() not found, using fallback.")
+                mixes = self._get_fallback_mixes()
+                if mixes: home_sections.append({'title': 'Mixes for you', 'items': mixes})
+                
         except Exception as e:
-            print(f"[Backend] Get Mixes Error: {e}")
-            return []
+            print(f"[Backend] Get Home Page Error: {e}")
+            
+        return home_sections
+
+    def _process_generic_item(self, item):
+        try:
+            # 基础信息
+            data = {
+                'obj': item, 
+                'name': getattr(item, 'title', getattr(item, 'name', 'Unknown')),
+                'sub_title': '',
+                'image_url': self.get_artwork_url(item, 320),
+                'type': type(item).__name__ 
+            }
+            
+            # 补充子标题
+            if hasattr(item, 'artist') and item.artist:
+                data['sub_title'] = item.artist.name
+            elif hasattr(item, 'artists') and item.artists:
+                data['sub_title'] = ", ".join([a.name for a in item.artists[:2]])
+            elif hasattr(item, 'description'):
+                data['sub_title'] = item.description
+            # 处理 Track 类型
+            elif hasattr(item, 'album'):
+                 data['sub_title'] = getattr(item.artist, 'name', '')
+                
+            return data
+        except:
+            return None
+
+    def _get_fallback_mixes(self):
+        try:
+            if hasattr(self.user, 'mixes'):
+                raw = self.user.mixes()
+                return [self._process_generic_item(m) for m in (raw() if callable(raw) else raw)]
+        except: return []
 
     def get_tracks(self, item):
         try:
+            # 1. 解包
+            if isinstance(item, dict) and 'obj' in item:
+                item = item['obj']
+
+            # 2. 优先尝试直接调用方法
             if hasattr(item, 'tracks') and callable(item.tracks):
-                res = item.tracks()
-                return res() if callable(res) else res
-            
+                return item.tracks()
             if hasattr(item, 'items') and callable(item.items):
-                res = item.items()
-                items = res() if callable(res) else res
-                if items and hasattr(items[0], 'track'):
-                     return [i.track for i in items if i.track] 
-                return items
+                return self._extract_tracks_from_items(item.items())
+
+            # 3. 重新抓取
+            item_type = type(item).__name__
+            item_id = getattr(item, 'id', None)
+            
+            if not item_id: return []
+
+            print(f"[Backend] Reloading {item_type} with ID {item_id}")
+
+            if 'Mix' in item_type:
+                mix = self.session.mix(item_id)
+                return self._extract_tracks_from_items(mix.items())
+            
+            elif 'Playlist' in item_type:
+                pl = self.session.playlist(item_id)
+                return self._extract_tracks_from_items(pl.items())
+            
+            elif 'Album' in item_type:
+                alb = self.session.album(item_id)
+                return alb.tracks()
 
             if hasattr(item, 'id'):
-                print(f"[Backend] Fetching deep object for ID: {item.id}")
-                real_album = self.session.album(item.id)
-                if real_album:
-                    res = real_album.tracks()
-                    return res() if callable(res) else res
+                return self.session.album(item.id).tracks()
             
             return []
         except Exception as e:
             print(f"Get Tracks Error: {e}")
             return []
 
-    # [关键修复] 升级版 get_artwork_url，兼容 Mixes/Playlists 的 UUID 图片
+    def _extract_tracks_from_items(self, items):
+        res = items() if callable(items) else items
+        final_tracks = []
+        for i in res:
+            if hasattr(i, 'track'):
+                if i.track: final_tracks.append(i.track)
+            else:
+                final_tracks.append(i)
+        return final_tracks
+
     def get_artwork_url(self, obj, size=320):
+        if isinstance(obj, dict) and 'obj' in obj: obj = obj['obj']
         if not obj: return None
         
-        # 1. 尝试直接获取 Mix/Playlist 的 image 属性 (通常是 UUID 字符串)
-        # 这是 My Mix 封面最常见的存储位置
         if hasattr(obj, 'image') and isinstance(obj.image, str) and obj.image:
              path = obj.image.replace('-', '/')
              return f"https://resources.tidal.com/images/{path}/{size}x{size}.jpg"
 
-        # 2. 尝试处理 images 对象/字典/列表
         if hasattr(obj, 'images'):
             try:
-                # 如果是 tidalapi 的 Images 对象，直接读属性
                 if hasattr(obj.images, 'large'): return obj.images.large
                 if hasattr(obj.images, 'medium'): return obj.images.medium
-                
-                # 如果是字典
-                if isinstance(obj.images, dict):
-                    return list(obj.images.values())[0] 
-                # 如果是列表
-                elif isinstance(obj.images, list) and len(obj.images) > 0:
-                     return obj.images[0].url
+                if isinstance(obj.images, dict): return list(obj.images.values())[0] 
+                elif isinstance(obj.images, list) and len(obj.images) > 0: return obj.images[0].url
             except: pass
 
-        # 3. 回退到 Album 逻辑 (针对 Tracks)
         if hasattr(obj, 'album') and obj.album: obj = obj.album
             
-        # 4. 处理 Artists 的 picture
         if hasattr(obj, 'picture'):
             if callable(obj.picture): return obj.picture(width=size, height=size)
             elif isinstance(obj.picture, str): 
                 try: return f"https://resources.tidal.com/images/{obj.picture.replace('-', '/')}/{size}x{size}.jpg"
                 except: pass
 
-        # 5. 处理 Albums 的 cover
         if hasattr(obj, 'cover'):
             if callable(obj.cover): return obj.cover(width=size, height=size)
             elif isinstance(obj.cover, str):
                 try: return f"https://resources.tidal.com/images/{obj.cover.replace('-', '/')}/{size}x{size}.jpg"
                 except: pass
         
-        # 6. 处理本地对象可能存在的 cover_url
         if hasattr(obj, 'cover_url'): return obj.cover_url
         
         return None
@@ -237,7 +327,7 @@ class TidalBackend:
             self._apply_global_config()
             full_track = self.session.track(track.id)
             url = full_track.get_url()
-            print(f"[Backend] Successfully fetched URL for {track.name} using quality: {self.quality}")
+            print(f"[Backend] Stream URL for {track.name}: {self.quality}")
             return url
         except Exception as e:
             print(f"[Backend] Stream URL Error: {e}")
@@ -249,20 +339,14 @@ class TidalBackend:
             "High (16-bit, 44.1 kHz)": ['LOSSLESS'],             
             "Low (320 kbps)": ['HIGH', 'LOW']                    
         }
-        
         target_keys = mapping.get(mode_str, ['HIGH'])
         found_quality = None
-        
         for key in target_keys:
             if hasattr(tidalapi.Quality, key):
                 found_quality = getattr(tidalapi.Quality, key)
                 break
-        
-        if found_quality is None:
-            found_quality = target_keys[0]
-
+        if found_quality is None: found_quality = target_keys[0]
         self.quality = found_quality
-        print(f"[Backend] Quality resolved to: {self.quality} for {mode_str}")
         self._apply_global_config()
 
     def search_artist(self, query):
@@ -271,32 +355,23 @@ class TidalBackend:
         except: return []
 
     def search_items(self, query):
-        print(f"[Backend] Searching for: {query}")
         results = {'artists': [], 'albums': [], 'tracks': []}
         try:
             res = self.session.search(query, limit=50)
             if hasattr(res, 'artists'):
                 raw = res.artists; results['artists'] = (raw() if callable(raw) else raw)[:6]
-            elif isinstance(res, dict) and 'artists' in res: results['artists'] = res['artists'][:6]
-
             if hasattr(res, 'albums'):
                 raw = res.albums; results['albums'] = (raw() if callable(raw) else raw)[:6]
-            elif isinstance(res, dict) and 'albums' in res: results['albums'] = res['albums'][:6]
-
             if hasattr(res, 'tracks'):
                 raw = res.tracks; results['tracks'] = (raw() if callable(raw) else raw)[:30]
-            elif isinstance(res, dict) and 'tracks' in res: results['tracks'] = res['tracks'][:30]
             return results
         except Exception as e:
-            print(f"[Search Error]: {e}")
             return results
 
     def logout(self):
-        print("[Backend] Logging out...")
         if os.path.exists(self.token_file):
             try: os.remove(self.token_file)
             except: pass
-
         self.user = None
         self.session = tidalapi.Session()
         self.fav_album_ids = set()
