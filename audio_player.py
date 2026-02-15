@@ -369,3 +369,24 @@ class AudioPlayer:
     def get_format_string(self):
         if "fmt_str" in self.stream_info: return self.stream_info["fmt_str"]
         return "Loading..."
+
+
+    def get_latency(self):
+        """获取当前音频输出端的真实延迟 (秒)"""
+        if not self.pipeline:
+            return 0.0
+            
+        try:
+            # 优先从具体的 audio-sink 查询，如果拿不到再查整个 pipeline
+            sink = self.pipeline.get_property("audio-sink")
+            target = sink if sink else self.pipeline
+            
+            query = Gst.Query.new_latency()
+            if target.query(query):
+                live, min_lat, max_lat = query.parse_latency()
+                # min_lat 是音频包从产生到进入硬件缓存的最短时间
+                return float(min_lat) / 1000000000.0
+        except Exception:
+            pass
+            
+        return 0.0
