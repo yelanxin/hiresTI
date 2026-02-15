@@ -638,7 +638,7 @@ class TidalApp(Adw.Application):
             lbl_art.set_size_request(160, -1); lbl_art.set_max_width_chars(20); lbl_art.set_margin_end(12); b.append(lbl_art)
             alb_name = t.album.name if hasattr(t, 'album') and t.album else "-"
             lbl_alb = Gtk.Label(label=alb_name, xalign=0, ellipsize=3, css_classes=["dim-label"])
-            lbl_alb.set_size_request(260, -1); lbl_alb.set_max_width_chars(20); lbl_alb.set_margin_end(12); b.append(lbl_alb)
+            lbl_alb.set_size_request(300, -1); lbl_alb.set_max_width_chars(20); lbl_alb.set_margin_end(12); b.append(lbl_alb)
             dur_sec = getattr(t, 'duration', 0)
             if dur_sec:
                 m, s = divmod(dur_sec, 60); dur_str = f"{m}:{s:02d}"
