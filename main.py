@@ -201,6 +201,37 @@ class TidalApp(Adw.Application):
         box_right.append(self.settings_btn)
         self.header.pack_end(box_right)
 
+    def _build_volume_popover(self):
+        pop = Gtk.Popover()
+        # 创建垂直布局容器
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
+
+        # 垂直滑块
+        self.vol_scale = Gtk.Scale.new_with_range(Gtk.Orientation.VERTICAL, 0, 100, 5)
+        self.vol_scale.set_inverted(True) # 让 100 在上面，0 在下面，符合直觉
+        self.vol_scale.set_size_request(-1, 150) # 设置高度
+        self.vol_scale.set_value(80) # 默认值
+
+        # 绑定事件：调整音量 + 动态更新图标
+        self.vol_scale.connect("value-changed", self.on_volume_changed_ui)
+
+        vbox.append(self.vol_scale)
+        pop.set_child(vbox)
+        return pop
+    
+    def on_volume_changed_ui(self, scale):
+        val = scale.get_value()
+        self.player.set_volume(val / 100.0)
+
+        # 根据音量大小切换图标
+        icon = "audio-volume-high-symbolic"
+        if val == 0: icon = "audio-volume-muted-symbolic"
+        elif val < 30: icon = "audio-volume-low-symbolic"
+        elif val < 70: icon = "audio-volume-medium-symbolic"
+
+        if hasattr(self, 'vol_btn'):
+            self.vol_btn.set_icon_name(icon)
+
 
     def toggle_mini_mode(self, btn):
         self.is_mini_mode = not self.is_mini_mode
@@ -505,6 +536,7 @@ class TidalApp(Adw.Application):
         self.mini_controls.set_visible(False)
         
         m_restore = Gtk.Button(icon_name="view-fullscreen-symbolic", css_classes=["flat", "circular"])
+        m_restore.set_tooltip_text("Restore to Default View")
         m_restore.connect("clicked", self.toggle_mini_mode)
         
         m_close = Gtk.Button(icon_name="window-close-symbolic", css_classes=["flat", "circular"])
@@ -528,11 +560,10 @@ class TidalApp(Adw.Application):
         # --- 2. 中间：播放控制 ---
         c_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, hexpand=True, valign=Gtk.Align.CENTER)
         
-        # 按钮行
         ctrls = Gtk.Box(spacing=12, halign=Gtk.Align.CENTER)
-        #ctrls.set_margin_top(25)
-        ctrls.add_css_class("player-ctrls-box")
-
+        ctrls.add_css_class("player-ctrls-box") 
+        # ctrls.set_margin_top(25) # 已由 CSS 控制
+        
         btn_prev = Gtk.Button(icon_name="media-skip-backward-symbolic", css_classes=["flat"])
         btn_prev.connect("clicked", self.on_prev_track); ctrls.append(btn_prev)
         self.play_btn = Gtk.Button(icon_name="media-playback-start-symbolic", css_classes=["pill", "suggested-action"])
@@ -541,7 +572,6 @@ class TidalApp(Adw.Application):
         btn_next.connect("clicked", lambda b: self.on_next_track()); ctrls.append(btn_next)
         c_box.append(ctrls)
         
-        # 进度条 (保存为 self.timeline_box 以便控制显隐)
         self.timeline_box = Gtk.Box(spacing=12, orientation=Gtk.Orientation.HORIZONTAL)
         attr_list = Pango.AttrList.from_string("font-features 'tnum=1'")
         self.lbl_current_time = Gtk.Label(label="0:00", css_classes=["dim-label"]); self.lbl_current_time.set_attributes(attr_list)
@@ -550,25 +580,49 @@ class TidalApp(Adw.Application):
         self.timeline_box.append(self.lbl_current_time); self.timeline_box.append(self.scale); self.timeline_box.append(self.lbl_total_time)
         self.timeline_box.set_size_request(450, -1); self.timeline_box.set_halign(Gtk.Align.CENTER); c_box.append(self.timeline_box)
         
-        # 技术信息 (保存为 self.tech_box)
         self.tech_box = Gtk.Box(spacing=8, halign=Gtk.Align.CENTER, margin_top=4)
         self.bp_label = Gtk.Label(label="BIT PERFECT", css_classes=["bp-text-glow"], visible=False); self.tech_box.append(self.bp_label)
         self.lbl_tech = Gtk.Label(label="", css_classes=["tech-label"], ellipsize=3, visible=False); self.tech_box.append(self.lbl_tech); c_box.append(self.tech_box)
         
         self.bottom_bar.append(c_box)
         
-        # --- 3. 右侧：音量和EQ (保存为 self.vol_box 以便控制显隐) ---
-        self.vol_box = Gtk.Box(spacing=12, valign=Gtk.Align.CENTER)
-        self.eq_btn = Gtk.Button(icon_name="eq-icon-symbolic", css_classes=["flat"]); self.eq_pop = self._build_eq_popover(); self.eq_pop.set_parent(self.eq_btn); self.eq_btn.connect("clicked", lambda b: self.eq_pop.popup()); self.vol_box.append(self.eq_btn)
-        self.vol = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 5); self.vol.set_value(80); self.vol.set_size_request(120, -1); self.vol.connect("value-changed", lambda s: self.player.set_volume(s.get_value()/100.0)); self.vol_box.append(self.vol); 
+        # --- 3. 右侧：EQ 和 音量 (修改部分) ---
+        # 减小间距，让图标靠得更近
+        self.vol_box = Gtk.Box(spacing=4, valign=Gtk.Align.CENTER) 
+        
+        # EQ 按钮
+        self.eq_btn = Gtk.Button(icon_name="eq-icon-symbolic", css_classes=["flat"])
+        self.eq_pop = self._build_eq_popover()
+        self.eq_pop.set_parent(self.eq_btn)
+        self.eq_btn.connect("clicked", lambda b: self.eq_pop.popup())
+        self.vol_box.append(self.eq_btn)
+        
+        # [修改] 音量按钮 (替代旧的 Slider)
+        self.vol_btn = Gtk.Button(icon_name="audio-volume-high-symbolic", css_classes=["flat"])
+        self.vol_pop = self._build_volume_popover()
+        self.vol_pop.set_parent(self.vol_btn)
+        self.vol_btn.connect("clicked", lambda b: self.vol_pop.popup())
+        self.vol_box.append(self.vol_btn)
+        
         self.bottom_bar.append(self.vol_box)
 
     def _lock_volume_controls(self, locked):
-        if not hasattr(self, 'vol'): return
+        # 检查新组件是否存在
+        if not hasattr(self, 'vol_scale'): return
+        
         if locked:
-            self.vol.set_value(100); self.player.set_volume(1.0); self.vol.set_sensitive(False)
+            # 锁定：设为 100%，并禁用按钮
+            self.vol_scale.set_value(100)
+            self.player.set_volume(1.0)
+            
+            # 禁用按钮，让用户无法点开调节
+            self.vol_btn.set_sensitive(False)
+            self.vol_btn.set_tooltip_text("Volume locked in Bit-Perfect/Exclusive mode")
         else:
-            self.vol.set_sensitive(True)
+            # 解锁
+            self.vol_btn.set_sensitive(True)
+            self.vol_scale.set_sensitive(True)
+            self.vol_btn.set_tooltip_text("Adjust Volume")
 
     def on_login_clicked(self, btn):
         if self.backend.user:
