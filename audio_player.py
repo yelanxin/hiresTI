@@ -213,28 +213,58 @@ class AudioPlayer:
     # 输出设置
     # ==========================================
     def set_output(self, driver, device_id=None):
+        """
+        设置音频输出驱动和设备 (整合 ALSA/PipeWire/PulseAudio 终极优化版)
+        """
+        print(f"[AudioPlayer] Setting output: Driver={driver}, Device={device_id}")
+
+        # 1. 停止播放并清理旧状态
         was_playing = self.is_playing()
         self.pipeline.set_state(Gst.State.NULL)
-        
+
+        # 如果从独占模式切换出去，尝试恢复 PulseAudio 设备配置
         if self.borrowed_pa_card:
              if not self.exclusive_lock_mode or driver != "ALSA" or not device_id:
                  self._restore_pa_device()
 
+        # ==========================================
+        # 分支 A: ALSA (硬件独占 / Bit-Perfect)
+        # ==========================================
         if driver == "ALSA" and device_id:
             try:
+                # 尝试释放 PulseAudio 占用 (抢占声卡)
                 card_idx = device_id.split(':')[1].split(',')[0]
                 self._release_pa_device(card_idx)
-                if self.exclusive_lock_mode: time.sleep(0.5)
+                if self.exclusive_lock_mode: time.sleep(0.5) # 给硬件一点喘息时间
             except: pass
 
             sink = Gst.ElementFactory.make("alsasink", "audio_sink")
             if sink:
                 sink.set_property("device", device_id)
-                sink.set_property("buffer-time", self.alsa_buffer_time)
-                sink.set_property("latency-time", self.alsa_latency_time)
-                sink.set_property("provide-clock", True)
-                sink.set_property("slave-method", 1)
+
+                # --- [核心优化 1] 动态延迟参数 ---
+                # 使用我们之前定义的变量 (来自用户设置的档位)
+                # 确保 self.alsa_buffer_time 已在 __init__ 或 set_alsa_latency 中定义
+                target_buffer = getattr(self, 'alsa_buffer_time', 100000)
+                target_latency = getattr(self, 'alsa_latency_time', 10000)
+
+                sink.set_property("buffer-time", target_buffer)
+                sink.set_property("latency-time", target_latency)
+
+                # --- [核心优化 2] 发烧级时钟设置 ---
+                # 强制让 DAC 做主时钟 (Master)，电脑做从属，大幅降低 Jitter
+                try: sink.set_property("provide-clock", True)
+                except: pass
+
+                # --- [核心优化 3] 时钟漂移校正 ---
+                # 1 = SKEW (微调指针)。相比 RESAMPLE (重采样)，这能保证原始数据不被修改。
+                try: sink.set_property("slave-method", 1)
+                except: pass
+
+                # 应用 Sink
                 self.pipeline.set_property("audio-sink", sink)
+
+                # 测试设备是否繁忙
                 ret = self.pipeline.set_state(Gst.State.READY)
                 if ret == Gst.StateChangeReturn.FAILURE:
                     print(f"[AudioPlayer] ALSA Device {device_id} is BUSY! Falling back.")
@@ -243,27 +273,92 @@ class AudioPlayer:
             else:
                 self._set_auto_sink()
 
-        elif driver == "PipeWire" or driver == "PulseAudio":
-            if not device_id:
-                if driver == "PipeWire":
-                    sink = Gst.ElementFactory.make("pipewiresink", "audio_sink")
-                    if not sink: sink = Gst.ElementFactory.make("pulsesink", "audio_sink")
-                else:
-                    sink = Gst.ElementFactory.make("pulsesink", "audio_sink")
+        # ==========================================
+        # 分支 B: PipeWire (低延迟 / 新一代架构)
+        # ==========================================
+        elif driver == "PipeWire":
+            sink = Gst.ElementFactory.make("pipewiresink", "audio_sink")
+            if sink:
+                # 1. 绑定设备
+                if device_id:
+                    # PipeWire 使用 target-object 指定 Node ID 或 Serial
+                    try: sink.set_property("target-object", device_id)
+                    except: pass # 旧版插件可能不支持
+
+                # 2. 构建高级参数
+                props = Gst.Structure.new_empty("props")
+
+                # --- [核心优化 4] 智能 Quantum 计算 ---
+                # 将用户的 ALSA 延迟档位映射到 PipeWire Quantum
+                # 公式: Quantum = Buffer时间(秒) * 48000
+                target_buffer_us = getattr(self, 'alsa_buffer_time', 100000)
+
+                # 基础 Quantum 计算
+                base_quantum = int((target_buffer_us / 1000000.0) * 48000)
+
+                # 寻找最近的 2 的幂 (PipeWire 喜欢 2 的幂: 1024, 2048, 4096...)
+                # 例如 100ms -> 4800 -> 映射到 4096
+                #      20ms  -> 960  -> 映射到 1024
+                quantum = 1024
+                for p in [256, 512, 1024, 2048, 4096, 8192]:
+                    if abs(p - base_quantum) < abs(quantum - base_quantum):
+                        quantum = p
+
+                # 强制限制在合理范围内 (发烧友建议 1024 - 4096)
+                quantum = max(512, min(quantum, 8192))
+
+                print(f"[PipeWire] Mapping buffer {target_buffer_us}us -> Quantum {quantum}/48000")
+
+                props.set_value("node.latency", f"{quantum}/48000")
+                props.set_value("node.autoconnect", "true")
+                props.set_value("media.role", "Music")       # 标记为音乐流，提高优先级
+                props.set_value("resample.quality", 12)      # 高质量重采样 (0-14)
+
+                # 尝试开启“独占式”调度 (如果支持)
+                # props.set_value("node.lock-quantum", "true")
+
+                sink.set_property("stream-properties", props)
                 self.pipeline.set_property("audio-sink", sink)
             else:
-                sink = Gst.ElementFactory.make("pulsesink", "audio_sink")
-                if sink:
+                # 如果系统没装 pipewiresink，回退到 Pulse
+                self.set_output("PulseAudio", device_id)
+                return
+
+        # ==========================================
+        # 分支 C: PulseAudio (传统兼容模式)
+        # ==========================================
+        elif driver == "PulseAudio":
+            sink = Gst.ElementFactory.make("pulsesink", "audio_sink")
+            if sink:
+                if device_id:
                     sink.set_property("device", device_id)
-                    self.pipeline.set_property("audio-sink", sink)
-                else:
-                    self._set_auto_sink()
+
+                # 虽然 PulseAudio 不一定听话，但我们还是把参数传过去
+                # 这有助于在低负载下获得正确的延迟
+                target_buffer = getattr(self, 'alsa_buffer_time', 100000)
+                target_latency = getattr(self, 'alsa_latency_time', 10000)
+                sink.set_property("buffer-time", target_buffer)
+                sink.set_property("latency-time", target_latency)
+
+                # 同样开启 DAC 主时钟模式
+                try: sink.set_property("provide-clock", True)
+                except: pass
+
+                self.pipeline.set_property("audio-sink", sink)
+            else:
+                self._set_auto_sink()
+
+        # ==========================================
+        # 分支 D: Auto / Fallback
+        # ==========================================
         else:
             self._set_auto_sink()
 
+        # 恢复播放状态
         if was_playing:
             self.pipeline.set_state(Gst.State.PLAYING)
-            
+
+        # 重新安装 Probe 以获取新的格式信息
         GLib.timeout_add(500, self._install_pad_probe)
 
     def _set_auto_sink(self):

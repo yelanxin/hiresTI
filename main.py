@@ -109,7 +109,6 @@ class TidalApp(Adw.Application):
         self.win = Adw.ApplicationWindow(application=self, title="hiresTI Desktop", default_width=ui_config.WINDOW_WIDTH, default_height=ui_config.WINDOW_HEIGHT)
         self.window_created = True
         
-        # 核心：使用 WindowHandle 确保无边框模式下全窗口可拖拽
         self.window_handle = Gtk.WindowHandle()
         self.win.set_content(self.window_handle)
         
@@ -120,20 +119,41 @@ class TidalApp(Adw.Application):
         self._build_body(self.main_vbox)
         self._build_player_bar(self.main_vbox)
 
-        # 恢复设置逻辑
+        # === 恢复设置逻辑 ===
         is_bp = self.settings.get("bit_perfect", False)
         is_ex = self.settings.get("exclusive_lock", False)
+        
+        # 1. 应用 Bit-Perfect 和 独占状态
+        self.player.toggle_bit_perfect(is_bp, exclusive_lock=is_ex)
         if is_bp:
-            self.player.toggle_bit_perfect(True, exclusive_lock=is_ex)
             if hasattr(self, 'bp_label'): self.bp_label.set_visible(True)
             self._lock_volume_controls(True)
         
+        # 2. 应用 Latency
+        saved_profile = self.settings.get("latency_profile", "Standard (100ms)")
+        if saved_profile in self.LATENCY_MAP:
+            buf_ms, lat_ms = self.LATENCY_MAP[saved_profile]
+            self.player.set_alsa_latency(buf_ms, lat_ms)
+        
+        # 3. 恢复驱动选择
         drivers = self.player.get_drivers()
         saved_drv = self.settings.get("driver", "Auto (Default)")
+        
+        # 如果保存的是 ALSA 或其他驱动，先尝试选中
         if saved_drv in drivers:
-            idx = drivers.index(saved_drv)
-            self.driver_dd.set_selected(idx)
+            try:
+                idx = drivers.index(saved_drv)
+                self.driver_dd.set_selected(idx)
+            except: pass
+            
+        # 触发一次驱动加载
         self.on_driver_changed(self.driver_dd, None)
+
+        # [修复重点] 4. 如果启动时独占模式是开启的，必须强制禁用驱动选择框
+        if is_ex:
+            self.driver_dd.set_sensitive(False)
+            # 双重保险：确保 UI 选中的是 ALSA
+            self._force_driver_selection("ALSA")
 
         if self.backend.try_load_session(): 
             self.on_login_success()
@@ -372,29 +392,30 @@ class TidalApp(Adw.Application):
         settings_scroll.set_child(settings_vbox)
         settings_vbox.append(Gtk.Label(label="Settings", xalign=0, css_classes=["album-title-large"], margin_bottom=10))
 
+        # --- Audio Quality ---
         group_q = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["settings-group"])
         row_q = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
         row_q.append(Gtk.Label(label="Audio Quality", hexpand=True, xalign=0))
-
-        self.quality_dd = Gtk.DropDown(model=Gtk.StringList.new([
-            "Max (Up to 24-bit, 192 kHz)",
-            "High (16-bit, 44.1 kHz)",
-            "Low (320 kbps)"
-        ]))
+        self.quality_dd = Gtk.DropDown(model=Gtk.StringList.new(["Max (Up to 24-bit, 192 kHz)", "High (16-bit, 44.1 kHz)", "Low (320 kbps)"]))
         self.quality_dd.connect("notify::selected-item", self.on_quality_changed)
         row_q.append(self.quality_dd); group_q.append(row_q); settings_vbox.append(group_q)
 
+        # --- Audio Output ---
         settings_vbox.append(Gtk.Label(label="Audio Output", xalign=0, css_classes=["section-title"], margin_top=10))
         group_out = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["settings-group"])
 
+        # 1. Bit-Perfect
         row_bp = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
         bp_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
         bp_info.append(Gtk.Label(label="Bit-Perfect Mode", xalign=0, css_classes=["settings-label"]))
         bp_info.append(Gtk.Label(label="Bypass software mixer & EQ", xalign=0, css_classes=["dim-label"]))
         row_bp.append(bp_info); row_bp.append(Gtk.Box(hexpand=True))
-        self.bp_switch = Gtk.Switch(valign=Gtk.Align.CENTER); self.bp_switch.connect("state-set", self.on_bit_perfect_toggled)
+        self.bp_switch = Gtk.Switch(valign=Gtk.Align.CENTER)
+        self.bp_switch.set_active(self.settings.get("bit_perfect", False))
+        self.bp_switch.connect("state-set", self.on_bit_perfect_toggled)
         row_bp.append(self.bp_switch); group_out.append(row_bp)
 
+        # 2. Exclusive Mode
         row_ex = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
         ex_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
         title_box = Gtk.Box(spacing=6, orientation=Gtk.Orientation.HORIZONTAL)
@@ -407,37 +428,38 @@ class TidalApp(Adw.Application):
         pop_box = Gtk.Box(margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
         pop_box.append(pop_content); help_pop.set_child(pop_box)
         help_btn.connect("clicked", lambda x: help_pop.popup())
-        title_box.append(help_btn)
-        ex_info.append(title_box)
+        title_box.append(help_btn); ex_info.append(title_box)
         ex_info.append(Gtk.Label(label="Bypass and release system audio control for this device", xalign=0, css_classes=["dim-label"]))
         row_ex.append(ex_info); row_ex.append(Gtk.Box(hexpand=True))
-        self.ex_switch = Gtk.Switch(valign=Gtk.Align.CENTER, sensitive=False)
+        self.ex_switch = Gtk.Switch(valign=Gtk.Align.CENTER)
+        self.ex_switch.set_sensitive(self.settings.get("bit_perfect", False))
+        self.ex_switch.set_active(self.settings.get("exclusive_lock", False))
         self.ex_switch.connect("state-set", self.on_exclusive_toggled)
         row_ex.append(self.ex_switch); group_out.append(row_ex)
 
+        # 3. Latency
         row_lat = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
         lat_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
-        lat_info.append(Gtk.Label(label="Exclusive Latency", xalign=0, css_classes=["settings-label"]))
-        lat_info.append(Gtk.Label(label="Adjust buffer size for stability vs response", xalign=0, css_classes=["dim-label"]))
-        row_lat.append(lat_info)
-        row_lat.append(Gtk.Box(hexpand=True))
-
+        lat_info.append(Gtk.Label(label="Output Latency", xalign=0, css_classes=["settings-label"]))
+        lat_info.append(Gtk.Label(label="Target buffer size (Effective in Exclusive Mode)", xalign=0, css_classes=["dim-label"]))
+        row_lat.append(lat_info); row_lat.append(Gtk.Box(hexpand=True))
         self.latency_dd = Gtk.DropDown(model=Gtk.StringList.new(self.LATENCY_OPTIONS))
         self.latency_dd.set_valign(Gtk.Align.CENTER)
-        self.latency_dd.set_sensitive(self.settings.get("exclusive_lock", False)) # 初始状态跟随独占开关
-
-        # 恢复上次选中的档位
+        
+        # [修复重点] 这里的可用性必须依赖于 exclusive_lock 的状态
+        self.latency_dd.set_sensitive(self.settings.get("exclusive_lock", False))
+        
         saved_profile = self.settings.get("latency_profile", "Standard (100ms)")
+        if saved_profile not in self.LATENCY_OPTIONS: saved_profile = "Standard (100ms)"
         try:
-            idx = self.LATENCY_OPTIONS.index(saved_profile)
-            self.latency_dd.set_selected(idx)
-        except:
-            self.latency_dd.set_selected(1) # Default to Standard
-
+            target_idx = self.LATENCY_OPTIONS.index(saved_profile)
+            self.latency_dd.set_selected(target_idx)
+        except ValueError:
+            self.latency_dd.set_selected(1)
         self.latency_dd.connect("notify::selected-item", self.on_latency_changed)
-        row_lat.append(self.latency_dd)
-        group_out.append(row_lat)
+        row_lat.append(self.latency_dd); group_out.append(row_lat)
 
+        # 4. Driver
         row_drv = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
         row_drv.append(Gtk.Label(label="Audio Driver", hexpand=True, xalign=0))
         drivers = self.player.get_drivers()
@@ -445,11 +467,13 @@ class TidalApp(Adw.Application):
         self.driver_dd.connect("notify::selected-item", self.on_driver_changed)
         row_drv.append(self.driver_dd); group_out.append(row_drv)
 
+        # 5. Device
         row_dev = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
         row_dev.append(Gtk.Label(label="Output Device", hexpand=True, xalign=0))
         self.device_dd = Gtk.DropDown(model=Gtk.StringList.new(["Default"])); self.device_dd.set_sensitive(False)
         self.device_dd.connect("notify::selected-item", self.on_device_changed)
         row_dev.append(self.device_dd); group_out.append(row_dev)
+
         settings_vbox.append(group_out); self.right_stack.add_named(settings_scroll, "settings")
 
     def _build_eq_popover(self):
@@ -590,13 +614,24 @@ class TidalApp(Adw.Application):
             self.driver_dd.set_sensitive(True)
 
     def on_exclusive_toggled(self, switch, state):
-        self.settings["exclusive_lock"] = state; self.save_settings()
+        self.settings["exclusive_lock"] = state
+        self.save_settings()
+        
         self.player.toggle_bit_perfect(True, exclusive_lock=state)
+        
+        # [修复重点] 恢复互锁：独占开 -> Latency 可用；独占关 -> Latency 变灰
         self.latency_dd.set_sensitive(state)
+
         if state:
-            self._force_driver_selection("ALSA"); self.driver_dd.set_sensitive(False); self.on_driver_changed(self.driver_dd, None)
+            # 开启独占：强制 ALSA，禁用驱动选择
+            self._force_driver_selection("ALSA")
+            self.driver_dd.set_sensitive(False)
+            self.on_driver_changed(self.driver_dd, None)
         else:
-            self.driver_dd.set_sensitive(True); self.on_device_changed(self.device_dd, None)
+            # 关闭独占：恢复驱动选择
+            self.driver_dd.set_sensitive(True)
+            # 刷新一下非独占状态下的设备列表
+            self.on_device_changed(self.device_dd, None)
 
     def on_latency_changed(self, dd, p):
         selected = dd.get_selected_item()
@@ -662,28 +697,54 @@ class TidalApp(Adw.Application):
         selected = dd.get_selected_item()
         if not selected: return
         driver_name = selected.get_string()
-        if self.ex_switch.get_active() and driver_name != "ALSA": return 
-        self.settings["driver"] = driver_name; self.save_settings()
-        self.current_device_name = "Default"; self.update_tech_label(self.player.stream_info)
+        
+        # 保存驱动设置
+        if not self.ex_switch.get_active() or driver_name == "ALSA":
+            self.settings["driver"] = driver_name
+            self.save_settings()
+
+        self.current_device_name = "Default"
+        self.update_tech_label(self.player.stream_info)
+
         def refresh_devices():
+            # [关键] 暂停设备变更的监听，防止刷新列表时误触保存
             self.ignore_device_change = True
+            
             devices = self.player.get_devices_for_driver(driver_name)
             self.current_device_list = devices 
             self.device_dd.set_model(Gtk.StringList.new([d["name"] for d in devices]))
+            
+            # --- 设备恢复逻辑 ---
             saved_dev = self.settings.get("device")
-            sel_idx = 0; found_saved = False
+            sel_idx = 0
+            found = False
+            
             if saved_dev:
                 for i, d in enumerate(devices):
-                    if d["name"] == saved_dev: sel_idx = i; found_saved = True; break
+                    # 只要名字匹配就选中
+                    if d["name"] == saved_dev: 
+                        sel_idx = i
+                        found = True
+                        break
+            
             self.device_dd.set_sensitive(len(devices) > 1)
-            if sel_idx < self.device_dd.get_model().get_n_items(): self.device_dd.set_selected(sel_idx)
-            self.ignore_device_change = False
-            target_device_id = None
+            
+            # 设置选中项
             if sel_idx < len(devices):
-                target_device_id = devices[sel_idx]['device_id']; self.current_device_name = devices[sel_idx]['name']
-                if not found_saved: self.settings["device"] = self.current_device_name
+                self.device_dd.set_selected(sel_idx)
+                
+            # [关键] 恢复监听
+            self.ignore_device_change = False
+            
+            # 只有在确实切换了设备的情况下才应用输出
+            target_id = None
+            if sel_idx < len(devices):
+                target_id = devices[sel_idx]['device_id']
+                self.current_device_name = devices[sel_idx]['name']
+                
             GLib.idle_add(lambda: self.update_tech_label(self.player.stream_info))
-            self.player.set_output(driver_name, target_device_id)
+            self.player.set_output(driver_name, target_id)
+
         Thread(target=lambda: GLib.idle_add(refresh_devices), daemon=True).start()
 
     def on_device_changed(self, dd, p):
