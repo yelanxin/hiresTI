@@ -370,23 +370,42 @@ class AudioPlayer:
         if "fmt_str" in self.stream_info: return self.stream_info["fmt_str"]
         return "Loading..."
 
-
     def get_latency(self):
         """获取当前音频输出端的真实延迟 (秒)"""
-        if not self.pipeline:
+        # 1. 如果没有在播放，硬件还没跑起来，没有延迟可言
+        if not self.is_playing() and not self.pipeline.get_state(0)[1] == Gst.State.PAUSED:
             return 0.0
             
         try:
-            # 优先从具体的 audio-sink 查询，如果拿不到再查整个 pipeline
+            # 2. 尝试获取真实的 Sink 元素
             sink = self.pipeline.get_property("audio-sink")
+            
+            # 如果是 autoaudiosink 或 bin，尝试深入获取内部真实的 sink
+            if isinstance(sink, Gst.Bin):
+                # 这是一个简化的查找，通常有效
+                iterator = sink.iterate_sinks()
+                first_result = iterator.next()
+                if first_result[0] == Gst.IteratorResult.OK:
+                    sink = first_result[1]
+
             target = sink if sink else self.pipeline
             
+            # 3. 发起查询
             query = Gst.Query.new_latency()
             if target.query(query):
-                live, min_lat, max_lat = query.parse_latency()
-                # min_lat 是音频包从产生到进入硬件缓存的最短时间
-                return float(min_lat) / 1000000000.0
-        except Exception:
+                is_live, min_lat, max_lat = query.parse_latency()
+                
+                # GStreamer 返回的是纳秒
+                latency_sec = float(min_lat) / 1e9
+                
+                # [调试] 如果你想看控制台打印真实数据，取消下面这行的注释
+                # print(f"[Latency Debug] {latency_sec * 1000:.2f} ms")
+                
+                return latency_sec
+                
+        except Exception as e:
+            print(f"[Latency Query Error] {e}")
             pass
             
         return 0.0
+
