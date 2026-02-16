@@ -48,7 +48,15 @@ class AudioPlayer:
         self.probe_id = None
         self.borrowed_pa_card = None
 
+        self.alsa_buffer_time = 100000
+        self.alsa_latency_time = 10000
+
         self._set_auto_sink()
+
+    def set_alsa_latency(self, buffer_ms, latency_ms):
+        self.alsa_buffer_time = int(buffer_ms * 1000)   # 毫秒转微秒
+        self.alsa_latency_time = int(latency_ms * 1000)
+        print(f"[AudioPlayer] ALSA Latency updated: Buffer={self.alsa_buffer_time}us, Period={self.alsa_latency_time}us")
 
     def cleanup(self):
         print("[AudioPlayer] Cleaning up resources...")
@@ -222,8 +230,10 @@ class AudioPlayer:
             sink = Gst.ElementFactory.make("alsasink", "audio_sink")
             if sink:
                 sink.set_property("device", device_id)
-                sink.set_property("buffer-time", 100000)
-                sink.set_property("latency-time", 10000)
+                sink.set_property("buffer-time", self.alsa_buffer_time)
+                sink.set_property("latency-time", self.alsa_latency_time)
+                sink.set_property("provide-clock", True)
+                sink.set_property("slave-method", 1)
                 self.pipeline.set_property("audio-sink", sink)
                 ret = self.pipeline.set_state(Gst.State.READY)
                 if ret == Gst.StateChangeReturn.FAILURE:
@@ -370,42 +380,55 @@ class AudioPlayer:
         if "fmt_str" in self.stream_info: return self.stream_info["fmt_str"]
         return "Loading..."
 
+
     def get_latency(self):
-        """获取当前音频输出端的真实延迟 (秒)"""
-        # 1. 如果没有在播放，硬件还没跑起来，没有延迟可言
-        if not self.is_playing() and not self.pipeline.get_state(0)[1] == Gst.State.PAUSED:
+        """获取当前音频输出端的真实延迟 (秒) - 终极增强版"""
+        # 1. 基础状态检查：如果没在播放或暂停，硬件未工作，延迟为 0
+        current_state = self.pipeline.get_state(0)[1]
+        if current_state != Gst.State.PLAYING and current_state != Gst.State.PAUSED:
             return 0.0
             
+        latency = 0.0
+        
+        # 获取当前的 Sink 元素 (例如 alsasink, pulsesink 或 autoaudiosink)
+        sink = self.pipeline.get_property("audio-sink")
+        
+        # --- 方法 A: 标准 GStreamer 查询 (优先尝试) ---
+        # 这是最标准的方法，向管道询问"当前延迟是多少"
         try:
-            # 2. 尝试获取真实的 Sink 元素
-            sink = self.pipeline.get_property("audio-sink")
-            
-            # 如果是 autoaudiosink 或 bin，尝试深入获取内部真实的 sink
-            if isinstance(sink, Gst.Bin):
-                # 这是一个简化的查找，通常有效
-                iterator = sink.iterate_sinks()
-                first_result = iterator.next()
-                if first_result[0] == Gst.IteratorResult.OK:
-                    sink = first_result[1]
-
+            # 如果 sink 是 bin (如 autoaudiosink 内部封装)，直接查 pipeline 可能更准
             target = sink if sink else self.pipeline
-            
-            # 3. 发起查询
             query = Gst.Query.new_latency()
+            
             if target.query(query):
                 is_live, min_lat, max_lat = query.parse_latency()
-                
-                # GStreamer 返回的是纳秒
-                latency_sec = float(min_lat) / 1e9
-                
-                # [调试] 如果你想看控制台打印真实数据，取消下面这行的注释
-                # print(f"[Latency Debug] {latency_sec * 1000:.2f} ms")
-                
-                return latency_sec
-                
-        except Exception as e:
-            print(f"[Latency Query Error] {e}")
+                # GStreamer 返回的是纳秒 (10^-9)，转换为秒
+                latency = float(min_lat) / 1e9
+        except: 
             pass
-            
-        return 0.0
 
+        # --- 方法 B: 属性读取保底 (针对 ALSA 驱动不上报的情况) ---
+        # 如果方法 A 失败 (返回 0 或极小值)，尝试直接读取 Sink 的属性
+        if latency <= 0.001 and sink:
+            try:
+                # 检查 sink 是否有 'buffer-time' 属性 (alsasink, pulsesink 都有)
+                # 这个属性通常对应硬件的缓冲区大小
+                if hasattr(sink.props, 'buffer_time'):
+                    # buffer-time 单位是微秒 (us)
+                    buf_time = sink.get_property("buffer-time")
+                    if buf_time > 0:
+                        latency = float(buf_time) / 1000000.0
+            except: 
+                pass
+                
+        # --- 方法 C: 独占模式配置回读 (终极保底) ---
+        # 如果以上都失败，但我们处于独占模式，说明延迟是我们自己设定的
+        # 直接返回我们保存的配置值 (self.alsa_buffer_time)
+        if latency <= 0.001 and self.exclusive_lock_mode:
+            # 确保变量存在 (防止初始化前的边缘情况)
+            if hasattr(self, 'alsa_buffer_time'):
+                return float(self.alsa_buffer_time) / 1000000.0
+            else:
+                return 0.1 # 如果变量还没初始化，默认返回 100ms
+            
+        return latency
