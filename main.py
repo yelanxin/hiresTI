@@ -21,6 +21,14 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 class TidalApp(Adw.Application):
+    # [新增] 定义延迟档位配置
+    LATENCY_OPTIONS = ["Safe (400ms)", "Standard (100ms)", "Low Latency (40ms)", "Aggressive (20ms)"]
+    LATENCY_MAP = {
+        "Safe (400ms)":      (400, 40),  # Buffer, Latency
+        "Standard (100ms)":  (100, 10),
+        "Low Latency (40ms)":(40, 4),
+        "Aggressive (20ms)": (20, 2)
+    }
     def __init__(self):
         super().__init__(application_id="com.hiresti.player")
         GLib.set_application_name("HiresTI")
@@ -44,6 +52,12 @@ class TidalApp(Adw.Application):
 
         # [修复点] 这里的 self.on_next_track 现在能在下面找到定义了
         self.player = AudioPlayer(on_eos_callback=self.on_next_track, on_tag_callback=self.update_tech_label)
+
+        saved_profile = self.settings.get("latency_profile", "Standard (100ms)")
+        if saved_profile not in self.LATENCY_MAP: saved_profile = "Standard (100ms)"
+        buf_ms, lat_ms = self.LATENCY_MAP[saved_profile]
+        self.player.set_alsa_latency(buf_ms, lat_ms)
+
         self.history_mgr = HistoryManager()
         self.cache_dir = os.path.expanduser("~/.cache/hiresti/covers")
         os.makedirs(self.cache_dir, exist_ok=True)
@@ -401,6 +415,29 @@ class TidalApp(Adw.Application):
         self.ex_switch.connect("state-set", self.on_exclusive_toggled)
         row_ex.append(self.ex_switch); group_out.append(row_ex)
 
+        row_lat = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
+        lat_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
+        lat_info.append(Gtk.Label(label="Exclusive Latency", xalign=0, css_classes=["settings-label"]))
+        lat_info.append(Gtk.Label(label="Adjust buffer size for stability vs response", xalign=0, css_classes=["dim-label"]))
+        row_lat.append(lat_info)
+        row_lat.append(Gtk.Box(hexpand=True))
+
+        self.latency_dd = Gtk.DropDown(model=Gtk.StringList.new(self.LATENCY_OPTIONS))
+        self.latency_dd.set_valign(Gtk.Align.CENTER)
+        self.latency_dd.set_sensitive(self.settings.get("exclusive_lock", False)) # 初始状态跟随独占开关
+
+        # 恢复上次选中的档位
+        saved_profile = self.settings.get("latency_profile", "Standard (100ms)")
+        try:
+            idx = self.LATENCY_OPTIONS.index(saved_profile)
+            self.latency_dd.set_selected(idx)
+        except:
+            self.latency_dd.set_selected(1) # Default to Standard
+
+        self.latency_dd.connect("notify::selected-item", self.on_latency_changed)
+        row_lat.append(self.latency_dd)
+        group_out.append(row_lat)
+
         row_drv = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
         row_drv.append(Gtk.Label(label="Audio Driver", hexpand=True, xalign=0))
         drivers = self.player.get_drivers()
@@ -555,10 +592,31 @@ class TidalApp(Adw.Application):
     def on_exclusive_toggled(self, switch, state):
         self.settings["exclusive_lock"] = state; self.save_settings()
         self.player.toggle_bit_perfect(True, exclusive_lock=state)
+        self.latency_dd.set_sensitive(state)
         if state:
             self._force_driver_selection("ALSA"); self.driver_dd.set_sensitive(False); self.on_driver_changed(self.driver_dd, None)
         else:
             self.driver_dd.set_sensitive(True); self.on_device_changed(self.device_dd, None)
+
+    def on_latency_changed(self, dd, p):
+        selected = dd.get_selected_item()
+        if not selected: return
+        profile_name = selected.get_string()
+
+        # 1. 保存设置
+        self.settings["latency_profile"] = profile_name
+        self.save_settings()
+
+        # 2. 应用到 Player
+        if profile_name in self.LATENCY_MAP:
+            buf_ms, lat_ms = self.LATENCY_MAP[profile_name]
+            self.player.set_alsa_latency(buf_ms, lat_ms)
+
+            # 3. 如果当前正处于独占模式，必须重启输出才能生效
+            if self.ex_switch.get_active():
+                print("[Main] Latency changed, restarting output...")
+                # 重新触发一次 set_output
+                self.on_driver_changed(self.driver_dd, None)
 
     def _force_driver_selection(self, keyword):
         model = self.driver_dd.get_model()
