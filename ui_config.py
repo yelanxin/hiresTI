@@ -112,6 +112,14 @@ window.undecorated { background-color: transparent; }
     padding: 0;
 }
 
+.viz-panel {
+    background: rgba(10, 10, 10, 0.8);
+    border-top: 1px solid rgba(255, 255, 255, 0.2);
+    padding: 10px;
+    border-radius: 12px 12px 0 0;
+    margin: 0px 35px 1px 35px;
+}
+
 /* 其他通用样式 (保持不变) */
 .card-bar scale.horizontal { margin: 0; padding: 0; }
 .card-bar scale trough { min-height: 4px; }

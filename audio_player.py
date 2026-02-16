@@ -14,44 +14,96 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class AudioPlayer:
-    def __init__(self, on_eos_callback=None, on_tag_callback=None):
+    def __init__(self, on_eos_callback=None, on_tag_callback=None, on_spectrum_callback=None):
+        """
+        完整初始化：包含频谱仪集成、技术参数存储、以及 ALSA/Pulse 状态管理
+        """
         try:
             Gst.init(None)
         except:
             pass
-            
+
+        # 1. 创建核心管道 (使用 playbin 自动处理解码)
         self.pipeline = Gst.ElementFactory.make("playbin", "player")
-        bus = self.pipeline.get_bus()
-        bus.add_signal_watch()
-        bus.connect("message", self.on_message)
-        
-        # 初始化 Discoverer
+
+        # 2. 初始化核心状态变量 (修复 AttributeError 的关键)
+        self.stream_info = {"codec": "-", "bitrate": 0, "rate": 0, "depth": 0}
+        self.probe_id = None
+        self.bit_perfect_mode = False
+        self.exclusive_lock_mode = False
+        self.active_rate_switch = False
+
+        # 声卡与独占模式管理变量
+        self.borrowed_pa_card = None
+        self.current_driver = "Auto"
+        self.current_device_id = None
+
+        # 默认音频参数 (为 Honda Civic 优化的低延迟预设)
+        self.alsa_buffer_time = 100000
+        self.alsa_latency_time = 10000
+
+        # 保存回调函数
+        self.on_eos_callback = on_eos_callback
+        self.on_tag_callback = on_tag_callback
+        self.on_spectrum_callback = on_spectrum_callback
+
+        # 3. 初始化 Discoverer (用于获取媒体元数据)
         try:
             self.discoverer = GstPbutils.Discoverer.new(1 * Gst.SECOND)
         except Exception as e:
             print(f"[Init Warning] Failed to create Discoverer: {e}")
             self.discoverer = None
-        
-        self.on_eos_callback = on_eos_callback
-        self.on_tag_callback = on_tag_callback
-        
+
+        # 4. 构建音频处理过滤器链 (Equalizer + Spectrum)
+        self._setup_filter_chain()
+
+        # 5. 连接总线消息监听 (捕获 EOS、错误以及频谱数据)
+        bus = self.pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message", self.on_message)
+        # 专门监听 element 消息以抓取 spectrum 数据
+        bus.connect("message::element", self._on_bus_message)
+
+    def _setup_filter_chain(self):
+        """
+        内部辅助方法：构建均衡器和频谱仪链条 (同步优化版)
+        """
+        # 1. 必须先创建元素！(这是解决 AttributeError 的关键)
         self.equalizer = Gst.ElementFactory.make("equalizer-10bands", "equalizer")
-        self.pipeline.set_property("audio-filter", self.equalizer)
+        self.spectrum = Gst.ElementFactory.make("spectrum", "spectrum")
         
-        self.bit_perfect_mode = False
-        self.exclusive_lock_mode = False 
-        self.active_rate_switch = False
+        # 安全检查
+        if not self.equalizer:
+            self.equalizer = Gst.ElementFactory.make("audioconvert", "eq_placeholder")
+
+        if not self.spectrum:
+            print("[AudioPlayer] Error: spectrum element missing!")
+            return
+
+        # 2. 现在才能配置属性
+        self.spectrum.set_property("bands", 128)
         
-        self.current_driver = "Auto"
-        self.current_device_id = None
-        self.stream_info = {"codec": "-", "bitrate": 0, "rate": 0, "depth": 0}
-        self.probe_id = None
-        self.borrowed_pa_card = None
+        # [同步优化] 将分析间隔从 50ms 缩短到 30ms (30,000,000 纳秒)
+        # 这会让视觉数据更快地从 GStreamer 发送到 UI
+        self.spectrum.set_property("interval", 30000000) 
+        
+        spec_props = [p.name for p in self.spectrum.list_properties()]
+        if 'message' in spec_props: self.spectrum.set_property("message", True)
+        elif 'post-messages' in spec_props: self.spectrum.set_property("post-messages", True)
 
-        self.alsa_buffer_time = 100000
-        self.alsa_latency_time = 10000
+        # 3. 构建并链接 Bin
+        self.filter_bin = Gst.Bin.new("filter_bin")
+        self.filter_bin.add(self.equalizer)
+        self.filter_bin.add(self.spectrum)
+        self.equalizer.link(self.spectrum)
+        
+        sink_pad = self.equalizer.get_static_pad("sink")
+        src_pad = self.spectrum.get_static_pad("src")
 
-        self._set_auto_sink()
+        if sink_pad and src_pad:
+            self.filter_bin.add_pad(Gst.GhostPad.new("sink", sink_pad))
+            self.filter_bin.add_pad(Gst.GhostPad.new("src", src_pad))
+            self.pipeline.set_property("audio-filter", self.filter_bin)
 
     def set_alsa_latency(self, buffer_ms, latency_ms):
         self.alsa_buffer_time = int(buffer_ms * 1000)   # 毫秒转微秒
@@ -72,6 +124,8 @@ class AudioPlayer:
 
         self.pipeline.set_property("uri", uri)
         self.stream_info = {"codec": "Loading...", "bitrate": 0}
+        if hasattr(self, 'filter_bin'):
+            self.pipeline.set_property("audio-filter", self.filter_bin)
 
     def _pre_adjust_pipewire_rate(self, uri):
         try:
@@ -414,15 +468,17 @@ class AudioPlayer:
         self.active_rate_switch = enabled and not exclusive_lock
         
         if enabled:
-            self.pipeline.set_property("audio-filter", None)
+            # [修正] Bit-Perfect 开启时，我们依然保留 spectrum，但旁路掉 equalizer
+            # 我们可以通过设置均衡器的各频段为 0，或者重新构建只含 spectrum 的 filter_bin
+            self.reset_eq() 
+            print("[AudioPlayer] Bit-Perfect ON: EQ Bypassed, Spectrum Kept.")
         else:
             self._restore_pa_device()
             self._set_pipewire_clock(0)
-            self.exclusive_lock_mode = False 
-            self.active_rate_switch = False
-            if self.equalizer:
-                self.pipeline.set_property("audio-filter", self.equalizer)
-            self._set_auto_sink()
+            print("[AudioPlayer] Bit-Perfect OFF: EQ Enabled.")
+            
+        # 确保 filter_bin 始终挂载，除非你真的想彻底关闭所有视觉反馈
+        self.pipeline.set_property("audio-filter", self.filter_bin)
         return None
 
     def _install_pad_probe(self):
@@ -463,6 +519,30 @@ class AudioPlayer:
                 GLib.idle_add(self.on_tag_callback, self.stream_info)
                 
         return Gst.PadProbeReturn.OK
+
+    def _on_bus_message(self, bus, msg):
+        if msg.type == Gst.MessageType.ELEMENT:
+            s = msg.get_structure()
+            if s and s.get_name() == "spectrum":
+                magnitudes = []
+                try:
+                    s_str = s.to_string()
+                    import re
+                    match = re.search(r'magnitude=.*?[\{<]\s*(.*?)\s*[\}>]', s_str)
+                    
+                    if match:
+                        raw_data = match.group(1) 
+                        magnitudes = [float(x.strip()) for x in raw_data.split(', ') if x.strip()]
+                except: 
+                    pass
+
+                if magnitudes and self.on_spectrum_callback:
+                    # --- [同步校准] ---
+                    # 你观察到声音慢了 0.5秒，所以这里设置为 500ms
+                    # 这样波形显示会推迟 0.5秒，刚好和声音对上
+                    visual_delay_ms = 1200
+                    
+                    GLib.timeout_add(visual_delay_ms, self.on_spectrum_callback, magnitudes)
 
     def on_message(self, bus, message):
         t = message.type

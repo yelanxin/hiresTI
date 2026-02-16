@@ -7,6 +7,7 @@ gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
 from gi.repository import Gtk, Adw, GLib, Gdk, Pango
 
+from visualizer import SpectrumVisualizer
 import webbrowser
 import json
 from threading import Thread
@@ -75,7 +76,7 @@ class TidalApp(Adw.Application):
             except: pass
 
         # [修复点] 这里的 self.on_next_track 现在能在下面找到定义了
-        self.player = AudioPlayer(on_eos_callback=self.on_next_track, on_tag_callback=self.update_tech_label)
+        self.player = AudioPlayer(on_eos_callback=self.on_next_track, on_tag_callback=self.update_tech_label, on_spectrum_callback=self.on_spectrum_data)
 
         saved_profile = self.settings.get("latency_profile", "Standard (100ms)")
         if saved_profile not in self.LATENCY_MAP: saved_profile = "Standard (100ms)"
@@ -184,6 +185,11 @@ class TidalApp(Adw.Application):
         else:
             self._toggle_login_view(False) 
 
+        # --- [新增] 键盘快捷键监听 ---
+        key_controller = Gtk.EventControllerKey()
+        key_controller.connect("key-pressed", self.on_key_pressed)
+        self.win.add_controller(key_controller)
+
         self.win.present()
         self.win.connect("notify::default-width", self.update_layout_proportions)
         GLib.timeout_add(1000, self.update_ui_loop)
@@ -242,6 +248,32 @@ class TidalApp(Adw.Application):
         vbox.append(self.vol_scale)
         pop.set_child(vbox)
         return pop
+
+    def on_key_pressed(self, controller, keyval, keycode, state):
+        """处理键盘快捷键"""
+        # 1. 空格键: 播放/暂停
+        if keyval == Gdk.KEY_space:
+            # 如果焦点不在搜索框里，才触发播放/暂停
+            if not self.search_entry.has_focus():
+                self.on_play_pause(self.play_btn)
+                return True
+
+        # 2. Ctrl + Right: 下一曲
+        if (state & Gdk.ModifierType.CONTROL_MASK) and keyval == Gdk.KEY_Right:
+            self.on_next_track()
+            return True
+
+        # 3. Ctrl + Left: 上一曲
+        if (state & Gdk.ModifierType.CONTROL_MASK) and keyval == Gdk.KEY_Left:
+            self.on_prev_track()
+            return True
+
+        # 4. Ctrl + F: 聚焦搜索框
+        if (state & Gdk.ModifierType.CONTROL_MASK) and keyval == Gdk.KEY_f:
+            self.search_entry.grab_focus()
+            return True
+
+        return False
     
     def on_volume_changed_ui(self, scale):
         val = scale.get_value()
@@ -258,6 +290,19 @@ class TidalApp(Adw.Application):
 
 
     def toggle_mini_mode(self, btn):
+        if hasattr(self, 'viz_revealer'):
+            self.viz_revealer.set_reveal_child(False)
+            self.viz_revealer.set_vexpand(False)
+            # 同时停止可能的空间占用
+            if hasattr(self, 'viz'): self.viz.set_vexpand(False)
+
+        # 2. [图标修复] 强制把按钮图标改为“向上”，并移除激活状态
+        if hasattr(self, 'viz_btn'):
+            self.viz_btn.set_icon_name("pan-up-symbolic")
+            self.viz_btn.remove_css_class("active")
+
+
+
         self.is_mini_mode = not self.is_mini_mode
         
         if self.is_mini_mode:
@@ -333,6 +378,27 @@ class TidalApp(Adw.Application):
 
     def _build_body(self, container):
         self.paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL, vexpand=True); container.append(self.paned)
+
+        # --- [新增] 可折叠频谱区域 ---
+        self.viz_revealer = Gtk.Revealer(transition_type=Gtk.RevealerTransitionType.SLIDE_UP)
+        self.viz_revealer.set_reveal_child(False) # 初始隐藏
+        container.append(self.viz_revealer)
+
+        # 频谱仪容器
+        viz_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["viz-panel"])
+        
+        from visualizer import SpectrumVisualizer
+        self.viz = SpectrumVisualizer()
+        self.viz.num_bars = 64
+        self.viz.set_valign(Gtk.Align.FILL)
+        self.viz_revealer.set_vexpand(False)
+        self.viz.set_vexpand(False)
+
+        viz_container.append(self.viz)
+        
+        self.viz_revealer.set_child(viz_container)
+        # ------------------------
+
         self.sidebar_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.nav_list = Gtk.ListBox(css_classes=["navigation-sidebar"], margin_top=10); self.nav_list.connect("row-activated", self.on_nav_selected)
         
@@ -633,6 +699,27 @@ class TidalApp(Adw.Application):
         self.vol_box.append(self.vol_btn)
         
         self.bottom_bar.append(self.vol_box)
+
+        # 在 _build_player_bar 结尾处
+        # 确保你有一个按钮来调用 toggle_visualizer
+        #self.viz_toggle_btn = Gtk.Button(icon_name="pan-up-symbolic", css_classes=["flat"])
+        #self.viz_toggle_btn.connect("clicked", self.toggle_visualizer)
+
+        self.viz_btn = Gtk.Button(icon_name="pan-up-symbolic", css_classes=["player-btn", "flat"])
+        self.viz_btn.connect("clicked", self.toggle_visualizer)
+        self.vol_box.prepend(self.viz_btn)
+
+
+    def on_spectrum_data(self, magnitudes):
+        """
+        接收来自播放器的频谱数据并更新 UI
+        """
+        if not magnitudes: return
+        
+        if hasattr(self, 'viz') and self.viz:
+            # 这里的判断很重要：如果 viz_revealer 没展开，数据就不会传给绘图区域
+            if self.viz_revealer.get_reveal_child():
+                self.viz.update_data(magnitudes)
 
     def _lock_volume_controls(self, locked):
         """
@@ -1622,6 +1709,29 @@ class TidalApp(Adw.Application):
         if hasattr(self, 'playing_track') and self.playing_track:
             track = self.playing_track
             if hasattr(track, 'album') and track.album: self.show_album_details(track.album)
+
+    def toggle_visualizer(self, btn):
+        """
+        [终极修复版] 处理波形面板的显示、隐藏与空间彻底释放
+        """
+        is_visible = self.viz_revealer.get_reveal_child()
+        target_state = not is_visible
+        
+        # 1. 触发 Revealer 动画
+        self.viz_revealer.set_reveal_child(target_state)
+
+        # 2. 核心：控制容器的纵向扩展属性
+        # 展开时设为 True 占用空间，隐藏时设为 False 释放空间
+        self.viz_revealer.set_vexpand(target_state)
+        self.viz.set_vexpand(target_state)
+
+        if target_state:
+            btn.set_icon_name("pan-down-symbolic")
+            btn.add_css_class("active")
+            self.viz.queue_draw()
+        else:
+            btn.set_icon_name("pan-up-symbolic")
+            btn.remove_css_class("active")
 
 if __name__ == "__main__":
     TidalApp().run(None)
