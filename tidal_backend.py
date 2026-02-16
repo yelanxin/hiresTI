@@ -149,18 +149,13 @@ class TidalBackend:
         """
         # 定义您想要显示的关键词 (不区分大小写)
         ALLOWED_KEYWORDS = [
-            "mix",              # 1. custom mixes
-            "spotlight",        # 2. Spotlighted
-            "suggested new",    # 4. suggested new albums
-            "because",          # 5. because you liked
-            "recommended new",  # 6. recommended new tracks
-            "new tracks",       # 6. (备用)
-            "radio",            # 7. Personal radio stations
-            "station",          # 7. (备用)
-            "uploads",          # 8. uploads for you
-            "for you",          # 8. (备用: mixes for you, etc)
-            "albums you",       # 9. Albums you'll love
-            "albums for you"    # 9. (备用)
+            # English
+            "mix", "spotlight", "suggested", "because", "recommended",
+            "new", "radio", "station", "uploads", "for you", "albums",
+            # Chinese (Simplified/Traditional)
+            "推荐", "精选", "最新", "专辑", "电台", "为你", "新歌", "热播",
+            # Japanese
+            "ミックス", "ラジオ", "おすすめ", "新着", "アルバム", "あなた", "人気"
         ]
 
         home_sections = []

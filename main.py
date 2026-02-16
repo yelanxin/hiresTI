@@ -42,6 +42,7 @@ class TidalApp(Adw.Application):
                     self.settings.update(saved)
             except: pass
 
+        # [修复点] 这里的 self.on_next_track 现在能在下面找到定义了
         self.player = AudioPlayer(on_eos_callback=self.on_next_track, on_tag_callback=self.update_tech_label)
         self.history_mgr = HistoryManager()
         self.cache_dir = os.path.expanduser("~/.cache/hiresti/covers")
@@ -59,6 +60,11 @@ class TidalApp(Adw.Application):
         self.search_track_data = []
         self.nav_history = []
         self.ignore_device_change = False
+        
+        # Mini Mode 状态与尺寸记忆
+        self.is_mini_mode = False
+        self.saved_width = ui_config.WINDOW_WIDTH
+        self.saved_height = ui_config.WINDOW_HEIGHT
 
     def do_shutdown(self):
         print("[Main] Shutting down application...")
@@ -89,35 +95,30 @@ class TidalApp(Adw.Application):
         self.win = Adw.ApplicationWindow(application=self, title="hiresTI Desktop", default_width=ui_config.WINDOW_WIDTH, default_height=ui_config.WINDOW_HEIGHT)
         self.window_created = True
         
-        main_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        self.win.set_content(main_vbox)
+        # 核心：使用 WindowHandle 确保无边框模式下全窗口可拖拽
+        self.window_handle = Gtk.WindowHandle()
+        self.win.set_content(self.window_handle)
+        
+        self.main_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.window_handle.set_child(self.main_vbox)
 
-        self._build_header(main_vbox)
-        self._build_body(main_vbox)
-        self._build_player_bar(main_vbox)
+        self._build_header(self.main_vbox)
+        self._build_body(self.main_vbox)
+        self._build_player_bar(self.main_vbox)
 
-        # 恢复设置
+        # 恢复设置逻辑
         is_bp = self.settings.get("bit_perfect", False)
         is_ex = self.settings.get("exclusive_lock", False)
         if is_bp:
             self.player.toggle_bit_perfect(True, exclusive_lock=is_ex)
-            if hasattr(self, 'bp_switch'): self.bp_switch.set_active(True)
-            if hasattr(self, 'eq_btn'): self.eq_btn.set_sensitive(False)
             if hasattr(self, 'bp_label'): self.bp_label.set_visible(True)
             self._lock_volume_controls(True)
-        if hasattr(self, 'ex_switch'):
-             self.ex_switch.set_sensitive(is_bp)
-             self.ex_switch.set_active(is_ex)
-        saved_drv = self.settings.get("driver", "Auto (Default)")
-        if is_ex:
-            saved_drv = "ALSA"
-            self.driver_dd.set_sensitive(False)
+        
         drivers = self.player.get_drivers()
+        saved_drv = self.settings.get("driver", "Auto (Default)")
         if saved_drv in drivers:
-            for i, d in enumerate(drivers):
-                if d == saved_drv:
-                    self.driver_dd.set_selected(i)
-                    break
+            idx = drivers.index(saved_drv)
+            self.driver_dd.set_selected(idx)
         self.on_driver_changed(self.driver_dd, None)
 
         if self.backend.try_load_session(): 
@@ -130,14 +131,14 @@ class TidalApp(Adw.Application):
         GLib.timeout_add(1000, self.update_ui_loop)
 
     def _build_header(self, container):
-        header = Adw.HeaderBar(); container.append(header)
+        self.header = Adw.HeaderBar(); container.append(self.header)
         
         self.back_btn = Gtk.Button(icon_name="go-previous-symbolic", sensitive=False)
         self.back_btn.connect("clicked", self.on_back_clicked) 
-        header.pack_start(self.back_btn)
+        self.header.pack_start(self.back_btn)
         
         self.search_entry = Gtk.Entry(placeholder_text="Search...", width_request=300, valign=Gtk.Align.CENTER)
-        self.search_entry.connect("activate", self.on_search); header.set_title_widget(self.search_entry)
+        self.search_entry.connect("activate", self.on_search); self.header.set_title_widget(self.search_entry)
         
         box_right = Gtk.Box(spacing=6)
         
@@ -147,18 +148,86 @@ class TidalApp(Adw.Application):
         self.user_popover = self._build_user_popover()
         self.user_popover.set_parent(self.login_btn)
         
-        self.info_btn = Gtk.Button(icon_name="utilities-system-monitor-symbolic", css_classes=["flat"])
+        self.info_btn = Gtk.Button(icon_name="media-view-subtitles-symbolic", css_classes=["flat"])
         self.info_btn.set_tooltip_text("Signal Path / Tech Info")
         self.info_btn.connect("clicked", self.on_tech_info_clicked)
         
+        # Mini Player 按钮
+        self.mini_btn = Gtk.Button(icon_name="view-restore-symbolic", css_classes=["flat"])
+        self.mini_btn.set_tooltip_text("Mini Player Mode")
+        self.mini_btn.connect("clicked", self.toggle_mini_mode)
+
         self.settings_btn = Gtk.Button(icon_name="emblem-system-symbolic", css_classes=["flat"])
         self.settings_btn.set_tooltip_text("Settings")
         self.settings_btn.connect("clicked", self.on_settings_clicked)
         
         box_right.append(self.login_btn)
         box_right.append(self.info_btn)
+        box_right.append(self.mini_btn)
         box_right.append(self.settings_btn)
-        header.pack_end(box_right)
+        self.header.pack_end(box_right)
+
+
+    def toggle_mini_mode(self, btn):
+        self.is_mini_mode = not self.is_mini_mode
+        
+        if self.is_mini_mode:
+            # === 进入迷你模式 ===
+            self.saved_width = self.win.get_width()
+            self.saved_height = self.win.get_height()
+            
+            # 1. [核心] 添加 CSS 类 "mini-state"，对应 ui_config.py
+            self.bottom_bar.add_css_class("mini-state")
+            
+            # 2. 移除主界面
+            self.main_vbox.remove(self.paned)
+            self.header.set_visible(False)
+            self.mini_controls.set_visible(True)
+            
+            # 3. [核心] 隐藏不需要的组件 (实现极简)
+            if hasattr(self, 'timeline_box'): self.timeline_box.set_visible(False)
+            if hasattr(self, 'vol_box'): self.vol_box.set_visible(False)
+            if hasattr(self, 'tech_box'): self.tech_box.set_visible(False)
+
+            # 4. 设置无边框
+            self.win.set_decorated(False)
+
+            self.win.set_resizable(False)
+            
+            # 5. 压缩高度 (因为没有进度条了，可以非常扁)
+            self.win.set_size_request(450, 85) 
+            self.win.set_default_size(450, 85)
+            self.win.present()
+            
+            if hasattr(self, 'mini_btn'): self.mini_btn.set_icon_name("view-fullscreen-symbolic")
+            
+        else:
+            # === 恢复完整模式 ===
+            self.win.set_resizable(True)
+            
+            # 1. [核心] 移除 CSS 类，恢复 margin
+            self.bottom_bar.remove_css_class("mini-state")
+            
+            # 2. 恢复主界面
+            self.main_vbox.insert_child_after(self.paned, self.header)
+            self.header.set_visible(True)
+            self.paned.set_visible(True)
+            self.mini_controls.set_visible(False)
+            
+            # 3. [核心] 恢复组件显示
+            if hasattr(self, 'timeline_box'): 
+                self.timeline_box.set_visible(True)
+                self.timeline_box.set_size_request(450, -1)
+                
+            if hasattr(self, 'vol_box'): self.vol_box.set_visible(True)
+            if hasattr(self, 'tech_box'): self.tech_box.set_visible(True)
+            
+            # 4. 恢复窗口
+            self.win.set_decorated(True)
+            self.win.set_size_request(ui_config.WINDOW_WIDTH, ui_config.WINDOW_HEIGHT)
+            self.win.set_default_size(self.saved_width, self.saved_height)
+            
+            if hasattr(self, 'mini_btn'): self.mini_btn.set_icon_name("view-restore-symbolic")
 
     def _build_user_popover(self):
         pop = Gtk.Popover()
@@ -202,7 +271,6 @@ class TidalApp(Adw.Application):
 
     def _build_grid_view(self):
         grid_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        
         t_box = Gtk.Box(spacing=12, margin_start=32, margin_end=32, margin_top=32, margin_bottom=12)
         self.grid_title_label = Gtk.Label(label="Home", xalign=0, css_classes=["section-title"])
         self.artist_fav_btn = Gtk.Button(css_classes=["heart-btn"], icon_name="emblem-favorite-symbolic", visible=False)
@@ -211,22 +279,17 @@ class TidalApp(Adw.Application):
 
         self.login_prompt_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=20, valign=Gtk.Align.CENTER, vexpand=True)
         self.login_prompt_box.set_visible(False)
-        
         prompt_icon = Gtk.Image(icon_name="avatar-default-symbolic", pixel_size=128, css_classes=["dim-label"])
         prompt_label = Gtk.Label(label="Please login to access your Tidal collection", css_classes=["heading"])
         prompt_btn = Gtk.Button(label="Login to Tidal", css_classes=["pill", "suggested-action"], halign=Gtk.Align.CENTER)
         prompt_btn.connect("clicked", self.on_login_clicked)
-        
-        self.login_prompt_box.append(prompt_icon)
-        self.login_prompt_box.append(prompt_label)
-        self.login_prompt_box.append(prompt_btn)
+        self.login_prompt_box.append(prompt_icon); self.login_prompt_box.append(prompt_label); self.login_prompt_box.append(prompt_btn)
         grid_vbox.append(self.login_prompt_box)
 
         self.alb_scroll = Gtk.ScrolledWindow(vexpand=True)
         self.collection_content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=32, margin_start=32, margin_end=32, margin_bottom=32)
         self.alb_scroll.set_child(self.collection_content_box)
         grid_vbox.append(self.alb_scroll)
-        
         self.right_stack.add_named(grid_vbox, "grid_view")
 
     def _toggle_login_view(self, logged_in):
@@ -282,7 +345,7 @@ class TidalApp(Adw.Application):
         trk_content.append(self.album_header_box)
 
         self.track_list = Gtk.ListBox(css_classes=["boxed-list"], margin_start=32, margin_end=32, margin_bottom=32)
-        # [关键修复] 这里的 self.on_track_selected 现在可以被正确引用了
+        # 信号连接
         self.track_list.connect("row-activated", self.on_track_selected)
         trk_content.append(self.track_list)
 
@@ -366,17 +429,34 @@ class TidalApp(Adw.Application):
             vb.append(scale); vb.append(Gtk.Label(label=f, css_classes=["caption"])); hbox.append(vb)
         vbox.append(hbox); pop.set_child(vbox); return pop
 
+
     def _build_player_bar(self, container):
+        self.player_overlay = Gtk.Overlay()
+        container.append(self.player_overlay)
+
         self.bottom_bar = Gtk.Box(spacing=24, css_classes=["card-bar"])
-        container.append(self.bottom_bar)
+        self.player_overlay.set_child(self.bottom_bar)
         
+        # 迷你模式控制按钮（右上角）
+        self.mini_controls = Gtk.Box(spacing=4, valign=Gtk.Align.START, halign=Gtk.Align.END)
+        self.mini_controls.set_margin_top(6)
+        self.mini_controls.set_margin_end(6)
+        self.mini_controls.set_visible(False)
+        
+        m_restore = Gtk.Button(icon_name="view-fullscreen-symbolic", css_classes=["flat", "circular"])
+        m_restore.connect("clicked", self.toggle_mini_mode)
+        
+        m_close = Gtk.Button(icon_name="window-close-symbolic", css_classes=["flat", "circular"])
+        m_close.connect("clicked", lambda b: self.win.close())
+        
+        self.mini_controls.append(m_restore)
+        self.mini_controls.append(m_close)
+        self.player_overlay.add_overlay(self.mini_controls)
+
+        # --- 1. 左侧：歌曲信息 ---
         self.info_area = Gtk.Box(spacing=14, valign=Gtk.Align.CENTER)
         self.art_img = Gtk.Image(width_request=72, height_request=72, css_classes=["playback-art"])
         gest = Gtk.GestureClick(); gest.connect("pressed", self.on_player_art_clicked); self.art_img.add_controller(gest)
-        m = Gtk.EventControllerMotion()
-        m.connect("enter", lambda c,x,y: utils.set_pointer_cursor(self.art_img, True))
-        m.connect("leave", lambda c: utils.set_pointer_cursor(self.art_img, False))
-        self.art_img.add_controller(m)
         t = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER, spacing=0)
         self.lbl_title = Gtk.Label(xalign=0, css_classes=["player-title"], ellipsize=3)
         self.lbl_artist = Gtk.Label(xalign=0, css_classes=["player-artist"], ellipsize=3)
@@ -384,38 +464,43 @@ class TidalApp(Adw.Application):
         t.append(self.lbl_title); t.append(self.lbl_artist); t.append(self.lbl_album)
         self.info_area.append(self.art_img); self.info_area.append(t); self.bottom_bar.append(self.info_area)
         
+        # --- 2. 中间：播放控制 ---
         c_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, hexpand=True, valign=Gtk.Align.CENTER)
+        
+        # 按钮行
         ctrls = Gtk.Box(spacing=12, halign=Gtk.Align.CENTER)
-        ctrls.append(Gtk.Button(icon_name="media-skip-backward-symbolic", css_classes=["flat"]))
+        #ctrls.set_margin_top(25)
+        ctrls.add_css_class("player-ctrls-box")
+
+        btn_prev = Gtk.Button(icon_name="media-skip-backward-symbolic", css_classes=["flat"])
+        btn_prev.connect("clicked", self.on_prev_track); ctrls.append(btn_prev)
         self.play_btn = Gtk.Button(icon_name="media-playback-start-symbolic", css_classes=["pill", "suggested-action"])
-        self.play_btn.connect("clicked", self.on_play_pause)
-        ctrls.append(self.play_btn)
-        ctrls.append(Gtk.Button(icon_name="media-skip-forward-symbolic", css_classes=["flat"]))
+        self.play_btn.connect("clicked", self.on_play_pause); ctrls.append(self.play_btn)
+        btn_next = Gtk.Button(icon_name="media-skip-forward-symbolic", css_classes=["flat"])
+        btn_next.connect("clicked", lambda b: self.on_next_track()); ctrls.append(btn_next)
         c_box.append(ctrls)
         
-        timeline_box = Gtk.Box(spacing=12, orientation=Gtk.Orientation.HORIZONTAL)
+        # 进度条 (保存为 self.timeline_box 以便控制显隐)
+        self.timeline_box = Gtk.Box(spacing=12, orientation=Gtk.Orientation.HORIZONTAL)
         attr_list = Pango.AttrList.from_string("font-features 'tnum=1'")
         self.lbl_current_time = Gtk.Label(label="0:00", css_classes=["dim-label"]); self.lbl_current_time.set_attributes(attr_list)
         self.lbl_total_time = Gtk.Label(label="0:00", css_classes=["dim-label"]); self.lbl_total_time.set_attributes(attr_list)
-        self.scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
-        self.scale.set_hexpand(True); self.scale.connect("value-changed", self.on_seek)
-        timeline_box.append(self.lbl_current_time); timeline_box.append(self.scale); timeline_box.append(self.lbl_total_time)
-        timeline_box.set_size_request(450, -1); timeline_box.set_halign(Gtk.Align.CENTER)
-        c_box.append(timeline_box)
+        self.scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1); self.scale.set_hexpand(True); self.scale.connect("value-changed", self.on_seek)
+        self.timeline_box.append(self.lbl_current_time); self.timeline_box.append(self.scale); self.timeline_box.append(self.lbl_total_time)
+        self.timeline_box.set_size_request(450, -1); self.timeline_box.set_halign(Gtk.Align.CENTER); c_box.append(self.timeline_box)
         
-        tech_box = Gtk.Box(spacing=8, halign=Gtk.Align.CENTER, margin_top=4)
-        self.bp_label = Gtk.Label(label="BIT PERFECT", css_classes=["bp-text-glow"])
-        self.bp_label.set_tooltip_text("Bit-Perfect Mode Active"); self.bp_label.set_visible(False); tech_box.append(self.bp_label)
-        self.lbl_tech = Gtk.Label(label="", css_classes=["tech-label"], ellipsize=3); self.lbl_tech.set_visible(False) 
-        tech_box.append(self.lbl_tech); c_box.append(tech_box)
+        # 技术信息 (保存为 self.tech_box)
+        self.tech_box = Gtk.Box(spacing=8, halign=Gtk.Align.CENTER, margin_top=4)
+        self.bp_label = Gtk.Label(label="BIT PERFECT", css_classes=["bp-text-glow"], visible=False); self.tech_box.append(self.bp_label)
+        self.lbl_tech = Gtk.Label(label="", css_classes=["tech-label"], ellipsize=3, visible=False); self.tech_box.append(self.lbl_tech); c_box.append(self.tech_box)
+        
         self.bottom_bar.append(c_box)
         
-        r_box = Gtk.Box(spacing=12, valign=Gtk.Align.CENTER)
-        self.eq_btn = Gtk.Button(icon_name="eq-icon-symbolic", css_classes=["flat"])
-        self.eq_btn.set_tooltip_text("Equalizer"); self.eq_pop = self._build_eq_popover(); self.eq_pop.set_parent(self.eq_btn); self.eq_btn.connect("clicked", lambda b: self.eq_pop.popup())
-        r_box.append(self.eq_btn)
-        self.vol = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 5)
-        self.vol.set_value(80); self.vol.set_size_request(120, -1); self.vol.connect("value-changed", lambda s: self.player.set_volume(s.get_value()/100.0)); r_box.append(self.vol); self.bottom_bar.append(r_box)
+        # --- 3. 右侧：音量和EQ (保存为 self.vol_box 以便控制显隐) ---
+        self.vol_box = Gtk.Box(spacing=12, valign=Gtk.Align.CENTER)
+        self.eq_btn = Gtk.Button(icon_name="eq-icon-symbolic", css_classes=["flat"]); self.eq_pop = self._build_eq_popover(); self.eq_pop.set_parent(self.eq_btn); self.eq_btn.connect("clicked", lambda b: self.eq_pop.popup()); self.vol_box.append(self.eq_btn)
+        self.vol = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 5); self.vol.set_value(80); self.vol.set_size_request(120, -1); self.vol.connect("value-changed", lambda s: self.player.set_volume(s.get_value()/100.0)); self.vol_box.append(self.vol); 
+        self.bottom_bar.append(self.vol_box)
 
     def _lock_volume_controls(self, locked):
         if not hasattr(self, 'vol'): return
@@ -638,7 +723,7 @@ class TidalApp(Adw.Application):
             lbl_art.set_size_request(160, -1); lbl_art.set_max_width_chars(20); lbl_art.set_margin_end(12); b.append(lbl_art)
             alb_name = t.album.name if hasattr(t, 'album') and t.album else "-"
             lbl_alb = Gtk.Label(label=alb_name, xalign=0, ellipsize=3, css_classes=["dim-label"])
-            lbl_alb.set_size_request(300, -1); lbl_alb.set_max_width_chars(20); lbl_alb.set_margin_end(12); b.append(lbl_alb)
+            lbl_alb.set_size_request(260, -1); lbl_alb.set_max_width_chars(20); lbl_alb.set_margin_end(12); b.append(lbl_alb)
             dur_sec = getattr(t, 'duration', 0)
             if dur_sec:
                 m, s = divmod(dur_sec, 60); dur_str = f"{m}:{s:02d}"
@@ -762,14 +847,28 @@ class TidalApp(Adw.Application):
         if self.player.is_playing(): self.player.pause(); btn.set_icon_name("media-playback-start-symbolic")
         else: self.player.play(); btn.set_icon_name("media-playback-pause-symbolic")
 
-    # [已修复] 补全 on_next_track
+
     def on_next_track(self):
-        if self.current_index < len(self.current_track_list)-1: 
+        """处理自动切歌回调：由 AudioPlayer 触发 EOS 时调用"""
+        if self.current_index < len(self.current_track_list) - 1:
             self.current_index += 1
+            # 获取下一行的 ListBoxRow
             next_row = self.track_list.get_row_at_index(self.current_index)
             if next_row:
+                # 模拟列表行激活，自动开始播放
                 self.track_list.select_row(next_row)
                 self.on_track_selected(self.track_list, next_row)
+        else:
+            print("[Player] Reached end of current track list.")
+
+    # [新增] 补全 on_prev_track
+    def on_prev_track(self, btn):
+        if self.current_index > 0:
+            self.current_index -= 1
+            prev_row = self.track_list.get_row_at_index(self.current_index)
+            if prev_row:
+                self.track_list.select_row(prev_row)
+                self.on_track_selected(self.track_list, prev_row)
 
     def on_seek(self, s): 
         if not self.is_programmatic_update: self.player.seek(s.get_value())
