@@ -21,6 +21,27 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 class TidalApp(Adw.Application):
+    # --- [新增] 播放模式常量 ---
+    MODE_LOOP = 0     # 列表循环 (默认)
+    MODE_ONE = 1      # 单曲循环
+    MODE_SHUFFLE = 2  # 专辑/列表随机 (本地乱序)
+    MODE_SMART = 3    # 算法随机 (模拟 AI 推荐/无限流)
+
+    # 对应的图标
+    MODE_ICONS = {
+        0: "media-playlist-repeat-symbolic",
+        1: "media-playlist-repeat-song-symbolic", # 注意：有些主题可能没有这个图标，如果没有会回退
+        2: "media-playlist-shuffle-symbolic",
+        3: "night-light-symbolic" # 用个星星/闪电图标代表算法/智能
+    }
+
+    # 对应的提示文字
+    MODE_TOOLTIPS = {
+        0: "Loop All (Album/Playlist)",
+        1: "Loop Single Track",
+        2: "Shuffle (Randomize Order)",
+        3: "Smart Shuffle (Algorithm)"
+    }
     # [新增] 定义延迟档位配置
     LATENCY_OPTIONS = ["Safe (400ms)", "Standard (100ms)", "Low Latency (40ms)", "Aggressive (20ms)"]
     LATENCY_MAP = {
@@ -42,6 +63,9 @@ class TidalApp(Adw.Application):
             "bit_perfect": False,
             "exclusive_lock": False
         }
+
+        self.play_mode = self.MODE_LOOP
+        self.shuffle_indices = [] # 用来存随机播放的顺序列表
         
         if os.path.exists(self.settings_file):
             try:
@@ -563,6 +587,11 @@ class TidalApp(Adw.Application):
         ctrls = Gtk.Box(spacing=12, halign=Gtk.Align.CENTER)
         ctrls.add_css_class("player-ctrls-box") 
         # ctrls.set_margin_top(25) # 已由 CSS 控制
+        # [新增] 播放模式按钮
+        self.mode_btn = Gtk.Button(icon_name=self.MODE_ICONS[self.MODE_LOOP], css_classes=["flat", "circular"])
+        self.mode_btn.set_tooltip_text(self.MODE_TOOLTIPS[self.MODE_LOOP])
+        self.mode_btn.connect("clicked", self.on_toggle_mode)
+        ctrls.append(self.mode_btn)
         
         btn_prev = Gtk.Button(icon_name="media-skip-backward-symbolic", css_classes=["flat"])
         btn_prev.connect("clicked", self.on_prev_track); ctrls.append(btn_prev)
@@ -711,6 +740,106 @@ class TidalApp(Adw.Application):
             self.driver_dd.set_sensitive(True)
             # 刷新一下非独占状态下的设备列表
             self.on_device_changed(self.device_dd, None)
+
+    def on_toggle_mode(self, btn):
+        """切换播放模式：循环 -> 单曲 -> 随机 -> 算法 -> 循环"""
+        # 循环切换 0 -> 1 -> 2 -> 3 -> 0
+        self.play_mode = (self.play_mode + 1) % 4
+        
+        # 获取图标和提示文字
+        icon = self.MODE_ICONS.get(self.play_mode, "media-playlist-repeat-symbolic")
+        tooltip = self.MODE_TOOLTIPS.get(self.play_mode, "Loop")
+        
+        # 更新 UI
+        if hasattr(self, 'mode_btn'):
+            self.mode_btn.set_icon_name(icon)
+            self.mode_btn.set_tooltip_text(tooltip)
+        
+        # 状态处理
+        if self.play_mode == self.MODE_SHUFFLE or self.play_mode == self.MODE_SMART:
+            # 立即生成随机池，防止切歌时 shuffle_indices 为空
+            self._generate_shuffle_list()
+            # print(f"[Mode] Switched to {tooltip}")
+        else:
+            # 切回顺序模式，清空随机池以节省内存
+            self.shuffle_indices = []
+            # print(f"[Mode] Switched to {tooltip}")
+
+    def _generate_shuffle_list(self):
+        """生成随机播放索引列表"""
+        # 1. 安全检查：列表是否存在
+        if not hasattr(self, 'current_track_list') or not self.current_track_list:
+            self.shuffle_indices = []
+            return 
+        
+        total = len(self.current_track_list)
+        if total == 0:
+            self.shuffle_indices = []
+            return
+
+        # 2. 生成基础索引 [0, 1, 2, ... total-1]
+        indices = list(range(total))
+        
+        # 3. 获取当前播放索引（防止类型错误）
+        current_idx = getattr(self, 'current_track_index', -1)
+        if current_idx is None: current_idx = -1
+        
+        # 4. 如果当前正在播放，从随机池中移除它（避免下一首立刻重复）
+        if current_idx >= 0 and current_idx < total:
+            if current_idx in indices:
+                indices.remove(current_idx)
+            
+        # 5. 执行洗牌
+        import random
+        random.shuffle(indices)
+        
+        self.shuffle_indices = indices
+
+    def get_next_index(self, direction=1):
+        """
+        根据当前模式计算下一首/上一首的索引
+        direction: 1 (Next), -1 (Prev)
+        """
+        # [重点修复] 变量名改为 current_track_list
+        if not hasattr(self, 'current_track_list') or not self.current_track_list:
+            return -1
+
+        total = len(self.current_track_list)
+        if total == 0: return -1
+
+        current = self.current_track_list
+
+        # --- 模式 A: 单曲循环 ---
+        if self.play_mode == self.MODE_ONE:
+            # 单曲循环逻辑上不改变索引，但在 on_next_track 里处理切歌
+            pass
+
+        # --- 模式 B: 随机 / 算法 ---
+        if self.play_mode in [self.MODE_SHUFFLE, self.MODE_SMART]:
+            if direction == 1:
+                # 确保随机列表已生成
+                if not self.shuffle_indices:
+                    self._generate_shuffle_list()
+
+                # 如果列表为空（例如只有一首歌），返回当前
+                if not self.shuffle_indices:
+                    return current
+
+                # 简单随机策略
+                import random
+                next_idx = random.randint(0, total - 1)
+                # 尽量不重复当前歌曲
+                if total > 1:
+                    while next_idx == current:
+                        next_idx = random.randint(0, total - 1)
+                return next_idx
+
+            else:
+                # 随机模式下的上一首，为了体验一致，通常切回列表顺序的上一个
+                return (current - 1) % total
+
+        # --- 模式 C: 列表循环 (默认) ---
+        return (current + direction) % total
 
     def on_latency_changed(self, dd, p):
         selected = dd.get_selected_item()
@@ -929,16 +1058,32 @@ class TidalApp(Adw.Application):
                 lbl_dur.set_attributes(Pango.AttrList.from_string("font-features 'tnum=1'")); lbl_dur.set_margin_end(24); b.append(lbl_dur)
             row.set_child(b); self.track_list.append(row)
 
-    def _update_track_list_icon(self):
-        row = self.track_list.get_first_child()
+    def _update_track_list_icon(self, target_list=None):
+        """
+        [升级版] 刷新列表图标：当前播放的显示 ▶，其他的显示数字
+        """
+        # 如果没指定列表，默认用专辑详情页的列表
+        if target_list is None:
+            if hasattr(self, 'track_list'): target_list = self.track_list
+            else: return
+
+        row = target_list.get_first_child()
         while row:
+            # 只有带 track_id 的行才处理
             if hasattr(row, 'track_id'):
                 box = row.get_child()
                 if box:
                     stack = box.get_first_child()
+                    # 确保它是我们放图标的那个 Stack 组件
                     if isinstance(stack, Gtk.Stack):
-                        if row.track_id == self.playing_track_id: stack.set_visible_child_name("icon")
-                        else: stack.set_visible_child_name("num")
+                        # 核心比对：行的 ID vs 当前播放 ID
+                        if row.track_id == self.playing_track_id: 
+                            stack.set_visible_child_name("icon")
+                            # 额外加个强调色 (可选)
+                            # box.add_css_class("playing-row") 
+                        else: 
+                            stack.set_visible_child_name("num")
+                            # box.remove_css_class("playing-row")
             row = row.get_next_sibling()
 
     def on_header_artist_clicked(self, gest, n, x, y):
@@ -1046,27 +1191,255 @@ class TidalApp(Adw.Application):
         else: self.player.play(); btn.set_icon_name("media-playback-pause-symbolic")
 
 
-    def on_next_track(self):
-        """处理自动切歌回调：由 AudioPlayer 触发 EOS 时调用"""
-        if self.current_index < len(self.current_track_list) - 1:
-            self.current_index += 1
-            # 获取下一行的 ListBoxRow
-            next_row = self.track_list.get_row_at_index(self.current_index)
-            if next_row:
-                # 模拟列表行激活，自动开始播放
-                self.track_list.select_row(next_row)
-                self.on_track_selected(self.track_list, next_row)
-        else:
-            print("[Player] Reached end of current track list.")
+    def on_next_track(self, btn=None):
+        """播放下一首"""
+        # 1. 列表检查
+        if not hasattr(self, 'current_track_list') or not self.current_track_list:
+            return
 
-    # [新增] 补全 on_prev_track
-    def on_prev_track(self, btn):
-        if self.current_index > 0:
-            self.current_index -= 1
-            prev_row = self.track_list.get_row_at_index(self.current_index)
-            if prev_row:
-                self.track_list.select_row(prev_row)
-                self.on_track_selected(self.track_list, prev_row)
+        total = len(self.current_track_list)
+        if total == 0: return
+
+        # 2. 获取当前索引 (安全处理 None)
+        current = getattr(self, 'current_track_index', 0)
+        if current is None: current = 0
+        
+        next_idx = -1
+
+        # --- 场景 A: 单曲循环 (MODE_ONE) ---
+        if self.play_mode == self.MODE_ONE:
+            if btn is None: 
+                # btn为None表示自动播放结束 -> 重播当前
+                next_idx = current
+            else: 
+                # btn有值表示用户手动点击 -> 强制切到下一首
+                next_idx = (current + 1) % total
+
+        # --- 场景 B: 随机/智能 (MODE_SHUFFLE / SMART) ---
+        elif self.play_mode in [self.MODE_SHUFFLE, self.MODE_SMART]:
+            if total <= 1:
+                next_idx = 0
+            else:
+                # 确保随机池有内容
+                if not hasattr(self, 'shuffle_indices') or not self.shuffle_indices:
+                    self._generate_shuffle_list()
+                
+                # 双重检查：如果生成后还是空的（比如total=1），则取0
+                if self.shuffle_indices:
+                    # 从池子里拿一个， pop(0) 保证不重复直到循环一轮
+                    # 但为了简单，这里我们随机取一个，不强制 pop
+                    import random
+                    next_idx = random.choice(self.shuffle_indices)
+                else:
+                    # 兜底：如果随机池逻辑失效，切到下一首
+                    next_idx = (current + 1) % total
+
+        # --- 场景 C: 列表循环 (MODE_LOOP) - 默认 ---
+        else:
+            next_idx = (current + 1) % total
+
+        # 3. 执行播放
+        if next_idx >= 0 and next_idx < total:
+            self.play_track(next_idx)
+
+    def on_prev_track(self, btn=None):
+        """播放上一首"""
+        # 1. 列表检查
+        if not hasattr(self, 'current_track_list') or not self.current_track_list:
+            return
+            
+        total = len(self.current_track_list)
+        if total == 0: return
+        
+        # 2. 获取当前索引 (安全处理 None)
+        current = getattr(self, 'current_track_index', 0)
+        if current is None: current = 0
+        
+        prev_idx = -1
+
+        # --- 统一策略 ---
+        # 无论是随机还是单曲，点击"上一首"通常意味着"回到列表的前一个"
+        # 或者是"重播当前歌曲"(如果播放了很久)，这里简化为切到前一个索引
+        
+        # Python 的取模运算处理负数很方便： (0 - 1) % 10 = 9
+        prev_idx = (current - 1) % total
+
+        # 3. 执行播放
+        if prev_idx >= 0 and prev_idx < total:
+            self.play_track(prev_idx)
+
+    def _load_cover_art(self, cover_id_or_url):
+        """
+        [修复版] 异步加载封面 (自动处理 UUID)
+        """
+        # 1. 尝试转换 ID 为 URL
+        url = self._get_tidal_image_url(cover_id_or_url)
+        
+        if not url or not hasattr(self, 'art_img'): return
+
+        def fetch_image():
+            try:
+                import urllib.request
+                # print(f"[Cover] Downloading: {url}") # 调试用
+                
+                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, timeout=5) as response:
+                    data = response.read()
+                    
+                from gi.repository import GdkPixbuf
+                loader = GdkPixbuf.PixbufLoader()
+                loader.write(data)
+                loader.close()
+                pixbuf = loader.get_pixbuf()
+                
+                if pixbuf:
+                    # 缩放图片
+                    scaled = pixbuf.scale_simple(72, 72, GdkPixbuf.InterpType.BILINEAR)
+                    # 必须在主线程更新 UI
+                    GLib.idle_add(self.art_img.set_from_pixbuf, scaled)
+                    
+            except Exception as e:
+                print(f"[Cover Error] Failed to load art: {e}")
+
+        from threading import Thread
+        Thread(target=fetch_image, daemon=True).start()
+
+    def _update_list_ui(self, index):
+        """
+        [新增] 强制更新列表选中状态
+        """
+        if not hasattr(self, 'list_box'): return
+
+        try:
+            # 1. 获取对应的行
+            row = self.list_box.get_row_at_index(index)
+            if row:
+                # 2. 选中该行 (这通常会触发 on_row_selected 信号，更新高亮)
+                self.list_box.select_row(row)
+
+                # 3. 滚动到该行 (防止切歌后当前歌曲在屏幕外)
+                # 注意：这需要 list_box 在 ScrolledWindow 里，且有对应调整对象
+                # 这里只做基础选中，不做强制滚动防止报错
+        except Exception as e:
+            print(f"[UI Error] List update failed: {e}")
+
+    def play_track(self, index):
+        """
+        [图标修复版] 播放指定索引歌曲
+        修复：更新 self.playing_track_id，确保列表图标能正确跟随
+        """
+        # 1. 边界检查
+        if not hasattr(self, 'current_track_list') or not self.current_track_list:
+            return
+        if index < 0 or index >= len(self.current_track_list):
+            return
+
+        # --- [关键修复 1] 更新播放状态数据 ---
+        self.current_track_index = index
+        track = self.current_track_list[index]
+        self.playing_track = track
+        self.playing_track_id = track.id  # <--- 之前漏了这行，导致图标判断失效！
+        
+        # 2. 立即更新播放栏文字
+        def _get_name(obj):
+            if obj is None: return "Unknown"
+            if isinstance(obj, str): return obj
+            return getattr(obj, 'name', getattr(obj, 'title', str(obj)))
+
+        try:
+            t_str = _get_name(getattr(track, "title", "Loading..."))
+            a_str = _get_name(getattr(track, "artist", ""))
+            al_str = _get_name(getattr(track, "album", ""))
+            
+            if hasattr(self, 'lbl_title'): self.lbl_title.set_label(t_str)
+            if hasattr(self, 'lbl_artist'): self.lbl_artist.set_label(a_str)
+            if hasattr(self, 'lbl_album'): self.lbl_album.set_label(al_str)
+        except: pass
+
+        # 3. 更新列表选中状态 + 图标
+        def update_list_ui_safe():
+            # 智能判断当前在哪个列表
+            target_list = None
+            current_view = self.right_stack.get_visible_child_name()
+            
+            if current_view == "tracks":
+                if hasattr(self, 'track_list'): target_list = self.track_list
+            elif current_view == "search_view":
+                if hasattr(self, 'res_trk_list'): target_list = self.res_trk_list
+            
+            if target_list:
+                try:
+                    # A. 选中高亮 (蓝色背景)
+                    row = target_list.get_row_at_index(index)
+                    if row:
+                        target_list.select_row(row)
+                    
+                    # B. [关键修复 2] 刷新图标 (传入当前列表对象)
+                    if hasattr(self, '_update_track_list_icon'):
+                        self._update_track_list_icon(target_list)
+                        
+                except Exception as e:
+                    print(f"[UI Warning] List update failed: {e}")
+
+        GLib.idle_add(update_list_ui_safe)
+
+        # 4. 加载封面
+        def load_cover_task():
+            try:
+                cover_id = getattr(track, "cover", None)
+                if not cover_id:
+                    alb = getattr(track, "album", None)
+                    if hasattr(alb, 'cover'): cover_id = alb.cover
+                if cover_id:
+                    self._load_cover_art(cover_id)
+            except: pass
+        GLib.timeout_add(100, load_cover_task)
+
+        # 5. 播放音频
+        def start_audio_task():
+            try:
+                # 获取流地址并播放
+                stream_url = None
+                if hasattr(self.backend, 'get_stream_url'):
+                    stream_url = self.backend.get_stream_url(track)
+                elif hasattr(self.backend, 'get_url'):
+                    stream_url = self.backend.get_url(track)
+
+                if stream_url:
+                    if hasattr(self.player, 'set_uri'):
+                        GLib.idle_add(self.player.set_uri, stream_url)
+                    elif hasattr(self.player, 'load_uri'):
+                        GLib.idle_add(self.player.load_uri, stream_url)
+                    
+                    GLib.idle_add(self.player.play)
+                    
+                    # 更新播放按钮为暂停图标
+                    if hasattr(self, 'play_btn'):
+                         GLib.idle_add(lambda: self.play_btn.set_icon_name("media-playback-pause-symbolic"))
+                else:
+                    print(f"[Player] Error: No stream URL returned")
+                    
+            except Exception as e:
+                print(f"[Player] Playback Error: {e}")
+
+        from threading import Thread
+        Thread(target=start_audio_task, daemon=True).start()
+
+    def _get_tidal_image_url(self, uuid, width=320, height=320):
+        """
+        [新增] 将 Tidal UUID 转换为可访问的 HTTP URL
+        例如: b3517800-fbba... -> https://resources.tidal.com/images/b3517800/fbba/.../320x320.jpg
+        """
+        if not uuid: return None
+        if isinstance(uuid, str) and ("http" in uuid or "file://" in uuid):
+            return uuid # 已经是 URL 了，直接返回
+
+        try:
+            # 替换横杠为斜杠
+            path = uuid.replace("-", "/")
+            return f"https://resources.tidal.com/images/{path}/{width}x{height}.jpg"
+        except:
+            return None
 
     def on_seek(self, s): 
         if not self.is_programmatic_update: self.player.seek(s.get_value())
