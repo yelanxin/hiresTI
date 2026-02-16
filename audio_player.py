@@ -91,6 +91,49 @@ class AudioPlayer:
             subprocess.run(cmd, check=False, stderr=subprocess.DEVNULL)
         except: pass
 
+    def set_uri(self, uri):
+        """
+        设置播放链接 (修正版：修复属性检测 bug)
+        """
+        # 1. 停止播放
+        self.stop()
+        
+        # 定义一个内部函数来检查属性是否存在
+        def has_property(obj, prop_name):
+            try:
+                # GObject.list_properties 返回的是参数规格对象(ParamSpec)列表
+                # 我们需要检查这些对象的 .name 属性
+                return any(p.name == prop_name for p in obj.list_properties())
+            except:
+                return False
+
+        # 2. 方案 A: 检查 Pipeline 本身是否有 "uri" 属性 (针对 playbin)
+        if has_property(self.pipeline, "uri"):
+            # print(f"[AudioPlayer] Setting URI on pipeline (playbin)")
+            self.pipeline.set_property("uri", uri)
+            return
+
+        # 3. 方案 B: 查找名为 "source" 的元件
+        source = self.pipeline.get_by_name("source")
+        if source and has_property(source, "location"):
+            source.set_property("location", uri)
+            return
+
+        # 4. 方案 C: 遍历所有元件寻找支持 "location" 的 (针对 souphttpsrc/filesrc)
+        iterator = self.pipeline.iterate_elements()
+        while True:
+            result, elem = iterator.next()
+            if result != Gst.IteratorResult.OK:
+                break
+            
+            if has_property(elem, "location"):
+                # print(f"[AudioPlayer] Found source element: {elem.get_name()}")
+                elem.set_property("location", uri)
+                return
+
+        # 5. 如果都失败了，打印调试信息
+        print(f"[AudioPlayer] Error: Could not find target for URI! Pipeline type: {type(self.pipeline)}")
+
     def play(self):
         self.pipeline.set_state(Gst.State.PLAYING)
 
