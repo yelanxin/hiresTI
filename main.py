@@ -590,8 +590,7 @@ class TidalApp(Adw.Application):
         # 减小间距，让图标靠得更近
         self.vol_box = Gtk.Box(spacing=4, valign=Gtk.Align.CENTER) 
         
-        # EQ 按钮
-        self.eq_btn = Gtk.Button(icon_name="eq-icon-symbolic", css_classes=["flat"])
+        self.eq_btn = Gtk.Button(icon_name="eq-icon-symbolic", css_classes=["flat", "eq-btn"])# EQ 按钮
         self.eq_pop = self._build_eq_popover()
         self.eq_pop.set_parent(self.eq_btn)
         self.eq_btn.connect("clicked", lambda b: self.eq_pop.popup())
@@ -607,22 +606,48 @@ class TidalApp(Adw.Application):
         self.bottom_bar.append(self.vol_box)
 
     def _lock_volume_controls(self, locked):
-        # 检查新组件是否存在
-        if not hasattr(self, 'vol_scale'): return
+        """
+        在 Bit-Perfect / 独占模式下，强制锁定音量和 EQ 控制
+        """
         
-        if locked:
-            # 锁定：设为 100%，并禁用按钮
-            self.vol_scale.set_value(100)
-            self.player.set_volume(1.0)
+        # --- 1. 处理音量控制 (Volume) ---
+        # 确保组件已创建 (防止在 UI 初始化前调用报错)
+        if hasattr(self, 'vol_scale') and hasattr(self, 'vol_btn'):
+            if locked:
+                # [锁定状态]
+                # 1. 物理/UI 音量强制设为 100% (Bit-Perfect 要求)
+                self.vol_scale.set_value(100)
+                
+                # 2. 禁用按钮，防止用户点击
+                self.vol_btn.set_sensitive(False)
+                
+                # 3. 更新提示文字
+                self.vol_btn.set_tooltip_text("Volume locked in Bit-Perfect/Exclusive mode")
+                
+                # 4. 强制显示最大音量图标 (视觉反馈)
+                self.vol_btn.set_icon_name("audio-volume-high-symbolic")
+                
+                # 5. 如果弹窗正开着，强制关掉
+                if hasattr(self, 'vol_pop'):
+                    self.vol_pop.popdown()
+            else:
+                # [解锁状态]
+                self.vol_btn.set_sensitive(True)
+                self.vol_scale.set_sensitive(True)
+                self.vol_btn.set_tooltip_text("Adjust Volume")
+
+        # --- 2. 处理均衡器 (EQ) ---
+        if hasattr(self, 'eq_btn'):
+            # Bit-Perfect 开启时，软件 EQ 被绕过，必须禁用入口
+            self.eq_btn.set_sensitive(not locked)
             
-            # 禁用按钮，让用户无法点开调节
-            self.vol_btn.set_sensitive(False)
-            self.vol_btn.set_tooltip_text("Volume locked in Bit-Perfect/Exclusive mode")
-        else:
-            # 解锁
-            self.vol_btn.set_sensitive(True)
-            self.vol_scale.set_sensitive(True)
-            self.vol_btn.set_tooltip_text("Adjust Volume")
+            if locked:
+                self.eq_btn.set_tooltip_text("EQ disabled in Bit-Perfect mode (Bypassed)")
+                # 如果 EQ 面板正开着，强制关掉
+                if hasattr(self, 'eq_pop'):
+                    self.eq_pop.popdown()
+            else:
+                self.eq_btn.set_tooltip_text("Equalizer")
 
     def on_login_clicked(self, btn):
         if self.backend.user:
