@@ -100,6 +100,18 @@ window.undecorated { background-color: transparent; }
     -gtk-icon-size: 20px;
 }
 
+/* 单独控制 EQ 按钮图标大小 */
+.eq-btn image {
+    -gtk-icon-size: 24px; /*在这里修改数值，默认通常是 16px */
+}
+
+/* 如果您想顺便调整按钮的内边距，让它看起来更大/更小 */
+.eq-btn {
+    min-width: 36px;
+    min-height: 36px;
+    padding: 0;
+}
+
 /* 其他通用样式 (保持不变) */
 .card-bar scale.horizontal { margin: 0; padding: 0; }
 .card-bar scale trough { min-height: 4px; }
