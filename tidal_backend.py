@@ -362,6 +362,35 @@ class TidalBackend:
         except Exception as e:
             return results
 
+    # --- tidal_backend.py --- 添加在 get_stream_url 附近
+
+    def get_lyrics(self, track_id):
+        print(f"[Backend] Fetching lyrics for Track ID: {track_id}...") # <--- 日志
+        try:
+            lyrics_obj = self.session.track(track_id).lyrics()
+
+            if not lyrics_obj:
+                print("[Backend] Result: None (No lyrics object found)")
+                return None
+
+            if hasattr(lyrics_obj, 'subtitles') and lyrics_obj.subtitles:
+                print("[Backend] Result: Found Synced Lyrics (LRC)")
+                return lyrics_obj.subtitles
+
+            if hasattr(lyrics_obj, 'text') and lyrics_obj.text:
+                print("[Backend] Result: Found Static Text Lyrics")
+                return lyrics_obj.text
+
+            print("[Backend] Result: Lyrics object empty")
+            return None
+        except Exception as e:
+            # 404 是正常的（表示没歌词），不打印错误堆栈
+            if "404" in str(e):
+                print("[Backend] Result: 404 Not Found (Track has no lyrics)")
+            else:
+                print(f"[Backend] Error: {e}")
+            return None
+
     def logout(self):
         if os.path.exists(self.token_file):
             try: os.remove(self.token_file)
