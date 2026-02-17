@@ -6,6 +6,7 @@ import gi
 gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
 from gi.repository import Gtk, Adw, GLib, Gdk, Pango
+from background_viz import BackgroundVisualizer
 
 from visualizer import SpectrumVisualizer
 import webbrowser
@@ -276,6 +277,11 @@ class TidalApp(Adw.Application):
         if (state & Gdk.ModifierType.CONTROL_MASK) and keyval == Gdk.KEY_f:
             self.search_entry.grab_focus()
             return True
+        # --- [新增] 4. G 键: 展开/收起波形和歌词 ---
+        if (keyval == Gdk.KEY_g or keyval == Gdk.KEY_G) and not self.search_entry.has_focus():
+            # 调用你现有的切换函数，并传入对应的按钮以同步图标状态
+            self.toggle_visualizer(self.viz_btn)
+            return True
 
         return False
     
@@ -426,19 +432,26 @@ class TidalApp(Adw.Application):
         self.viz_stack.add_titled(self.viz, "spectrum", "Spectrum")
 
         # 页面二：歌词 (滚动版)
-        self.lyrics_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        
+        # --- 页面二：歌词 (律动版) ---
+        self.lyrics_tab_root = Gtk.Overlay() # 使用 Overlay 承载背景和文字
+
+        from background_viz import BackgroundVisualizer
+        self.bg_viz = BackgroundVisualizer()
+        self.lyrics_tab_root.set_child(self.bg_viz) # 背景在最底层
+
         self.lyrics_scroller = Gtk.ScrolledWindow(vexpand=True, hexpand=True)
         self.lyrics_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        
+        self.lyrics_scroller.add_css_class("lyrics-scroller")
+
         self.lyrics_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.lyrics_vbox.set_halign(Gtk.Align.CENTER)
-        self.lyrics_vbox.set_margin_top(30)
+        self.lyrics_vbox.set_margin_top(30) # 留白确保居中
         self.lyrics_vbox.set_margin_bottom(30)
-        
+
         self.lyrics_scroller.set_child(self.lyrics_vbox)
-        self.lyrics_box.append(self.lyrics_scroller)
-        self.viz_stack.add_titled(self.lyrics_box, "lyrics", "Lyrics")
+        self.lyrics_tab_root.add_overlay(self.lyrics_scroller) # 歌词文字叠加在背景上
+
+        self.viz_stack.add_titled(self.lyrics_tab_root, "lyrics", "Lyrics")
 
         # 组装
         self.viz_stack_box.append(self.viz_stack)
@@ -767,14 +780,18 @@ class TidalApp(Adw.Application):
 
 
     def on_spectrum_data(self, magnitudes):
-        """
-        接收来自播放器的频谱数据并更新 UI
-        """
         if not magnitudes: return
         
-        if hasattr(self, 'viz') and self.viz:
-            # 这里的判断很重要：如果 viz_revealer 没展开，数据就不会传给绘图区域
-            if self.viz_revealer.get_reveal_child():
+        if self.viz_revealer.get_reveal_child():
+            current_page = self.viz_stack.get_visible_child_name()
+            
+            # [关键] 无论在哪一页，背景律动都可以保持运行，增加沉浸感
+            # 或者仅在歌词页运行以节省性能：
+            if current_page == "lyrics" and hasattr(self, 'bg_viz'):
+                self.bg_viz.update_energy(magnitudes)
+            
+            # 频谱图仅在对应页面更新
+            if current_page == "spectrum" and hasattr(self, 'viz'):
                 self.viz.update_data(magnitudes)
 
     def _lock_volume_controls(self, locked):
@@ -1484,6 +1501,9 @@ class TidalApp(Adw.Application):
         track = self.current_track_list[index]
         self.playing_track = track
         self.playing_track_id = track.id
+
+        if hasattr(self, 'bg_viz'):
+            self.bg_viz.randomize_colors()
         
         print(f"[Main] Playing: {track.name}") # <--- 日志
 
