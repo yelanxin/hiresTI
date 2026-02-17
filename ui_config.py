@@ -12,6 +12,7 @@ WINDOW_HEIGHT = 800
 # ui_config.py
 
 # ... 前面的变量保持不变 ...
+# --- ui_config.py ---
 
 CSS_DATA = """
 .circular-avatar { border-radius: 9999px; }
@@ -22,26 +23,17 @@ CSS_DATA = """
 .sidebar-row:hover { background-color: alpha(currentColor, 0.08); }
 .sidebar-row:selected { background-color: alpha(@accent_bg_color, 0.8); color: white; }
 
-/* =================================================================== */
-/* 核心播放栏样式修复 */
-/* =================================================================== */
-
-/* 1. 正常模式：悬浮、有边距、有圆角 */
+/* 核心播放栏样式 */
 .card-bar { 
     background-color: @headerbar_bg_color;
     border-top: 1px solid alpha(currentColor, 0.12); 
     padding: 5px 16px; 
-    
-    /* [正常模式] 四周有 25px 的悬浮空间 */
     margin: 0px 25px 25px 25px;
-    
     border-radius: 12px;
     border: 1px solid alpha(currentColor, 0.1);
-    transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1); /* 平滑过渡 */
+    transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
 }
 
-/* 2. [迷你模式]：强制去边距、去圆角、填满 */
-/* 注意：这里选择器是 .card-bar.mini-state，优先级很高 */
 .card-bar.mini-state {
     margin: 0;       
     padding: 20px 0px 20px 20px;
@@ -50,77 +42,121 @@ CSS_DATA = """
     background-color: @headerbar_bg_color;
 }
 
-/* 确保窗口背景透明，防止底下透出黑色 */
-window.undecorated { background-color: transparent; }
-.player-overlay-container { background-color: transparent; }
-
-/* =================================================================== */
-
-/* ================================================= */
-/* Mini Mode 播放控件专属样式 */
-/* ================================================= */
-
-/* 1. 控制按钮容器的位置 (替代之前的 set_margin_top) */
-.card-bar.mini-state .player-ctrls-box {
-    margin-top: 12px;   /* 整体下移距离 */
-    margin-right: 20px; /* 整体右移/左移微调 */
-    border-spacing: 15px; /* 按钮之间的间距 (如果是 Box 可尝试此属性或 spacing) */
-}
-
-/* 2. 普通按钮 (上一首/下一首) 样式 */
-.card-bar.mini-state .player-ctrls-box button.flat {
-    min-height: 32px;  /* 按钮高度 */
-    min-width: 32px;   /* 按钮宽度 */
-    padding: 0;        /* 去掉内边距让它更紧凑 */
-    color: alpha(currentColor, 0.7); /* 稍微调暗一点颜色 */
-    background: transparent;
-}
-
-/* 3. 播放/暂停大按钮 (中间那个) 样式 */
-.card-bar.mini-state .player-ctrls-box .pill {
-    min-height: 42px;  /* 设置得比两边大一点 */
-    min-width: 42px;
-    padding: 0;
-    background-color: @accent_color; /* 使用主题色 */
-    color: white;      /* 图标白色 */
-    border-radius: 99px; /* 圆形 */
-    box-shadow: 0 2px 5px alpha(black, 0.2); /* 加点阴影更有质感 */
-}
-.card-bar.mini-state .player-ctrls-box .pill:hover {
-    filter: brightness(1.1); /* 悬停变亮 */
-    transform: scale(1.05);  /* 悬停微放大 */
-}
-
-/* 4. 控制图标的大小 */
-.card-bar.mini-state .player-ctrls-box button image {
-    -gtk-icon-size: 16px; /* 这里调整图标本身的大小 */
-}
-/* 单独放大播放按钮的图标 */
-.card-bar.mini-state .player-ctrls-box .pill image {
-    -gtk-icon-size: 20px;
-}
-
-/* 单独控制 EQ 按钮图标大小 */
-.eq-btn image {
-    -gtk-icon-size: 24px; /*在这里修改数值，默认通常是 16px */
-}
-
-/* 如果您想顺便调整按钮的内边距，让它看起来更大/更小 */
-.eq-btn {
-    min-width: 36px;
-    min-height: 36px;
-    padding: 0;
-}
-
+/* 波形面板黑框 */
 .viz-panel {
     background: rgba(10, 10, 10, 0.8);
     border-top: 1px solid rgba(255, 255, 255, 0.2);
     padding: 10px;
-    border-radius: 12px 12px 0 0;
+    border-radius: 12px;
     margin: 0px 35px 1px 35px;
 }
 
-/* 其他通用样式 (保持不变) */
+/* ===================================
+   Mini Switcher 独立胶囊版 (修复版)
+   =================================== */
+
+/* 1. 容器清理 */
+    .mini-switcher,
+    .mini-switcher > box {
+        background: none;
+        background-color: transparent;
+        box-shadow: none;
+        margin: 0 0 0px 32px;
+        padding: 0;
+    }
+
+    /* 2. 按钮本体 - 核心去背景 */
+    .mini-switcher button {
+        /* [关键] 必须清除 background-image，否则会有灰色渐变 */
+
+        border: 1px solid alpha(currentColor, 0.1);
+        box-shadow: none;
+        text-shadow: none; /* 去掉文字阴影 */
+
+        /* 尺寸与字体 */
+        min-height: 22px;
+        min-width: 0;
+        padding: 2px 12px;
+        margin-right: 5px; /* 独立胶囊间距 */
+
+        font-weight: 800;
+        font-size: 11px;
+        color: rgba(255, 255, 255, 0.4);
+        transition: all 0.2s;
+    }
+
+    .mini-switcher button:first-child {
+        border-radius: 12px 0 0 0;
+    }
+
+    /* 4. 右边按钮：只圆右边 */
+    .mini-switcher button:last-child {
+        border-radius: 0 12px 0 0;
+    }
+
+    /* 3. 防止窗口失去焦点时变灰 (Inspector 里显示你是 backdrop 状态) */
+    .mini-switcher button:backdrop {
+        background-image: none;
+        background-color: transparent;
+        color: rgba(255, 255, 255, 0.3);
+    }
+
+    /* 4. 选中状态 (Spectrum 被选中时) */
+    .mini-switcher button:checked {
+        background-color: rgba(255, 255, 255, 0.15); /* 只有这里有淡淡的背景 */
+        background-image: none;
+        color: white;
+        box-shadow: none;
+    }
+
+    /* 选中状态但在后台时 */
+    .mini-switcher button:checked:backdrop {
+        background-color: rgba(255, 255, 255, 0.15);
+        color: white;
+    }
+
+    /* 5. 鼠标悬停 */
+    .mini-switcher button:hover {
+        background-color: rgba(255, 255, 255, 0.08);
+        background-image: none;
+        color: white;
+    }
+
+    .viz-panel {
+    /* rgba(红, 绿, 蓝, 透明度)
+       最后一个数字控制透明度：范围是 0.0 到 1.0
+
+       0.95 = 几乎不透明 (很深)
+       0.8  = 默认值 (深色玻璃感)
+       0.5  = 半透明
+       0.2  = 非常透
+       0.0  = 完全透明 (看不见背景，只有波形)
+    */
+    background: rgba(10, 10, 10, 0.98);  /* <--- 试着把这里改成 0.6 或 0.5 */
+    border-top: 1px solid rgba(255, 255, 255, 0.2);
+    border-top: 1px solid rgba(255, 255, 255, 0.15);
+    border-bottom: 1px solid rgba(0, 0, 0, 0.3);
+
+    /* 3. 玻璃内发光/阴影：增加立体感，不让它看起来像一张纸 */
+    /* inset 0 0 20px 意味着在内部有一圈淡淡的黑晕 */
+    box-shadow: inset 0 0 20px rgba(0, 0, 0, 0.2);
+
+    padding: 10px;
+    border-radius: 0px 12px 0 0;
+    margin: 0px 32px 0px 32px;
+    }
+
+/* 其他样式保持不变... */
+window.undecorated { background-color: transparent; }
+.player-overlay-container { background-color: transparent; }
+.card-bar.mini-state .player-ctrls-box { margin-top: 12px; margin-right: 20px; border-spacing: 15px; }
+.card-bar.mini-state .player-ctrls-box button.flat { min-height: 32px; min-width: 32px; padding: 0; color: alpha(currentColor, 0.7); background: transparent; }
+.card-bar.mini-state .player-ctrls-box .pill { min-height: 42px; min-width: 42px; padding: 0; background-color: @accent_color; color: white; border-radius: 99px; box-shadow: 0 2px 5px alpha(black, 0.2); }
+.card-bar.mini-state .player-ctrls-box .pill:hover { filter: brightness(1.1); transform: scale(1.05); }
+.card-bar.mini-state .player-ctrls-box button image { -gtk-icon-size: 16px; }
+.card-bar.mini-state .player-ctrls-box .pill image { -gtk-icon-size: 20px; }
+.eq-btn image { -gtk-icon-size: 24px; }
+.eq-btn { min-width: 36px; min-height: 36px; padding: 0; }
 .card-bar scale.horizontal { margin: 0; padding: 0; }
 .card-bar scale trough { min-height: 4px; }
 .pill { margin: 10px; padding: 10px; min-width: 25px; min-height: 25px; border-radius: 99px; }
