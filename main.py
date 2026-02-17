@@ -17,6 +17,7 @@ from models import HistoryManager
 from signal_path import AudioSignalPathWindow
 import utils
 import ui_config
+from lyrics_manager import LyricsManager
 
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -77,6 +78,9 @@ class TidalApp(Adw.Application):
 
         # [修复点] 这里的 self.on_next_track 现在能在下面找到定义了
         self.player = AudioPlayer(on_eos_callback=self.on_next_track, on_tag_callback=self.update_tech_label, on_spectrum_callback=self.on_spectrum_data)
+
+        self.lyrics_mgr = LyricsManager() # <--- 初始化管理器
+        print("[Main] LyricsManager initialized") # <--- 日志
 
         saved_profile = self.settings.get("latency_profile", "Standard (100ms)")
         if saved_profile not in self.LATENCY_MAP: saved_profile = "Standard (100ms)"
@@ -192,7 +196,7 @@ class TidalApp(Adw.Application):
 
         self.win.present()
         self.win.connect("notify::default-width", self.update_layout_proportions)
-        GLib.timeout_add(1000, self.update_ui_loop)
+        GLib.timeout_add(20, self.update_ui_loop)
 
     def _build_header(self, container):
         self.header = Adw.HeaderBar(); container.append(self.header)
@@ -377,79 +381,75 @@ class TidalApp(Adw.Application):
         win.present()
 
     def _build_body(self, container):
-        # --- [布局重构] 核心改变：从 Box 改为 Overlay ---
-        # 1. 创建覆盖层容器
-        # 这允许波形图“浮”在内容之上，而不是把内容推上去
+        # 1. 创建 Overlay
         self.body_overlay = Gtk.Overlay()
-        self.body_overlay.set_vexpand(True) # 填满窗口剩余空间
+        self.body_overlay.set_vexpand(True)
         container.append(self.body_overlay)
 
-        # 2. 底层：主内容区域 (侧边栏 + 列表)
-        # 以前直接加到 container，现在加到 overlay 的底层
+        # 2. 底层内容
         self.paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
         self.body_overlay.set_child(self.paned)
 
-        # 3. 浮层：波形抽屉 (Revealer)
+        # 3. 浮层抽屉
         self.viz_revealer = Gtk.Revealer(transition_type=Gtk.RevealerTransitionType.SLIDE_UP)
         self.viz_revealer.set_reveal_child(False)
-        
-        # [关键] 靠底部对齐，且不要强行占满高度
-        self.viz_revealer.set_valign(Gtk.Align.END) 
-        self.viz_revealer.set_vexpand(False) 
-        
-        # 将 Revealer 作为“浮层”加入
+        self.viz_revealer.set_valign(Gtk.Align.END)
+        self.viz_revealer.set_vexpand(False)
         self.body_overlay.add_overlay(self.viz_revealer)
 
-        # --- 下面是抽屉内容的构建 (保持之前的透明逻辑) ---
-        
-        # 4. 创建根容器 (透明)
+        # 4. 抽屉内容
         self.viz_root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         
-        # 5. Stack (内容容器)
-        self.viz_stack = Gtk.Stack()
-        self.viz_stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
-        self.viz_stack.set_transition_duration(250)
-
-        self.viz_stack.set_size_request(-1, 250)
-
-        # 6. Switcher (按钮)
+        # 切换按钮
         self.viz_switcher = Gtk.StackSwitcher()
-        self.viz_switcher.set_stack(self.viz_stack)
         self.viz_switcher.set_halign(Gtk.Align.START)
-        self.viz_switcher.set_hexpand(False) 
+        self.viz_switcher.set_margin_start(32)
         self.viz_switcher.add_css_class("mini-switcher")
         self.viz_switcher.remove_css_class("linked")
-        
-        # 7. 内容黑框 (只包裹 Stack)
+        self.viz_switcher.set_hexpand(False)
+
+        # 黑框容器
         self.viz_stack_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.viz_stack_box.add_css_class("viz-panel")
         
-        # 8. 页面一：频谱图
+        # Stack
+        self.viz_stack = Gtk.Stack()
+        self.viz_stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
+        self.viz_stack.set_size_request(-1, 250) # 固定高度
+        self.viz_switcher.set_stack(self.viz_stack)
+
+        # 页面一：频谱
         from visualizer import SpectrumVisualizer
         self.viz = SpectrumVisualizer()
-        self.viz.num_bars = 64
+        self.viz.num_bars = 40
         self.viz.set_valign(Gtk.Align.FILL)
-        self.viz.set_vexpand(False)
         self.viz_stack.add_titled(self.viz, "spectrum", "Spectrum")
 
-        # 9. 页面二：歌词
+        # 页面二：歌词 (滚动版)
         self.lyrics_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        self.lyrics_box.set_valign(Gtk.Align.CENTER)
-        self.lyrics_placeholder = Gtk.Label(label="No Lyrics Available")
-        self.lyrics_placeholder.add_css_class("title-3")
-        self.lyrics_placeholder.set_opacity(0.5)
-        self.lyrics_box.append(self.lyrics_placeholder)
+        
+        self.lyrics_scroller = Gtk.ScrolledWindow(vexpand=True, hexpand=True)
+        self.lyrics_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        
+        self.lyrics_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.lyrics_vbox.set_halign(Gtk.Align.CENTER)
+        self.lyrics_vbox.set_margin_top(30)
+        self.lyrics_vbox.set_margin_bottom(30)
+        
+        self.lyrics_scroller.set_child(self.lyrics_vbox)
+        self.lyrics_box.append(self.lyrics_scroller)
         self.viz_stack.add_titled(self.lyrics_box, "lyrics", "Lyrics")
 
-        # 10. 组装抽屉
+        # 组装
         self.viz_stack_box.append(self.viz_stack)
-        self.viz_root.append(self.viz_switcher)     # 按钮
-        self.viz_root.append(self.viz_stack_box)    # 黑框
+        self.viz_root.append(self.viz_switcher)
+        self.viz_root.append(self.viz_stack_box)
         self.viz_revealer.set_child(self.viz_root)
 
-        # --- 侧边栏与主视图构建 (保持不变) ---
+        # --- 侧边栏 (保持原样) ---
         self.sidebar_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        self.nav_list = Gtk.ListBox(css_classes=["navigation-sidebar"], margin_top=10); self.nav_list.connect("row-activated", self.on_nav_selected)
+        self.nav_list = Gtk.ListBox(css_classes=["navigation-sidebar"], margin_top=10)
+        self.nav_list.connect("row-activated", self.on_nav_selected)
         
         nav_items = [
             ("home", "go-home-symbolic", "Home"),
@@ -461,7 +461,7 @@ class TidalApp(Adw.Application):
         for nid, icon, txt in nav_items:
             r = Gtk.ListBoxRow(); r.nav_id = nid; b = Gtk.Box(spacing=12, margin_start=12, margin_top=8, margin_bottom=8)
             b.append(Gtk.Image.new_from_icon_name(icon)); b.append(Gtk.Label(label=txt)); r.set_child(b); self.nav_list.append(r)
-            
+        
         self.sidebar_box.append(self.nav_list)
         self.paned.set_start_child(self.sidebar_box)
         self.right_stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.SLIDE_LEFT_RIGHT); self.paned.set_end_child(self.right_stack)
@@ -470,7 +470,6 @@ class TidalApp(Adw.Application):
         self._build_tracks_view()
         self._build_settings_page()
         self._build_search_view()
-        
         self.paned.set_position(int(ui_config.WINDOW_WIDTH * ui_config.SIDEBAR_RATIO))
 
     def _build_grid_view(self):
@@ -526,7 +525,12 @@ class TidalApp(Adw.Application):
         trk_content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
 
         self.album_header_box = Gtk.Box(spacing=24, css_classes=["album-header-box"])
-        self.header_art = Gtk.Image(width_request=160, height_request=160, css_classes=["header-art"])
+        self.header_art = Gtk.Picture()
+        self.header_art.set_size_request(160, 160)
+        self.header_art.set_can_shrink(True)
+        try: self.header_art.set_content_fit(Gtk.ContentFit.COVER)
+        except: pass
+        self.header_art.add_css_class("header-art")
 
         info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER, hexpand=True)
         self.header_title = Gtk.Label(xalign=0, wrap=True, css_classes=["album-title-large"])
@@ -687,7 +691,10 @@ class TidalApp(Adw.Application):
 
         # --- 1. 左侧：歌曲信息 ---
         self.info_area = Gtk.Box(spacing=14, valign=Gtk.Align.CENTER)
-        self.art_img = Gtk.Image(width_request=72, height_request=72, css_classes=["playback-art"])
+        self.art_img = Gtk.Image()
+        self.art_img.set_size_request(72, 72)
+        self.art_img.add_css_class("playback-art")
+
         gest = Gtk.GestureClick(); gest.connect("pressed", self.on_player_art_clicked); self.art_img.add_controller(gest)
         t = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER, spacing=0)
         self.lbl_title = Gtk.Label(xalign=0, css_classes=["player-title"], ellipsize=3)
@@ -1118,23 +1125,14 @@ class TidalApp(Adw.Application):
         self.show_album_details(obj)
 
     def _play_single_track(self, track):
+        """
+        [修正版] 播放单个推荐曲目
+        """
+        # 1. 设置临时列表
         self.current_track_list = [track]
-        self.current_index = 0
-        self.playing_track = track
-        self.playing_track_id = track.id
-        self._update_track_list_icon()
-        self.lbl_title.set_text(track.name)
-        art_name = getattr(track.artist, 'name', 'Unknown Artist')
-        self.lbl_artist.set_text(art_name)
-        alb_name = track.album.name if hasattr(track, 'album') and track.album else "Unknown Album"
-        self.lbl_album.set_text(alb_name)
-        cover_url = self.backend.get_artwork_url(track, 1280)
-        utils.load_img(self.art_img, cover_url, self.cache_dir, 72)
-        Thread(target=lambda: self.history_mgr.add(track, cover_url), daemon=True).start()
-        def play():
-            url = self.backend.get_stream_url(track)
-            if url: GLib.idle_add(lambda: (self.player.load(url), self.player.play(), self.play_btn.set_icon_name("media-playback-pause-symbolic")))
-        Thread(target=play, daemon=True).start()
+        
+        # 2. [关键] 调用 play_track(0) 播放列表里的第1首
+        self.play_track(0)
 
     def show_album_details(self, alb):
         current_view = self.right_stack.get_visible_child_name()
@@ -1248,7 +1246,7 @@ class TidalApp(Adw.Application):
         curr, rem = albs[:batch], albs[batch:]
         for alb in curr:
             v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, css_classes=["card"])
-            img = Gtk.Image(pixel_size=130, css_classes=["album-cover-img"])
+            img = Gtk.Image(css_classes=["album-cover-img"])
             utils.load_img(img, lambda a=alb: self.backend.get_artwork_url(a, 640), self.cache_dir, 130)
             v.append(img); v.append(Gtk.Label(label=alb.name, ellipsize=3, halign=Gtk.Align.CENTER, wrap=True, max_width_chars=16))
             c = Gtk.FlowBoxChild(); c.set_child(v)
@@ -1406,39 +1404,17 @@ class TidalApp(Adw.Application):
 
     def _load_cover_art(self, cover_id_or_url):
         """
-        [修复版] 异步加载封面 (自动处理 UUID)
+        [修复版] 统一使用 utils.load_img 加载封面
+        解决播放栏图标在 HiDPI 屏幕上过小的问题
         """
-        # 1. 尝试转换 ID 为 URL
+        # 1. 获取 URL
         url = self._get_tidal_image_url(cover_id_or_url)
+        if not url: return
         
-        if not url or not hasattr(self, 'art_img'): return
-
-        def fetch_image():
-            try:
-                import urllib.request
-                # print(f"[Cover] Downloading: {url}") # 调试用
-                
-                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(req, timeout=5) as response:
-                    data = response.read()
-                    
-                from gi.repository import GdkPixbuf
-                loader = GdkPixbuf.PixbufLoader()
-                loader.write(data)
-                loader.close()
-                pixbuf = loader.get_pixbuf()
-                
-                if pixbuf:
-                    # 缩放图片
-                    scaled = pixbuf.scale_simple(72, 72, GdkPixbuf.InterpType.BILINEAR)
-                    # 必须在主线程更新 UI
-                    GLib.idle_add(self.art_img.set_from_pixbuf, scaled)
-                    
-            except Exception as e:
-                print(f"[Cover Error] Failed to load art: {e}")
-
-        from threading import Thread
-        Thread(target=fetch_image, daemon=True).start()
+        # 2. 直接委托给 utils 加载
+        # 我们请求 72px 大小，utils 会自动加载 144px 的高清图并正确显示
+        if hasattr(self, 'art_img'):
+            utils.load_img(self.art_img, url, self.cache_dir, 72)
 
     def _update_list_ui(self, index):
         """
@@ -1459,107 +1435,113 @@ class TidalApp(Adw.Application):
         except Exception as e:
             print(f"[UI Error] List update failed: {e}")
 
-    def play_track(self, index):
-        """
-        [图标修复版] 播放指定索引歌曲
-        修复：更新 self.playing_track_id，确保列表图标能正确跟随
-        """
-        # 1. 边界检查
-        if not hasattr(self, 'current_track_list') or not self.current_track_list:
-            return
-        if index < 0 or index >= len(self.current_track_list):
+
+    def render_lyrics_list(self, lyrics_obj=None, status_msg=None):
+        """渲染歌词列表到界面"""
+        print(f"[UI] Rendering lyrics... Msg: {status_msg}") # <--- 日志
+
+        if not hasattr(self, 'lyrics_vbox'): return
+
+        # 清空旧内容
+        while child := self.lyrics_vbox.get_first_child():
+            self.lyrics_vbox.remove(child)
+        self.lyric_widgets = []
+        self.current_lyric_index = -1
+
+        # 显示状态文字 (Loading / No Lyrics)
+        if status_msg:
+            lbl = Gtk.Label(label=status_msg, css_classes=["title-2"], valign=Gtk.Align.CENTER)
+            lbl.set_opacity(0.5)
+            center = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER, vexpand=True)
+            center.append(lbl)
+            self.lyrics_vbox.append(center)
             return
 
-        # --- [关键修复 1] 更新播放状态数据 ---
+        # 显示歌词内容
+        if lyrics_obj:
+            source = lyrics_obj.time_points if lyrics_obj.has_synced else [0]
+            print(f"[UI] Drawing {len(source)} lines...") # <--- 日志
+
+            for t in source:
+                text = lyrics_obj.lyrics_map.get(t, "") if lyrics_obj.has_synced else lyrics_obj.raw_text
+                if not text: text = " "
+
+                lbl = Gtk.Label(label=text, css_classes=["lyric-line"], wrap=True, max_width_chars=40)
+                lbl.set_justify(Gtk.Justification.CENTER)
+                self.lyrics_vbox.append(lbl)
+
+                if lyrics_obj.has_synced:
+                    self.lyric_widgets.append({"time": t, "widget": lbl})
+
+
+    def play_track(self, index):
+        print(f"\n[Main] play_track called. Index: {index}") # <--- 日志
+        
+        if not hasattr(self, 'current_track_list') or not self.current_track_list: return
+        if index < 0 or index >= len(self.current_track_list): return
+
         self.current_track_index = index
         track = self.current_track_list[index]
         self.playing_track = track
-        self.playing_track_id = track.id  # <--- 之前漏了这行，导致图标判断失效！
+        self.playing_track_id = track.id
         
-        # 2. 立即更新播放栏文字
+        print(f"[Main] Playing: {track.name}") # <--- 日志
+
+        # 更新标题
         def _get_name(obj):
-            if obj is None: return "Unknown"
             if isinstance(obj, str): return obj
             return getattr(obj, 'name', getattr(obj, 'title', str(obj)))
-
+        
         try:
-            t_str = _get_name(getattr(track, "title", "Loading..."))
-            a_str = _get_name(getattr(track, "artist", ""))
-            al_str = _get_name(getattr(track, "album", ""))
-            
-            if hasattr(self, 'lbl_title'): self.lbl_title.set_label(t_str)
-            if hasattr(self, 'lbl_artist'): self.lbl_artist.set_label(a_str)
-            if hasattr(self, 'lbl_album'): self.lbl_album.set_label(al_str)
+            self.lbl_title.set_label(_get_name(getattr(track, "title", "Loading...")))
+            self.lbl_artist.set_label(_get_name(getattr(track, "artist", "")))
+            self.lbl_album.set_label(_get_name(getattr(track, "album", "")))
         except: pass
 
-        # 3. 更新列表选中状态 + 图标
-        def update_list_ui_safe():
-            # 智能判断当前在哪个列表
-            target_list = None
-            current_view = self.right_stack.get_visible_child_name()
+        # 更新UI状态
+        GLib.idle_add(lambda: self._update_list_ui(index))
+        GLib.idle_add(lambda: self._update_track_list_icon())
+        
+        cover_id = getattr(track, "cover", None) or getattr(track.album, "cover", None)
+        if cover_id:
+            Thread(target=lambda: self._load_cover_art(cover_id), daemon=True).start()
+
+        # [核心] 后台任务
+        def task():
+            print("[Main] Background task started...") # <--- 日志
             
-            if current_view == "tracks":
-                if hasattr(self, 'track_list'): target_list = self.track_list
-            elif current_view == "search_view":
-                if hasattr(self, 'res_trk_list'): target_list = self.res_trk_list
-            
-            if target_list:
-                try:
-                    # A. 选中高亮 (蓝色背景)
-                    row = target_list.get_row_at_index(index)
-                    if row:
-                        target_list.select_row(row)
-                    
-                    # B. [关键修复 2] 刷新图标 (传入当前列表对象)
-                    if hasattr(self, '_update_track_list_icon'):
-                        self._update_track_list_icon(target_list)
-                        
-                except Exception as e:
-                    print(f"[UI Warning] List update failed: {e}")
-
-        GLib.idle_add(update_list_ui_safe)
-
-        # 4. 加载封面
-        def load_cover_task():
+            # 1. 音频播放
             try:
-                cover_id = getattr(track, "cover", None)
-                if not cover_id:
-                    alb = getattr(track, "album", None)
-                    if hasattr(alb, 'cover'): cover_id = alb.cover
-                if cover_id:
-                    self._load_cover_art(cover_id)
-            except: pass
-        GLib.timeout_add(100, load_cover_task)
-
-        # 5. 播放音频
-        def start_audio_task():
-            try:
-                # 获取流地址并播放
-                stream_url = None
-                if hasattr(self.backend, 'get_stream_url'):
-                    stream_url = self.backend.get_stream_url(track)
-                elif hasattr(self.backend, 'get_url'):
-                    stream_url = self.backend.get_url(track)
-
-                if stream_url:
-                    if hasattr(self.player, 'set_uri'):
-                        GLib.idle_add(self.player.set_uri, stream_url)
-                    elif hasattr(self.player, 'load_uri'):
-                        GLib.idle_add(self.player.load_uri, stream_url)
-                    
-                    GLib.idle_add(self.player.play)
-                    
-                    # 更新播放按钮为暂停图标
-                    if hasattr(self, 'play_btn'):
-                         GLib.idle_add(lambda: self.play_btn.set_icon_name("media-playback-pause-symbolic"))
+                url = self.backend.get_stream_url(track)
+                if url:
+                    print("[Main] Stream URL OK. Loading player...") # <--- 日志
+                    GLib.idle_add(lambda: (self.player.load(url), self.player.play(), self.play_btn.set_icon_name("media-playback-pause-symbolic")))
                 else:
-                    print(f"[Player] Error: No stream URL returned")
+                    print("[Main] Error: Stream URL is None")
+            except Exception as e:
+                print(f"[Main] Playback Error: {e}")
+
+            # 2. 歌词获取 (这就是你之前缺失的部分！)
+            try:
+                print("[Main] Starting lyrics sequence...") # <--- 日志
+                GLib.idle_add(self.render_lyrics_list, None, "Loading Lyrics...")
+                
+                raw_lyrics = self.backend.get_lyrics(track.id)
+                
+                if raw_lyrics:
+                    print(f"[Main] Got lyrics data! Length: {len(raw_lyrics)}") # <--- 日志
+                    self.lyrics_mgr.load_lyrics(raw_lyrics)
+                    GLib.idle_add(self.render_lyrics_list, self.lyrics_mgr, None)
+                else:
+                    print("[Main] No lyrics returned.") # <--- 日志
+                    GLib.idle_add(self.render_lyrics_list, None, "No Lyrics Available")
                     
             except Exception as e:
-                print(f"[Player] Playback Error: {e}")
+                print(f"[Main] Lyrics Error: {e}")
+                import traceback
+                traceback.print_exc()
 
-        from threading import Thread
-        Thread(target=start_audio_task, daemon=True).start()
+        Thread(target=task, daemon=True).start()
 
     def _get_tidal_image_url(self, uuid, width=320, height=320):
         """
@@ -1580,15 +1562,101 @@ class TidalApp(Adw.Application):
     def on_seek(self, s): 
         if not self.is_programmatic_update: self.player.seek(s.get_value())
 
+    def _scroll_to_lyric(self, widget):
+        """
+        [动画版] 计算歌词的目标滚动位置 (不直接滚动)
+        """
+        if not hasattr(self, 'lyrics_scroller') or not widget: return
+        
+        try:
+            # 计算控件位置
+            success, rect = widget.compute_bounds(self.lyrics_vbox)
+            if not success: return
+
+            # 算出 Label 中心点 Y 坐标
+            label_center_y = rect.origin.y + (rect.size.height / 2)
+            
+            # 算出可视区域高度
+            viewport_h = self.lyrics_scroller.get_height()
+            
+            # 算出目标滚动值
+            target = label_center_y - (viewport_h / 2)
+            
+            # 获取当前最大滚动范围，防止越界
+            adj = self.lyrics_scroller.get_vadjustment()
+            max_scroll = adj.get_upper() - adj.get_page_size()
+            
+            # [关键] 将目标值存入 self变量，而不是直接 set_value
+            # 我们将在 update_ui_loop 里一帧一帧地滑过去
+            self.target_scroll_y = max(0, min(target, max_scroll))
+            
+        except: pass
+
     def update_ui_loop(self):
+        """
+        [50FPS 高性能循环] 处理进度条、时间显示和歌词平滑滚动
+        """
+        # 1. 获取播放器状态
         p, d = self.player.get_position()
-        if d > 0: 
+        
+        # --- A. 进度条与时间 (带节流) ---
+        if d > 0:
+            # 进度条需要流畅，每帧都更新
             self.is_programmatic_update = True
             self.scale.set_range(0, d)
             self.scale.set_value(p)
             self.is_programmatic_update = False
-            self.lbl_current_time.set_text(f"{int(p//60)}:{int(p%60):02d}")
-            self.lbl_total_time.set_text(f"{int(d//60)}:{int(d%60):02d}")
+            
+            # [优化] 时间文字不需要每秒刷 50 次，每秒刷 1 次即可
+            # 我们通过检查整数秒的变化来减少 Label.set_text 的开销
+            current_int_sec = int(p)
+            if not hasattr(self, '_last_sec') or self._last_sec != current_int_sec:
+                self.lbl_current_time.set_text(f"{int(p//60)}:{int(p%60):02d}")
+                self.lbl_total_time.set_text(f"{int(d//60)}:{int(d%60):02d}")
+                self._last_sec = current_int_sec
+
+        # --- B. 歌词高亮逻辑 ---
+        if hasattr(self, 'lyrics_mgr') and self.lyrics_mgr.has_synced and hasattr(self, 'lyric_widgets') and self.lyric_widgets:
+            # 0.3秒 提前量补偿
+            current_time = p + 0.3
+            active_idx = -1
+            
+            # 查找当前句
+            for i, item in enumerate(self.lyric_widgets):
+                if item['time'] <= current_time:
+                    active_idx = i
+                else:
+                    break
+            
+            current_idx = getattr(self, 'current_lyric_index', -1)
+            
+            # 如果行号变了，更新高亮样式
+            if active_idx != current_idx:
+                if current_idx != -1 and current_idx < len(self.lyric_widgets):
+                    self.lyric_widgets[current_idx]['widget'].remove_css_class("active")
+                
+                if active_idx != -1:
+                    w = self.lyric_widgets[active_idx]['widget']
+                    w.add_css_class("active")
+                    # 计算新的目标位置 (只计算，不滚动)
+                    self._scroll_to_lyric(w)
+                
+                self.current_lyric_index = active_idx
+
+        # --- C. [核心] 歌词平滑滚动动画 (Lerp) ---
+        # 每一帧都执行一点点移动，形成阻尼效果
+        if hasattr(self, 'target_scroll_y') and hasattr(self, 'lyrics_scroller'):
+            adj = self.lyrics_scroller.get_vadjustment()
+            current_y = adj.get_value()
+            target_y = self.target_scroll_y
+            
+            # 如果距离足够大，才执行动画 (节省计算)
+            if abs(target_y - current_y) > 0.5:
+                # 线性插值公式：新位置 = 当前 + (目标 - 当前) * 系数
+                # 0.08 是平滑系数：越小越慢越软，越大越快
+                new_y = current_y + (target_y - current_y) * 0.08
+                adj.set_value(new_y)
+
         return True
 
     def update_layout_proportions(self, w, p):
@@ -1684,49 +1752,31 @@ class TidalApp(Adw.Application):
             row.append(info); self.res_trk_list.append(row)
 
     def on_search_track_selected(self, box, row):
+        """
+        [修正版] 点击搜索结果歌曲
+        """
         if not row: return
         idx = row.get_index()
-        if idx < len(self.search_track_data):
+        
+        if hasattr(self, 'search_track_data') and idx < len(self.search_track_data):
+            # 1. 切换播放列表为搜索结果
             self.current_track_list = self.search_track_data
-            self.current_index = idx
-            track = self.current_track_list[idx]
-            self.playing_track = track
-            self.playing_track_id = track.id
-            self.lbl_title.set_text(track.name)
-            art_name = getattr(track.artist, 'name', 'Unknown Artist')
-            self.lbl_artist.set_text(art_name)
-            alb_name = track.album.name if hasattr(track, 'album') and track.album else "Unknown Album"
-            self.lbl_album.set_text(alb_name)
-            cover_url = self.backend.get_artwork_url(track, 1280)
-            if cover_url: utils.load_img(self.art_img, cover_url, self.cache_dir, 72)
-            else: self.art_img.set_from_icon_name("audio-x-generic-symbolic")
-            def play():
-                url = self.backend.get_stream_url(track)
-                if url: GLib.idle_add(lambda: (self.player.load(url), self.player.play(), self.play_btn.set_icon_name("media-playback-pause-symbolic")))
-            Thread(target=play, daemon=True).start()
+            
+            # 2. [关键] 统一调用 play_track
+            self.play_track(idx)
 
-    # [已修复] 补全 on_track_selected
     def on_track_selected(self, box, row):
+        """
+        [修正版] 点击主列表歌曲
+        """
         if not row: return
+        
+        # 1. 获取点击的索引
         idx = row.get_index()
-        track = self.current_track_list[idx]
-        self.current_index = idx
-        self.playing_track = track
-        self.playing_track_id = track.id
-        self._update_track_list_icon()
-
-        self.lbl_title.set_text(track.name)
-        art_name = getattr(track.artist, 'name', 'Unknown Artist')
-        self.lbl_artist.set_text(art_name)
-        alb_name = track.album.name if hasattr(track, 'album') and track.album else "Unknown Album"
-        self.lbl_album.set_text(alb_name)
-        cover_url = self.backend.get_artwork_url(track, 1280)
-        utils.load_img(self.art_img, cover_url, self.cache_dir, 72)
-        Thread(target=lambda: self.history_mgr.add(track, cover_url), daemon=True).start()
-        def play():
-            url = self.backend.get_stream_url(track)
-            if url: GLib.idle_add(lambda: (self.player.load(url), self.player.play(), self.play_btn.set_icon_name("media-playback-pause-symbolic")))
-        Thread(target=play, daemon=True).start()
+        
+        # 2. [关键] 必须调用 play_track，因为歌词逻辑都在那里面！
+        # 不要在这里自己写播放代码，否则会漏掉歌词功能
+        self.play_track(idx)
 
     # [已修复] 补全 on_back_clicked
     def on_back_clicked(self, btn):

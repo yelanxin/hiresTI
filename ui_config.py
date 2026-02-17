@@ -61,7 +61,7 @@ CSS_DATA = """
         background: none;
         background-color: transparent;
         box-shadow: none;
-        margin: 0 0 0px 32px;
+        margin: 0 0 0px 0px;
         padding: 0;
     }
 
@@ -146,6 +146,20 @@ CSS_DATA = """
     margin: 0px 32px 0px 32px;
     }
 
+    .lyrics-scroller { background: transparent; }
+    .lyric-line {
+        font-size: 16px; 
+        font-weight: 200; 
+        color: rgba(255, 255, 255, 0.35);
+        margin-bottom: 0px; 
+        padding: 4px 10px; 
+        transition: all 0.4s cubic-bezier(0.25, 0.8, 0.25, 1);
+    }
+    .lyric-line.active {
+        font-size: 20px; font-weight: 800; color: #ffffff; opacity: 1;
+        margin-bottom: 24px; margin-top: 8px; text-shadow: 0 0 15px rgba(255, 255, 255, 0.2);
+    }
+
 /* 其他样式保持不变... */
 window.undecorated { background-color: transparent; }
 .player-overlay-container { background-color: transparent; }
@@ -164,7 +178,7 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
 .card { background-color: transparent; border: none; box-shadow: none; padding: 8px; min-width: 130px; transition: background-color 0.2s; }
 .card:hover { background-color: alpha(currentColor, 0.06); }
 .card:hover label { color: @accent_color; }
-.album-cover-img { border-radius: 8px; }
+.album-cover-img { border-radius: 8px; -gtk-icon-transform: scale(1);}
 .header-art { border-radius: 12px; }
 .album-header-box { padding: 32px; margin-bottom: 10px; }
 .album-title-large { font-size: 28px; font-weight: 800; margin-bottom: 4px; }
