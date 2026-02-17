@@ -141,12 +141,20 @@ CSS_DATA = """
     /* inset 0 0 20px 意味着在内部有一圈淡淡的黑晕 */
     box-shadow: inset 0 0 20px rgba(0, 0, 0, 0.2);
 
-    padding: 10px;
+    padding: 0px;
     border-radius: 0px 12px 0 0;
     margin: 0px 32px 0px 32px;
     }
 
-    .lyrics-scroller { background: transparent; }
+    .lyrics-scroller {
+        background: transparent;
+        background-color: transparent;
+    }
+
+    /* Box 也要透明 */
+    .lyrics-scroller > box {
+        background: transparent;
+    }
     .lyric-line {
         font-size: 16px; 
         font-weight: 200; 
