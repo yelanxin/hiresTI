@@ -377,28 +377,77 @@ class TidalApp(Adw.Application):
         win.present()
 
     def _build_body(self, container):
-        self.paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL, vexpand=True); container.append(self.paned)
+        # --- [布局重构] 核心改变：从 Box 改为 Overlay ---
+        # 1. 创建覆盖层容器
+        # 这允许波形图“浮”在内容之上，而不是把内容推上去
+        self.body_overlay = Gtk.Overlay()
+        self.body_overlay.set_vexpand(True) # 填满窗口剩余空间
+        container.append(self.body_overlay)
 
-        # --- [新增] 可折叠频谱区域 ---
+        # 2. 底层：主内容区域 (侧边栏 + 列表)
+        # 以前直接加到 container，现在加到 overlay 的底层
+        self.paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        self.body_overlay.set_child(self.paned)
+
+        # 3. 浮层：波形抽屉 (Revealer)
         self.viz_revealer = Gtk.Revealer(transition_type=Gtk.RevealerTransitionType.SLIDE_UP)
-        self.viz_revealer.set_reveal_child(False) # 初始隐藏
-        container.append(self.viz_revealer)
-
-        # 频谱仪容器
-        viz_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["viz-panel"])
+        self.viz_revealer.set_reveal_child(False)
         
+        # [关键] 靠底部对齐，且不要强行占满高度
+        self.viz_revealer.set_valign(Gtk.Align.END) 
+        self.viz_revealer.set_vexpand(False) 
+        
+        # 将 Revealer 作为“浮层”加入
+        self.body_overlay.add_overlay(self.viz_revealer)
+
+        # --- 下面是抽屉内容的构建 (保持之前的透明逻辑) ---
+        
+        # 4. 创建根容器 (透明)
+        self.viz_root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        
+        # 5. Stack (内容容器)
+        self.viz_stack = Gtk.Stack()
+        self.viz_stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
+        self.viz_stack.set_transition_duration(250)
+
+        self.viz_stack.set_size_request(-1, 250)
+
+        # 6. Switcher (按钮)
+        self.viz_switcher = Gtk.StackSwitcher()
+        self.viz_switcher.set_stack(self.viz_stack)
+        self.viz_switcher.set_halign(Gtk.Align.START)
+        self.viz_switcher.set_hexpand(False) 
+        self.viz_switcher.add_css_class("mini-switcher")
+        self.viz_switcher.remove_css_class("linked")
+        
+        # 7. 内容黑框 (只包裹 Stack)
+        self.viz_stack_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.viz_stack_box.add_css_class("viz-panel")
+        
+        # 8. 页面一：频谱图
         from visualizer import SpectrumVisualizer
         self.viz = SpectrumVisualizer()
         self.viz.num_bars = 64
         self.viz.set_valign(Gtk.Align.FILL)
-        self.viz_revealer.set_vexpand(False)
         self.viz.set_vexpand(False)
+        self.viz_stack.add_titled(self.viz, "spectrum", "Spectrum")
 
-        viz_container.append(self.viz)
-        
-        self.viz_revealer.set_child(viz_container)
-        # ------------------------
+        # 9. 页面二：歌词
+        self.lyrics_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.lyrics_box.set_valign(Gtk.Align.CENTER)
+        self.lyrics_placeholder = Gtk.Label(label="No Lyrics Available")
+        self.lyrics_placeholder.add_css_class("title-3")
+        self.lyrics_placeholder.set_opacity(0.5)
+        self.lyrics_box.append(self.lyrics_placeholder)
+        self.viz_stack.add_titled(self.lyrics_box, "lyrics", "Lyrics")
 
+        # 10. 组装抽屉
+        self.viz_stack_box.append(self.viz_stack)
+        self.viz_root.append(self.viz_switcher)     # 按钮
+        self.viz_root.append(self.viz_stack_box)    # 黑框
+        self.viz_revealer.set_child(self.viz_root)
+
+        # --- 侧边栏与主视图构建 (保持不变) ---
         self.sidebar_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.nav_list = Gtk.ListBox(css_classes=["navigation-sidebar"], margin_top=10); self.nav_list.connect("row-activated", self.on_nav_selected)
         
@@ -1712,26 +1761,25 @@ class TidalApp(Adw.Application):
 
     def toggle_visualizer(self, btn):
         """
-        [终极修复版] 处理波形面板的显示、隐藏与空间彻底释放
+        [Overlay 适配版]
         """
         is_visible = self.viz_revealer.get_reveal_child()
         target_state = not is_visible
         
-        # 1. 触发 Revealer 动画
+        # 1. 触发 Revealer 动画 (上下滑动)
         self.viz_revealer.set_reveal_child(target_state)
 
-        # 2. 核心：控制容器的纵向扩展属性
-        # 展开时设为 True 占用空间，隐藏时设为 False 释放空间
-        self.viz_revealer.set_vexpand(target_state)
-        self.viz.set_vexpand(target_state)
-
+        # 2. 图标切换
         if target_state:
             btn.set_icon_name("pan-down-symbolic")
             btn.add_css_class("active")
-            self.viz.queue_draw()
+            if hasattr(self, 'viz'): self.viz.queue_draw()
         else:
             btn.set_icon_name("pan-up-symbolic")
             btn.remove_css_class("active")
+            
+        # 注意：Overlay 模式下不需要再设置 set_vexpand 了，
+        # 因为它现在是浮在上面的，不会挤压下面的内容。
 
 if __name__ == "__main__":
     TidalApp().run(None)
