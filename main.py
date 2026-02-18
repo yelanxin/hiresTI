@@ -1,4 +1,7 @@
 import os
+import logging
+import time
+from datetime import datetime, timedelta
 # [Fix] 屏蔽 MESA 驱动层非致命调试警告
 os.environ["MESA_LOG_LEVEL"] = "error"
 
@@ -6,22 +9,34 @@ import gi
 gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
 from gi.repository import Gtk, Adw, GLib, Gdk, Pango
-from background_viz import BackgroundVisualizer
-
-from visualizer import SpectrumVisualizer
 import webbrowser
-import json
 from threading import Thread
 from tidal_backend import TidalBackend
 from audio_player import AudioPlayer
-from models import HistoryManager
+from models import HistoryManager, PlaylistManager
 from signal_path import AudioSignalPathWindow
 import utils
 import ui_config
+from ui import builders as ui_builders
+from ui import views_builders as ui_views_builders
+from actions import ui_actions
+from actions import ui_navigation
+from actions import playback_actions
+from actions import audio_settings_actions
+from actions import lyrics_playback_actions
+from actions import playback_stream_actions
 from lyrics_manager import LyricsManager
+from app_logging import setup_logging
+from app_settings import load_settings, save_settings as persist_settings
 
-import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+logger = logging.getLogger(__name__)
+
+try:
+    import pystray
+    from PIL import Image
+except Exception:
+    pystray = None
+    Image = None
 
 class TidalApp(Adw.Application):
     # --- [新增] 播放模式常量 ---
@@ -32,10 +47,10 @@ class TidalApp(Adw.Application):
 
     # 对应的图标
     MODE_ICONS = {
-        0: "media-playlist-repeat-symbolic",
-        1: "media-playlist-repeat-song-symbolic", # 注意：有些主题可能没有这个图标，如果没有会回退
-        2: "media-playlist-shuffle-symbolic",
-        3: "night-light-symbolic" # 用个星星/闪电图标代表算法/智能
+        0: "hiresti-mode-loop-symbolic",
+        1: "hiresti-mode-one-symbolic",
+        2: "hiresti-mode-shuffle-symbolic",
+        3: "hiresti-mode-smart-symbolic"
     }
 
     # 对应的提示文字
@@ -45,65 +60,365 @@ class TidalApp(Adw.Application):
         2: "Shuffle (Randomize Order)",
         3: "Smart Shuffle (Algorithm)"
     }
+    LYRICS_FONT_PRESETS = ["Live", "Studio", "Compact"]
     # [新增] 定义延迟档位配置
     LATENCY_OPTIONS = ["Safe (400ms)", "Standard (100ms)", "Low Latency (40ms)", "Aggressive (20ms)"]
+    VIZ_BAR_OPTIONS = [4, 8, 16, 32, 48, 64, 96, 128]
     LATENCY_MAP = {
         "Safe (400ms)":      (400, 40),  # Buffer, Latency
         "Standard (100ms)":  (100, 10),
         "Low Latency (40ms)":(40, 4),
         "Aggressive (20ms)": (20, 2)
     }
+
+    def _init_ui_refs(self):
+        # Widgets created during do_activate/build steps.
+        self.bp_label = None
+        self.viz_stack_box = None
+        self.vol_btn = None
+        self.vol_scale = None
+        self.vol_pop = None
+        self.viz_revealer = None
+        self.viz_theme_dd = None
+        self.viz_bars_dd = None
+        self.viz_effect_dd = None
+        self.viz_profile_dd = None
+        self.lyrics_font_dd = None
+        self.lyrics_motion_dd = None
+        self.lyrics_font_label = None
+        self.lyrics_offset_label = None
+        self.timeline_box = None
+        self.scale_overlay = None
+        self.scale_thumb = None
+        self.vol_box = None
+        self.tech_box = None
+        self.bg_viz = None
+        self.lyrics_tab_root = None
+        self.viz = None
+        self.eq_btn = None
+        self.eq_pop = None
+        self.mode_btn = None
+        self.track_list = None
+        self.playlist_track_list = None
+        self.queue_track_list = None
+        self.queue_drawer_list = None
+        self.queue_count_label = None
+        self.queue_clear_btn = None
+        self.queue_revealer = None
+        self.queue_backdrop = None
+        self.queue_btn = None
+        self.viz_anchor = None
+        self.viz_handle_box = None
+        self.current_album = None
+        self.current_selected_artist = None
+        self.list_box = None
+        self.output_status_label = None
+        self.output_recover_btn = None
+        self.output_notice_revealer = None
+        self.output_notice_icon = None
+        self.output_notice_label = None
+        self._output_notice_source = 0
+        self._viz_handle_anim_source = 0
+        self._viz_handle_settle_source = 0
+        self._last_output_state = None
+        self._last_output_error = None
+        self.network_status_label = None
+        self.decoder_status_label = None
+        self.events_btn = None
+        self._diag_events = []
+        self._diag_health = {"network": "idle", "decoder": "idle", "output": "idle"}
+        self._diag_pop = None
+        self._diag_text = None
+        self.search_content_box = None
+        self.add_playlist_btn = None
+        self.add_selected_tracks_btn = None
+        self.search_selected_indices = set()
+        self.collection_base_margin_bottom = 32
+        self.track_list_base_margin_bottom = 32
+        self.search_base_margin_bottom = 32
+        self.daily_mix_data = []
+        self._tray_icon = None
+        self._tray_ready = False
+        self._allow_window_close = False
+        self._thumb_smooth_x = None
+
+    def _apply_overlay_scroll_padding(self, expanded):
+        extra = 0
+        if expanded:
+            # Use actual overlay height + small breathing room.
+            breathing_px = 12
+            overlay_h = 0
+            # Use stack content height only (exclude switcher/header), closer to actual covered area.
+            if hasattr(self, "viz_stack") and self.viz_stack is not None:
+                overlay_h = self.viz_stack.get_height()
+            if overlay_h <= 1:
+                overlay_h = 250
+            extra = overlay_h + breathing_px
+        if hasattr(self, "collection_content_box") and self.collection_content_box is not None:
+            self.collection_content_box.set_margin_bottom(self.collection_base_margin_bottom + extra)
+        if self.track_list is not None:
+            self.track_list.set_margin_bottom(self.track_list_base_margin_bottom + extra)
+        if self.search_content_box is not None:
+            self.search_content_box.set_margin_bottom(self.search_base_margin_bottom + extra)
+
+    def record_diag_event(self, message):
+        ts = time.strftime("%H:%M:%S")
+        self._diag_events.append(f"{ts} | {message}")
+        if len(self._diag_events) > 120:
+            self._diag_events = self._diag_events[-120:]
+        if self._diag_text is not None:
+            combined = list(getattr(self.player, "event_log", [])) + self._diag_events
+            buf = self._diag_text.get_buffer()
+            buf.set_text("\n".join(combined[-120:]))
+
+    def _apply_status_class(self, label, state):
+        if label is None:
+            return
+        class_map = {
+            "ok": "status-active",
+            "warn": "status-fallback",
+            "error": "status-error",
+            "idle": "status-idle",
+            "switching": "status-switching",
+        }
+        for cls in ("status-active", "status-fallback", "status-error", "status-switching", "status-idle"):
+            label.remove_css_class(cls)
+        label.add_css_class(class_map.get(state, "status-idle"))
+
+    def set_diag_health(self, kind, state, detail=None):
+        if kind not in self._diag_health:
+            return
+        prev = self._diag_health.get(kind)
+        self._diag_health[kind] = state
+        if prev != state:
+            text = f"{kind.upper()} -> {state.upper()}"
+            if detail:
+                text = f"{text} ({detail})"
+            self.record_diag_event(text)
+        if kind == "network" and self.network_status_label is not None:
+            self.network_status_label.set_text(f"NET {state.upper()}")
+            self._apply_status_class(self.network_status_label, state)
+        if kind == "decoder" and self.decoder_status_label is not None:
+            self.decoder_status_label.set_text(f"DEC {state.upper()}")
+            self._apply_status_class(self.decoder_status_label, state)
+
+    def show_diag_events(self, _btn=None):
+        if self._diag_pop is None or self._diag_text is None:
+            return
+        combined = list(getattr(self.player, "event_log", [])) + self._diag_events
+        buf = self._diag_text.get_buffer()
+        buf.set_text("\n".join(combined[-120:]) if combined else "No events yet.")
+        self._diag_pop.popup()
+
+    def show_output_notice(self, text, state="idle", timeout_ms=2600):
+        if not text or self.output_notice_revealer is None or self.output_notice_label is None:
+            return
+        self.output_notice_label.set_text(str(text))
+        icon_map = {
+            "switching": "hiresti-tech-symbolic",
+            "ok": "emblem-ok-symbolic",
+            "warn": "dialog-warning-symbolic",
+            "error": "dialog-error-symbolic",
+            "idle": "hiresti-tech-symbolic",
+        }
+        if self.output_notice_icon is not None:
+            self.output_notice_icon.set_from_icon_name(icon_map.get(state, "hiresti-tech-symbolic"))
+        chip = self.output_notice_revealer.get_child()
+        if chip is not None:
+            for cls in ("output-notice-ok", "output-notice-warn", "output-notice-error", "output-notice-switching"):
+                chip.remove_css_class(cls)
+            class_map = {
+                "ok": "output-notice-ok",
+                "warn": "output-notice-warn",
+                "error": "output-notice-error",
+                "switching": "output-notice-switching",
+            }
+            cls = class_map.get(state)
+            if cls:
+                chip.add_css_class(cls)
+        self.output_notice_revealer.set_reveal_child(True)
+        if self._output_notice_source:
+            GLib.source_remove(self._output_notice_source)
+            self._output_notice_source = 0
+
+        def _hide_notice():
+            self._output_notice_source = 0
+            if self.output_notice_revealer is not None:
+                self.output_notice_revealer.set_reveal_child(False)
+            return False
+
+        self._output_notice_source = GLib.timeout_add(int(timeout_ms), _hide_notice)
+
+    def on_output_state_transition(self, prev_state, state, detail=None):
+        if state == "switching":
+            self.show_output_notice("Audio device changed, reconnecting...", "switching", 2400)
+            return
+        if state == "active" and prev_state in ("switching", "fallback", "error"):
+            self.show_output_notice("Audio output reconnected", "ok", 2200)
+            return
+        if state == "fallback":
+            self.show_output_notice("Primary output unavailable, switched to fallback", "warn", 3200)
+            return
+        if state == "error":
+            msg = str(detail or "Unknown output error")
+            self.show_output_notice(f"Output error: {msg}", "error", 3600)
+
+    def _schedule_cache_maintenance(self):
+        def _parse_int_env(name, default):
+            raw = os.getenv(name)
+            if not raw:
+                return default
+            try:
+                value = int(raw)
+                return value if value > 0 else default
+            except ValueError:
+                return default
+
+        max_mb = _parse_int_env("HIRESTI_COVER_CACHE_MAX_MB", 300)
+        max_days = _parse_int_env("HIRESTI_COVER_CACHE_MAX_DAYS", 30)
+        max_bytes = max_mb * 1024 * 1024
+
+        def task():
+            logger.info(
+                "Running cover/audio cache maintenance (cover=%sMB ttl=%sd, audio tracks=%s)",
+                max_mb,
+                max_days,
+                getattr(self, "audio_cache_tracks", 0),
+            )
+            utils.prune_image_cache(self.cache_dir, max_bytes=max_bytes, max_age_days=max_days)
+            utils.prune_audio_cache(
+                getattr(self, "audio_cache_dir", ""),
+                max_tracks=max(0, int(getattr(self, "audio_cache_tracks", 0) or 0)),
+            )
+
+        Thread(target=task, daemon=True).start()
+
+    def _account_scope_from_backend_user(self):
+        user = getattr(self.backend, "user", None)
+        uid = getattr(user, "id", None)
+        if uid is None:
+            return "guest"
+        raw = str(uid).strip()
+        if not raw:
+            return "guest"
+        safe = "".join(ch if (ch.isalnum() or ch in ("-", "_")) else "_" for ch in raw)
+        return f"u_{safe}" if safe else "guest"
+
+    def _apply_account_scope(self, force=False):
+        scope = self._account_scope_from_backend_user()
+        if (not force) and scope == getattr(self, "_account_scope", None):
+            return
+        self._account_scope = scope
+        if hasattr(self, "history_mgr") and self.history_mgr is not None:
+            self.history_mgr.set_scope(scope)
+        if hasattr(self, "playlist_mgr") and self.playlist_mgr is not None:
+            self.playlist_mgr.set_scope(scope)
+        # Reset playlist-specific transient state to avoid stale references across accounts.
+        self.current_playlist_id = None
+        self.playlist_edit_mode = False
+        self.playlist_rename_mode = False
+        logger.info("Local data scope switched to account: %s", scope)
+
     def __init__(self):
         super().__init__(application_id="com.hiresti.player")
         GLib.set_application_name("HiresTI")
         GLib.set_prgname("HiresTI")
         self.backend = TidalBackend()
-        self.settings_file = os.path.expanduser("~/.cache/hiresti/settings.json")
-        
-        self.settings = {
-            "driver": "Auto (Default)", 
-            "device": "Default Output",
-            "bit_perfect": False,
-            "exclusive_lock": False
-        }
+        self._cache_root = os.path.expanduser("~/.cache/hiresti")
+        self._account_scope = "guest"
+        self.settings_file = os.path.join(self._cache_root, "settings.json")
+        self.settings = load_settings(self.settings_file)
+        # Guard against corrupted/extreme sync offset values.
+        try:
+            raw_off = int(self.settings.get("viz_sync_offset_ms", 0) or 0)
+        except Exception:
+            raw_off = 0
+        if abs(raw_off) > 200:
+            self.settings["viz_sync_offset_ms"] = 0
+        raw_map = self.settings.get("viz_sync_device_offsets", {})
+        if isinstance(raw_map, dict):
+            clean_map = {}
+            for k, v in raw_map.items():
+                if isinstance(k, str) and isinstance(v, int) and abs(v) <= 200:
+                    clean_map[k] = v
+            self.settings["viz_sync_device_offsets"] = clean_map
+        else:
+            self.settings["viz_sync_device_offsets"] = {}
 
-        self.play_mode = self.MODE_LOOP
+        self.play_mode = self.settings.get("play_mode", self.MODE_LOOP)
+        if self.play_mode not in self.MODE_ICONS:
+            self.play_mode = self.MODE_LOOP
         self.shuffle_indices = [] # 用来存随机播放的顺序列表
         
-        if os.path.exists(self.settings_file):
-            try:
-                with open(self.settings_file, 'r') as f:
-                    saved = json.load(f)
-                    self.settings.update(saved)
-            except: pass
-
         # [修复点] 这里的 self.on_next_track 现在能在下面找到定义了
-        self.player = AudioPlayer(on_eos_callback=self.on_next_track, on_tag_callback=self.update_tech_label, on_spectrum_callback=self.on_spectrum_data)
+        self.player = AudioPlayer(
+            on_eos_callback=self.on_next_track,
+            on_tag_callback=self.update_tech_label,
+            on_spectrum_callback=self.on_spectrum_data,
+            on_viz_sync_offset_update=self.on_viz_sync_offset_update,
+        )
+        self._viz_sync_device_key = None
+        self._viz_sync_offsets = dict(self.settings.get("viz_sync_device_offsets", {}))
+        self._viz_sync_last_saved_ms = int(self.settings.get("viz_sync_offset_ms", 0) or 0)
+        self.player.visual_sync_offset_ms = self._viz_sync_last_saved_ms
 
         self.lyrics_mgr = LyricsManager() # <--- 初始化管理器
-        print("[Main] LyricsManager initialized") # <--- 日志
+        logger.info("LyricsManager initialized")
 
         saved_profile = self.settings.get("latency_profile", "Standard (100ms)")
         if saved_profile not in self.LATENCY_MAP: saved_profile = "Standard (100ms)"
         buf_ms, lat_ms = self.LATENCY_MAP[saved_profile]
         self.player.set_alsa_latency(buf_ms, lat_ms)
+        self.player.visual_sync_offset_ms = int(buf_ms)
+        self.settings["viz_sync_offset_ms"] = int(buf_ms)
+        self._viz_sync_last_saved_ms = int(buf_ms)
+        logger.info(
+            "Viz sync offset applied: %dms (source=startup latency_profile=%s)",
+            int(buf_ms),
+            saved_profile,
+        )
 
-        self.history_mgr = HistoryManager()
-        self.cache_dir = os.path.expanduser("~/.cache/hiresti/covers")
+        self.history_mgr = HistoryManager(base_dir=self._cache_root, scope_key=self._account_scope)
+        self.playlist_mgr = PlaylistManager(base_dir=self._cache_root, scope_key=self._account_scope)
+        self.cache_dir = os.path.join(self._cache_root, "covers")
         os.makedirs(self.cache_dir, exist_ok=True)
+        self.audio_cache_dir = os.path.join(self._cache_root, "audio")
+        os.makedirs(self.audio_cache_dir, exist_ok=True)
+        self.audio_cache_tracks = int(self.settings.get("audio_cache_tracks", 20) or 0)
+        self._schedule_cache_maintenance()
         
         self.current_track_list = []
+        self.play_queue = []
         self.current_index = -1
         self.playing_track = None
         self.playing_track_id = None 
+        self.current_playlist_id = None
+        self.playlist_edit_mode = False
+        self.playlist_rename_mode = False
+        self.album_track_source = []
+        self.album_sort_field = None
+        self.album_sort_asc = True
+        self.album_sort_buttons = {}
+        self.playlist_sort_field = None
+        self.playlist_sort_asc = True
         
         self.window_created = False
         self.is_programmatic_update = False
         self.current_device_list = []
         self.current_device_name = self.settings.get("device", "Default Output")
         self.search_track_data = []
+        self.search_history = list(self.settings.get("search_history", []))
         self.nav_history = []
         self.ignore_device_change = False
+        self._search_request_id = 0
+        self._search_debounce_source = 0
+        self._play_request_id = 0
+        self._settings_save_source = 0
+        self._playing_pulse_source = 0
+        self._playing_pulse_on = False
+        self._home_sections_cache = None
+        self.stream_prefetch_cache = {}
+        self._init_ui_refs()
         
         # Mini Mode 状态与尺寸记忆
         self.is_mini_mode = False
@@ -111,16 +426,289 @@ class TidalApp(Adw.Application):
         self.saved_height = ui_config.WINDOW_HEIGHT
 
     def do_shutdown(self):
-        print("[Main] Shutting down application...")
-        if hasattr(self, 'player'):
+        logger.info("Shutting down application...")
+        self._stop_tray_icon()
+        self.settings["search_history"] = list(self.search_history)[:10]
+        pending = getattr(self, "_settings_save_source", 0)
+        if pending:
+            GLib.source_remove(pending)
+            self._settings_save_source = 0
+        pulse = getattr(self, "_playing_pulse_source", 0)
+        if pulse:
+            GLib.source_remove(pulse)
+            self._playing_pulse_source = 0
+        self.save_settings()
+        if self.player is not None:
             self.player.cleanup()
         super().do_shutdown()
 
     def save_settings(self):
         try:
-            with open(self.settings_file, 'w') as f:
-                json.dump(self.settings, f, indent=2)
-        except: pass
+            persist_settings(self.settings_file, self.settings)
+        except Exception as e:
+            logger.warning("Failed to save settings to %s: %s", self.settings_file, e)
+
+    def schedule_save_settings(self, delay_ms=250):
+        pending = getattr(self, "_settings_save_source", 0)
+        if pending:
+            GLib.source_remove(pending)
+            self._settings_save_source = 0
+
+        def _flush():
+            self._settings_save_source = 0
+            self.save_settings()
+            return False
+
+        self._settings_save_source = GLib.timeout_add(delay_ms, _flush)
+
+    def _remember_last_nav(self, nav_id):
+        if not nav_id:
+            return
+        self.settings["last_nav"] = nav_id
+        self.settings["last_view"] = "grid_view"
+        self.schedule_save_settings()
+
+    def _remember_last_view(self, view_name):
+        if not view_name:
+            return
+        self.settings["last_view"] = view_name
+        self.schedule_save_settings()
+
+    def _save_search_history(self):
+        self.settings["search_history"] = list(self.search_history)[:10]
+        self.schedule_save_settings()
+
+    def _restore_runtime_state(self):
+        saved_volume = self.settings.get("volume", 80)
+        if self.vol_scale is not None:
+            self.vol_scale.set_value(saved_volume)
+        if self.player is not None:
+            self.player.set_volume(saved_volume / 100.0)
+
+        if self.mode_btn is not None:
+            self.mode_btn.set_icon_name(self.MODE_ICONS.get(self.play_mode, "hiresti-mode-loop-symbolic"))
+            self.mode_btn.set_tooltip_text(self.MODE_TOOLTIPS.get(self.play_mode, "Loop All (Album/Playlist)"))
+
+        saved_paned = self.settings.get("paned_position", 0)
+        if isinstance(saved_paned, int) and saved_paned > 0 and self.paned is not None:
+            self.paned.set_position(saved_paned)
+
+        self._apply_spectrum_theme_by_index(self.settings.get("spectrum_theme", 0), update_dropdown=True)
+        self._apply_viz_bars_by_count(self.settings.get("viz_bar_count", 32), update_dropdown=True)
+        self._apply_viz_profile_by_index(self.settings.get("viz_profile", 1), update_dropdown=True)
+        self._apply_viz_effect_by_index(self.settings.get("viz_effect", 3), update_dropdown=True)
+        self._apply_lyrics_font_preset_by_index(self.settings.get("lyrics_font_preset", 1), update_dropdown=True)
+        self._apply_lyrics_motion_by_index(self.settings.get("lyrics_bg_motion", 1), update_dropdown=True)
+        self._apply_lyrics_offset_ms(self.settings.get("lyrics_user_offset_ms", 0))
+
+    def _viz_sync_key(self, driver, device_id=None, device_name=None):
+        drv = str(driver or "Auto").strip() or "Auto"
+        dev = str(device_id or "").strip()
+        if not dev:
+            dev = str(device_name or self.settings.get("device") or "default").strip() or "default"
+        return f"{drv}|{dev}"
+
+    def _get_viz_offset_from_latency_profile(self):
+        profile = str(self.settings.get("latency_profile", "Standard (100ms)") or "").strip()
+        if profile in self.LATENCY_MAP:
+            buf_ms, _lat_ms = self.LATENCY_MAP[profile]
+            return int(max(0, min(500, buf_ms)))
+        return 100
+
+    def _apply_viz_sync_offset_for_device(self, driver, device_id=None, device_name=None):
+        key = self._viz_sync_key(driver, device_id=device_id, device_name=device_name)
+        self._viz_sync_device_key = key
+        profile_off = self._get_viz_offset_from_latency_profile()
+        self.player.visual_sync_offset_ms = profile_off
+        self.settings["viz_sync_offset_ms"] = profile_off
+        if hasattr(self.player, "visual_sync_auto_offset_ms"):
+            self.player.visual_sync_auto_offset_ms = 0.0
+        self._viz_sync_last_saved_ms = profile_off
+        logger.info(
+            "Viz sync offset applied: %dms (source=output-change key=%s)",
+            int(profile_off),
+            key,
+        )
+
+    def on_viz_sync_offset_update(self, learned_offset_ms):
+        # Disabled: runtime auto-learning should not persist to settings.
+        return False
+
+    def _apply_viz_bars_by_count(self, count, update_dropdown=False):
+        try:
+            c = int(count)
+        except Exception:
+            c = 64
+        if c not in self.VIZ_BAR_OPTIONS:
+            c = 64
+        if self.viz is not None:
+            self.viz.set_num_bars(c)
+        self.settings["viz_bar_count"] = c
+        if update_dropdown and self.viz_bars_dd is not None:
+            self.viz_bars_dd.set_selected(self.VIZ_BAR_OPTIONS.index(c))
+
+    def on_viz_bars_changed(self, dd, _param):
+        idx = dd.get_selected()
+        if idx < 0 or idx >= len(self.VIZ_BAR_OPTIONS):
+            return
+        self._apply_viz_bars_by_count(self.VIZ_BAR_OPTIONS[idx], update_dropdown=False)
+        self.schedule_save_settings()
+
+    def _apply_spectrum_theme_by_index(self, idx, update_dropdown=False):
+        if self.viz is None:
+            return
+        names = self.viz.get_theme_names()
+        if not names:
+            return
+        if not isinstance(idx, int) or idx < 0 or idx >= len(names):
+            idx = 0
+        self.viz.set_theme(names[idx])
+        self.settings["spectrum_theme"] = idx
+        if update_dropdown and self.viz_theme_dd is not None:
+            self.viz_theme_dd.set_selected(idx)
+
+    def _apply_viz_effect_by_index(self, idx, update_dropdown=False):
+        if self.viz is None:
+            return
+        names = self.viz.get_effect_names()
+        if not names:
+            return
+        if not isinstance(idx, int) or idx < 0 or idx >= len(names):
+            idx = 0
+        self.viz.set_effect(names[idx])
+        self.settings["viz_effect"] = idx
+        if update_dropdown and self.viz_effect_dd is not None:
+            self.viz_effect_dd.set_selected(idx)
+
+    def on_viz_effect_changed(self, dd, _param):
+        idx = dd.get_selected()
+        self._apply_viz_effect_by_index(idx, update_dropdown=False)
+        self.schedule_save_settings()
+
+    def _apply_viz_profile_by_index(self, idx, update_dropdown=False):
+        if self.viz is None:
+            return
+        names = self.viz.get_profile_names()
+        if not names:
+            return
+        if not isinstance(idx, int) or idx < 0 or idx >= len(names):
+            idx = 1 if len(names) > 1 else 0
+        self.viz.set_profile(names[idx])
+        self.settings["viz_profile"] = idx
+        if update_dropdown and self.viz_profile_dd is not None:
+            self.viz_profile_dd.set_selected(idx)
+
+    def on_viz_profile_changed(self, dd, _param):
+        idx = dd.get_selected()
+        self._apply_viz_profile_by_index(idx, update_dropdown=False)
+        self.schedule_save_settings()
+
+    def on_spectrum_theme_changed(self, dd, _param):
+        idx = dd.get_selected()
+        self._apply_spectrum_theme_by_index(idx, update_dropdown=False)
+        self.schedule_save_settings()
+
+    def _apply_lyrics_font_preset_by_index(self, idx, update_dropdown=False):
+        if self.lyrics_vbox is None:
+            return
+        if not isinstance(idx, int) or idx < 0 or idx >= len(self.LYRICS_FONT_PRESETS):
+            idx = 1
+        for cls in ("lyrics-font-live", "lyrics-font-studio", "lyrics-font-compact"):
+            self.lyrics_vbox.remove_css_class(cls)
+        class_map = {0: "lyrics-font-live", 1: "lyrics-font-studio", 2: "lyrics-font-compact"}
+        self.lyrics_vbox.add_css_class(class_map.get(idx, "lyrics-font-studio"))
+        self.settings["lyrics_font_preset"] = idx
+        if update_dropdown and self.lyrics_font_dd is not None:
+            self.lyrics_font_dd.set_selected(idx)
+
+    def on_lyrics_font_preset_changed(self, dd, _param):
+        idx = dd.get_selected()
+        self._apply_lyrics_font_preset_by_index(idx, update_dropdown=False)
+        self.schedule_save_settings()
+
+    def _apply_lyrics_motion_by_index(self, idx, update_dropdown=False):
+        if self.bg_viz is None:
+            return
+        names = self.bg_viz.get_motion_mode_names()
+        if not isinstance(idx, int) or idx < 0 or idx >= len(names):
+            idx = 1
+        self.bg_viz.set_motion_mode(names[idx])
+        self.settings["lyrics_bg_motion"] = idx
+        if update_dropdown and self.lyrics_motion_dd is not None:
+            self.lyrics_motion_dd.set_selected(idx)
+
+    def on_lyrics_motion_changed(self, dd, _param):
+        idx = dd.get_selected()
+        self._apply_lyrics_motion_by_index(idx, update_dropdown=False)
+        self.schedule_save_settings()
+
+    def _apply_lyrics_offset_ms(self, offset_ms):
+        try:
+            val = int(offset_ms)
+        except Exception:
+            val = 0
+        val = max(-2000, min(2000, val))
+        self.lyrics_user_offset_ms = val
+        self.settings["lyrics_user_offset_ms"] = val
+        if self.lyrics_offset_label is not None:
+            sign = "+" if val > 0 else ""
+            self.lyrics_offset_label.set_text(f"{sign}{val}ms")
+
+    def on_lyrics_offset_step(self, _btn, delta_ms):
+        self._apply_lyrics_offset_ms(getattr(self, "lyrics_user_offset_ms", 0) + int(delta_ms))
+        self.schedule_save_settings()
+
+    def on_viz_page_changed(self, stack, _param):
+        if self.viz_theme_dd is None:
+            return
+        page = stack.get_visible_child_name() if stack is not None else ""
+        is_spectrum = page == "spectrum"
+        is_lyrics = page == "lyrics"
+        self.viz_theme_dd.set_visible(is_spectrum)
+        if self.viz_bars_dd is not None:
+            self.viz_bars_dd.set_visible(is_spectrum)
+        if self.viz_profile_dd is not None:
+            self.viz_profile_dd.set_visible(is_spectrum)
+        if self.viz_effect_dd is not None:
+            self.viz_effect_dd.set_visible(is_spectrum)
+        if self.lyrics_font_label is not None:
+            self.lyrics_font_label.set_visible(is_lyrics)
+        if self.lyrics_font_dd is not None:
+            self.lyrics_font_dd.set_visible(is_lyrics)
+        if self.lyrics_motion_dd is not None:
+            self.lyrics_motion_dd.set_visible(is_lyrics)
+        if hasattr(self, "lyrics_ctrl_box") and self.lyrics_ctrl_box is not None:
+            self.lyrics_ctrl_box.set_visible(is_lyrics)
+        if hasattr(self, "lyrics_offset_box") and self.lyrics_offset_box is not None:
+            self.lyrics_offset_box.set_visible(is_lyrics)
+
+    def _restore_last_view(self):
+        nav_id = self.settings.get("last_nav", "home")
+        view = self.settings.get("last_view", "grid_view")
+
+        if view == "settings":
+            self.on_settings_clicked(getattr(self, "tools_btn", None))
+            return
+
+        if view == "search_view":
+            self.right_stack.set_visible_child_name("search_view")
+            self.back_btn.set_sensitive(True)
+            self.nav_list.select_row(None)
+            self.grid_title_label.set_text("Search")
+            return
+
+        target = None
+        child = self.nav_list.get_first_child()
+        while child:
+            if hasattr(child, "nav_id") and child.nav_id == nav_id:
+                target = child
+                break
+            child = child.get_next_sibling()
+        if target is None:
+            target = self.nav_list.get_first_child()
+        if target is not None:
+            self.nav_list.select_row(target)
+            self.on_nav_selected(self.nav_list, target)
 
     def do_activate(self):
         if self.window_created: 
@@ -133,11 +721,14 @@ class TidalApp(Adw.Application):
             icon_theme.add_search_path(icons_path)
 
         provider = Gtk.CssProvider()
-        provider.load_from_data(ui_config.CSS_DATA.encode())
+        logo_svg = os.path.join(os.path.dirname(__file__), "icons", "hicolor", "scalable", "apps", "hiresti.svg")
+        css_data = ui_config.CSS_DATA.replace("__HIRESTI_LOGO_SVG__", logo_svg.replace("\\", "/"))
+        provider.load_from_data(css_data.encode())
         Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
         self.win = Adw.ApplicationWindow(application=self, title="hiresTI Desktop", default_width=ui_config.WINDOW_WIDTH, default_height=ui_config.WINDOW_HEIGHT)
         self.window_created = True
+        self.win.connect("close-request", self.on_window_close_request)
         
         self.window_handle = Gtk.WindowHandle()
         self.win.set_content(self.window_handle)
@@ -148,6 +739,8 @@ class TidalApp(Adw.Application):
         self._build_header(self.main_vbox)
         self._build_body(self.main_vbox)
         self._build_player_bar(self.main_vbox)
+        self._setup_theme_watch()
+        self._restore_runtime_state()
 
         # === 恢复设置逻辑 ===
         is_bp = self.settings.get("bit_perfect", False)
@@ -156,7 +749,7 @@ class TidalApp(Adw.Application):
         # 1. 应用 Bit-Perfect 和 独占状态
         self.player.toggle_bit_perfect(is_bp, exclusive_lock=is_ex)
         if is_bp:
-            if hasattr(self, 'bp_label'): self.bp_label.set_visible(True)
+            if self.bp_label is not None: self.bp_label.set_visible(True)
             self._lock_volume_controls(True)
         
         # 2. 应用 Latency
@@ -174,10 +767,11 @@ class TidalApp(Adw.Application):
             try:
                 idx = drivers.index(saved_drv)
                 self.driver_dd.set_selected(idx)
-            except: pass
+            except Exception as e:
+                logger.warning("Failed to restore saved driver selection '%s': %s", saved_drv, e)
             
-        # 触发一次驱动加载
-        self.on_driver_changed(self.driver_dd, None)
+        # Defer heavy output initialization until after first frame is presented.
+        GLib.idle_add(lambda: (self.on_driver_changed(self.driver_dd, None), False)[1])
 
         # [修复重点] 4. 如果启动时独占模式是开启的，必须强制禁用驱动选择框
         if is_ex:
@@ -185,10 +779,7 @@ class TidalApp(Adw.Application):
             # 双重保险：确保 UI 选中的是 ALSA
             self._force_driver_selection("ALSA")
 
-        if self.backend.try_load_session(): 
-            self.on_login_success()
-        else:
-            self._toggle_login_view(False) 
+        self._restore_session_async()
 
         # --- [新增] 键盘快捷键监听 ---
         key_controller = Gtk.EventControllerKey()
@@ -197,44 +788,159 @@ class TidalApp(Adw.Application):
 
         self.win.present()
         self.win.connect("notify::default-width", self.update_layout_proportions)
+        self.paned.connect("notify::position", self.on_paned_position_changed)
+        GLib.idle_add(self._restore_paned_position_after_layout)
+        GLib.idle_add(lambda: (self._position_viz_handle(False), False)[1])
+
         GLib.timeout_add(20, self.update_ui_loop)
+        GLib.timeout_add(1000, self._refresh_output_status_loop)
+        self._init_tray_icon()
+
+    def _get_tray_icon_path(self):
+        candidates = [
+            os.path.join(os.path.dirname(__file__), "icons", "hicolor", "64x64", "apps", "hiresti.png"),
+            os.path.join(os.path.dirname(__file__), "icons", "hicolor", "128x128", "apps", "hiresti.png"),
+            os.path.join(os.path.dirname(__file__), "icons", "hicolor", "32x32", "apps", "hiresti.png"),
+        ]
+        for p in candidates:
+            if os.path.exists(p):
+                return p
+        return None
+
+    def _show_from_tray(self, _icon=None, _item=None):
+        def _show():
+            if self.win is not None:
+                self.win.present()
+            return False
+        GLib.idle_add(_show)
+
+    def _quit_from_tray(self, _icon=None, _item=None):
+        def _quit():
+            self._allow_window_close = True
+            self.quit()
+            return False
+        GLib.idle_add(_quit)
+
+    def _init_tray_icon(self):
+        if self._tray_ready:
+            return
+        if pystray is None or Image is None:
+            logger.info("pystray is unavailable. Window will still hide to background on close.")
+            return
+        icon_path = self._get_tray_icon_path()
+        if not icon_path:
+            logger.info("Tray icon image not found. Skipping tray setup.")
+            return
+        try:
+            image = Image.open(icon_path)
+            menu = pystray.Menu(
+                pystray.MenuItem("Show", self._show_from_tray, default=True),
+                pystray.MenuItem("Quit", self._quit_from_tray),
+            )
+            self._tray_icon = pystray.Icon("hiresti", image, "HiresTI", menu)
+            self._tray_icon.run_detached()
+            self._tray_ready = True
+        except Exception as e:
+            logger.warning("Failed to initialize tray icon: %s", e)
+            self._tray_icon = None
+            self._tray_ready = False
+
+    def _stop_tray_icon(self):
+        if self._tray_icon is None:
+            return
+        try:
+            self._tray_icon.stop()
+        except Exception:
+            pass
+        self._tray_icon = None
+        self._tray_ready = False
+
+    def on_window_close_request(self, _win):
+        if self._allow_window_close:
+            return False
+        try:
+            self._init_tray_icon()
+            if not self._tray_ready:
+                # No tray support (e.g. GNOME without indicator extension): close normally.
+                return False
+            if self.win is not None:
+                self.win.hide()
+            logger.info("Window hidden to background. Playback continues.")
+        except Exception as e:
+            logger.warning("Failed to hide window to background: %s", e)
+            return False
+        return True
+
+    def _restore_session_async(self):
+        def task():
+            ok = self.backend.try_load_session()
+            if ok:
+                GLib.idle_add(self.on_login_success)
+            else:
+                GLib.idle_add(self._toggle_login_view, False)
+
+        Thread(target=task, daemon=True).start()
+
+    def _setup_theme_watch(self):
+        """
+        Keep spectrum/lyrics panel background in sync with system light/dark mode.
+        """
+        self.style_manager = Adw.StyleManager.get_default()
+        self.style_manager.set_color_scheme(Adw.ColorScheme.DEFAULT)
+        self.style_manager.connect("notify::dark", lambda *_: self._apply_viz_panel_theme())
+        self._apply_viz_panel_theme()
+        self._apply_app_theme_classes()
+
+    def _apply_viz_panel_theme(self):
+        if self.viz_stack_box is None:
+            return
+        is_dark = self.style_manager.get_dark()
+        self.viz_stack_box.remove_css_class("viz-panel-dark")
+        self.viz_stack_box.remove_css_class("viz-panel-light")
+        if getattr(self, "viz_handle_box", None) is not None:
+            self.viz_handle_box.remove_css_class("viz-handle-dark")
+            self.viz_handle_box.remove_css_class("viz-handle-light")
+        if getattr(self, "queue_anchor", None) is not None:
+            self.queue_anchor.remove_css_class("queue-handle-dark")
+            self.queue_anchor.remove_css_class("queue-handle-light")
+        if getattr(self, "viz_root", None) is not None:
+            self.viz_root.remove_css_class("viz-surface-dark")
+            self.viz_root.remove_css_class("viz-surface-light")
+        if is_dark:
+            self.viz_stack_box.add_css_class("viz-panel-dark")
+            if getattr(self, "viz_handle_box", None) is not None:
+                self.viz_handle_box.add_css_class("viz-handle-dark")
+            if getattr(self, "queue_anchor", None) is not None:
+                self.queue_anchor.add_css_class("queue-handle-dark")
+            if getattr(self, "viz_root", None) is not None:
+                self.viz_root.add_css_class("viz-surface-dark")
+        else:
+            self.viz_stack_box.add_css_class("viz-panel-light")
+            if getattr(self, "viz_handle_box", None) is not None:
+                self.viz_handle_box.add_css_class("viz-handle-light")
+            if getattr(self, "queue_anchor", None) is not None:
+                self.queue_anchor.add_css_class("queue-handle-light")
+            if getattr(self, "viz_root", None) is not None:
+                self.viz_root.add_css_class("viz-surface-light")
+        if self.lyrics_vbox is not None:
+            self.lyrics_vbox.remove_css_class("lyrics-theme-dark")
+            self.lyrics_vbox.remove_css_class("lyrics-theme-light")
+            self.lyrics_vbox.add_css_class("lyrics-theme-dark" if is_dark else "lyrics-theme-light")
+        if self.bg_viz is not None:
+            self.bg_viz.set_theme_mode(is_dark)
+
+    def _apply_app_theme_classes(self):
+        root = getattr(self, "main_vbox", None)
+        if root is None:
+            return
+        root.remove_css_class("app-theme-dark")
+        root.remove_css_class("app-theme-fresh")
+        root.remove_css_class("app-theme-sunset")
+        root.remove_css_class("app-theme-mint")
+        root.remove_css_class("app-theme-retro")
 
     def _build_header(self, container):
-        self.header = Adw.HeaderBar(); container.append(self.header)
-        
-        self.back_btn = Gtk.Button(icon_name="go-previous-symbolic", sensitive=False)
-        self.back_btn.connect("clicked", self.on_back_clicked) 
-        self.header.pack_start(self.back_btn)
-        
-        self.search_entry = Gtk.Entry(placeholder_text="Search...", width_request=300, valign=Gtk.Align.CENTER)
-        self.search_entry.connect("activate", self.on_search); self.header.set_title_widget(self.search_entry)
-        
-        box_right = Gtk.Box(spacing=6)
-        
-        self.login_btn = Gtk.Button(label="Login", css_classes=["flat"])
-        self.login_btn.connect("clicked", self.on_login_clicked)
-        
-        self.user_popover = self._build_user_popover()
-        self.user_popover.set_parent(self.login_btn)
-        
-        self.info_btn = Gtk.Button(icon_name="media-view-subtitles-symbolic", css_classes=["flat"])
-        self.info_btn.set_tooltip_text("Signal Path / Tech Info")
-        self.info_btn.connect("clicked", self.on_tech_info_clicked)
-        
-        # Mini Player 按钮
-        self.mini_btn = Gtk.Button(icon_name="view-restore-symbolic", css_classes=["flat"])
-        self.mini_btn.set_tooltip_text("Mini Player Mode")
-        self.mini_btn.connect("clicked", self.toggle_mini_mode)
-
-        self.settings_btn = Gtk.Button(icon_name="emblem-system-symbolic", css_classes=["flat"])
-        self.settings_btn.set_tooltip_text("Settings")
-        self.settings_btn.connect("clicked", self.on_settings_clicked)
-        
-        box_right.append(self.login_btn)
-        box_right.append(self.info_btn)
-        box_right.append(self.mini_btn)
-        box_right.append(self.settings_btn)
-        self.header.pack_end(box_right)
+        ui_builders.build_header(self, container)
 
     def _build_volume_popover(self):
         pop = Gtk.Popover()
@@ -277,9 +983,21 @@ class TidalApp(Adw.Application):
         if (state & Gdk.ModifierType.CONTROL_MASK) and keyval == Gdk.KEY_f:
             self.search_entry.grab_focus()
             return True
-        # --- [新增] 4. G 键: 展开/收起波形和歌词 ---
-        if (keyval == Gdk.KEY_g or keyval == Gdk.KEY_G) and not self.search_entry.has_focus():
-            # 调用你现有的切换函数，并传入对应的按钮以同步图标状态
+        if keyval == Gdk.KEY_q or keyval == Gdk.KEY_Q:
+            queue_open = bool(
+                getattr(self, "queue_revealer", None) is not None
+                and self.queue_revealer.get_reveal_child()
+            )
+            # Allow Q to always close an opened queue; only block opening while typing in search.
+            if queue_open or not self.search_entry.has_focus():
+                self.toggle_queue_drawer()
+                return True
+        if keyval == Gdk.KEY_Escape and getattr(self, "queue_revealer", None) is not None:
+            if self.queue_revealer.get_reveal_child():
+                self.close_queue_drawer()
+                return True
+        # Tab: 展开/收起波形和歌词
+        if keyval == Gdk.KEY_Tab and not self.search_entry.has_focus():
             self.toggle_visualizer(self.viz_btn)
             return True
 
@@ -288,30 +1006,26 @@ class TidalApp(Adw.Application):
     def on_volume_changed_ui(self, scale):
         val = scale.get_value()
         self.player.set_volume(val / 100.0)
+        self.settings["volume"] = int(round(val))
+        self.schedule_save_settings()
 
         # 根据音量大小切换图标
-        icon = "audio-volume-high-symbolic"
-        if val == 0: icon = "audio-volume-muted-symbolic"
-        elif val < 30: icon = "audio-volume-low-symbolic"
-        elif val < 70: icon = "audio-volume-medium-symbolic"
+        icon = "hiresti-volume-high-symbolic"
+        if val == 0: icon = "hiresti-volume-muted-symbolic"
+        elif val < 30: icon = "hiresti-volume-low-symbolic"
+        elif val < 70: icon = "hiresti-volume-medium-symbolic"
 
-        if hasattr(self, 'vol_btn'):
+        if self.vol_btn is not None:
             self.vol_btn.set_icon_name(icon)
 
 
     def toggle_mini_mode(self, btn):
-        if hasattr(self, 'viz_revealer'):
-            self.viz_revealer.set_reveal_child(False)
-            self.viz_revealer.set_vexpand(False)
-            # 同时停止可能的空间占用
-            if hasattr(self, 'viz'): self.viz.set_vexpand(False)
-
-        # 2. [图标修复] 强制把按钮图标改为“向上”，并移除激活状态
-        if hasattr(self, 'viz_btn'):
-            self.viz_btn.set_icon_name("pan-up-symbolic")
-            self.viz_btn.remove_css_class("active")
-
-
+        # 0. 隐藏抽屉
+        if self.viz_revealer is not None:
+            self._set_visualizer_expanded(False)
+            self.settings["viz_expanded"] = False
+            self.schedule_save_settings()
+        self.close_queue_drawer()
 
         self.is_mini_mode = not self.is_mini_mode
         
@@ -320,58 +1034,40 @@ class TidalApp(Adw.Application):
             self.saved_width = self.win.get_width()
             self.saved_height = self.win.get_height()
             
-            # 1. [核心] 添加 CSS 类 "mini-state"，对应 ui_config.py
-            self.bottom_bar.add_css_class("mini-state")
-            
-            # 2. 移除主界面
-            self.main_vbox.remove(self.paned)
+            # [关键修复] 不要 remove，而是直接隐藏，防止布局崩溃导致信息消失
             self.header.set_visible(False)
+            self.paned.set_visible(False) 
+            
+            self.bottom_bar.add_css_class("mini-state")
             self.mini_controls.set_visible(True)
             
-            # 3. [核心] 隐藏不需要的组件 (实现极简)
-            if hasattr(self, 'timeline_box'): self.timeline_box.set_visible(False)
-            if hasattr(self, 'vol_box'): self.vol_box.set_visible(False)
-            if hasattr(self, 'tech_box'): self.tech_box.set_visible(False)
+            # 隐藏进度条和音量，仅保留歌曲信息和控制键
+            if self.timeline_box is not None: self.timeline_box.set_visible(False)
+            if self.vol_box is not None: self.vol_box.set_visible(False)
+            if self.tech_box is not None: self.tech_box.set_visible(False)
 
-            # 4. 设置无边框
             self.win.set_decorated(False)
-
             self.win.set_resizable(False)
             
-            # 5. 压缩高度 (因为没有进度条了，可以非常扁)
-            self.win.set_size_request(450, 85) 
-            self.win.set_default_size(450, 85)
-            self.win.present()
-            
-            if hasattr(self, 'mini_btn'): self.mini_btn.set_icon_name("view-fullscreen-symbolic")
+            # [调优] 进一步收窄迷你模式宽度
+            self.win.set_size_request(390, 85)
+            self.win.set_default_size(390, 85)
             
         else:
             # === 恢复完整模式 ===
-            self.win.set_resizable(True)
-            
-            # 1. [核心] 移除 CSS 类，恢复 margin
-            self.bottom_bar.remove_css_class("mini-state")
-            
-            # 2. 恢复主界面
-            self.main_vbox.insert_child_after(self.paned, self.header)
             self.header.set_visible(True)
             self.paned.set_visible(True)
             self.mini_controls.set_visible(False)
             
-            # 3. [核心] 恢复组件显示
-            if hasattr(self, 'timeline_box'): 
-                self.timeline_box.set_visible(True)
-                self.timeline_box.set_size_request(450, -1)
-                
-            if hasattr(self, 'vol_box'): self.vol_box.set_visible(True)
-            if hasattr(self, 'tech_box'): self.tech_box.set_visible(True)
+            if self.timeline_box is not None: self.timeline_box.set_visible(True)
+            if self.vol_box is not None: self.vol_box.set_visible(True)
+            if self.tech_box is not None: self.tech_box.set_visible(True)
             
-            # 4. 恢复窗口
+            self.bottom_bar.remove_css_class("mini-state")
             self.win.set_decorated(True)
+            self.win.set_resizable(True)
             self.win.set_size_request(ui_config.WINDOW_WIDTH, ui_config.WINDOW_HEIGHT)
             self.win.set_default_size(self.saved_width, self.saved_height)
-            
-            if hasattr(self, 'mini_btn'): self.mini_btn.set_icon_name("view-restore-symbolic")
 
     def _build_user_popover(self):
         pop = Gtk.Popover()
@@ -387,281 +1083,19 @@ class TidalApp(Adw.Application):
         win.present()
 
     def _build_body(self, container):
-        # 1. 创建 Overlay
-        self.body_overlay = Gtk.Overlay()
-        self.body_overlay.set_vexpand(True)
-        container.append(self.body_overlay)
-
-        # 2. 底层内容
-        self.paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
-        self.body_overlay.set_child(self.paned)
-
-        # 3. 浮层抽屉
-        self.viz_revealer = Gtk.Revealer(transition_type=Gtk.RevealerTransitionType.SLIDE_UP)
-        self.viz_revealer.set_reveal_child(False)
-        self.viz_revealer.set_valign(Gtk.Align.END)
-        self.viz_revealer.set_vexpand(False)
-        self.body_overlay.add_overlay(self.viz_revealer)
-
-        # 4. 抽屉内容
-        self.viz_root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        
-        # 切换按钮
-        self.viz_switcher = Gtk.StackSwitcher()
-        self.viz_switcher.set_halign(Gtk.Align.START)
-        self.viz_switcher.set_margin_start(32)
-        self.viz_switcher.add_css_class("mini-switcher")
-        self.viz_switcher.remove_css_class("linked")
-        self.viz_switcher.set_hexpand(False)
-
-        # 黑框容器
-        self.viz_stack_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        self.viz_stack_box.add_css_class("viz-panel")
-        
-        # Stack
-        self.viz_stack = Gtk.Stack()
-        self.viz_stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
-        self.viz_stack.set_size_request(-1, 250) # 固定高度
-        self.viz_switcher.set_stack(self.viz_stack)
-
-        # 页面一：频谱
-        from visualizer import SpectrumVisualizer
-        self.viz = SpectrumVisualizer()
-        self.viz.num_bars = 40
-        self.viz.set_valign(Gtk.Align.FILL)
-        self.viz_stack.add_titled(self.viz, "spectrum", "Spectrum")
-
-        # 页面二：歌词 (滚动版)
-        # --- 页面二：歌词 (律动版) ---
-        self.lyrics_tab_root = Gtk.Overlay() # 使用 Overlay 承载背景和文字
-
-        from background_viz import BackgroundVisualizer
-        self.bg_viz = BackgroundVisualizer()
-        self.lyrics_tab_root.set_child(self.bg_viz) # 背景在最底层
-
-        self.lyrics_scroller = Gtk.ScrolledWindow(vexpand=True, hexpand=True)
-        self.lyrics_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        self.lyrics_scroller.add_css_class("lyrics-scroller")
-
-        self.lyrics_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        self.lyrics_vbox.set_halign(Gtk.Align.CENTER)
-        self.lyrics_vbox.set_margin_top(30) # 留白确保居中
-        self.lyrics_vbox.set_margin_bottom(30)
-
-        self.lyrics_scroller.set_child(self.lyrics_vbox)
-        self.lyrics_tab_root.add_overlay(self.lyrics_scroller) # 歌词文字叠加在背景上
-
-        self.viz_stack.add_titled(self.lyrics_tab_root, "lyrics", "Lyrics")
-
-        # 组装
-        self.viz_stack_box.append(self.viz_stack)
-        self.viz_root.append(self.viz_switcher)
-        self.viz_root.append(self.viz_stack_box)
-        self.viz_revealer.set_child(self.viz_root)
-
-        # --- 侧边栏 (保持原样) ---
-        self.sidebar_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        self.nav_list = Gtk.ListBox(css_classes=["navigation-sidebar"], margin_top=10)
-        self.nav_list.connect("row-activated", self.on_nav_selected)
-        
-        nav_items = [
-            ("home", "go-home-symbolic", "Home"),
-            ("collection", "user-bookmarks-symbolic", "My Collection"),
-            ("artists", "avatar-default-symbolic", "Artists"),
-            ("history", "document-open-recent-symbolic", "History")
-        ]
-        
-        for nid, icon, txt in nav_items:
-            r = Gtk.ListBoxRow(); r.nav_id = nid; b = Gtk.Box(spacing=12, margin_start=12, margin_top=8, margin_bottom=8)
-            b.append(Gtk.Image.new_from_icon_name(icon)); b.append(Gtk.Label(label=txt)); r.set_child(b); self.nav_list.append(r)
-        
-        self.sidebar_box.append(self.nav_list)
-        self.paned.set_start_child(self.sidebar_box)
-        self.right_stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.SLIDE_LEFT_RIGHT); self.paned.set_end_child(self.right_stack)
-        
-        self._build_grid_view()
-        self._build_tracks_view()
-        self._build_settings_page()
-        self._build_search_view()
-        self.paned.set_position(int(ui_config.WINDOW_WIDTH * ui_config.SIDEBAR_RATIO))
+        ui_builders.build_body(self, container)
 
     def _build_grid_view(self):
-        grid_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        t_box = Gtk.Box(spacing=12, margin_start=32, margin_end=32, margin_top=32, margin_bottom=12)
-        self.grid_title_label = Gtk.Label(label="Home", xalign=0, css_classes=["section-title"])
-        self.artist_fav_btn = Gtk.Button(css_classes=["heart-btn"], icon_name="emblem-favorite-symbolic", visible=False)
-        self.artist_fav_btn.connect("clicked", self.on_artist_fav_clicked)
-        t_box.append(self.grid_title_label); t_box.append(self.artist_fav_btn); grid_vbox.append(t_box)
-
-        self.login_prompt_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=20, valign=Gtk.Align.CENTER, vexpand=True)
-        self.login_prompt_box.set_visible(False)
-        prompt_icon = Gtk.Image(icon_name="avatar-default-symbolic", pixel_size=128, css_classes=["dim-label"])
-        prompt_label = Gtk.Label(label="Please login to access your Tidal collection", css_classes=["heading"])
-        prompt_btn = Gtk.Button(label="Login to Tidal", css_classes=["pill", "suggested-action"], halign=Gtk.Align.CENTER)
-        prompt_btn.connect("clicked", self.on_login_clicked)
-        self.login_prompt_box.append(prompt_icon); self.login_prompt_box.append(prompt_label); self.login_prompt_box.append(prompt_btn)
-        grid_vbox.append(self.login_prompt_box)
-
-        self.alb_scroll = Gtk.ScrolledWindow(vexpand=True)
-        self.collection_content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=32, margin_start=32, margin_end=32, margin_bottom=32)
-        self.alb_scroll.set_child(self.collection_content_box)
-        grid_vbox.append(self.alb_scroll)
-        self.right_stack.add_named(grid_vbox, "grid_view")
+        ui_views_builders.build_grid_view(self)
 
     def _toggle_login_view(self, logged_in):
-        self.login_prompt_box.set_visible(not logged_in)
-        self.alb_scroll.set_visible(logged_in)
-        if not logged_in:
-            self.login_btn.set_label("Login")
-            self.grid_title_label.set_text("Welcome")
-        else:
-            display_name = "User"
-            user = self.backend.user
-            if user:
-                meta = getattr(user, 'profile_metadata', None)
-                if meta:
-                    if isinstance(meta, dict): display_name = meta.get('name') or meta.get('firstName') or display_name
-                    else: display_name = getattr(meta, 'name', None) or getattr(meta, 'first_name', None) or display_name
-                if display_name == "User" or display_name is None:
-                    candidates = [getattr(user, 'first_name', None), getattr(user, 'name', None), getattr(user, 'firstname', None)]
-                    for c in candidates:
-                        if c and isinstance(c, str) and c.strip(): display_name = c; break
-                if (not display_name or display_name == "User") and hasattr(user, 'username') and user.username:
-                    try: display_name = user.username.split('@')[0].capitalize()
-                    except: display_name = user.username
-            self.login_btn.set_label(f"Hi, {display_name}")
-            self.grid_title_label.set_text("Home")
+        ui_views_builders.toggle_login_view(self, logged_in)
 
     def _build_tracks_view(self):
-        trk_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        trk_scroll = Gtk.ScrolledWindow(vexpand=True)
-        trk_content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-
-        self.album_header_box = Gtk.Box(spacing=24, css_classes=["album-header-box"])
-        self.header_art = Gtk.Picture()
-        self.header_art.set_size_request(160, 160)
-        self.header_art.set_can_shrink(True)
-        try: self.header_art.set_content_fit(Gtk.ContentFit.COVER)
-        except: pass
-        self.header_art.add_css_class("header-art")
-
-        info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER, hexpand=True)
-        self.header_title = Gtk.Label(xalign=0, wrap=True, css_classes=["album-title-large"])
-
-        self.header_artist = Gtk.Label(xalign=0, css_classes=["album-artist-medium"])
-        tap = Gtk.GestureClick(); tap.connect("pressed", self.on_header_artist_clicked); self.header_artist.add_controller(tap)
-        motion = Gtk.EventControllerMotion()
-        motion.connect("enter", lambda c,x,y: utils.set_pointer_cursor(self.header_artist, True))
-        motion.connect("leave", lambda c: utils.set_pointer_cursor(self.header_artist, False))
-        self.header_artist.add_controller(motion)
-
-        self.header_meta = Gtk.Label(xalign=0, css_classes=["album-meta"])
-
-        info.append(self.header_title); info.append(self.header_artist); info.append(self.header_meta)
-
-        self.fav_btn = Gtk.Button(css_classes=["heart-btn"], icon_name="non-starred-symbolic", valign=Gtk.Align.CENTER)
-        self.fav_btn.connect("clicked", self.on_fav_clicked)
-
-        self.album_header_box.append(self.header_art); self.album_header_box.append(info); self.album_header_box.append(self.fav_btn)
-        trk_content.append(self.album_header_box)
-
-        self.track_list = Gtk.ListBox(css_classes=["boxed-list"], margin_start=32, margin_end=32, margin_bottom=32)
-        # 信号连接
-        self.track_list.connect("row-activated", self.on_track_selected)
-        trk_content.append(self.track_list)
-
-        trk_scroll.set_child(trk_content); trk_vbox.append(trk_scroll)
-        self.right_stack.add_named(trk_vbox, "tracks")
+        ui_views_builders.build_tracks_view(self)
 
     def _build_settings_page(self):
-        settings_scroll = Gtk.ScrolledWindow(vexpand=True)
-        settings_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["settings-container"], spacing=20)
-        settings_scroll.set_child(settings_vbox)
-        settings_vbox.append(Gtk.Label(label="Settings", xalign=0, css_classes=["album-title-large"], margin_bottom=10))
-
-        # --- Audio Quality ---
-        group_q = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["settings-group"])
-        row_q = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
-        row_q.append(Gtk.Label(label="Audio Quality", hexpand=True, xalign=0))
-        self.quality_dd = Gtk.DropDown(model=Gtk.StringList.new(["Max (Up to 24-bit, 192 kHz)", "High (16-bit, 44.1 kHz)", "Low (320 kbps)"]))
-        self.quality_dd.connect("notify::selected-item", self.on_quality_changed)
-        row_q.append(self.quality_dd); group_q.append(row_q); settings_vbox.append(group_q)
-
-        # --- Audio Output ---
-        settings_vbox.append(Gtk.Label(label="Audio Output", xalign=0, css_classes=["section-title"], margin_top=10))
-        group_out = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["settings-group"])
-
-        # 1. Bit-Perfect
-        row_bp = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
-        bp_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
-        bp_info.append(Gtk.Label(label="Bit-Perfect Mode", xalign=0, css_classes=["settings-label"]))
-        bp_info.append(Gtk.Label(label="Bypass software mixer & EQ", xalign=0, css_classes=["dim-label"]))
-        row_bp.append(bp_info); row_bp.append(Gtk.Box(hexpand=True))
-        self.bp_switch = Gtk.Switch(valign=Gtk.Align.CENTER)
-        self.bp_switch.set_active(self.settings.get("bit_perfect", False))
-        self.bp_switch.connect("state-set", self.on_bit_perfect_toggled)
-        row_bp.append(self.bp_switch); group_out.append(row_bp)
-
-        # 2. Exclusive Mode
-        row_ex = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
-        ex_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
-        title_box = Gtk.Box(spacing=6, orientation=Gtk.Orientation.HORIZONTAL)
-        title_box.append(Gtk.Label(label="Force Hardware Exclusive", xalign=0, css_classes=["settings-label"]))
-        help_btn = Gtk.Button(icon_name="dialog-question-symbolic", css_classes=["flat", "circular"])
-        help_btn.set_tooltip_text("Click for details") 
-        help_pop = Gtk.Popover(); help_pop.set_parent(help_btn); help_pop.set_autohide(True)
-        pop_content = Gtk.Label(wrap=True, max_width_chars=40, xalign=0)
-        pop_content.set_markup("<b>Exclusive Mode Control</b>\n\n<b>⚠️ Recommendation:</b>\nOnly enable this for <b>External USB DACs</b>.\n\n• <b>Benefits:</b> Ensures true Bit-Perfect playback.\n• <b>Limitations:</b> System volume DISABLED.")
-        pop_box = Gtk.Box(margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
-        pop_box.append(pop_content); help_pop.set_child(pop_box)
-        help_btn.connect("clicked", lambda x: help_pop.popup())
-        title_box.append(help_btn); ex_info.append(title_box)
-        ex_info.append(Gtk.Label(label="Bypass and release system audio control for this device", xalign=0, css_classes=["dim-label"]))
-        row_ex.append(ex_info); row_ex.append(Gtk.Box(hexpand=True))
-        self.ex_switch = Gtk.Switch(valign=Gtk.Align.CENTER)
-        self.ex_switch.set_sensitive(self.settings.get("bit_perfect", False))
-        self.ex_switch.set_active(self.settings.get("exclusive_lock", False))
-        self.ex_switch.connect("state-set", self.on_exclusive_toggled)
-        row_ex.append(self.ex_switch); group_out.append(row_ex)
-
-        # 3. Latency
-        row_lat = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
-        lat_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
-        lat_info.append(Gtk.Label(label="Output Latency", xalign=0, css_classes=["settings-label"]))
-        lat_info.append(Gtk.Label(label="Target buffer size (Effective in Exclusive Mode)", xalign=0, css_classes=["dim-label"]))
-        row_lat.append(lat_info); row_lat.append(Gtk.Box(hexpand=True))
-        self.latency_dd = Gtk.DropDown(model=Gtk.StringList.new(self.LATENCY_OPTIONS))
-        self.latency_dd.set_valign(Gtk.Align.CENTER)
-        
-        # [修复重点] 这里的可用性必须依赖于 exclusive_lock 的状态
-        self.latency_dd.set_sensitive(self.settings.get("exclusive_lock", False))
-        
-        saved_profile = self.settings.get("latency_profile", "Standard (100ms)")
-        if saved_profile not in self.LATENCY_OPTIONS: saved_profile = "Standard (100ms)"
-        try:
-            target_idx = self.LATENCY_OPTIONS.index(saved_profile)
-            self.latency_dd.set_selected(target_idx)
-        except ValueError:
-            self.latency_dd.set_selected(1)
-        self.latency_dd.connect("notify::selected-item", self.on_latency_changed)
-        row_lat.append(self.latency_dd); group_out.append(row_lat)
-
-        # 4. Driver
-        row_drv = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
-        row_drv.append(Gtk.Label(label="Audio Driver", hexpand=True, xalign=0))
-        drivers = self.player.get_drivers()
-        self.driver_dd = Gtk.DropDown(model=Gtk.StringList.new(drivers))
-        self.driver_dd.connect("notify::selected-item", self.on_driver_changed)
-        row_drv.append(self.driver_dd); group_out.append(row_drv)
-
-        # 5. Device
-        row_dev = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
-        row_dev.append(Gtk.Label(label="Output Device", hexpand=True, xalign=0))
-        self.device_dd = Gtk.DropDown(model=Gtk.StringList.new(["Default"])); self.device_dd.set_sensitive(False)
-        self.device_dd.connect("notify::selected-item", self.on_device_changed)
-        row_dev.append(self.device_dd); group_out.append(row_dev)
-
-        settings_vbox.append(group_out); self.right_stack.add_named(settings_scroll, "settings")
+        ui_views_builders.build_settings_page(self)
 
     def _build_eq_popover(self):
         pop = Gtk.Popover()
@@ -679,120 +1113,19 @@ class TidalApp(Adw.Application):
 
 
     def _build_player_bar(self, container):
-        self.player_overlay = Gtk.Overlay()
-        container.append(self.player_overlay)
-
-        self.bottom_bar = Gtk.Box(spacing=24, css_classes=["card-bar"])
-        self.player_overlay.set_child(self.bottom_bar)
-        
-        # 迷你模式控制按钮（右上角）
-        self.mini_controls = Gtk.Box(spacing=4, valign=Gtk.Align.START, halign=Gtk.Align.END)
-        self.mini_controls.set_margin_top(6)
-        self.mini_controls.set_margin_end(6)
-        self.mini_controls.set_visible(False)
-        
-        m_restore = Gtk.Button(icon_name="view-fullscreen-symbolic", css_classes=["flat", "circular"])
-        m_restore.set_tooltip_text("Restore to Default View")
-        m_restore.connect("clicked", self.toggle_mini_mode)
-        
-        m_close = Gtk.Button(icon_name="window-close-symbolic", css_classes=["flat", "circular"])
-        m_close.connect("clicked", lambda b: self.win.close())
-        
-        self.mini_controls.append(m_restore)
-        self.mini_controls.append(m_close)
-        self.player_overlay.add_overlay(self.mini_controls)
-
-        # --- 1. 左侧：歌曲信息 ---
-        self.info_area = Gtk.Box(spacing=14, valign=Gtk.Align.CENTER)
-        self.art_img = Gtk.Image()
-        self.art_img.set_size_request(72, 72)
-        self.art_img.add_css_class("playback-art")
-
-        gest = Gtk.GestureClick(); gest.connect("pressed", self.on_player_art_clicked); self.art_img.add_controller(gest)
-        t = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER, spacing=0)
-        self.lbl_title = Gtk.Label(xalign=0, css_classes=["player-title"], ellipsize=3)
-        self.lbl_artist = Gtk.Label(xalign=0, css_classes=["player-artist"], ellipsize=3)
-        self.lbl_album = Gtk.Label(xalign=0, css_classes=["player-album"], ellipsize=3)
-        t.append(self.lbl_title); t.append(self.lbl_artist); t.append(self.lbl_album)
-        self.info_area.append(self.art_img); self.info_area.append(t); self.bottom_bar.append(self.info_area)
-        
-        # --- 2. 中间：播放控制 ---
-        c_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, hexpand=True, valign=Gtk.Align.CENTER)
-        
-        ctrls = Gtk.Box(spacing=12, halign=Gtk.Align.CENTER)
-        ctrls.add_css_class("player-ctrls-box") 
-        # ctrls.set_margin_top(25) # 已由 CSS 控制
-        # [新增] 播放模式按钮
-        self.mode_btn = Gtk.Button(icon_name=self.MODE_ICONS[self.MODE_LOOP], css_classes=["flat", "circular"])
-        self.mode_btn.set_tooltip_text(self.MODE_TOOLTIPS[self.MODE_LOOP])
-        self.mode_btn.connect("clicked", self.on_toggle_mode)
-        ctrls.append(self.mode_btn)
-        
-        btn_prev = Gtk.Button(icon_name="media-skip-backward-symbolic", css_classes=["flat"])
-        btn_prev.connect("clicked", self.on_prev_track); ctrls.append(btn_prev)
-        self.play_btn = Gtk.Button(icon_name="media-playback-start-symbolic", css_classes=["pill", "suggested-action"])
-        self.play_btn.connect("clicked", self.on_play_pause); ctrls.append(self.play_btn)
-        btn_next = Gtk.Button(icon_name="media-skip-forward-symbolic", css_classes=["flat"])
-        btn_next.connect("clicked", lambda b: self.on_next_track()); ctrls.append(btn_next)
-        c_box.append(ctrls)
-        
-        self.timeline_box = Gtk.Box(spacing=12, orientation=Gtk.Orientation.HORIZONTAL)
-        attr_list = Pango.AttrList.from_string("font-features 'tnum=1'")
-        self.lbl_current_time = Gtk.Label(label="0:00", css_classes=["dim-label"]); self.lbl_current_time.set_attributes(attr_list)
-        self.lbl_total_time = Gtk.Label(label="0:00", css_classes=["dim-label"]); self.lbl_total_time.set_attributes(attr_list)
-        self.scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1); self.scale.set_hexpand(True); self.scale.connect("value-changed", self.on_seek)
-        self.timeline_box.append(self.lbl_current_time); self.timeline_box.append(self.scale); self.timeline_box.append(self.lbl_total_time)
-        self.timeline_box.set_size_request(450, -1); self.timeline_box.set_halign(Gtk.Align.CENTER); c_box.append(self.timeline_box)
-        
-        self.tech_box = Gtk.Box(spacing=8, halign=Gtk.Align.CENTER, margin_top=4)
-        self.bp_label = Gtk.Label(label="BIT PERFECT", css_classes=["bp-text-glow"], visible=False); self.tech_box.append(self.bp_label)
-        self.lbl_tech = Gtk.Label(label="", css_classes=["tech-label"], ellipsize=3, visible=False); self.tech_box.append(self.lbl_tech); c_box.append(self.tech_box)
-        
-        self.bottom_bar.append(c_box)
-        
-        # --- 3. 右侧：EQ 和 音量 (修改部分) ---
-        # 减小间距，让图标靠得更近
-        self.vol_box = Gtk.Box(spacing=4, valign=Gtk.Align.CENTER) 
-        
-        self.eq_btn = Gtk.Button(icon_name="eq-icon-symbolic", css_classes=["flat", "eq-btn"])# EQ 按钮
-        self.eq_pop = self._build_eq_popover()
-        self.eq_pop.set_parent(self.eq_btn)
-        self.eq_btn.connect("clicked", lambda b: self.eq_pop.popup())
-        self.vol_box.append(self.eq_btn)
-        
-        # [修改] 音量按钮 (替代旧的 Slider)
-        self.vol_btn = Gtk.Button(icon_name="audio-volume-high-symbolic", css_classes=["flat"])
-        self.vol_pop = self._build_volume_popover()
-        self.vol_pop.set_parent(self.vol_btn)
-        self.vol_btn.connect("clicked", lambda b: self.vol_pop.popup())
-        self.vol_box.append(self.vol_btn)
-        
-        self.bottom_bar.append(self.vol_box)
-
-        # 在 _build_player_bar 结尾处
-        # 确保你有一个按钮来调用 toggle_visualizer
-        #self.viz_toggle_btn = Gtk.Button(icon_name="pan-up-symbolic", css_classes=["flat"])
-        #self.viz_toggle_btn.connect("clicked", self.toggle_visualizer)
-
-        self.viz_btn = Gtk.Button(icon_name="pan-up-symbolic", css_classes=["player-btn", "flat"])
-        self.viz_btn.connect("clicked", self.toggle_visualizer)
-        self.vol_box.prepend(self.viz_btn)
+        ui_builders.build_player_bar(self, container)
 
 
-    def on_spectrum_data(self, magnitudes):
-        if not magnitudes: return
-        
-        if self.viz_revealer.get_reveal_child():
-            current_page = self.viz_stack.get_visible_child_name()
-            
-            # [关键] 无论在哪一页，背景律动都可以保持运行，增加沉浸感
-            # 或者仅在歌词页运行以节省性能：
-            if current_page == "lyrics" and hasattr(self, 'bg_viz'):
-                self.bg_viz.update_energy(magnitudes)
-            
-            # 频谱图仅在对应页面更新
-            if current_page == "spectrum" and hasattr(self, 'viz'):
-                self.viz.update_data(magnitudes)
+    def on_spectrum_data(self, magnitudes, position_s=None):
+        if not magnitudes:
+            return
+        if not self.viz_revealer.get_reveal_child():
+            return
+        current_page = self.viz_stack.get_visible_child_name()
+        if current_page == "lyrics" and self.bg_viz is not None:
+            self.bg_viz.update_energy(magnitudes)
+        if current_page == "spectrum" and self.viz is not None:
+            self.viz.update_data(magnitudes)
 
     def _lock_volume_controls(self, locked):
         """
@@ -801,7 +1134,7 @@ class TidalApp(Adw.Application):
         
         # --- 1. 处理音量控制 (Volume) ---
         # 确保组件已创建 (防止在 UI 初始化前调用报错)
-        if hasattr(self, 'vol_scale') and hasattr(self, 'vol_btn'):
+        if self.vol_scale is not None and self.vol_btn is not None:
             if locked:
                 # [锁定状态]
                 # 1. 物理/UI 音量强制设为 100% (Bit-Perfect 要求)
@@ -814,10 +1147,10 @@ class TidalApp(Adw.Application):
                 self.vol_btn.set_tooltip_text("Volume locked in Bit-Perfect/Exclusive mode")
                 
                 # 4. 强制显示最大音量图标 (视觉反馈)
-                self.vol_btn.set_icon_name("audio-volume-high-symbolic")
+                self.vol_btn.set_icon_name("hiresti-volume-high-symbolic")
                 
                 # 5. 如果弹窗正开着，强制关掉
-                if hasattr(self, 'vol_pop'):
+                if self.vol_pop is not None:
                     self.vol_pop.popdown()
             else:
                 # [解锁状态]
@@ -826,14 +1159,14 @@ class TidalApp(Adw.Application):
                 self.vol_btn.set_tooltip_text("Adjust Volume")
 
         # --- 2. 处理均衡器 (EQ) ---
-        if hasattr(self, 'eq_btn'):
+        if self.eq_btn is not None:
             # Bit-Perfect 开启时，软件 EQ 被绕过，必须禁用入口
             self.eq_btn.set_sensitive(not locked)
             
             if locked:
                 self.eq_btn.set_tooltip_text("EQ disabled in Bit-Perfect mode (Bypassed)")
                 # 如果 EQ 面板正开着，强制关掉
-                if hasattr(self, 'eq_pop'):
+                if self.eq_pop is not None:
                     self.eq_pop.popdown()
             else:
                 self.eq_btn.set_tooltip_text("Equalizer")
@@ -851,20 +1184,19 @@ class TidalApp(Adw.Application):
     def on_logout_clicked(self, btn):
         self.user_popover.popdown()
         self.backend.logout()
+        self._apply_account_scope(force=True)
+        self._home_sections_cache = None
+        self.stream_prefetch_cache.clear()
         self._toggle_login_view(False)
         while c := self.collection_content_box.get_first_child(): self.collection_content_box.remove(c)
-        print("[UI] User logged out.")
+        logger.info("User logged out.")
 
     def on_login_success(self):
-        print("[UI] Login successful!")
+        logger.info("Login successful.")
+        self._apply_account_scope(force=True)
+        self._home_sections_cache = None
         self._toggle_login_view(True)
-        child = self.nav_list.get_first_child()
-        while child:
-            if hasattr(child, 'nav_id') and child.nav_id == 'home':
-                self.nav_list.select_row(child)
-                self.on_nav_selected(self.nav_list, child)
-                break
-            child = child.get_next_sibling()
+        self._restore_last_view()
 
     def on_bit_perfect_toggled(self, switch, state):
         self.settings["bit_perfect"] = state; self.save_settings()
@@ -875,7 +1207,7 @@ class TidalApp(Adw.Application):
         self.player.toggle_bit_perfect(state, exclusive_lock=is_ex)
         self.eq_btn.set_sensitive(not state)
         if state: self.eq_pop.popdown()
-        if hasattr(self, 'bp_label'): self.bp_label.set_visible(state)
+        if self.bp_label is not None: self.bp_label.set_visible(state)
         if is_ex:
             self._force_driver_selection("ALSA"); self.driver_dd.set_sensitive(False); self.on_driver_changed(self.driver_dd, None)
         else:
@@ -907,11 +1239,11 @@ class TidalApp(Adw.Application):
         self.play_mode = (self.play_mode + 1) % 4
         
         # 获取图标和提示文字
-        icon = self.MODE_ICONS.get(self.play_mode, "media-playlist-repeat-symbolic")
+        icon = self.MODE_ICONS.get(self.play_mode, "hiresti-mode-loop-symbolic")
         tooltip = self.MODE_TOOLTIPS.get(self.play_mode, "Loop")
         
         # 更新 UI
-        if hasattr(self, 'mode_btn'):
+        if self.mode_btn is not None:
             self.mode_btn.set_icon_name(icon)
             self.mode_btn.set_tooltip_text(tooltip)
         
@@ -924,15 +1256,18 @@ class TidalApp(Adw.Application):
             # 切回顺序模式，清空随机池以节省内存
             self.shuffle_indices = []
             # print(f"[Mode] Switched to {tooltip}")
+        self.settings["play_mode"] = self.play_mode
+        self.schedule_save_settings()
 
     def _generate_shuffle_list(self):
         """生成随机播放索引列表"""
         # 1. 安全检查：列表是否存在
-        if not hasattr(self, 'current_track_list') or not self.current_track_list:
+        queue = self._get_active_queue()
+        if not queue:
             self.shuffle_indices = []
             return 
         
-        total = len(self.current_track_list)
+        total = len(queue)
         if total == 0:
             self.shuffle_indices = []
             return
@@ -956,70 +1291,14 @@ class TidalApp(Adw.Application):
         self.shuffle_indices = indices
 
     def get_next_index(self, direction=1):
-        """
-        根据当前模式计算下一首/上一首的索引
-        direction: 1 (Next), -1 (Prev)
-        """
-        # [重点修复] 变量名改为 current_track_list
-        if not hasattr(self, 'current_track_list') or not self.current_track_list:
-            return -1
-
-        total = len(self.current_track_list)
-        if total == 0: return -1
-
-        current = self.current_track_list
-
-        # --- 模式 A: 单曲循环 ---
-        if self.play_mode == self.MODE_ONE:
-            # 单曲循环逻辑上不改变索引，但在 on_next_track 里处理切歌
-            pass
-
-        # --- 模式 B: 随机 / 算法 ---
-        if self.play_mode in [self.MODE_SHUFFLE, self.MODE_SMART]:
-            if direction == 1:
-                # 确保随机列表已生成
-                if not self.shuffle_indices:
-                    self._generate_shuffle_list()
-
-                # 如果列表为空（例如只有一首歌），返回当前
-                if not self.shuffle_indices:
-                    return current
-
-                # 简单随机策略
-                import random
-                next_idx = random.randint(0, total - 1)
-                # 尽量不重复当前歌曲
-                if total > 1:
-                    while next_idx == current:
-                        next_idx = random.randint(0, total - 1)
-                return next_idx
-
-            else:
-                # 随机模式下的上一首，为了体验一致，通常切回列表顺序的上一个
-                return (current - 1) % total
-
-        # --- 模式 C: 列表循环 (默认) ---
-        return (current + direction) % total
+        return playback_actions.get_next_index(self, direction)
 
     def on_latency_changed(self, dd, p):
-        selected = dd.get_selected_item()
-        if not selected: return
-        profile_name = selected.get_string()
+        audio_settings_actions.on_latency_changed(self, dd, p)
 
-        # 1. 保存设置
-        self.settings["latency_profile"] = profile_name
-        self.save_settings()
-
-        # 2. 应用到 Player
-        if profile_name in self.LATENCY_MAP:
-            buf_ms, lat_ms = self.LATENCY_MAP[profile_name]
-            self.player.set_alsa_latency(buf_ms, lat_ms)
-
-            # 3. 如果当前正处于独占模式，必须重启输出才能生效
-            if self.ex_switch.get_active():
-                print("[Main] Latency changed, restarting output...")
-                # 重新触发一次 set_output
-                self.on_driver_changed(self.driver_dd, None)
+    def _refresh_output_status_loop(self):
+        audio_settings_actions.update_output_status_ui(self)
+        return True
 
     def _force_driver_selection(self, keyword):
         model = self.driver_dd.get_model()
@@ -1030,101 +1309,71 @@ class TidalApp(Adw.Application):
         fmt = info.get('fmt_str', '')
         codec = info.get('codec', '-')
         if not fmt and (not codec or codec in ["-", "Loading..."]):
-            self.lbl_tech.set_visible(False)
+            self.lbl_tech.set_text("")
+            self.lbl_tech.set_tooltip_text(None)
+            self.lbl_tech.remove_css_class("tech-label")
+            for cls in ("tech-state-ok", "tech-state-mixed", "tech-state-warn"):
+                self.lbl_tech.remove_css_class(cls)
+            self.lbl_tech.set_visible(True)
             return
-        dev_name = getattr(self, 'current_device_name', 'Default')
-        if len(dev_name) > 30: dev_name = dev_name[:28] + ".."
-        display_codec = codec
-        if not display_codec or display_codec in ["-", "Loading..."]:
-            display_codec = "PCM" 
-        self.lbl_tech.set_text(f"{display_codec} | {fmt} | {info.get('bitrate',0)//1000}kbps | {dev_name}")
+
+        display_codec = codec if codec and codec not in ["-", "Loading..."] else "PCM"
+
+        rate_depth = fmt
+        if "|" in fmt:
+            parts = [p.strip() for p in fmt.split("|")]
+            if len(parts) >= 2:
+                rate = parts[0]
+                depth = parts[1].replace("bit", "-bit")
+                rate_depth = f"{depth}/{rate}"
+
+        bitrate = int(info.get("bitrate", 0) or 0)
+        bitrate_text = f" • {bitrate//1000}k" if bitrate > 0 else ""
+
+        is_bp = bool(getattr(self.player, "bit_perfect_mode", False))
+        is_ex = bool(getattr(self.player, "exclusive_lock_mode", False))
+        output_state = str(getattr(self.player, "output_state", "idle"))
+
+        mode_tag = "BP" if is_bp else "MIX"
+        lock_tag = "EX" if is_ex else "SHR"
+        self.lbl_tech.add_css_class("tech-label")
+        self.lbl_tech.set_text(f"{mode_tag}/{lock_tag} • {rate_depth} • {display_codec}{bitrate_text}")
+
+        # Full detail remains available on hover.
+        dev_name = getattr(self, "current_device_name", "Default")
+        self.lbl_tech.set_tooltip_text(
+            f"{display_codec} | {fmt} | {bitrate//1000}kbps | {dev_name} | output={output_state}"
+        )
+
+        for cls in ("tech-state-ok", "tech-state-mixed", "tech-state-warn"):
+            self.lbl_tech.remove_css_class(cls)
+        if output_state in ("fallback", "error"):
+            self.lbl_tech.add_css_class("tech-state-warn")
+        elif is_bp:
+            self.lbl_tech.add_css_class("tech-state-ok")
+        else:
+            self.lbl_tech.add_css_class("tech-state-mixed")
+
         self.lbl_tech.set_visible(True)
 
     def on_settings_clicked(self, btn):
+        self._remember_last_view("settings")
         self.right_stack.set_visible_child_name("settings"); self.grid_title_label.set_text("Settings"); self.back_btn.set_sensitive(True); self.nav_list.select_row(None)
 
     def on_quality_changed(self, dd, p):
-        selected = dd.get_selected_item()
-        if not selected: return
-        mode_str = selected.get_string()
-        self.backend.set_quality_mode(mode_str)
-        if self.player.is_playing() and self.current_index >= 0:
-            pos, _ = self.player.get_position()
-            track = self.current_track_list[self.current_index]
-            def refresh():
-                new_url = self.backend.get_stream_url(track)
-                GLib.idle_add(lambda: self._restart_player_with_url(new_url, pos))
-            Thread(target=refresh, daemon=True).start()
+        playback_stream_actions.on_quality_changed(self, dd, p)
 
     def _restart_player_with_url(self, url, pos):
-        if not url: return
-        self.player.stop(); self.player.load(url); self.player.play()
-        GLib.timeout_add(700, lambda: self.player.seek(pos))
+        playback_stream_actions.restart_player_with_url(self, url, pos)
 
     def on_driver_changed(self, dd, p):
-        selected = dd.get_selected_item()
-        if not selected: return
-        driver_name = selected.get_string()
-        
-        # 保存驱动设置
-        if not self.ex_switch.get_active() or driver_name == "ALSA":
-            self.settings["driver"] = driver_name
-            self.save_settings()
-
-        self.current_device_name = "Default"
-        self.update_tech_label(self.player.stream_info)
-
-        def refresh_devices():
-            # [关键] 暂停设备变更的监听，防止刷新列表时误触保存
-            self.ignore_device_change = True
-            
-            devices = self.player.get_devices_for_driver(driver_name)
-            self.current_device_list = devices 
-            self.device_dd.set_model(Gtk.StringList.new([d["name"] for d in devices]))
-            
-            # --- 设备恢复逻辑 ---
-            saved_dev = self.settings.get("device")
-            sel_idx = 0
-            found = False
-            
-            if saved_dev:
-                for i, d in enumerate(devices):
-                    # 只要名字匹配就选中
-                    if d["name"] == saved_dev: 
-                        sel_idx = i
-                        found = True
-                        break
-            
-            self.device_dd.set_sensitive(len(devices) > 1)
-            
-            # 设置选中项
-            if sel_idx < len(devices):
-                self.device_dd.set_selected(sel_idx)
-                
-            # [关键] 恢复监听
-            self.ignore_device_change = False
-            
-            # 只有在确实切换了设备的情况下才应用输出
-            target_id = None
-            if sel_idx < len(devices):
-                target_id = devices[sel_idx]['device_id']
-                self.current_device_name = devices[sel_idx]['name']
-                
-            GLib.idle_add(lambda: self.update_tech_label(self.player.stream_info))
-            self.player.set_output(driver_name, target_id)
-
-        Thread(target=lambda: GLib.idle_add(refresh_devices), daemon=True).start()
+        audio_settings_actions.on_driver_changed(self, dd, p)
 
     def on_device_changed(self, dd, p):
-        if self.ignore_device_change: return
-        idx = dd.get_selected()
-        if hasattr(self, 'current_device_list') and idx < len(self.current_device_list):
-            device_info = self.current_device_list[idx]
-            self.current_device_name = device_info['name']
-            self.update_tech_label(self.player.stream_info)
-            self.settings["device"] = device_info['name']; self.save_settings()
-            driver_label = self.driver_dd.get_selected_item().get_string()
-            self.player.set_output(driver_label, device_info['device_id'])
+        audio_settings_actions.on_device_changed(self, dd, p)
+
+    def on_recover_output_clicked(self, btn):
+        audio_settings_actions.on_recover_output_clicked(self, btn)
 
     # [统一点击入口]
     def on_grid_item_activated(self, flow, child):
@@ -1147,297 +1396,757 @@ class TidalApp(Adw.Application):
         """
         # 1. 设置临时列表
         self.current_track_list = [track]
+        self._set_play_queue([track])
         
         # 2. [关键] 调用 play_track(0) 播放列表里的第1首
         self.play_track(0)
 
     def show_album_details(self, alb):
-        current_view = self.right_stack.get_visible_child_name()
-        if current_view and current_view != "tracks": self.nav_history.append(current_view)
-        self.current_album = alb
-        self.right_stack.set_visible_child_name("tracks"); self.back_btn.set_sensitive(True)
-        title = getattr(alb, 'title', getattr(alb, 'name', 'Unknown'))
-        self.header_title.set_text(title)
-        artist_name = "Various Artists"
-        if hasattr(alb, 'artist') and alb.artist: 
-            artist_name = alb.artist.name if hasattr(alb.artist, 'name') else str(alb.artist)
-        self.header_artist.set_text(artist_name)
-        utils.load_img(self.header_art, lambda: self.backend.get_artwork_url(alb, 640), self.cache_dir, 160)
-        is_fav = self.backend.is_favorite(getattr(alb, 'id', '')); self._update_fav_icon(self.fav_btn, is_fav)
-        while c := self.track_list.get_first_child(): self.track_list.remove(c)
-        def detail_task():
-            ts = self.backend.get_tracks(alb)
-            desc = ""
-            if hasattr(alb, 'release_date') and alb.release_date:
-                desc += str(alb.release_date.year)
-            elif hasattr(alb, 'last_updated'):
-                desc += "Updated Recently"
-            count = len(ts) if ts else 0
-            if count > 0: desc += f"  •  {count} Tracks"
-            GLib.idle_add(lambda: self.header_meta.set_text(desc.strip(' • ')))
-            GLib.idle_add(self.populate_tracks, ts)
-        Thread(target=detail_task, daemon=True).start()
+        ui_actions.show_album_details(self, alb)
+
+    def _sort_tracks(self, tracks, field, asc=True):
+        items = list(tracks or [])
+        if not field:
+            return items
+
+        def _artist_name(t):
+            return str(getattr(getattr(t, "artist", None), "name", "") or "").lower()
+
+        def _album_name(t):
+            return str(getattr(getattr(t, "album", None), "name", "") or "").lower()
+
+        def _title(t):
+            return str(getattr(t, "name", "") or "").lower()
+
+        if field == "title":
+            key_func = _title
+        elif field == "artist":
+            key_func = _artist_name
+        elif field == "album":
+            key_func = _album_name
+        elif field == "time":
+            key_func = lambda t: int(getattr(t, "duration", 0) or 0)
+        else:
+            return items
+        return sorted(items, key=key_func, reverse=not asc)
+
+    def _format_sort_label(self, base, field, active_field, asc):
+        if field != active_field:
+            return base
+        return f"{base} {'▲' if asc else '▼'}"
+
+    def _update_album_sort_headers(self):
+        btns = getattr(self, "album_sort_buttons", {}) or {}
+        if not btns:
+            return
+        labels = {
+            "title": "Title",
+            "artist": "Artist",
+            "album": "Album",
+            "time": "Time",
+        }
+        for field, btn in btns.items():
+            if field in labels:
+                text = self._format_sort_label(labels[field], field, self.album_sort_field, self.album_sort_asc)
+                head_lbl = getattr(btn, "_head_label", None)
+                if head_lbl is not None:
+                    head_lbl.set_text(text)
+                elif hasattr(btn, "set_text"):
+                    btn.set_text(text)
+                else:
+                    btn.set_label(text)
+
+    def load_album_tracks(self, tracks):
+        self.album_track_source = list(tracks or [])
+        self._render_album_tracks()
+
+    def _render_album_tracks(self):
+        tracks = self._sort_tracks(self.album_track_source, self.album_sort_field, self.album_sort_asc)
+        self.populate_tracks(tracks)
+        self._update_album_sort_headers()
+
+    def on_album_sort_clicked(self, field):
+        if self.album_sort_field == field:
+            self.album_sort_asc = not self.album_sort_asc
+        else:
+            self.album_sort_field = field
+            self.album_sort_asc = True
+        self._render_album_tracks()
+
+    def on_playlist_sort_clicked(self, field):
+        if self.playlist_sort_field == field:
+            self.playlist_sort_asc = not self.playlist_sort_asc
+        else:
+            self.playlist_sort_field = field
+            self.playlist_sort_asc = True
+        if self.current_playlist_id:
+            self.render_playlist_detail(self.current_playlist_id)
+
+    def get_sorted_playlist_tracks(self, playlist_id):
+        tracks = self.playlist_mgr.get_tracks(playlist_id) if hasattr(self, "playlist_mgr") else []
+        if getattr(self, "playlist_edit_mode", False):
+            return tracks
+        return self._sort_tracks(tracks, self.playlist_sort_field, self.playlist_sort_asc)
 
     def populate_tracks(self, tracks):
-        self.current_track_list = tracks
-        if self.playing_track_id:
-            found_idx = -1
-            for i, t in enumerate(tracks):
-                if t.id == self.playing_track_id: found_idx = i; break
-            if found_idx != -1: self.current_index = found_idx
-        while c := self.track_list.get_first_child(): self.track_list.remove(c)
-        for i, t in enumerate(tracks):
-            row = Gtk.ListBoxRow(); row.track_id = t.id
-            b = Gtk.Box(spacing=16, margin_top=10, margin_bottom=10)
-            stack = Gtk.Stack(); stack.set_size_request(30, -1)
-            lbl = Gtk.Label(label=str(i+1), css_classes=["dim-label"]); stack.add_named(lbl, "num")
-            icon = Gtk.Image(icon_name="media-playback-start-symbolic"); icon.add_css_class("accent"); stack.add_named(icon, "icon")
-            if self.playing_track_id and t.id == self.playing_track_id: stack.set_visible_child_name("icon")
-            else: stack.set_visible_child_name("num")
-            b.append(stack)
-            lbl_title = Gtk.Label(label=t.name, xalign=0, hexpand=True, ellipsize=3); b.append(lbl_title)
-            art_name = getattr(t.artist, 'name', '-') if hasattr(t, 'artist') else '-'
-            lbl_art = Gtk.Label(label=art_name, xalign=0, ellipsize=3, css_classes=["dim-label"])
-            lbl_art.set_size_request(160, -1); lbl_art.set_max_width_chars(20); lbl_art.set_margin_end(12); b.append(lbl_art)
-            alb_name = t.album.name if hasattr(t, 'album') and t.album else "-"
-            lbl_alb = Gtk.Label(label=alb_name, xalign=0, ellipsize=3, css_classes=["dim-label"])
-            lbl_alb.set_size_request(260, -1); lbl_alb.set_max_width_chars(20); lbl_alb.set_margin_end(12); b.append(lbl_alb)
-            dur_sec = getattr(t, 'duration', 0)
-            if dur_sec:
-                m, s = divmod(dur_sec, 60); dur_str = f"{m}:{s:02d}"
-                lbl_dur = Gtk.Label(label=dur_str, css_classes=["dim-label"])
-                lbl_dur.set_attributes(Pango.AttrList.from_string("font-features 'tnum=1'")); lbl_dur.set_margin_end(24); b.append(lbl_dur)
-            row.set_child(b); self.track_list.append(row)
+        ui_actions.populate_tracks(self, tracks)
 
     def _update_track_list_icon(self, target_list=None):
         """
         [升级版] 刷新列表图标：当前播放的显示 ▶，其他的显示数字
         """
-        # 如果没指定列表，默认用专辑详情页的列表
-        if target_list is None:
-            if hasattr(self, 'track_list'): target_list = self.track_list
-            else: return
+        if self.playing_track_id and not getattr(self, "_playing_pulse_source", 0):
+            self._playing_pulse_source = GLib.timeout_add(1000, self._tick_playing_row_pulse)
+        if not self.playing_track_id and getattr(self, "_playing_pulse_source", 0):
+            GLib.source_remove(self._playing_pulse_source)
+            self._playing_pulse_source = 0
+            self._playing_pulse_on = False
 
-        row = target_list.get_first_child()
-        while row:
-            # 只有带 track_id 的行才处理
-            if hasattr(row, 'track_id'):
-                box = row.get_child()
-                if box:
-                    stack = box.get_first_child()
-                    # 确保它是我们放图标的那个 Stack 组件
-                    if isinstance(stack, Gtk.Stack):
-                        # 核心比对：行的 ID vs 当前播放 ID
-                        if row.track_id == self.playing_track_id: 
-                            stack.set_visible_child_name("icon")
-                            # 额外加个强调色 (可选)
-                            # box.add_css_class("playing-row") 
-                        else: 
-                            stack.set_visible_child_name("num")
-                            # box.remove_css_class("playing-row")
-            row = row.get_next_sibling()
+        targets = []
+        if target_list is not None:
+            targets.append(target_list)
+        else:
+            if self.track_list is not None:
+                targets.append(self.track_list)
+            if getattr(self, "playlist_track_list", None) is not None:
+                targets.append(self.playlist_track_list)
+            if getattr(self, "queue_track_list", None) is not None:
+                targets.append(self.queue_track_list)
+            if getattr(self, "queue_drawer_list", None) is not None:
+                targets.append(self.queue_drawer_list)
+            if not targets:
+                return
+
+        for tl in targets:
+            row = tl.get_first_child()
+            while row:
+                # 只有带 track_id 的行才处理
+                if hasattr(row, 'track_id'):
+                    box = row.get_child()
+                    if box:
+                        stack = box.get_first_child()
+                        # 确保它是我们放图标的那个 Stack 组件
+                        if isinstance(stack, Gtk.Stack):
+                            # 核心比对：行的 ID vs 当前播放 ID
+                            if row.track_id == self.playing_track_id: 
+                                stack.set_visible_child_name("icon")
+                                row.add_css_class("playing-row")
+                                if getattr(self, "_playing_pulse_on", False):
+                                    row.add_css_class("playing-row-pulse")
+                                else:
+                                    row.remove_css_class("playing-row-pulse")
+                            else: 
+                                stack.set_visible_child_name("num")
+                                row.remove_css_class("playing-row")
+                                row.remove_css_class("playing-row-pulse")
+                row = row.get_next_sibling()
+
+    def _tick_playing_row_pulse(self):
+        if not self.playing_track_id:
+            self._playing_pulse_source = 0
+            self._playing_pulse_on = False
+            self._update_track_list_icon()
+            return False
+        self._playing_pulse_on = not self._playing_pulse_on
+        self._update_track_list_icon()
+        return True
 
     def on_header_artist_clicked(self, gest, n, x, y):
-        if hasattr(self, 'current_album') and self.current_album:
+        if self.current_album:
             artist_obj = None
-            if hasattr(self.current_album, 'artist') and self.current_album.artist: artist_obj = self.current_album.artist
-            if artist_obj and not isinstance(artist_obj, str) and hasattr(artist_obj, 'id'): self.on_artist_clicked(artist_obj)
+            if hasattr(self.current_album, 'artist') and self.current_album.artist:
+                artist_obj = self.current_album.artist
+
+            if not artist_obj or isinstance(artist_obj, str):
+                return
+
+            artist_id = getattr(artist_obj, "id", None)
+            artist_name = getattr(artist_obj, "name", "").strip()
+            if not artist_id and not artist_name:
+                return
+
+            def resolve_artist():
+                # Always resolve to a real backend artist object before navigation.
+                resolved = self.backend.resolve_artist(artist_id=artist_id, artist_name=artist_name)
+                if not resolved:
+                    logger.info("Artist resolve failed for history entry: id=%s name=%s", artist_id, artist_name)
+                    return
+                GLib.idle_add(self.on_artist_clicked, resolved)
+
+            Thread(target=resolve_artist, daemon=True).start()
 
     def on_artist_clicked(self, artist):
-        current_view = self.right_stack.get_visible_child_name()
-        if current_view: self.nav_history.append(current_view)
-        self.current_selected_artist = artist
-        self.right_stack.set_visible_child_name("grid_view")
-        self.grid_title_label.set_text(f"Albums by {artist.name}")
-        self.back_btn.set_sensitive(True)
-        self.artist_fav_btn.set_visible(True)
-        is_fav = self.backend.is_artist_favorite(artist.id); self._update_fav_icon(self.artist_fav_btn, is_fav)
-        while c := self.collection_content_box.get_first_child(): self.collection_content_box.remove(c)
-        self.main_flow = Gtk.FlowBox(valign=Gtk.Align.START, max_children_per_line=30, selection_mode=Gtk.SelectionMode.NONE, column_spacing=24, row_spacing=28)
-        self.main_flow.connect("child-activated", self.on_grid_item_activated)
-        self.collection_content_box.append(self.main_flow)
-        Thread(target=lambda: GLib.idle_add(self.batch_load_albums, list(self.backend.get_albums(artist))), daemon=True).start()
+        ui_navigation.on_artist_clicked(self, artist)
 
     def batch_load_albums(self, albs, batch=6):
-        if not albs: return False
-        curr, rem = albs[:batch], albs[batch:]
-        for alb in curr:
-            v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, css_classes=["card"])
-            img = Gtk.Image(css_classes=["album-cover-img"])
-            utils.load_img(img, lambda a=alb: self.backend.get_artwork_url(a, 640), self.cache_dir, 130)
-            v.append(img); v.append(Gtk.Label(label=alb.name, ellipsize=3, halign=Gtk.Align.CENTER, wrap=True, max_width_chars=16))
-            c = Gtk.FlowBoxChild(); c.set_child(v)
-            c.data_item = {'obj': alb, 'type': 'Album'}
-            self.main_flow.append(c)
-        if rem: GLib.timeout_add(50, self.batch_load_albums, rem, batch)
-        return False
+        return ui_actions.batch_load_albums(self, albs, batch)
 
     def batch_load_artists(self, artists, batch=10):
-        if not artists: return False
-        curr, rem = artists[:batch], artists[batch:]
-        for art in curr:
-            v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, css_classes=["card"])
-            img = Gtk.Image(pixel_size=120, css_classes=["circular-avatar"])
-            utils.load_img(img, lambda a=art: self.backend.get_artwork_url(a, 320), self.cache_dir, 120)
-            v.append(img); v.append(Gtk.Label(label=art.name, ellipsize=2, halign=Gtk.Align.CENTER, wrap=True, max_width_chars=14, css_classes=["heading"]))
-            c = Gtk.FlowBoxChild(); c.set_child(v)
-            c.data_item = {'obj': art, 'type': 'Artist'}
-            self.main_flow.append(c)
-        if rem: GLib.timeout_add(50, self.batch_load_artists, rem, batch)
-        return False
+        return ui_actions.batch_load_artists(self, artists, batch)
 
     def batch_load_home(self, sections):
-        if not sections: return
-        for sec in sections:
-            self.collection_content_box.append(Gtk.Label(label=sec['title'], xalign=0, css_classes=["title-4", "dim-label"]))
-            flow = Gtk.FlowBox(valign=Gtk.Align.START, max_children_per_line=30, selection_mode=Gtk.SelectionMode.NONE, column_spacing=24, row_spacing=28)
-            flow.connect("child-activated", self.on_grid_item_activated)
-            self.collection_content_box.append(flow)
-            for item_data in sec['items']:
-                v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, css_classes=["card"])
-                img_size = 130; img_cls = "album-cover-img"
-                if item_data['type'] == 'Artist' or 'Radio' in item_data['name']:
-                    img_size = 120; img_cls = "circular-avatar"
-                img = Gtk.Image(pixel_size=img_size, css_classes=[img_cls])
-                if item_data['image_url']: utils.load_img(img, item_data['image_url'], self.cache_dir, img_size)
-                else: img.set_from_icon_name("audio-x-generic-symbolic")
-                v.append(img)
-                v.append(Gtk.Label(label=item_data['name'], ellipsize=2, halign=Gtk.Align.CENTER, wrap=True, max_width_chars=16, css_classes=["heading"]))
-                if item_data['sub_title']:
-                    v.append(Gtk.Label(label=item_data['sub_title'], ellipsize=1, halign=Gtk.Align.CENTER, css_classes=["caption", "dim-label"]))
-                c = Gtk.FlowBoxChild(); c.set_child(v); c.data_item = item_data
-                flow.append(c)
+        ui_actions.batch_load_home(self, sections)
+
+    def render_daily_mixes(self, mixes=None):
+        if mixes is None:
+            mixes = self.build_daily_mixes()
+        ui_actions.render_daily_mixes(self, mixes)
+
+    def render_history_dashboard(self):
+        ui_actions.render_history_dashboard(self)
+
+    def render_queue_dashboard(self):
+        ui_actions.render_queue_dashboard(self)
+
+    def render_queue_drawer(self):
+        ui_actions.render_queue_drawer(self)
+
+    def _sync_queue_handle_state(self, expanded):
+        btn = getattr(self, "queue_btn", None)
+        if btn is not None:
+            btn.set_icon_name(
+                "hiresti-queue-handle-right-symbolic" if expanded else "hiresti-queue-handle-left-symbolic"
+            )
+            btn.set_tooltip_text("Close Queue" if expanded else "Open Queue")
+            if expanded:
+                btn.add_css_class("active")
+            else:
+                btn.remove_css_class("active")
+        anchor = getattr(self, "queue_anchor", None)
+        if anchor is not None:
+            if expanded:
+                anchor.add_css_class("open")
+            else:
+                anchor.remove_css_class("open")
+
+    def toggle_queue_drawer(self, _btn=None):
+        revealer = getattr(self, "queue_revealer", None)
+        if revealer is None:
+            return
+        show = not revealer.get_reveal_child()
+        if show:
+            self.render_queue_drawer()
+        revealer.set_reveal_child(show)
+        if getattr(self, "queue_backdrop", None) is not None:
+            self.queue_backdrop.set_visible(show)
+        self._sync_queue_handle_state(show)
+
+    def close_queue_drawer(self):
+        revealer = getattr(self, "queue_revealer", None)
+        if revealer is not None:
+            revealer.set_reveal_child(False)
+        if getattr(self, "queue_backdrop", None) is not None:
+            self.queue_backdrop.set_visible(False)
+        self._sync_queue_handle_state(False)
+
+    def _is_queue_nav_selected(self):
+        row = self.nav_list.get_selected_row() if self.nav_list is not None else None
+        return bool(row and getattr(row, "nav_id", None) == "queue")
+
+    def _get_active_queue(self):
+        q = list(getattr(self, "play_queue", []) or [])
+        if q:
+            return q
+        return list(getattr(self, "current_track_list", []) or [])
+
+    def _set_play_queue(self, tracks):
+        self.play_queue = list(tracks or [])
+        self.shuffle_indices = []
+
+    def _refresh_queue_views(self):
+        self.render_queue_drawer()
+        if self._is_queue_nav_selected():
+            self.render_queue_dashboard()
+        return False
+
+    def render_playlists_home(self):
+        if hasattr(self, "grid_title_label") and self.grid_title_label is not None:
+            self.grid_title_label.set_text("Playlists")
+            self.grid_title_label.set_visible(True)
+        if hasattr(self, "grid_subtitle_label") and self.grid_subtitle_label is not None:
+            self.grid_subtitle_label.set_text("Create and manage your own playlists")
+            self.grid_subtitle_label.set_visible(True)
+        ui_actions.render_playlists_home(self)
+
+    def render_playlist_detail(self, playlist_id):
+        ui_actions.render_playlist_detail(self, playlist_id)
+
+    def on_playlist_card_clicked(self, playlist_id):
+        self.current_playlist_id = playlist_id
+        self.playlist_edit_mode = False
+        self.playlist_rename_mode = False
+        if hasattr(self, "grid_title_label") and self.grid_title_label is not None:
+            self.grid_title_label.set_visible(False)
+        if hasattr(self, "grid_subtitle_label") and self.grid_subtitle_label is not None:
+            self.grid_subtitle_label.set_visible(False)
+        if self.back_btn is not None:
+            self.back_btn.set_sensitive(True)
+        self.render_playlist_detail(playlist_id)
+
+    def on_playlist_track_selected(self, box, row):
+        if not row:
+            return
+        idx = getattr(row, "playlist_track_index", -1)
+        tracks = getattr(box, "playlist_tracks", [])
+        if not tracks or idx < 0 or idx >= len(tracks):
+            return
+        self.current_track_list = tracks
+        self._set_play_queue(tracks)
+        self.play_track(idx)
+
+    def _next_playlist_name(self):
+        playlists = self.playlist_mgr.list_playlists() if hasattr(self, "playlist_mgr") else []
+        max_n = 0
+        for p in playlists:
+            name = str(p.get("name", "") or "").strip()
+            if not name.startswith("Playlist "):
+                continue
+            suffix = name[len("Playlist "):].strip()
+            if suffix.isdigit():
+                n = int(suffix)
+                if n > max_n:
+                    max_n = n
+        return f"Playlist {max_n + 1}"
+
+    def on_create_playlist_clicked(self, _btn=None):
+        name = self._next_playlist_name()
+        p = self.playlist_mgr.create_playlist(name)
+        self.current_playlist_id = p.get("id")
+        self.render_playlists_home()
+
+    def _prompt_playlist_pick(self, on_pick):
+        playlists = self.playlist_mgr.list_playlists() if hasattr(self, "playlist_mgr") else []
+        if not playlists:
+            created = self.playlist_mgr.create_playlist(self._next_playlist_name())
+            on_pick(created.get("id"), True)
+            return
+
+        dialog = Gtk.Dialog(title="Add to Playlist", transient_for=self.win, modal=True)
+        root = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=12,
+            margin_top=12,
+            margin_bottom=12,
+            margin_start=12,
+            margin_end=12,
+        )
+        box_wrap = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
+        box_wrap.append(Gtk.Label(label="Select a playlist:", xalign=0))
+
+        names = [p.get("name", "Untitled Playlist") for p in playlists]
+        dd = Gtk.DropDown(model=Gtk.StringList.new(names))
+        dd.set_selected(0)
+        box_wrap.append(dd)
+        dedupe_ck = Gtk.CheckButton(label="Auto de-duplicate", active=True)
+        box_wrap.append(dedupe_ck)
+        root.append(box_wrap)
+        action_row = Gtk.Box(spacing=8, halign=Gtk.Align.END)
+        cancel_btn = Gtk.Button(label="Cancel")
+        new_btn = Gtk.Button(label="New Playlist")
+        add_btn = Gtk.Button(label="Add")
+        cancel_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.CANCEL))
+        new_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.APPLY))
+        add_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.OK))
+        action_row.append(cancel_btn)
+        action_row.append(new_btn)
+        action_row.append(add_btn)
+        root.append(action_row)
+        dialog.set_child(root)
+
+        def _on_response(d, resp):
+            if resp == Gtk.ResponseType.OK:
+                idx = dd.get_selected()
+                if 0 <= idx < len(playlists):
+                    on_pick(playlists[idx].get("id"), dedupe_ck.get_active())
+            elif resp == Gtk.ResponseType.APPLY:
+                created = self.playlist_mgr.create_playlist(self._next_playlist_name())
+                on_pick(created.get("id"), dedupe_ck.get_active())
+            d.destroy()
+
+        dialog.connect("response", _on_response)
+        dialog.present()
+
+    def on_add_tracks_to_playlist(self, tracks):
+        items = [t for t in (tracks or []) if t is not None]
+        if not items:
+            return
+
+        def _do_add(playlist_id, dedupe):
+            for t in items:
+                cover_url = self.backend.get_artwork_url(t, 320)
+                self.playlist_mgr.add_track(playlist_id, t, cover_url=cover_url, dedupe=dedupe)
+            if self.current_playlist_id and str(self.current_playlist_id) == str(playlist_id):
+                self.render_playlist_detail(playlist_id)
+
+        self._prompt_playlist_pick(_do_add)
+
+    def on_add_single_track_to_playlist(self, track):
+        if track is None:
+            return
+        self.on_add_tracks_to_playlist([track])
+
+    def on_add_current_album_to_playlist(self, _btn=None):
+        tracks = list(getattr(self, "current_track_list", []) or [])
+        if not tracks:
+            return
+        self.on_add_tracks_to_playlist(tracks)
+
+    def on_search_track_checkbox_toggled(self, _cb, track_index, checked):
+        if not isinstance(getattr(self, "search_selected_indices", None), set):
+            self.search_selected_indices = set()
+        if checked:
+            self.search_selected_indices.add(int(track_index))
+        else:
+            self.search_selected_indices.discard(int(track_index))
+        self._update_search_batch_add_state()
+
+    def _update_search_batch_add_state(self):
+        btn = getattr(self, "add_selected_tracks_btn", None)
+        if btn is None:
+            return
+        count = len(getattr(self, "search_selected_indices", set()) or set())
+        btn.set_sensitive(count > 0)
+        btn.set_label(f"Add Selected ({count})" if count > 0 else "Add Selected")
+
+    def on_add_selected_search_tracks(self, _btn=None):
+        selected = sorted(list(getattr(self, "search_selected_indices", set()) or []))
+        tracks = []
+        for idx in selected:
+            if 0 <= idx < len(self.search_track_data):
+                tracks.append(self.search_track_data[idx])
+        if not tracks:
+            return
+        self.on_add_tracks_to_playlist(tracks)
+
+    def _prompt_playlist_name(self, title, initial_name, on_submit):
+        dialog = Gtk.Dialog(title=title, transient_for=self.win, modal=True)
+        root = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=12,
+            margin_top=12,
+            margin_bottom=12,
+            margin_start=12,
+            margin_end=12,
+        )
+        entry = Gtk.Entry(text=initial_name or "")
+        entry.connect("activate", lambda _e: dialog.response(Gtk.ResponseType.OK))
+        root.append(entry)
+        action_row = Gtk.Box(spacing=8, halign=Gtk.Align.END)
+        cancel_btn = Gtk.Button(label="Cancel")
+        save_btn = Gtk.Button(label="Save")
+        cancel_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.CANCEL))
+        save_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.OK))
+        action_row.append(cancel_btn)
+        action_row.append(save_btn)
+        root.append(action_row)
+        dialog.set_child(root)
+
+        def _on_response(d, resp):
+            if resp == Gtk.ResponseType.OK:
+                on_submit(entry.get_text().strip())
+            d.destroy()
+
+        dialog.connect("response", _on_response)
+        dialog.present()
+
+    def on_playlist_start_inline_rename(self, playlist_id):
+        self.playlist_rename_mode = True
+        self.render_playlist_detail(playlist_id)
+
+    def on_playlist_commit_inline_rename(self, playlist_id, name):
+        new_name = (name or "").strip()
+        if new_name:
+            self.playlist_mgr.rename_playlist(playlist_id, new_name)
+        self.playlist_rename_mode = False
+        self.render_playlist_detail(playlist_id)
+
+    def on_playlist_cancel_inline_rename(self, playlist_id):
+        self.playlist_rename_mode = False
+        self.render_playlist_detail(playlist_id)
+
+    def on_playlist_delete_clicked(self, playlist_id):
+        dialog = Gtk.Dialog(title="Delete Playlist", transient_for=self.win, modal=True)
+        root = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=12,
+            margin_top=12,
+            margin_bottom=12,
+            margin_start=12,
+            margin_end=12,
+        )
+        root.append(Gtk.Label(label="Delete this playlist permanently?", xalign=0))
+        action_row = Gtk.Box(spacing=8, halign=Gtk.Align.END)
+        cancel_btn = Gtk.Button(label="Cancel")
+        delete_btn = Gtk.Button(label="Delete")
+        cancel_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.CANCEL))
+        delete_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.OK))
+        action_row.append(cancel_btn)
+        action_row.append(delete_btn)
+        root.append(action_row)
+        dialog.set_child(root)
+
+        def _on_response(d, resp):
+            if resp == Gtk.ResponseType.OK:
+                self.playlist_mgr.delete_playlist(playlist_id)
+                self.current_playlist_id = None
+                self.render_playlists_home()
+            d.destroy()
+
+        dialog.connect("response", _on_response)
+        dialog.present()
+
+    def on_playlist_remove_track_clicked(self, playlist_id, track_index):
+        self.playlist_mgr.remove_track(playlist_id, track_index)
+        self.render_playlist_detail(playlist_id)
+
+    def on_playlist_move_track_clicked(self, playlist_id, track_index, direction):
+        self.playlist_mgr.move_track(playlist_id, track_index, direction)
+        self.render_playlist_detail(playlist_id)
+
+    def on_playlist_toggle_edit(self, _btn=None):
+        self.playlist_edit_mode = not bool(getattr(self, "playlist_edit_mode", False))
+        if self.current_playlist_id:
+            self.render_playlist_detail(self.current_playlist_id)
+
+    def on_playlist_reorder_track(self, playlist_id, from_index, to_index):
+        if self.playlist_mgr.move_track_to(playlist_id, from_index, to_index):
+            self.render_playlist_detail(playlist_id)
+
+    def on_history_album_clicked(self, album):
+        if album is None:
+            return
+        self.show_album_details(album)
+
+    def on_history_track_clicked(self, tracks, index):
+        if not tracks or index < 0 or index >= len(tracks):
+            return
+        self.current_track_list = tracks
+        self._set_play_queue(tracks)
+        self.play_track(index)
+
+    def on_queue_track_selected(self, box, row):
+        if not row:
+            return
+        idx = getattr(row, "queue_track_index", row.get_index())
+        tracks = self._get_active_queue()
+        if idx < 0 or idx >= len(tracks):
+            return
+        self.play_track(idx)
+
+    def on_queue_remove_track_clicked(self, track_index):
+        tracks = self._get_active_queue()
+        idx = int(track_index)
+        if idx < 0 or idx >= len(tracks):
+            return
+        removed_current = idx == int(getattr(self, "current_track_index", -1) or -1)
+        tracks.pop(idx)
+        self.play_queue = tracks
+
+        if not tracks:
+            self.current_track_index = -1
+            self.playing_track = None
+            self.playing_track_id = None
+            try:
+                self.player.stop()
+            except Exception:
+                pass
+            if self.play_btn is not None:
+                self.play_btn.set_icon_name("media-playback-start-symbolic")
+            GLib.idle_add(self._refresh_queue_views)
+            return
+
+        if idx < self.current_track_index:
+            self.current_track_index = max(0, self.current_track_index - 1)
+
+        if removed_current:
+            new_idx = min(idx, len(tracks) - 1)
+            GLib.idle_add(self._refresh_queue_views)
+            GLib.idle_add(lambda: self.play_track(new_idx) or False)
+            return
+
+        GLib.idle_add(self._refresh_queue_views)
+        self._update_track_list_icon()
+
+    def on_queue_clear_clicked(self, _btn=None):
+        tracks = self._get_active_queue()
+        if not tracks:
+            return
+        self.play_queue = []
+        self.current_track_index = -1
+        self.playing_track = None
+        self.playing_track_id = None
+        try:
+            self.player.stop()
+        except Exception:
+            pass
+        if self.play_btn is not None:
+            self.play_btn.set_icon_name("media-playback-start-symbolic")
+        GLib.idle_add(self._refresh_queue_views)
+
+    def build_daily_mixes(self, days=7, per_day=8):
+        per_day = max(6, int(per_day))
+        entries = []
+        if hasattr(self, "history_mgr") and self.history_mgr is not None:
+            entries = self.history_mgr.get_recent_track_entries(limit=400)
+            if not entries and getattr(self.backend, "user", None):
+                # Backfill for legacy history format (album-only records).
+                for alb in self.history_mgr.get_albums()[:24]:
+                    tracks = self.backend.get_tracks(alb) or []
+                    for t in tracks[:10]:
+                        entries.append(
+                            {
+                                "track_id": getattr(t, "id", None),
+                                "track_name": getattr(t, "name", "Unknown Track"),
+                                "duration": getattr(t, "duration", 0) or 0,
+                                "album_id": getattr(getattr(t, "album", None), "id", getattr(alb, "id", None)),
+                                "album_name": getattr(getattr(t, "album", None), "name", getattr(alb, "name", "Unknown Album")),
+                                "artist": getattr(getattr(t, "artist", None), "name", "Unknown"),
+                                "artist_id": getattr(getattr(t, "artist", None), "id", None),
+                                "cover": getattr(getattr(t, "album", None), "cover", getattr(alb, "cover_url", None)),
+                            }
+                        )
+                    if len(entries) >= 400:
+                        break
+        if not entries:
+            self.daily_mix_data = []
+            return []
+
+        track_stats = {}
+        artist_stats = {}
+        album_stats = {}
+        meta_by_track = {}
+        total = max(1, len(entries))
+
+        for idx, e in enumerate(entries):
+            tid = str(e.get("track_id"))
+            if not tid:
+                continue
+            recency = max(0.2, 1.0 - (idx / total))
+            track_stats[tid] = track_stats.get(tid, 0.0) + 1.6 + recency
+
+            artist_key = str(e.get("artist_id") or e.get("artist") or "")
+            if artist_key:
+                artist_stats[artist_key] = artist_stats.get(artist_key, 0.0) + 1.0 + recency * 0.4
+
+            album_key = str(e.get("album_id") or "")
+            if album_key:
+                album_stats[album_key] = album_stats.get(album_key, 0.0) + 0.8 + recency * 0.3
+
+            if tid not in meta_by_track:
+                meta_by_track[tid] = e
+
+        if not meta_by_track:
+            self.daily_mix_data = []
+            return []
+
+        def _score(tid):
+            meta = meta_by_track[tid]
+            artist_key = str(meta.get("artist_id") or meta.get("artist") or "")
+            album_key = str(meta.get("album_id") or "")
+            return (
+                track_stats.get(tid, 0.0)
+                + 0.9 * artist_stats.get(artist_key, 0.0)
+                + 0.5 * album_stats.get(album_key, 0.0)
+            )
+
+        sorted_ids = sorted(meta_by_track.keys(), key=_score, reverse=True)
+        mixes = []
+        today = datetime.now().date()
+        used_track_ids = set()
+
+        for day_offset in range(days):
+            day = today - timedelta(days=day_offset)
+            day_seed = int(day.strftime("%Y%m%d"))
+            if not sorted_ids:
+                break
+            rot = day_seed % len(sorted_ids)
+            rotated = sorted_ids[rot:] + sorted_ids[:rot]
+            pick_ids = []
+            for tid in rotated:
+                if tid in used_track_ids:
+                    continue
+                pick_ids.append(tid)
+                if len(pick_ids) >= per_day:
+                    break
+            if len(pick_ids) < 6:
+                break
+            tracks = []
+            for tid in pick_ids:
+                local_track = self.history_mgr.to_local_track(meta_by_track[tid])
+                if local_track is not None:
+                    tracks.append(local_track)
+            if len(tracks) >= 6:
+                used_track_ids.update(pick_ids)
+                mixes.append(
+                    {
+                        "date_label": day.strftime("%Y-%m-%d"),
+                        "title": "Daily Mix",
+                        "tracks": tracks,
+                    }
+                )
+
+        self.daily_mix_data = mixes
+        return mixes
+
+    def on_daily_mix_track_selected(self, box, row):
+        if not row:
+            return
+        track_index = getattr(row, "daily_track_index", -1)
+        daily_tracks = getattr(box, "daily_tracks", None)
+        if not daily_tracks or track_index < 0 or track_index >= len(daily_tracks):
+            return
+        self.current_track_list = daily_tracks
+        self._set_play_queue(daily_tracks)
+        self.play_track(track_index)
+
+    def on_daily_mix_item_activated(self, flow, child):
+        if child is None:
+            return
+        track_index = getattr(child, "daily_track_index", -1)
+        daily_tracks = getattr(flow, "daily_tracks", None)
+        if not daily_tracks or track_index < 0 or track_index >= len(daily_tracks):
+            return
+        self.current_track_list = daily_tracks
+        self._set_play_queue(daily_tracks)
+        self.play_track(track_index)
 
     def on_nav_selected(self, box, row):
-        if not row: return
-        self.nav_history.clear()
-        self.artist_fav_btn.set_visible(False)
-        self.right_stack.set_visible_child_name("grid_view")
-        self.back_btn.set_sensitive(False)
-        while c := self.collection_content_box.get_first_child(): self.collection_content_box.remove(c)
-        if row.nav_id == "home":
-            self.grid_title_label.set_text("Home")
-            if self.backend.user: 
-                Thread(target=lambda: GLib.idle_add(self.batch_load_home, self.backend.get_home_page())).start()
-        elif row.nav_id == "collection":
-            self.grid_title_label.set_text("My Collection")
-            self.create_album_flow()
-            if self.backend.user: Thread(target=lambda: GLib.idle_add(self.batch_load_albums, list(self.backend.get_recent_albums()))).start()
-        elif row.nav_id == "history":
-            self.grid_title_label.set_text("History")
-            self.create_album_flow()
-            Thread(target=lambda: GLib.idle_add(self.batch_load_albums, self.history_mgr.get_albums())).start()
-        elif row.nav_id == "artists":
-            self.grid_title_label.set_text("Favorite Artists")
-            self.create_album_flow()
-            if self.backend.user: Thread(target=lambda: GLib.idle_add(self.batch_load_artists, self.backend.get_favorites())).start()
+        if row and hasattr(row, "nav_id"):
+            self._remember_last_nav(row.nav_id)
+        ui_navigation.on_nav_selected(self, box, row)
 
     def create_album_flow(self):
-        self.main_flow = Gtk.FlowBox(valign=Gtk.Align.START, max_children_per_line=30, selection_mode=Gtk.SelectionMode.NONE, column_spacing=24, row_spacing=28)
+        section_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, css_classes=["home-section", "home-generic-section"])
+        self.main_flow = Gtk.FlowBox(
+            valign=Gtk.Align.START,
+            max_children_per_line=30,
+            selection_mode=Gtk.SelectionMode.NONE,
+            column_spacing=24,
+            row_spacing=28,
+            css_classes=["home-flow"],
+        )
         self.main_flow.connect("child-activated", self.on_grid_item_activated)
-        self.collection_content_box.append(self.main_flow)
+        section_box.append(self.main_flow)
+        self.collection_content_box.append(section_box)
 
     def on_play_pause(self, btn):
-        if self.player.is_playing(): self.player.pause(); btn.set_icon_name("media-playback-start-symbolic")
-        else: self.player.play(); btn.set_icon_name("media-playback-pause-symbolic")
+        playback_actions.on_play_pause(self, btn)
 
 
     def on_next_track(self, btn=None):
-        """播放下一首"""
-        # 1. 列表检查
-        if not hasattr(self, 'current_track_list') or not self.current_track_list:
-            return
-
-        total = len(self.current_track_list)
-        if total == 0: return
-
-        # 2. 获取当前索引 (安全处理 None)
-        current = getattr(self, 'current_track_index', 0)
-        if current is None: current = 0
-        
-        next_idx = -1
-
-        # --- 场景 A: 单曲循环 (MODE_ONE) ---
-        if self.play_mode == self.MODE_ONE:
-            if btn is None: 
-                # btn为None表示自动播放结束 -> 重播当前
-                next_idx = current
-            else: 
-                # btn有值表示用户手动点击 -> 强制切到下一首
-                next_idx = (current + 1) % total
-
-        # --- 场景 B: 随机/智能 (MODE_SHUFFLE / SMART) ---
-        elif self.play_mode in [self.MODE_SHUFFLE, self.MODE_SMART]:
-            if total <= 1:
-                next_idx = 0
-            else:
-                # 确保随机池有内容
-                if not hasattr(self, 'shuffle_indices') or not self.shuffle_indices:
-                    self._generate_shuffle_list()
-                
-                # 双重检查：如果生成后还是空的（比如total=1），则取0
-                if self.shuffle_indices:
-                    # 从池子里拿一个， pop(0) 保证不重复直到循环一轮
-                    # 但为了简单，这里我们随机取一个，不强制 pop
-                    import random
-                    next_idx = random.choice(self.shuffle_indices)
-                else:
-                    # 兜底：如果随机池逻辑失效，切到下一首
-                    next_idx = (current + 1) % total
-
-        # --- 场景 C: 列表循环 (MODE_LOOP) - 默认 ---
-        else:
-            next_idx = (current + 1) % total
-
-        # 3. 执行播放
-        if next_idx >= 0 and next_idx < total:
-            self.play_track(next_idx)
+        playback_actions.on_next_track(self, btn)
 
     def on_prev_track(self, btn=None):
-        """播放上一首"""
-        # 1. 列表检查
-        if not hasattr(self, 'current_track_list') or not self.current_track_list:
-            return
-            
-        total = len(self.current_track_list)
-        if total == 0: return
-        
-        # 2. 获取当前索引 (安全处理 None)
-        current = getattr(self, 'current_track_index', 0)
-        if current is None: current = 0
-        
-        prev_idx = -1
-
-        # --- 统一策略 ---
-        # 无论是随机还是单曲，点击"上一首"通常意味着"回到列表的前一个"
-        # 或者是"重播当前歌曲"(如果播放了很久)，这里简化为切到前一个索引
-        
-        # Python 的取模运算处理负数很方便： (0 - 1) % 10 = 9
-        prev_idx = (current - 1) % total
-
-        # 3. 执行播放
-        if prev_idx >= 0 and prev_idx < total:
-            self.play_track(prev_idx)
+        playback_actions.on_prev_track(self, btn)
 
     def _load_cover_art(self, cover_id_or_url):
-        """
-        [修复版] 统一使用 utils.load_img 加载封面
-        解决播放栏图标在 HiDPI 屏幕上过小的问题
-        """
-        # 1. 获取 URL
-        url = self._get_tidal_image_url(cover_id_or_url)
-        if not url: return
-        
-        # 2. 直接委托给 utils 加载
-        # 我们请求 72px 大小，utils 会自动加载 144px 的高清图并正确显示
-        if hasattr(self, 'art_img'):
-            utils.load_img(self.art_img, url, self.cache_dir, 72)
+        playback_stream_actions.load_cover_art(self, cover_id_or_url)
 
     def _update_list_ui(self, index):
         """
         [新增] 强制更新列表选中状态
         """
-        if not hasattr(self, 'list_box'): return
+        if self.list_box is None: return
 
         try:
             # 1. 获取对应的行
@@ -1450,118 +2159,15 @@ class TidalApp(Adw.Application):
                 # 注意：这需要 list_box 在 ScrolledWindow 里，且有对应调整对象
                 # 这里只做基础选中，不做强制滚动防止报错
         except Exception as e:
-            print(f"[UI Error] List update failed: {e}")
+            logger.warning("List update failed: %s", e)
 
 
     def render_lyrics_list(self, lyrics_obj=None, status_msg=None):
-        """渲染歌词列表到界面"""
-        print(f"[UI] Rendering lyrics... Msg: {status_msg}") # <--- 日志
-
-        if not hasattr(self, 'lyrics_vbox'): return
-
-        # 清空旧内容
-        while child := self.lyrics_vbox.get_first_child():
-            self.lyrics_vbox.remove(child)
-        self.lyric_widgets = []
-        self.current_lyric_index = -1
-
-        # 显示状态文字 (Loading / No Lyrics)
-        if status_msg:
-            lbl = Gtk.Label(label=status_msg, css_classes=["title-2"], valign=Gtk.Align.CENTER)
-            lbl.set_opacity(0.5)
-            center = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER, vexpand=True)
-            center.append(lbl)
-            self.lyrics_vbox.append(center)
-            return
-
-        # 显示歌词内容
-        if lyrics_obj:
-            source = lyrics_obj.time_points if lyrics_obj.has_synced else [0]
-            print(f"[UI] Drawing {len(source)} lines...") # <--- 日志
-
-            for t in source:
-                text = lyrics_obj.lyrics_map.get(t, "") if lyrics_obj.has_synced else lyrics_obj.raw_text
-                if not text: text = " "
-
-                lbl = Gtk.Label(label=text, css_classes=["lyric-line"], wrap=True, max_width_chars=40)
-                lbl.set_justify(Gtk.Justification.CENTER)
-                self.lyrics_vbox.append(lbl)
-
-                if lyrics_obj.has_synced:
-                    self.lyric_widgets.append({"time": t, "widget": lbl})
+        lyrics_playback_actions.render_lyrics_list(self, lyrics_obj, status_msg)
 
 
     def play_track(self, index):
-        print(f"\n[Main] play_track called. Index: {index}") # <--- 日志
-        
-        if not hasattr(self, 'current_track_list') or not self.current_track_list: return
-        if index < 0 or index >= len(self.current_track_list): return
-
-        self.current_track_index = index
-        track = self.current_track_list[index]
-        self.playing_track = track
-        self.playing_track_id = track.id
-
-        if hasattr(self, 'bg_viz'):
-            self.bg_viz.randomize_colors()
-        
-        print(f"[Main] Playing: {track.name}") # <--- 日志
-
-        # 更新标题
-        def _get_name(obj):
-            if isinstance(obj, str): return obj
-            return getattr(obj, 'name', getattr(obj, 'title', str(obj)))
-        
-        try:
-            self.lbl_title.set_label(_get_name(getattr(track, "title", "Loading...")))
-            self.lbl_artist.set_label(_get_name(getattr(track, "artist", "")))
-            self.lbl_album.set_label(_get_name(getattr(track, "album", "")))
-        except: pass
-
-        # 更新UI状态
-        GLib.idle_add(lambda: self._update_list_ui(index))
-        GLib.idle_add(lambda: self._update_track_list_icon())
-        
-        cover_id = getattr(track, "cover", None) or getattr(track.album, "cover", None)
-        if cover_id:
-            Thread(target=lambda: self._load_cover_art(cover_id), daemon=True).start()
-
-        # [核心] 后台任务
-        def task():
-            print("[Main] Background task started...") # <--- 日志
-            
-            # 1. 音频播放
-            try:
-                url = self.backend.get_stream_url(track)
-                if url:
-                    print("[Main] Stream URL OK. Loading player...") # <--- 日志
-                    GLib.idle_add(lambda: (self.player.load(url), self.player.play(), self.play_btn.set_icon_name("media-playback-pause-symbolic")))
-                else:
-                    print("[Main] Error: Stream URL is None")
-            except Exception as e:
-                print(f"[Main] Playback Error: {e}")
-
-            # 2. 歌词获取 (这就是你之前缺失的部分！)
-            try:
-                print("[Main] Starting lyrics sequence...") # <--- 日志
-                GLib.idle_add(self.render_lyrics_list, None, "Loading Lyrics...")
-                
-                raw_lyrics = self.backend.get_lyrics(track.id)
-                
-                if raw_lyrics:
-                    print(f"[Main] Got lyrics data! Length: {len(raw_lyrics)}") # <--- 日志
-                    self.lyrics_mgr.load_lyrics(raw_lyrics)
-                    GLib.idle_add(self.render_lyrics_list, self.lyrics_mgr, None)
-                else:
-                    print("[Main] No lyrics returned.") # <--- 日志
-                    GLib.idle_add(self.render_lyrics_list, None, "No Lyrics Available")
-                    
-            except Exception as e:
-                print(f"[Main] Lyrics Error: {e}")
-                import traceback
-                traceback.print_exc()
-
-        Thread(target=task, daemon=True).start()
+        lyrics_playback_actions.play_track(self, index)
 
     def _get_tidal_image_url(self, uuid, width=320, height=320):
         """
@@ -1576,112 +2182,94 @@ class TidalApp(Adw.Application):
             # 替换横杠为斜杠
             path = uuid.replace("-", "/")
             return f"https://resources.tidal.com/images/{path}/{width}x{height}.jpg"
-        except:
+        except Exception as e:
+            logger.warning("Failed to build TIDAL image URL from uuid '%s': %s", uuid, e)
             return None
 
     def on_seek(self, s): 
+        self._update_progress_thumb_position()
         if not self.is_programmatic_update: self.player.seek(s.get_value())
 
-    def _scroll_to_lyric(self, widget):
-        """
-        [动画版] 计算歌词的目标滚动位置 (不直接滚动)
-        """
-        if not hasattr(self, 'lyrics_scroller') or not widget: return
-        
+    def _update_progress_thumb_position(self):
+        if self.scale is None or self.scale_thumb is None:
+            return
         try:
-            # 计算控件位置
-            success, rect = widget.compute_bounds(self.lyrics_vbox)
-            if not success: return
+            adj = self.scale.get_adjustment()
+            lower = float(adj.get_lower())
+            upper = float(adj.get_upper())
+            value = float(self.scale.get_value())
+            width = int(self.scale.get_width())
+            if upper <= lower or width <= 0:
+                self.scale_thumb.set_margin_start(0)
+                self._thumb_smooth_x = None
+                return
+            ratio = (value - lower) / (upper - lower)
+            ratio = max(0.0, min(1.0, ratio))
+            thumb_w = 14
+            max_x = float(max(0, width - thumb_w))
+            raw_x = float(ratio * max_x)
 
-            # 算出 Label 中心点 Y 坐标
-            label_center_y = rect.origin.y + (rect.size.height / 2)
-            
-            # 算出可视区域高度
-            viewport_h = self.lyrics_scroller.get_height()
-            
-            # 算出目标滚动值
-            target = label_center_y - (viewport_h / 2)
-            
-            # 获取当前最大滚动范围，防止越界
-            adj = self.lyrics_scroller.get_vadjustment()
-            max_scroll = adj.get_upper() - adj.get_page_size()
-            
-            # [关键] 将目标值存入 self变量，而不是直接 set_value
-            # 我们将在 update_ui_loop 里一帧一帧地滑过去
-            self.target_scroll_y = max(0, min(target, max_scroll))
-            
-        except: pass
+            prev_x = self._thumb_smooth_x
+            if prev_x is None:
+                smooth_x = raw_x
+            elif not self.is_programmatic_update:
+                # User drag/seek: follow cursor immediately.
+                smooth_x = raw_x
+            else:
+                # Playback tick: smooth motion and suppress tiny backward jitter.
+                if raw_x < prev_x and (prev_x - raw_x) <= 1.5:
+                    raw_x = prev_x
+                if abs(raw_x - prev_x) > 56.0:
+                    # Track switch / hard seek: snap to new position.
+                    smooth_x = raw_x
+                else:
+                    smooth_x = prev_x + (raw_x - prev_x) * 0.38
+                    if abs(smooth_x - prev_x) < 0.30:
+                        smooth_x = prev_x
+
+            smooth_x = max(0.0, min(max_x, smooth_x))
+            self._thumb_smooth_x = smooth_x
+            self.scale_thumb.set_margin_start(int(round(smooth_x)))
+        except Exception:
+            pass
+
+    def _scroll_to_lyric(self, widget):
+        lyrics_playback_actions.scroll_to_lyric(self, widget)
+
+    def _restore_paned_position_after_layout(self):
+        if self.paned is None:
+            return False
+        try:
+            saved_paned = int(self.settings.get("paned_position", 0) or 0)
+        except Exception:
+            saved_paned = 0
+        if saved_paned > 0 and self.paned.get_position() != saved_paned:
+            self.paned.set_position(saved_paned)
+        return False
 
     def update_ui_loop(self):
-        """
-        [50FPS 高性能循环] 处理进度条、时间显示和歌词平滑滚动
-        """
-        # 1. 获取播放器状态
-        p, d = self.player.get_position()
-        
-        # --- A. 进度条与时间 (带节流) ---
-        if d > 0:
-            # 进度条需要流畅，每帧都更新
-            self.is_programmatic_update = True
-            self.scale.set_range(0, d)
-            self.scale.set_value(p)
-            self.is_programmatic_update = False
-            
-            # [优化] 时间文字不需要每秒刷 50 次，每秒刷 1 次即可
-            # 我们通过检查整数秒的变化来减少 Label.set_text 的开销
-            current_int_sec = int(p)
-            if not hasattr(self, '_last_sec') or self._last_sec != current_int_sec:
-                self.lbl_current_time.set_text(f"{int(p//60)}:{int(p%60):02d}")
-                self.lbl_total_time.set_text(f"{int(d//60)}:{int(d%60):02d}")
-                self._last_sec = current_int_sec
-
-        # --- B. 歌词高亮逻辑 ---
-        if hasattr(self, 'lyrics_mgr') and self.lyrics_mgr.has_synced and hasattr(self, 'lyric_widgets') and self.lyric_widgets:
-            # 0.3秒 提前量补偿
-            current_time = p + 0.3
-            active_idx = -1
-            
-            # 查找当前句
-            for i, item in enumerate(self.lyric_widgets):
-                if item['time'] <= current_time:
-                    active_idx = i
-                else:
-                    break
-            
-            current_idx = getattr(self, 'current_lyric_index', -1)
-            
-            # 如果行号变了，更新高亮样式
-            if active_idx != current_idx:
-                if current_idx != -1 and current_idx < len(self.lyric_widgets):
-                    self.lyric_widgets[current_idx]['widget'].remove_css_class("active")
-                
-                if active_idx != -1:
-                    w = self.lyric_widgets[active_idx]['widget']
-                    w.add_css_class("active")
-                    # 计算新的目标位置 (只计算，不滚动)
-                    self._scroll_to_lyric(w)
-                
-                self.current_lyric_index = active_idx
-
-        # --- C. [核心] 歌词平滑滚动动画 (Lerp) ---
-        # 每一帧都执行一点点移动，形成阻尼效果
-        if hasattr(self, 'target_scroll_y') and hasattr(self, 'lyrics_scroller'):
-            adj = self.lyrics_scroller.get_vadjustment()
-            current_y = adj.get_value()
-            target_y = self.target_scroll_y
-            
-            # 如果距离足够大，才执行动画 (节省计算)
-            if abs(target_y - current_y) > 0.5:
-                # 线性插值公式：新位置 = 当前 + (目标 - 当前) * 系数
-                # 0.08 是平滑系数：越小越慢越软，越大越快
-                new_y = current_y + (target_y - current_y) * 0.08
-                adj.set_value(new_y)
-
-        return True
+        return lyrics_playback_actions.update_ui_loop(self)
 
     def update_layout_proportions(self, w, p):
-        s_px = max(int(self.win.get_width() * ui_config.SIDEBAR_RATIO), 240)
-        self.paned.set_position(s_px); self.info_area.set_size_request(s_px, -1)
+        try:
+            saved_paned = int(self.settings.get("paned_position", 0) or 0)
+        except Exception:
+            saved_paned = 0
+        if saved_paned > 0:
+            s_px = saved_paned
+        else:
+            s_px = max(int(self.win.get_width() * ui_config.SIDEBAR_RATIO), 240)
+        self.paned.set_position(s_px)
+        GLib.idle_add(lambda: (self._align_viz_handle_to_play_button(), False)[1])
+
+    def on_paned_position_changed(self, _paned, _param):
+        if self.paned is None:
+            return
+        pos = self.paned.get_position()
+        if not isinstance(pos, int) or pos <= 0:
+            return
+        self.settings["paned_position"] = pos
+        self.schedule_save_settings()
 
     def _update_fav_icon(self, btn, is_active):
         if is_active:
@@ -1690,7 +2278,7 @@ class TidalApp(Adw.Application):
             btn.set_icon_name("non-starred-symbolic"); btn.remove_css_class("active")
 
     def on_fav_clicked(self, btn):
-        if not hasattr(self, 'current_album'): return
+        if not self.current_album: return
         is_currently_active = "active" in btn.get_css_classes()
         is_add = not is_currently_active
         def do():
@@ -1698,7 +2286,7 @@ class TidalApp(Adw.Application):
         Thread(target=do, daemon=True).start()
 
     def on_artist_fav_clicked(self, btn):
-        if not hasattr(self, 'current_selected_artist'): return
+        if not self.current_selected_artist: return
         art = self.current_selected_artist
         is_currently_active = "active" in btn.get_css_classes()
         is_add = not is_currently_active
@@ -1707,69 +2295,20 @@ class TidalApp(Adw.Application):
         Thread(target=do, daemon=True).start()
 
     def _build_search_view(self):
-        self.search_scroll = Gtk.ScrolledWindow(vexpand=True)
-        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24, margin_top=32, margin_bottom=32, margin_start=32, margin_end=32)
-        self.search_scroll.set_child(vbox)
-        self.res_art_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        self.res_art_box.append(Gtk.Label(label="Artists", xalign=0, css_classes=["section-title"]))
-        self.res_art_flow = Gtk.FlowBox(max_children_per_line=10, selection_mode=Gtk.SelectionMode.NONE, column_spacing=24, row_spacing=24)
-        self.res_art_flow.connect("child-activated", self.on_grid_item_activated) 
-        self.res_art_box.append(self.res_art_flow); vbox.append(self.res_art_box)
-        self.res_alb_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        self.res_alb_box.append(Gtk.Label(label="Albums", xalign=0, css_classes=["section-title"]))
-        self.res_alb_flow = Gtk.FlowBox(max_children_per_line=10, selection_mode=Gtk.SelectionMode.NONE, column_spacing=24, row_spacing=24)
-        self.res_alb_flow.connect("child-activated", self.on_grid_item_activated) 
-        self.res_alb_box.append(self.res_alb_flow); vbox.append(self.res_alb_box)
-        self.res_trk_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        self.res_trk_box.append(Gtk.Label(label="Tracks", xalign=0, css_classes=["section-title"]))
-        self.res_trk_list = Gtk.ListBox(css_classes=["boxed-list"])
-        self.res_trk_list.connect("row-activated", self.on_search_track_selected)
-        self.res_trk_box.append(self.res_trk_list); vbox.append(self.res_trk_box)
-        self.right_stack.add_named(self.search_scroll, "search_view")
+        ui_views_builders.build_search_view(self)
+        ui_actions.render_search_history(self)
 
     def on_search(self, entry):
-        q = entry.get_text()
-        if not q: return
-        self.nav_history.clear()
-        self.right_stack.set_visible_child_name("search_view"); self.nav_list.select_row(None); self.back_btn.set_sensitive(True)
-        self.grid_title_label.set_text(f"Search: {q}")
-        def clear_container(c):
-            while child := c.get_first_child(): c.remove(child)
-        clear_container(self.res_art_flow); clear_container(self.res_alb_flow); clear_container(self.res_trk_list)
-        def do_search():
-            results = self.backend.search_items(q); GLib.idle_add(self.render_search_results, results)
-        Thread(target=do_search, daemon=True).start()
+        ui_actions.on_search(self, entry)
+
+    def on_search_changed(self, entry):
+        ui_actions.on_search_changed(self, entry)
+
+    def clear_search_history(self, btn):
+        ui_actions.clear_search_history(self, btn)
 
     def render_search_results(self, res):
-        artists = res.get('artists', []); albums = res.get('albums', []); tracks = res.get('tracks', [])
-        self.res_art_box.set_visible(bool(artists))
-        for art in artists:
-            v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, css_classes=["card"])
-            img = Gtk.Image(pixel_size=100, css_classes=["circular-avatar"])
-            utils.load_img(img, lambda a=art: self.backend.get_artwork_url(a, 320), self.cache_dir, 100)
-            v.append(img); v.append(Gtk.Label(label=art.name, ellipsize=2, wrap=True, max_width_chars=12, css_classes=["heading"]))
-            c = Gtk.FlowBoxChild(); c.set_child(v);
-            c.data_item = {'obj': art, 'type': 'Artist'}
-            self.res_art_flow.append(c)
-        self.res_alb_box.set_visible(bool(albums))
-        for alb in albums:
-            v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, css_classes=["card"])
-            img = Gtk.Image(pixel_size=110, css_classes=["album-cover-img"])
-            utils.load_img(img, lambda a=alb: self.backend.get_artwork_url(a, 320), self.cache_dir, 110)
-            v.append(img); v.append(Gtk.Label(label=alb.name, ellipsize=2, wrap=True, max_width_chars=14))
-            c = Gtk.FlowBoxChild(); c.set_child(v)
-            c.data_item = {'obj': alb, 'type': 'Album'}
-            self.res_alb_flow.append(c)
-        self.res_trk_box.set_visible(bool(tracks)); self.search_track_data = tracks
-        for i, t in enumerate(tracks):
-            row = Gtk.Box(spacing=16, margin_top=8, margin_bottom=8, margin_start=12)
-            img = Gtk.Image(pixel_size=48, css_classes=["album-cover-img"])
-            utils.load_img(img, lambda tr=t: self.backend.get_artwork_url(tr, 80), self.cache_dir, 48)
-            row.append(img)
-            info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
-            info.append(Gtk.Label(label=t.name, xalign=0, ellipsize=3, css_classes=["heading"]))
-            info.append(Gtk.Label(label=getattr(t.artist, 'name', 'Unknown'), xalign=0, css_classes=["dim-label"]))
-            row.append(info); self.res_trk_list.append(row)
+        ui_actions.render_search_results(self, res)
 
     def on_search_track_selected(self, box, row):
         """
@@ -1778,12 +2317,24 @@ class TidalApp(Adw.Application):
         if not row: return
         idx = row.get_index()
         
-        if hasattr(self, 'search_track_data') and idx < len(self.search_track_data):
+        if idx < len(self.search_track_data):
             # 1. 切换播放列表为搜索结果
             self.current_track_list = self.search_track_data
+            self._set_play_queue(self.search_track_data)
             
             # 2. [关键] 统一调用 play_track
             self.play_track(idx)
+
+    def on_search_history_track_selected(self, box, row):
+        if not row:
+            return
+        idx = row.get_index()
+        tracks = list(getattr(self, "search_history_track_data", []) or [])
+        if idx < 0 or idx >= len(tracks):
+            return
+        self.current_track_list = tracks
+        self._set_play_queue(tracks)
+        self.play_track(idx)
 
     def on_track_selected(self, box, row):
         """
@@ -1793,6 +2344,7 @@ class TidalApp(Adw.Application):
         
         # 1. 获取点击的索引
         idx = row.get_index()
+        self._set_play_queue(getattr(self, "current_track_list", []))
         
         # 2. [关键] 必须调用 play_track，因为歌词逻辑都在那里面！
         # 不要在这里自己写播放代码，否则会漏掉歌词功能
@@ -1800,34 +2352,60 @@ class TidalApp(Adw.Application):
 
     # [已修复] 补全 on_back_clicked
     def on_back_clicked(self, btn):
-        if self.nav_history:
-            target_view = self.nav_history.pop()
-            self.right_stack.set_visible_child_name(target_view)
-            if target_view == "search_view": return
-            if not self.nav_history and target_view == "grid_view":
-                btn.set_sensitive(False)
-                self.artist_fav_btn.set_visible(False)
-                if not self.nav_list.get_selected_row():
-                    child = self.nav_list.get_first_child()
-                    while child:
-                        if hasattr(child, 'nav_id') and child.nav_id == "home": self.nav_list.select_row(child); self.on_nav_selected(None, child); break
-                        child = child.get_next_sibling()
-            return
-        self.right_stack.set_visible_child_name("grid_view")
-        btn.set_sensitive(False)
-        self.artist_fav_btn.set_visible(False)
-        row = self.nav_list.get_selected_row()
-        if row: self.on_nav_selected(None, row)
-        else:
-             child = self.nav_list.get_first_child()
-             while child:
-                 if hasattr(child, 'nav_id') and child.nav_id == "home": self.nav_list.select_row(child); self.on_nav_selected(None, child); break
-                 child = child.get_next_sibling()
+        ui_navigation.on_back_clicked(self, btn)
 
     def on_player_art_clicked(self, gest, n, x, y):
-        if hasattr(self, 'playing_track') and self.playing_track:
+        if self.playing_track:
             track = self.playing_track
             if hasattr(track, 'album') and track.album: self.show_album_details(track.album)
+
+    def _build_help_popover(self):
+        pop = Gtk.Popover()
+        pop.set_has_arrow(False)
+        pop.add_css_class("shortcuts-surface")
+        vbox = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=12,
+            margin_top=18,
+            margin_bottom=18,
+            margin_start=18,
+            margin_end=18,
+            css_classes=["shortcuts-popover"],
+        )
+        vbox.set_size_request(420, -1)
+
+        title = Gtk.Label(label="Keyboard Shortcuts", css_classes=["shortcuts-title"], halign=Gtk.Align.START)
+        vbox.append(title)
+        subtitle = Gtk.Label(
+            label="Fast controls for playback and navigation",
+            xalign=0,
+            wrap=True,
+            css_classes=["shortcuts-subtitle"],
+        )
+        vbox.append(subtitle)
+
+        shortcuts = [
+            ("Space", "Play / Pause"),
+            ("Ctrl + →", "Next Track"),
+            ("Ctrl + ←", "Previous Track"),
+            ("Ctrl + F", "Focus Search"),
+            ("Q", "Toggle Queue Drawer"),
+            ("Tab", "Toggle Lyrics & Viz")
+        ]
+
+        list_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, css_classes=["shortcuts-list"])
+        for key, action in shortcuts:
+            row = Gtk.Box(spacing=12, css_classes=["shortcuts-row"])
+            action_lbl = Gtk.Label(label=action, xalign=0, hexpand=True, css_classes=["shortcuts-action"])
+            key_lbl = Gtk.Label(label=key, xalign=1, hexpand=False, css_classes=["shortcuts-keycap"])
+            key_lbl.set_attributes(Pango.AttrList.from_string("font-features 'tnum=1'"))
+            row.append(action_lbl)
+            row.append(key_lbl)
+            list_box.append(row)
+
+        vbox.append(list_box)
+        pop.set_child(vbox)
+        return pop
 
     def toggle_visualizer(self, btn):
         """
@@ -1835,21 +2413,115 @@ class TidalApp(Adw.Application):
         """
         is_visible = self.viz_revealer.get_reveal_child()
         target_state = not is_visible
-        
-        # 1. 触发 Revealer 动画 (上下滑动)
-        self.viz_revealer.set_reveal_child(target_state)
+        self._set_visualizer_expanded(target_state)
+        self.settings["viz_expanded"] = target_state
+        self.schedule_save_settings()
 
-        # 2. 图标切换
-        if target_state:
-            btn.set_icon_name("pan-down-symbolic")
-            btn.add_css_class("active")
-            if hasattr(self, 'viz'): self.viz.queue_draw()
+    def _set_visualizer_expanded(self, expanded):
+        # 触发 Revealer 动画 (上下滑动)
+        self.viz_revealer.set_reveal_child(expanded)
+        self._apply_overlay_scroll_padding(expanded)
+        self._position_viz_handle(expanded)
+        if self._viz_handle_settle_source:
+            GLib.source_remove(self._viz_handle_settle_source)
+            self._viz_handle_settle_source = 0
+        if expanded:
+            def _settle_handle():
+                self._viz_handle_settle_source = 0
+                self._position_viz_handle(True)
+                return False
+            # Reposition once after layout settles; avoids first-open mismatch.
+            self._viz_handle_settle_source = GLib.timeout_add(220, _settle_handle)
+
+        # 图标切换
+        if expanded:
+            self.viz_btn.set_icon_name("hiresti-pan-down-symbolic")
+            self.viz_btn.add_css_class("active")
+            if self.viz is not None:
+                self.viz.queue_draw()
         else:
-            btn.set_icon_name("pan-up-symbolic")
-            btn.remove_css_class("active")
-            
-        # 注意：Overlay 模式下不需要再设置 set_vexpand 了，
-        # 因为它现在是浮在上面的，不会挤压下面的内容。
+            self.viz_btn.set_icon_name("hiresti-pan-up-symbolic")
+            self.viz_btn.remove_css_class("active")
+
+    def _position_viz_handle(self, expanded):
+        box = getattr(self, "viz_handle_box", None)
+        if box is None:
+            return
+        self._align_viz_handle_to_play_button()
+        base_bottom = 0
+        target = 0
+        if not expanded:
+            self._animate_viz_handle_to(base_bottom, duration_ms=180)
+            return
+        panel_h = 0
+        if getattr(self, "viz_root", None) is not None:
+            panel_h = int(self.viz_root.get_height() or 0)
+        if panel_h <= 1 and getattr(self, "viz_stack", None) is not None:
+            stack_h = int(self.viz_stack.get_height() or 0)
+            if stack_h > 1:
+                panel_h = stack_h + 36
+        if panel_h <= 1:
+            panel_h = 286
+        target = max(base_bottom, panel_h - 24 + base_bottom - 12 - 7)
+        self._animate_viz_handle_to(target, duration_ms=180)
+
+    def _align_viz_handle_to_play_button(self):
+        box = getattr(self, "viz_handle_box", None)
+        play_btn = getattr(self, "play_btn", None)
+        overlay = getattr(self, "body_overlay", None)
+        if box is None or play_btn is None or overlay is None:
+            return
+        try:
+            ok, rect = play_btn.compute_bounds(overlay)
+        except Exception:
+            return
+        if not ok or rect is None:
+            return
+        viz_btn = getattr(self, "viz_btn", None)
+        handle_w = int(box.get_width() or (viz_btn.get_width() if viz_btn is not None else 0) or 50)
+        overlay_w = int(overlay.get_width() or 0)
+        center_x = float(rect.get_x()) + (float(rect.get_width()) / 2.0)
+        target_start = int(round(center_x - (handle_w / 2.0)))
+        if overlay_w > 0:
+            target_start = max(0, min(max(0, overlay_w - handle_w), target_start))
+        box.set_halign(Gtk.Align.START)
+        box.set_margin_start(target_start)
+        box.set_margin_end(0)
+
+    def _animate_viz_handle_to(self, target_bottom, duration_ms=180):
+        box = getattr(self, "viz_handle_box", None)
+        if box is None:
+            return
+        try:
+            target = int(target_bottom)
+        except Exception:
+            target = 0
+        target = max(0, min(2000, target))
+        start = int(box.get_margin_bottom() or 0)
+        if self._viz_handle_anim_source:
+            GLib.source_remove(self._viz_handle_anim_source)
+            self._viz_handle_anim_source = 0
+        if duration_ms <= 0 or start == target:
+            box.set_margin_bottom(target)
+            return
+
+        start_us = GLib.get_monotonic_time()
+        span_us = max(1, int(duration_ms) * 1000)
+
+        def _tick():
+            elapsed = GLib.get_monotonic_time() - start_us
+            t = min(1.0, max(0.0, float(elapsed) / float(span_us)))
+            # Ease-out curve for a natural "pushed out" feeling.
+            eased = 1.0 - ((1.0 - t) * (1.0 - t))
+            cur = int(round(start + (target - start) * eased))
+            box.set_margin_bottom(max(0, cur))
+            if t >= 1.0:
+                self._viz_handle_anim_source = 0
+                return False
+            return True
+
+        self._viz_handle_anim_source = GLib.timeout_add(16, _tick)
 
 if __name__ == "__main__":
+    setup_logging()
     TidalApp().run(None)
