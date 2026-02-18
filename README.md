@@ -29,7 +29,8 @@ Replace the image paths below with your own screenshots.
 ![Settings](screenshots/1.0.4-4.png)
 
 ### Mini Mode
-![MiniMode](screenshots/1.0.4-5.png)
+<img src="screenshots/1.0.4-5.png" width="400">
+
 
 ## Requirements
 
