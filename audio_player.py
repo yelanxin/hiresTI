@@ -10,18 +10,17 @@ gi.require_version('Gst', '1.0')
 gi.require_version('GstPbutils', '1.0') 
 from gi.repository import Gst, GLib, GstPbutils
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class AudioPlayer:
-    def __init__(self, on_eos_callback=None, on_tag_callback=None, on_spectrum_callback=None):
+    def __init__(self, on_eos_callback=None, on_tag_callback=None, on_spectrum_callback=None, on_viz_sync_offset_update=None):
         """
         完整初始化：包含频谱仪集成、技术参数存储、以及 ALSA/Pulse 状态管理
         """
         try:
             Gst.init(None)
-        except:
-            pass
+        except Exception as e:
+            logger.debug("GStreamer init skipped/failed: %s", e)
 
         # 1. 创建核心管道 (使用 playbin 自动处理解码)
         self.pipeline = Gst.ElementFactory.make("playbin", "player")
@@ -32,6 +31,27 @@ class AudioPlayer:
         self.bit_perfect_mode = False
         self.exclusive_lock_mode = False
         self.active_rate_switch = False
+        self.output_state = "idle"
+        self.output_error = None
+        self.requested_driver = None
+        self.requested_device_id = None
+        self.event_log = []
+        self.last_latency_source = "none"
+        self.last_latency_seconds = 0.0
+        self.visual_sync_offset_ms = 0
+        self.visual_sync_base_ms = 0
+        self.visual_sync_lead_ms = 0
+        self.visual_sync_startup_ms = 0
+        self.visual_sync_auto_offset_ms = 0.0
+        self._viz_offset_report_last_ts = 0.0
+        self._viz_offset_report_last_val = 0
+        self._viz_latency_cached_ms = 0.0
+        self._viz_latency_smooth_ms = 0.0
+        self._viz_msg_age_smooth_ms = 0.0
+        self._viz_latency_last_probe_ts = 0.0
+        self._viz_start_guard_until = 0.0
+        self._viz_epoch = 0
+        self._viz_debug_last_ts = 0.0
 
         # 声卡与独占模式管理变量
         self.borrowed_pa_card = None
@@ -46,12 +66,13 @@ class AudioPlayer:
         self.on_eos_callback = on_eos_callback
         self.on_tag_callback = on_tag_callback
         self.on_spectrum_callback = on_spectrum_callback
+        self.on_viz_sync_offset_update = on_viz_sync_offset_update
 
         # 3. 初始化 Discoverer (用于获取媒体元数据)
         try:
             self.discoverer = GstPbutils.Discoverer.new(1 * Gst.SECOND)
         except Exception as e:
-            print(f"[Init Warning] Failed to create Discoverer: {e}")
+            logger.warning("Failed to create Discoverer: %s", e)
             self.discoverer = None
 
         # 4. 构建音频处理过滤器链 (Equalizer + Spectrum)
@@ -63,6 +84,12 @@ class AudioPlayer:
         bus.connect("message", self.on_message)
         # 专门监听 element 消息以抓取 spectrum 数据
         bus.connect("message::element", self._on_bus_message)
+
+    def _push_event(self, message):
+        ts = time.strftime("%H:%M:%S")
+        self.event_log.append(f"{ts} | {message}")
+        if len(self.event_log) > 20:
+            self.event_log = self.event_log[-20:]
 
     def _setup_filter_chain(self):
         """
@@ -77,15 +104,14 @@ class AudioPlayer:
             self.equalizer = Gst.ElementFactory.make("audioconvert", "eq_placeholder")
 
         if not self.spectrum:
-            print("[AudioPlayer] Error: spectrum element missing!")
+            logger.error("spectrum element missing")
             return
 
         # 2. 现在才能配置属性
         self.spectrum.set_property("bands", 128)
         
-        # [同步优化] 将分析间隔从 50ms 缩短到 30ms (30,000,000 纳秒)
-        # 这会让视觉数据更快地从 GStreamer 发送到 UI
-        self.spectrum.set_property("interval", 30000000) 
+        # Keep stable sync cadence; visual punch is handled in BackgroundVisualizer.
+        self.spectrum.set_property("interval", 30000000)
         
         spec_props = [p.name for p in self.spectrum.list_properties()]
         if 'message' in spec_props: self.spectrum.set_property("message", True)
@@ -108,16 +134,41 @@ class AudioPlayer:
     def set_alsa_latency(self, buffer_ms, latency_ms):
         self.alsa_buffer_time = int(buffer_ms * 1000)   # 毫秒转微秒
         self.alsa_latency_time = int(latency_ms * 1000)
-        print(f"[AudioPlayer] ALSA Latency updated: Buffer={self.alsa_buffer_time}us, Period={self.alsa_latency_time}us")
+        logger.info(
+            "ALSA latency updated: buffer=%sus period=%sus",
+            self.alsa_buffer_time,
+            self.alsa_latency_time,
+        )
 
     def cleanup(self):
-        print("[AudioPlayer] Cleaning up resources...")
+        logger.info("Cleaning up audio resources...")
         self.stop()
         self._restore_pa_device()
         self._set_pipewire_clock(0)
 
+    def _reset_visual_sync_state(self):
+        self._viz_latency_cached_ms = 0.0
+        self._viz_latency_smooth_ms = 0.0
+        self._viz_msg_age_smooth_ms = 0.0
+        self._viz_latency_last_probe_ts = 0.0
+        self._viz_start_guard_until = 0.0
+        self._viz_epoch += 1
+
+    def _arm_visual_start_guard(self):
+        self._viz_start_guard_until = time.monotonic() + (max(0.0, float(self.visual_sync_startup_ms or 0)) / 1000.0)
+
+    def _dispatch_spectrum(self, magnitudes, pos_s, epoch):
+        if epoch != self._viz_epoch:
+            return False
+        try:
+            self.on_spectrum_callback(magnitudes, pos_s)
+        except Exception:
+            pass
+        return False
+
     def load(self, uri):
         self.stop()
+        self._reset_visual_sync_state()
         
         if self.active_rate_switch and not self.exclusive_lock_mode and self.discoverer:
             self._pre_adjust_pipewire_rate(uri)
@@ -134,16 +185,17 @@ class AudioPlayer:
             if audio_streams:
                 target_rate = audio_streams[0].get_sample_rate()
                 if target_rate > 0:
-                    print(f"[Rate Switcher] Source is {target_rate}Hz. Adjusting PipeWire clock...")
+                    logger.info("Source is %sHz. Adjusting PipeWire clock...", target_rate)
                     self._set_pipewire_clock(target_rate)
         except Exception as e:
-            print(f"[Rate Switcher] Discovery failed (continuing anyway): {e}")
+            logger.warning("Rate discovery failed (continuing): %s", e)
 
     def _set_pipewire_clock(self, rate):
         try:
             cmd = ["pw-metadata", "-n", "settings", "0", "clock.force-rate", str(rate)]
             subprocess.run(cmd, check=False, stderr=subprocess.DEVNULL)
-        except: pass
+        except Exception as e:
+            logger.debug("Failed to set PipeWire clock rate to %s: %s", rate, e)
 
     def set_uri(self, uri):
         """
@@ -151,6 +203,7 @@ class AudioPlayer:
         """
         # 1. 停止播放
         self.stop()
+        self._reset_visual_sync_state()
         
         # 定义一个内部函数来检查属性是否存在
         def has_property(obj, prop_name):
@@ -158,7 +211,7 @@ class AudioPlayer:
                 # GObject.list_properties 返回的是参数规格对象(ParamSpec)列表
                 # 我们需要检查这些对象的 .name 属性
                 return any(p.name == prop_name for p in obj.list_properties())
-            except:
+            except Exception:
                 return False
 
         # 2. 方案 A: 检查 Pipeline 本身是否有 "uri" 属性 (针对 playbin)
@@ -186,9 +239,13 @@ class AudioPlayer:
                 return
 
         # 5. 如果都失败了，打印调试信息
-        print(f"[AudioPlayer] Error: Could not find target for URI! Pipeline type: {type(self.pipeline)}")
+        logger.error("Could not find target for URI. Pipeline type: %s", type(self.pipeline))
 
     def play(self):
+        # Apply a short guard window on every resume/start.
+        # Some outputs keep a noticeable re-prime latency even from PAUSED.
+        self._reset_visual_sync_state()
+        self._arm_visual_start_guard()
         self.pipeline.set_state(Gst.State.PLAYING)
 
     def pause(self):
@@ -210,7 +267,8 @@ class AudioPlayer:
             success_dur, dur = self.pipeline.query_duration(Gst.Format.TIME)
             if success and success_dur:
                 return pos / Gst.SECOND, dur / Gst.SECOND
-        except: pass
+        except Exception as e:
+            logger.debug("Failed to query position/duration: %s", e)
         return 0, 0
 
     def set_volume(self, vol):
@@ -242,7 +300,8 @@ class AudioPlayer:
                     friendly_name = dev_id 
                     if desc_match: friendly_name = desc_match.group(1).strip()
                     devices.append({"name": friendly_name, "device_id": dev_id})
-        except: pass
+        except Exception as e:
+            logger.debug("Failed to enumerate PulseAudio sinks: %s", e)
         return devices
 
     def get_drivers(self):
@@ -272,7 +331,7 @@ class AudioPlayer:
                     hw_id = f"hw:{idx},0"
                     devices.append({"name": friendly_name, "device_id": hw_id})
             except Exception as e:
-                print(f"[ALSA Scan Error] {e}")
+                logger.warning("ALSA scan error: %s", e)
             devices.sort(key=lambda x: "USB" not in x["name"])
             return devices
         return []
@@ -294,7 +353,8 @@ class AudioPlayer:
                 subprocess.run(["pactl", "set-card-profile", target_pa_name, "off"], check=False)
                 self.borrowed_pa_card = target_pa_name
                 return True
-        except: pass
+        except Exception as e:
+            logger.debug("Failed to release PA device for card %s: %s", alsa_card_index, e)
         return False
 
     def _restore_pa_device(self):
@@ -304,7 +364,8 @@ class AudioPlayer:
                 if res.returncode != 0:
                      subprocess.run(["pactl", "set-card-profile", self.borrowed_pa_card, "output:analog-stereo"])
                 self.borrowed_pa_card = None
-            except: pass
+            except Exception as e:
+                logger.warning("Failed to restore PA device profile for %s: %s", self.borrowed_pa_card, e)
 
     # ==========================================
     # 输出设置
@@ -313,7 +374,12 @@ class AudioPlayer:
         """
         设置音频输出驱动和设备 (整合 ALSA/PipeWire/PulseAudio 终极优化版)
         """
-        print(f"[AudioPlayer] Setting output: Driver={driver}, Device={device_id}")
+        logger.info("Setting output: driver=%s device=%s", driver, device_id)
+        self.output_state = "switching"
+        self.output_error = None
+        self.requested_driver = driver
+        self.requested_device_id = device_id
+        self._push_event(f"Output switch requested: {driver} / {device_id or 'default'}")
 
         # 1. 停止播放并清理旧状态
         was_playing = self.is_playing()
@@ -333,7 +399,8 @@ class AudioPlayer:
                 card_idx = device_id.split(':')[1].split(',')[0]
                 self._release_pa_device(card_idx)
                 if self.exclusive_lock_mode: time.sleep(0.5) # 给硬件一点喘息时间
-            except: pass
+            except Exception as e:
+                logger.debug("ALSA pre-release step failed for %s: %s", device_id, e)
 
             sink = Gst.ElementFactory.make("alsasink", "audio_sink")
             if sink:
@@ -350,13 +417,17 @@ class AudioPlayer:
 
                 # --- [核心优化 2] 发烧级时钟设置 ---
                 # 强制让 DAC 做主时钟 (Master)，电脑做从属，大幅降低 Jitter
-                try: sink.set_property("provide-clock", True)
-                except: pass
+                try:
+                    sink.set_property("provide-clock", True)
+                except Exception as e:
+                    logger.debug("ALSA sink provide-clock unsupported: %s", e)
 
                 # --- [核心优化 3] 时钟漂移校正 ---
                 # 1 = SKEW (微调指针)。相比 RESAMPLE (重采样)，这能保证原始数据不被修改。
-                try: sink.set_property("slave-method", 1)
-                except: pass
+                try:
+                    sink.set_property("slave-method", 1)
+                except Exception as e:
+                    logger.debug("ALSA sink slave-method unsupported: %s", e)
 
                 # 应用 Sink
                 self.pipeline.set_property("audio-sink", sink)
@@ -364,9 +435,7 @@ class AudioPlayer:
                 # 测试设备是否繁忙
                 ret = self.pipeline.set_state(Gst.State.READY)
                 if ret == Gst.StateChangeReturn.FAILURE:
-                    print(f"[AudioPlayer] ALSA Device {device_id} is BUSY! Falling back.")
-                    self.pipeline.set_state(Gst.State.NULL)
-                    self._set_auto_sink()
+                    self._switch_to_auto_sink(f"alsa busy: {device_id}")
             else:
                 self._set_auto_sink()
 
@@ -379,8 +448,10 @@ class AudioPlayer:
                 # 1. 绑定设备
                 if device_id:
                     # PipeWire 使用 target-object 指定 Node ID 或 Serial
-                    try: sink.set_property("target-object", device_id)
-                    except: pass # 旧版插件可能不支持
+                    try:
+                        sink.set_property("target-object", device_id)
+                    except Exception as e: # 旧版插件可能不支持
+                        logger.debug("PipeWire target-object unsupported for %s: %s", device_id, e)
 
                 # 2. 构建高级参数
                 props = Gst.Structure.new_empty("props")
@@ -404,7 +475,7 @@ class AudioPlayer:
                 # 强制限制在合理范围内 (发烧友建议 1024 - 4096)
                 quantum = max(512, min(quantum, 8192))
 
-                print(f"[PipeWire] Mapping buffer {target_buffer_us}us -> Quantum {quantum}/48000")
+                logger.info("PipeWire latency map: buffer %sus -> quantum %s/48000", target_buffer_us, quantum)
 
                 props.set_value("node.latency", f"{quantum}/48000")
                 props.set_value("node.autoconnect", "true")
@@ -438,8 +509,10 @@ class AudioPlayer:
                 sink.set_property("latency-time", target_latency)
 
                 # 同样开启 DAC 主时钟模式
-                try: sink.set_property("provide-clock", True)
-                except: pass
+                try:
+                    sink.set_property("provide-clock", True)
+                except Exception as e:
+                    logger.debug("Pulse sink provide-clock unsupported: %s", e)
 
                 self.pipeline.set_property("audio-sink", sink)
             else:
@@ -454,6 +527,9 @@ class AudioPlayer:
         # 恢复播放状态
         if was_playing:
             self.pipeline.set_state(Gst.State.PLAYING)
+        if self.output_state == "switching":
+            self.output_state = "active"
+            self._push_event(f"Output active: {driver} / {device_id or 'default'}")
 
         # 重新安装 Probe 以获取新的格式信息
         GLib.timeout_add(500, self._install_pad_probe)
@@ -462,20 +538,31 @@ class AudioPlayer:
         sink = Gst.ElementFactory.make("autoaudiosink", "audio_sink")
         self.pipeline.set_property("audio-sink", sink)
 
+    def _switch_to_auto_sink(self, reason, resume_play=False):
+        logger.warning("Switching to system fallback sink: %s", reason)
+        self.pipeline.set_state(Gst.State.NULL)
+        self._set_auto_sink()
+        self.output_state = "fallback"
+        self.output_error = reason
+        self._push_event(f"Fallback to auto sink: {reason}")
+        if resume_play:
+            GLib.timeout_add(100, lambda: self.pipeline.set_state(Gst.State.PLAYING))
+
     def toggle_bit_perfect(self, enabled, exclusive_lock=False):
         self.bit_perfect_mode = enabled
         self.exclusive_lock_mode = exclusive_lock 
         self.active_rate_switch = enabled and not exclusive_lock
+        self._push_event(f"Bit-Perfect={'ON' if enabled else 'OFF'} Exclusive={'ON' if exclusive_lock else 'OFF'}")
         
         if enabled:
             # [修正] Bit-Perfect 开启时，我们依然保留 spectrum，但旁路掉 equalizer
             # 我们可以通过设置均衡器的各频段为 0，或者重新构建只含 spectrum 的 filter_bin
             self.reset_eq() 
-            print("[AudioPlayer] Bit-Perfect ON: EQ Bypassed, Spectrum Kept.")
+            logger.info("Bit-Perfect ON: EQ bypassed, spectrum kept")
         else:
             self._restore_pa_device()
             self._set_pipewire_clock(0)
-            print("[AudioPlayer] Bit-Perfect OFF: EQ Enabled.")
+            logger.info("Bit-Perfect OFF: EQ enabled")
             
         # 确保 filter_bin 始终挂载，除非你真的想彻底关闭所有视觉反馈
         self.pipeline.set_property("audio-filter", self.filter_bin)
@@ -490,7 +577,9 @@ class AudioPlayer:
             if self.probe_id: self.probe_id = None
             self.probe_id = pad.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, self._pad_probe_cb)
             return False
-        except: return False
+        except Exception as e:
+            logger.debug("Failed to install pad probe: %s", e)
+            return False
 
     def _pad_probe_cb(self, pad, info):
         event = info.get_event()
@@ -533,16 +622,127 @@ class AudioPlayer:
                     if match:
                         raw_data = match.group(1) 
                         magnitudes = [float(x.strip()) for x in raw_data.split(', ') if x.strip()]
-                except: 
-                    pass
+                except Exception as e:
+                    logger.debug("Failed to parse spectrum message: %s", e)
 
                 if magnitudes and self.on_spectrum_callback:
-                    # --- [同步校准] ---
-                    # 你观察到声音慢了 0.5秒，所以这里设置为 500ms
-                    # 这样波形显示会推迟 0.5秒，刚好和声音对上
-                    visual_delay_ms = 1200
-                    
-                    GLib.timeout_add(visual_delay_ms, self.on_spectrum_callback, magnitudes)
+                    epoch = self._viz_epoch
+                    pos_s = None
+                    try:
+                        ok, pos_ns = self.pipeline.query_position(Gst.Format.TIME)
+                        if ok and pos_ns is not None and pos_ns >= 0:
+                            pos_s = float(pos_ns) / float(Gst.SECOND)
+                    except Exception:
+                        pos_s = None
+                    msg_pos_s = self._extract_spectrum_message_pos_s(s)
+                    delay_ms = self._estimate_visual_delay_ms(current_pos_s=pos_s, msg_pos_s=msg_pos_s)
+                    if delay_ms <= 0:
+                        GLib.idle_add(self._dispatch_spectrum, magnitudes, pos_s, epoch)
+                    else:
+                        GLib.timeout_add(delay_ms, self._dispatch_spectrum, magnitudes, pos_s, epoch)
+
+    def _extract_spectrum_message_pos_s(self, s):
+        """Try to extract the spectrum frame time (seconds) from message structure."""
+        if not s:
+            return None
+        ns_value = None
+        for key in ("endtime", "running-time", "stream-time", "timestamp"):
+            try:
+                if s.has_field(key):
+                    # 1) Preferred: explicit clock-time getter.
+                    try:
+                        ct = s.get_clock_time(key)
+                        if isinstance(ct, int) and ct >= 0:
+                            ns_value = ct
+                            break
+                    except Exception:
+                        pass
+                    # 2) uint64 path.
+                    try:
+                        ok_u64, v_u64 = s.get_uint64(key)
+                        if ok_u64 and isinstance(v_u64, int) and v_u64 >= 0:
+                            ns_value = v_u64
+                            break
+                    except Exception:
+                        pass
+                    # 3) generic value path.
+                    raw = s.get_value(key)
+                    if isinstance(raw, int) and raw >= 0:
+                        ns_value = raw
+                        break
+            except Exception:
+                continue
+        # 4) Last-resort parse from structure text.
+        if ns_value is None:
+            try:
+                s_str = s.to_string()
+                m = re.search(r"(?:endtime|running-time|stream-time|timestamp)=\((?:g?uint64|uint64)\)\s*(\d+)", s_str)
+                if m:
+                    ns_value = int(m.group(1))
+            except Exception:
+                pass
+        if ns_value is None:
+            return None
+        return float(ns_value) / float(Gst.SECOND)
+
+    def _estimate_visual_delay_ms(self, current_pos_s=None, msg_pos_s=None):
+        now = time.monotonic()
+
+        # Always sample sink latency at low rate; this is the audible-path lag.
+        if (now - self._viz_latency_last_probe_ts) >= 0.12:
+            self._viz_latency_last_probe_ts = now
+            try:
+                lat_s = float(self.get_latency() or 0.0)
+            except Exception:
+                lat_s = 0.0
+            self._viz_latency_cached_ms = max(0.0, min(lat_s * 1000.0, 1500.0))
+
+        # Smooth sink latency itself; frame scheduling uses per-frame timestamp delta.
+        if self._viz_latency_smooth_ms <= 0.0:
+            self._viz_latency_smooth_ms = self._viz_latency_cached_ms
+        else:
+            self._viz_latency_smooth_ms = (self._viz_latency_smooth_ms * 0.80) + (self._viz_latency_cached_ms * 0.20)
+
+        # Core timing:
+        # emit when this spectrum frame is expected to be audible:
+        #   delay = (frame_time + sink_latency - current_time)
+        if (
+            msg_pos_s is not None
+            and current_pos_s is not None
+            and msg_pos_s >= 0.0
+            and current_pos_s >= 0.0
+        ):
+            msg_age_ms = max(0.0, (float(current_pos_s) - float(msg_pos_s)) * 1000.0)
+            if self._viz_msg_age_smooth_ms <= 0.0:
+                self._viz_msg_age_smooth_ms = msg_age_ms
+            else:
+                self._viz_msg_age_smooth_ms = (self._viz_msg_age_smooth_ms * 0.85) + (msg_age_ms * 0.15)
+            target_ms = ((float(msg_pos_s) + (self._viz_latency_smooth_ms / 1000.0) - float(current_pos_s)) * 1000.0)
+        else:
+            # No reliable frame timestamp: subtract learned message age overhead.
+            target_ms = max(0.0, self._viz_latency_smooth_ms - self._viz_msg_age_smooth_ms)
+
+        learned_offset_ms = float(self.visual_sync_offset_ms or 0)
+        total_ms = (
+            target_ms
+            + float(self.visual_sync_base_ms or 0)
+            + learned_offset_ms
+            - float(self.visual_sync_lead_ms or 0)
+        )
+        # Disabled: do not auto-persist learned offset to avoid drift/corruption.
+        if logger.isEnabledFor(logging.DEBUG) and (now - self._viz_debug_last_ts) >= 1.0:
+            self._viz_debug_last_ts = now
+            logger.debug(
+                "viz-sync delay=%.1fms target=%.1fms lat=%.1fms msg_age=%.1fms off=%d cur=%.3fs msg=%.3fs",
+                total_ms,
+                target_ms,
+                self._viz_latency_smooth_ms,
+                self._viz_msg_age_smooth_ms,
+                int(round(learned_offset_ms)),
+                float(current_pos_s or 0.0),
+                float(msg_pos_s or -1.0),
+            )
+        return int(max(0.0, min(total_ms, 2000.0)))
 
     def on_message(self, bus, message):
         t = message.type
@@ -552,14 +752,14 @@ class AudioPlayer:
         elif t == Gst.MessageType.ERROR:
             err, debug = message.parse_error()
             debug_info = str(debug) if debug else ""
-            print(f"[GStreamer Error] Code={err.code}, Msg={err.message}")
+            logger.error("GStreamer error: code=%s msg=%s", err.code, err.message)
+            self.output_state = "error"
+            self.output_error = err.message
+            self._push_event(f"GStreamer error: {err.message}")
             # 忙碌恢复逻辑
             is_busy = err.code == 4 or "Device is being used" in debug_info or "busy" in debug_info
             if is_busy and not self.exclusive_lock_mode:
-                print("[Auto-Recovery] Hardware is BUSY. Switching to System Fallback...")
-                self.pipeline.set_state(Gst.State.NULL)
-                self._set_auto_sink()
-                GLib.timeout_add(100, lambda: self.pipeline.set_state(Gst.State.PLAYING))
+                self._switch_to_auto_sink("runtime busy recovery", resume_play=True)
         
         elif t == Gst.MessageType.TAG:
             tags = message.parse_tag()
@@ -604,6 +804,8 @@ class AudioPlayer:
         # 1. 基础状态检查：如果没在播放或暂停，硬件未工作，延迟为 0
         current_state = self.pipeline.get_state(0)[1]
         if current_state != Gst.State.PLAYING and current_state != Gst.State.PAUSED:
+            self.last_latency_source = "not-playing"
+            self.last_latency_seconds = 0.0
             return 0.0
             
         latency = 0.0
@@ -622,13 +824,31 @@ class AudioPlayer:
                 is_live, min_lat, max_lat = query.parse_latency()
                 # GStreamer 返回的是纳秒 (10^-9)，转换为秒
                 latency = float(min_lat) / 1e9
-        except: 
-            pass
+                if latency > 0.001:
+                    self.last_latency_source = "gst-query"
+                    self.last_latency_seconds = latency
+                    return latency
+        except Exception as e:
+            logger.debug("Latency query failed: %s", e)
 
         # --- 方法 B: 属性读取保底 (针对 ALSA 驱动不上报的情况) ---
         # 如果方法 A 失败 (返回 0 或极小值)，尝试直接读取 Sink 的属性
         if latency <= 0.001 and sink:
             try:
+                # 优先读取运行时“实际”缓冲属性（如果插件支持）
+                prop_names = {p.name for p in sink.list_properties()}
+                for actual_name in ("actual-latency-time", "actual-buffer-time"):
+                    if actual_name in prop_names:
+                        actual_us = sink.get_property(actual_name)
+                        if actual_us and actual_us > 0:
+                            latency = float(actual_us) / 1000000.0
+                            self.last_latency_source = actual_name
+                            self.last_latency_seconds = latency
+                            break
+
+                if latency > 0.001:
+                    return latency
+
                 # 检查 sink 是否有 'buffer-time' 属性 (alsasink, pulsesink 都有)
                 # 这个属性通常对应硬件的缓冲区大小
                 if hasattr(sink.props, 'buffer_time'):
@@ -636,8 +856,10 @@ class AudioPlayer:
                     buf_time = sink.get_property("buffer-time")
                     if buf_time > 0:
                         latency = float(buf_time) / 1000000.0
-            except: 
-                pass
+                        self.last_latency_source = "buffer-time"
+                        self.last_latency_seconds = latency
+            except Exception as e:
+                logger.debug("Latency fallback via buffer-time failed: %s", e)
                 
         # --- 方法 C: 独占模式配置回读 (终极保底) ---
         # 如果以上都失败，但我们处于独占模式，说明延迟是我们自己设定的
@@ -645,8 +867,15 @@ class AudioPlayer:
         if latency <= 0.001 and self.exclusive_lock_mode:
             # 确保变量存在 (防止初始化前的边缘情况)
             if hasattr(self, 'alsa_buffer_time'):
-                return float(self.alsa_buffer_time) / 1000000.0
+                latency = float(self.alsa_buffer_time) / 1000000.0
+                self.last_latency_source = "config-fallback"
+                self.last_latency_seconds = latency
+                return latency
             else:
+                self.last_latency_source = "default-fallback"
+                self.last_latency_seconds = 0.1
                 return 0.1 # 如果变量还没初始化，默认返回 100ms
-            
+
+        self.last_latency_source = "none"
+        self.last_latency_seconds = latency
         return latency
