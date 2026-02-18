@@ -1,36 +1,42 @@
 # Changelog
 
 ## 1.0.4 - 2026-02-18
+Coverage: changes from 2026-02-11 to 2026-02-18.
 
 ### Added
-- Added account-scoped local data isolation for history and playlists.
-- Added new visualizer effects:
+- 10-band EQ and related UI controls.
+- Bit-perfect playback flow and status indicators.
+- Lyrics page and lyrics background visualizer.
+- Visualizer module and multiple new effects/themes, including:
   - `Pro Bars`
   - `Pro Line`
   - `Pro Fall`
   - `Stars`
-- Added `Infrared` spectrum theme.
-- Added `Stars BWR` theme for `Stars` effect (pure black background + blue/white/red stars).
-- Added richer `Burst` particle rendering (denser particles, layered glow, bass shockwave).
+  - `Infrared` theme
+  - `Stars BWR` theme
+- Home page improvements (custom mixes, sidebar updates, track time display).
+- Added account-scoped local data isolation for history and playlists.
+- Packaging support updates for DEB/RPM release workflow.
 
 ### Changed
-- Refined visualizer naming to shorter effect labels:
+- Visualizer naming refined to shorter effect labels:
   - `Wave`, `Fill`, `Mirror`, `Dots`, `Peak`, `Trail`, `Pulse`, `Stereo`, `Burst`, `Fall`, `Spiral`, `Pro Bars`, `Pro Line`, `Pro Fall`
 - Improved `Pro Fall` performance by pre-binning spectrum history and reducing per-frame computation.
-- Updated default visualizer behavior and theme integration so effects follow selected spectrum theme more consistently.
-- Reworked packaging script (`package.sh`):
+- Updated visualizer/theme integration so effects follow selected spectrum theme more consistently.
+- Reworked `package.sh`:
   - Bundles required source folders (`ui/`, `actions/`, `icons/`).
   - Adds preflight checks.
-  - Uses safer shell options and quoting.
+  - Uses safer shell mode and quoting.
   - Produces dual RPM variants from one command:
     - Fedora (`.fedora`)
     - EL9 (`.el9`)
   - Keeps support for single-variant RPM builds (`rpm-fedora`, `rpm-el9`).
-- Updated README with packaging/install instructions and screenshot placeholders.
+- Updated docs and README structure for releases.
+- Multiple fixes in output device restore flow, exclusive mode latency/settings, search behavior, and UI polish.
 
 ### Removed
 - Removed `IR Waterfall` effect (superseded by `Pro Fall`).
-- Removed legacy redundant infrared-only branch no longer used.
+- Removed redundant legacy infrared-only rendering branch.
 
 ### Packaging Output (1.0.4)
 - `hiresti_1.0.4_all.deb`
