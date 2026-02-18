@@ -71,44 +71,10 @@ sudo dnf install ./hiresti-<version>-1.fedora.<arch>.rpm
 sudo dnf install ./hiresti-<version>-1.el9.<arch>.rpm
 ```
 
-## Build Packages
-
-The project provides one script for DEB and RPM packaging.
+### Arch Linux
 
 ```bash
-chmod +x package.sh
-```
-
-### Build DEB
-
-```bash
-./package.sh deb 1.0.4
-```
-
-### Build RPM (both Fedora + EL9)
-
-```bash
-./package.sh rpm 1.0.4
-```
-
-### Build only Fedora RPM
-
-```bash
-./package.sh rpm-fedora 1.0.4
-```
-
-### Build only EL9 RPM
-
-```bash
-./package.sh rpm-el9 1.0.4
-```
-
-Output files are generated under `dist/`.
-
-## Run From Source
-
-```bash
-python3 main.py
+sudo pacman -U ./hiresti-<version>-1-<arch>.pkg.tar.zst
 ```
 
 ## Project Structure
