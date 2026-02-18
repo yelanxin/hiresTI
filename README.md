@@ -17,16 +17,16 @@ Native Linux TIDAL desktop player built with GTK4 + Libadwaita + GStreamer.
 Replace the image paths below with your own screenshots.
 
 ### Main Window
-![Main Window](screenshots/PLACEHOLDER-main.png)
+![Main Window](screenshots/1.0.4-1.png)
 
 ### Now Playing / Visualizer
-![Visualizer](screenshots/PLACEHOLDER-visualizer.png)
+![Visualizer](screenshots/1.0.4-2.png)
 
 ### Queue / Playlist
-![Queue Playlist](screenshots/PLACEHOLDER-queue-playlist.png)
+![Queue Playlist](screenshots/1.0.4-3.png)
 
 ### Settings
-![Settings](screenshots/PLACEHOLDER-settings.png)
+![Settings](screenshots/1.0.4-4.png)
 
 ## Requirements
 
