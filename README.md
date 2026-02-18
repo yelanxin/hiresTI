@@ -28,6 +28,9 @@ Replace the image paths below with your own screenshots.
 ### Settings
 ![Settings](screenshots/1.0.4-4.png)
 
+### Mini Mode
+![MiniMode](screenshots/1.0.4-5.png)
+
 ## Requirements
 
 Runtime (system packages):
