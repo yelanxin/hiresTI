@@ -1,59 +1,127 @@
-# hiresTI Music Player | [中文](README_CN.md)
+# hiresTI Music Player
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![GTK4](https://img.shields.io/badge/UI-GTK4%20%2B%20Libadwaita-green)
 ![License](https://img.shields.io/badge/License-MIT-purple)
-![Status](https://img.shields.io/badge/Status-v1.0-orange)
 
-![Logo](icons/hicolor/64x64/apps/hiresti.png)
+Native Linux TIDAL desktop player built with GTK4 + Libadwaita + GStreamer.
 
+- Bit-perfect playback flow
+- Exclusive output mode support
+- Rich visualizer effects and themes
+- Local playlists/history
+- TIDAL OAuth login
 
-**hiresTI** is a modern, high-fidelity TIDAL client for Linux, built with **GTK4**, **Libadwaita**, and **GStreamer**. 
+## Screenshots
 
-Designed for audiophiles, it prioritizes sound quality above all else, featuring a dedicated **Bit-Perfect Mode** and **Hardware Exclusive Locking** to bypass the OS mixer and deliver pure, unaltered audio to your DAC.
+Replace the image paths below with your own screenshots.
 
-![Main Interface](screenshots/1.png)
+### Main Window
+![Main Window](screenshots/PLACEHOLDER-main.png)
 
-## ✨ Key Features
+### Now Playing / Visualizer
+![Visualizer](screenshots/PLACEHOLDER-visualizer.png)
 
-* **🎧 Audiophile-Grade Audio Engine**
-    * **Bit-Perfect Playback**: Automatically switches your DAC's sample rate to match the source track (44.1kHz, 96kHz, etc.) using PipeWire metadata.
-    * **Hardware Exclusive Mode**: Completely bypasses the system sound server (PulseAudio/PipeWire) and locks the ALSA hardware device for the purest signal path.
-    * **Glowing "BIT PERFECT" Indicator**: Visual confirmation when the audio path is uncompromised.
-    * **10-Band Equalizer**: Built-in DSP for sound tuning (automatically disabled in Bit-Perfect mode).
+### Queue / Playlist
+![Queue Playlist](screenshots/PLACEHOLDER-queue-playlist.png)
 
-* **🎨 Modern Linux UI**
-    * Native **GTK4 + Libadwaita** interface that feels right at home on GNOME/Fedora/Ubuntu.
-    * **HiDPI Support**: Crisp, high-resolution album art rendering.
-    * **Adaptive Player Bar**: Three-line layout (Title, Artist, Album) with a floating, translucent glass-morphism effect.
-    * **Interactive Elements**: Clickable artist names, hover effects, and animated favorite (heart) icons.
+### Settings
+![Settings](screenshots/PLACEHOLDER-settings.png)
 
-* **🚀 Tidal Integration**
-    * **OAuth Login**: Secure login via the official Tidal web flow.
-    * **Master/Hi-Res Support**: Supports FLAC streaming up to 24-bit/192kHz.
-    * **My Collection**: Access your Playlists, Favorite Artists, and Albums.
-    * **Search**: Unified search for Artists, Albums, and Tracks.
+## Requirements
 
-## 📸 Screenshots
+Runtime (system packages):
 
-| Album Detail | Setting |
-|:---:|:---:|
-| ![Detail](screenshots/2.png) | ![Search](screenshots/3.png) |
+- Python 3.10+
+- GTK4
+- Libadwaita
+- GStreamer + good/bad/ugly plugins
+- PyGObject bindings
 
-## 🛠️ Installation
+Python packages (bundled in package script):
 
-We provide pre-built packages for major Linux distributions. No need to manually install Python libraries!
+- tidalapi
+- requests
+- urllib3
+- pystray
+- pillow
 
-### 🐧 Debian / Ubuntu / Linux Mint / Deepin 
-Download the latest `.deb or .rpm` release from the [Releases Page](../../releases).
+## Install
+
+### Debian / Ubuntu (DEB)
 
 ```bash
-# Install the package
-sudo dpkg -i hiresti_1.0.0_all.deg
+sudo dpkg -i hiresti_<version>_all.deb
+sudo apt -f install
 ```
 
-### 🎩 Fedora / RedHat / CentOS / openSUSE
+### Fedora (RPM)
+
 ```bash
-# Install with dnf (recommended handles dependencies automatically)
-sudo dnf install ./hiresti-1.0.0-1.x86_64.rpm
+sudo dnf install ./hiresti-<version>-1.fedora.<arch>.rpm
 ```
+
+### EL9 (Rocky / Alma / RHEL 9)
+
+```bash
+sudo dnf install ./hiresti-<version>-1.el9.<arch>.rpm
+```
+
+## Build Packages
+
+The project provides one script for DEB and RPM packaging.
+
+```bash
+chmod +x package.sh
+```
+
+### Build DEB
+
+```bash
+./package.sh deb 1.0.4
+```
+
+### Build RPM (both Fedora + EL9)
+
+```bash
+./package.sh rpm 1.0.4
+```
+
+### Build only Fedora RPM
+
+```bash
+./package.sh rpm-fedora 1.0.4
+```
+
+### Build only EL9 RPM
+
+```bash
+./package.sh rpm-el9 1.0.4
+```
+
+Output files are generated under `dist/`.
+
+## Run From Source
+
+```bash
+python3 main.py
+```
+
+## Project Structure
+
+- `main.py`: app lifecycle and orchestration
+- `ui/`: GTK widget builders
+- `actions/`: UI and playback actions
+- `visualizer.py`: spectrum effects/themes
+- `audio_player.py`: playback + output control
+- `models.py`: local history/playlists storage
+- `package.sh`: DEB/RPM build script
+
+## Notes
+
+- Local data is stored under `~/.cache/hiresti`.
+- History and playlists are account-scoped after login (per TIDAL user id).
+
+## License
+
+MIT
