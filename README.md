@@ -92,7 +92,7 @@ sudo pacman -U ./hiresti-<version>-1-<arch>.pkg.tar.zst
 
 If you run into issues, have feature requests, or want to report bugs, please open a GitHub issue:
 
-- https://github.com/yourrepo/hiresti/issues
+- https://github.com/yelanxin/hiresTI/issues
 
 ## License
 
