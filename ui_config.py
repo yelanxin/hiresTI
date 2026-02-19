@@ -523,6 +523,16 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
 .player-heart-btn:hover { color: alpha(currentColor, 0.7); background-color: alpha(currentColor, 0.05); transform: scale(1.05); }
 .player-heart-btn.active { color: #e91e63; opacity: 1; }
 .section-title { font-size: 20px; font-weight: 700; margin: 12px; }
+.login-hero-card {
+    background-color: alpha(currentColor, 0.045);
+    border: 1px solid alpha(currentColor, 0.09);
+    border-radius: 18px;
+    padding: 22px;
+}
+.login-hero-icon { opacity: 0.78; margin-bottom: 6px; }
+.login-hero-title { font-size: 20px; font-weight: 760; margin-bottom: 2px; }
+.login-hero-subtitle { font-size: 13px; margin-bottom: 8px; }
+.login-hero-btn { min-width: 220px; min-height: 46px; padding: 0 16px; }
 .tech-label { font-family: "Monospace"; font-size: 10px; font-weight: bold; color: @accent_color; background-color: alpha(@accent_bg_color, 0.12); padding: 3px; border-radius: 4px; margin-top: 0; }
 .settings-container { padding: 40px; }
 .settings-group { background-color: alpha(currentColor, 0.05); border-radius: 12px; padding: 6px; margin-bottom: 24px; }

@@ -41,21 +41,55 @@ def build_grid_view(app):
     app.login_prompt_box = Gtk.Box(
         orientation=Gtk.Orientation.VERTICAL,
         spacing=20,
+        hexpand=True,
+        halign=Gtk.Align.FILL,
         valign=Gtk.Align.CENTER,
         vexpand=True,
     )
     app.login_prompt_box.set_visible(False)
-    prompt_icon = Gtk.Image(icon_name="avatar-default-symbolic", pixel_size=128, css_classes=["dim-label"])
-    prompt_label = Gtk.Label(label="Please login to access your Tidal collection", css_classes=["heading"])
-    prompt_btn = Gtk.Button(
-        label="Login to Tidal",
-        css_classes=["pill", "suggested-action"],
+    prompt_card = Gtk.Box(
+        orientation=Gtk.Orientation.VERTICAL,
+        spacing=12,
+        margin_top=12,
+        margin_bottom=12,
+        margin_start=18,
+        margin_end=18,
+        halign=Gtk.Align.CENTER,
+        css_classes=["login-hero-card"],
+    )
+    prompt_card.set_size_request(460, -1)
+    prompt_icon = Gtk.Image(
+        icon_name="hiresti",
+        pixel_size=104,
+        css_classes=["dim-label", "login-hero-icon"],
         halign=Gtk.Align.CENTER,
     )
+    prompt_label = Gtk.Label(
+        label="Please login to access your TIDAL collection",
+        css_classes=["heading", "login-hero-title"],
+        wrap=True,
+        justify=Gtk.Justification.CENTER,
+        xalign=0.5,
+    )
+    prompt_sub = Gtk.Label(
+        label="Open TIDAL authentication to load your personalized home, library, and mixes.",
+        css_classes=["dim-label", "login-hero-subtitle"],
+        wrap=True,
+        justify=Gtk.Justification.CENTER,
+        xalign=0.5,
+    )
+    prompt_btn = Gtk.Button(
+        label="Login to Tidal",
+        css_classes=["pill", "suggested-action", "login-hero-btn"],
+        halign=Gtk.Align.CENTER,
+    )
+    prompt_btn.set_size_request(220, 46)
     prompt_btn.connect("clicked", app.on_login_clicked)
-    app.login_prompt_box.append(prompt_icon)
-    app.login_prompt_box.append(prompt_label)
-    app.login_prompt_box.append(prompt_btn)
+    prompt_card.append(prompt_icon)
+    prompt_card.append(prompt_label)
+    prompt_card.append(prompt_sub)
+    prompt_card.append(prompt_btn)
+    app.login_prompt_box.append(prompt_card)
     grid_vbox.append(app.login_prompt_box)
 
     app.alb_scroll = Gtk.ScrolledWindow(vexpand=True)
@@ -76,6 +110,8 @@ def build_grid_view(app):
 def toggle_login_view(app, logged_in):
     app.login_prompt_box.set_visible(not logged_in)
     app.alb_scroll.set_visible(logged_in)
+    if hasattr(app, "sidebar_box") and app.sidebar_box is not None:
+        app.sidebar_box.set_visible(logged_in)
     if not logged_in:
         app.login_btn.set_label("Login")
         app.grid_title_label.set_text("Welcome")

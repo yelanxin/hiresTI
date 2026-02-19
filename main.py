@@ -1,7 +1,10 @@
 import os
 import logging
 import time
+import shutil
+import subprocess
 from datetime import datetime, timedelta
+from urllib.parse import urlparse
 os.environ["MESA_LOG_LEVEL"] = "error"
 
 import gi
@@ -27,6 +30,7 @@ from actions import playback_stream_actions
 from lyrics_manager import LyricsManager
 from app_logging import setup_logging
 from app_settings import load_settings, save_settings as persist_settings
+from app_errors import classify_exception
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +40,11 @@ try:
 except Exception:
     pystray = None
     Image = None
+
+try:
+    import qrcode
+except Exception:
+    qrcode = None
 
 class TidalApp(Adw.Application):
     MODE_LOOP = 0     # 列表循环 (默认)
@@ -133,6 +142,12 @@ class TidalApp(Adw.Application):
         self._diag_health = {"network": "idle", "decoder": "idle", "output": "idle"}
         self._diag_pop = None
         self._diag_text = None
+        self._login_in_progress = False
+        self._login_attempt_id = None
+        self._login_mode = None
+        self._login_dialog = None
+        self._login_qr_tempfile = None
+        self._login_status_label = None
         self.search_content_box = None
         self.add_playlist_btn = None
         self.add_selected_tracks_btn = None
@@ -793,6 +808,8 @@ class TidalApp(Adw.Application):
         self.win.add_controller(key_controller)
 
         self.win.present()
+        GLib.idle_add(self._clear_initial_search_focus)
+        GLib.timeout_add(120, self._clear_initial_search_focus)
         self.win.connect("notify::default-width", self.update_layout_proportions)
         self.win.connect("notify::default-height", self.update_layout_proportions)
         # Fullscreen/restore can finish allocation a bit later; listen and re-align.
@@ -954,6 +971,15 @@ class TidalApp(Adw.Application):
         root.remove_css_class("app-theme-sunset")
         root.remove_css_class("app-theme-mint")
         root.remove_css_class("app-theme-retro")
+
+    def _clear_initial_search_focus(self):
+        # Keep shortcuts available until user explicitly clicks/focuses the search box.
+        if getattr(self, "win", None) is not None:
+            try:
+                self.win.set_focus(None)
+            except Exception:
+                pass
+        return False
 
     def _build_header(self, container):
         ui_builders.build_header(self, container)
@@ -1213,15 +1239,302 @@ class TidalApp(Adw.Application):
     def on_login_clicked(self, btn):
         if self.backend.user:
             self.user_popover.popup()
+            return
+        if self._login_in_progress:
+            self.show_output_notice("Login already in progress.", "warn", 2200)
+            if self._login_dialog is not None:
+                self._login_dialog.present()
+            return
+        self._show_login_method_dialog()
+
+    def _show_login_method_dialog(self):
+        self._cleanup_login_dialog()
+        dialog = Gtk.Dialog(title="Choose Login Method", transient_for=self.win, modal=True)
+        dialog.set_default_size(460, 250)
+        root = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=12,
+            margin_top=12,
+            margin_bottom=12,
+            margin_start=12,
+            margin_end=12,
+        )
+        title = Gtk.Label(label="Select Login Method", xalign=0)
+        title.add_css_class("title-3")
+        sub = Gtk.Label(
+            label="Choose one method to continue with your TIDAL account authorization.",
+            xalign=0,
+            wrap=True,
+            css_classes=["dim-label"],
+        )
+        root.append(title)
+        root.append(sub)
+
+        actions = Gtk.Box(spacing=10, orientation=Gtk.Orientation.VERTICAL)
+
+        web_btn = Gtk.Button(css_classes=["suggested-action"])
+        web_row = Gtk.Box(spacing=10, margin_top=8, margin_bottom=8, margin_start=8, margin_end=8)
+        web_row.append(Gtk.Image.new_from_icon_name("network-workgroup-symbolic"))
+        web_text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        web_text.append(Gtk.Label(label="Web Login", xalign=0))
+        web_text.append(Gtk.Label(label="Open browser on this device to authorize", xalign=0, css_classes=["dim-label"]))
+        web_row.append(web_text)
+        web_btn.set_child(web_row)
+
+        qr_btn = Gtk.Button()
+        qr_row = Gtk.Box(spacing=10, margin_top=8, margin_bottom=8, margin_start=8, margin_end=8)
+        qr_row.append(Gtk.Image.new_from_icon_name("view-grid-symbolic"))
+        qr_text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        qr_text.append(Gtk.Label(label="QR Login", xalign=0))
+        qr_text.append(Gtk.Label(label="Scan QR with your phone to authorize", xalign=0, css_classes=["dim-label"]))
+        qr_row.append(qr_text)
+        qr_btn.set_child(qr_row)
+
+        web_btn.connect("clicked", lambda _b: dialog.response(1))
+        qr_btn.connect("clicked", lambda _b: dialog.response(2))
+        actions.append(web_btn)
+        actions.append(qr_btn)
+        root.append(actions)
+        dialog.set_child(root)
+
+        def _on_response(d, resp):
+            d.destroy()
+            if self._login_dialog is d:
+                self._login_dialog = None
+            if resp == 1:
+                self._start_login_flow("web")
+            elif resp == 2:
+                self._start_login_flow("qr")
+
+        dialog.connect("response", _on_response)
+        dialog.present()
+        self._login_dialog = dialog
+
+    def _start_login_flow(self, mode):
+        mode = "qr" if str(mode).lower() == "qr" else "web"
+
+        attempt_id = str(int(time.time() * 1000))
+        self._login_in_progress = True
+        self._login_attempt_id = attempt_id
+        self._login_mode = mode
+        self.record_diag_event(f"AUTH START id={attempt_id} mode={mode}")
+        logger.info("Login start (id=%s mode=%s).", attempt_id, mode)
+
+        try:
+            oauth = self.backend.start_oauth()
+            login_url = oauth.get("url", "")
+            login_future = oauth.get("future")
+            if not login_url or login_future is None:
+                raise RuntimeError("OAuth context is incomplete")
+        except Exception as e:
+            self._on_login_failed(attempt_id, e)
+            return
+
+        if mode == "web":
+            browser_ok = self._open_login_url(login_url, attempt_id)
+            if browser_ok:
+                self.show_output_notice("Browser opened. Please complete login there.", "ok", 3200)
+            else:
+                self.show_output_notice("Failed to open browser. Please retry or use QR login.", "warn", 3600)
         else:
-            u, f = self.backend.start_oauth(); webbrowser.open(u)
-            def login_thread():
-                if self.backend.finish_login(f):
-                    GLib.idle_add(self.on_login_success)
-            Thread(target=login_thread, daemon=True).start()
+            shown = self._show_login_qr_dialog(oauth, attempt_id)
+            if not shown:
+                self._on_login_failed_for_attempt(
+                    attempt_id,
+                    "QR code rendering failed. Install Python package 'qrcode' or system tool 'qrencode'.",
+                )
+                return
+            self.show_output_notice("Please scan the QR code with your phone to login.", "ok", 3200)
+
+        def login_thread():
+            ok = self.backend.finish_login(login_future)
+            if ok:
+                GLib.idle_add(self._on_login_success_for_attempt, attempt_id)
+            else:
+                GLib.idle_add(self._on_login_failed_for_attempt, attempt_id, "Authentication failed or timed out.")
+
+        Thread(target=login_thread, daemon=True).start()
+
+    def _open_login_url(self, url, attempt_id):
+        url = str(url or "").strip()
+        if not url:
+            logger.error("Login URL empty (id=%s).", attempt_id)
+            return False
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            logger.error("Login URL invalid scheme=%s (id=%s): %s", parsed.scheme, attempt_id, url)
+            return False
+        try:
+            opened = bool(webbrowser.open(url, new=2))
+            logger.info("Browser open result=%s (id=%s host=%s).", opened, attempt_id, parsed.netloc or "")
+            self.record_diag_event(f"AUTH BROWSER id={attempt_id} opened={opened}")
+            return opened
+        except Exception as e:
+            logger.error("Browser open error (id=%s): %s", attempt_id, e)
+            self.record_diag_event(f"AUTH BROWSER ERROR id={attempt_id} err={e}")
+            return False
+
+    def _cleanup_login_dialog(self):
+        if self._login_dialog is not None:
+            try:
+                self._login_dialog.destroy()
+            except Exception:
+                pass
+            self._login_dialog = None
+        self._login_status_label = None
+        if self._login_qr_tempfile:
+            try:
+                if os.path.exists(self._login_qr_tempfile):
+                    os.remove(self._login_qr_tempfile)
+            except Exception as e:
+                logger.debug("Failed to remove QR temp file %s: %s", self._login_qr_tempfile, e)
+            self._login_qr_tempfile = None
+
+    def _cancel_login_attempt(self, attempt_id, reason="canceled"):
+        if not self._login_in_progress:
+            return
+        if attempt_id != self._login_attempt_id:
+            return
+        self.record_diag_event(f"AUTH CANCELED id={attempt_id} reason={reason}")
+        logger.info("Login canceled (id=%s reason=%s).", attempt_id, reason)
+        self._login_in_progress = False
+        self._login_attempt_id = None
+        self._login_mode = None
+        self._cleanup_login_dialog()
+        self.show_output_notice("Login canceled.", "warn", 1800)
+
+    def _build_qr_tempfile(self, url, attempt_id):
+        url = str(url or "").strip()
+        if not url:
+            logger.error("QR generation aborted: empty login url (id=%s).", attempt_id)
+            return None
+        if qrcode is None:
+            tool = shutil.which("qrencode")
+            if not tool:
+                logger.error(
+                    "QR generation unavailable (id=%s): python 'qrcode' and system 'qrencode' are both missing.",
+                    attempt_id,
+                )
+                return None
+            try:
+                path = os.path.join(GLib.get_tmp_dir(), f"hiresti-login-qr-{attempt_id}.png")
+                subprocess.run([tool, "-m", "1", "-s", "6", "-o", path, url], check=True)
+                if os.path.exists(path):
+                    return path
+            except Exception as e:
+                logger.warning("qrencode generation failed (id=%s): %s", attempt_id, e)
+            return None
+        try:
+            qr = qrcode.QRCode(border=1, box_size=6)
+            qr.add_data(url)
+            qr.make(fit=True)
+            img = qr.make_image(fill_color="black", back_color="white")
+            path = os.path.join(GLib.get_tmp_dir(), f"hiresti-login-qr-{attempt_id}.png")
+            img.save(path)
+            return path
+        except Exception as e:
+            logger.warning("QR generation failed (id=%s): %s", attempt_id, e)
+            return None
+
+    def _show_login_qr_dialog(self, oauth, attempt_id):
+        self._cleanup_login_dialog()
+        login_url = str((oauth or {}).get("url", "") or "")
+        user_code = str((oauth or {}).get("user_code", "") or "")
+
+        dialog = Gtk.Dialog(title="Scan QR to Login", transient_for=self.win, modal=True)
+        root = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=12,
+            margin_top=12,
+            margin_bottom=12,
+            margin_start=12,
+            margin_end=12,
+        )
+        root.append(Gtk.Label(label="Use your phone camera or TIDAL app to scan this QR code.", xalign=0, wrap=True))
+
+        qr_path = self._build_qr_tempfile(login_url, attempt_id)
+        self._login_qr_tempfile = qr_path
+        if not qr_path or not os.path.exists(qr_path):
+            return False
+        pic = Gtk.Picture.new_for_filename(qr_path)
+        pic.set_size_request(280, 280)
+        pic.set_halign(Gtk.Align.CENTER)
+        try:
+            pic.set_content_fit(Gtk.ContentFit.CONTAIN)
+        except Exception:
+            pass
+        root.append(pic)
+
+        if user_code:
+            root.append(Gtk.Label(label=f"Verification code: {user_code}", xalign=0))
+        status = Gtk.Label(label="Waiting for mobile authorization...", xalign=0, wrap=True)
+        root.append(status)
+        self._login_status_label = status
+
+        actions = Gtk.Box(spacing=8, halign=Gtk.Align.END)
+        cancel_btn = Gtk.Button(label="Cancel")
+        cancel_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.CANCEL))
+        actions.append(cancel_btn)
+        root.append(actions)
+        dialog.set_child(root)
+
+        def _on_response(d, resp):
+            d.destroy()
+            if self._login_dialog is d:
+                self._login_dialog = None
+            if resp == Gtk.ResponseType.CANCEL:
+                self._cancel_login_attempt(attempt_id, reason="user-cancel")
+
+        dialog.connect("response", _on_response)
+        dialog.present()
+        self._login_dialog = dialog
+        return True
+
+    def _on_login_success_for_attempt(self, attempt_id):
+        if attempt_id != self._login_attempt_id:
+            return False
+        self.record_diag_event(f"AUTH SUCCESS id={attempt_id}")
+        if self._login_status_label is not None:
+            self._login_status_label.set_text("Authorization complete, signing in...")
+        self._login_in_progress = False
+        self._login_attempt_id = None
+        self._login_mode = None
+        self._cleanup_login_dialog()
+        self.on_login_success()
+        return False
+
+    def _on_login_failed(self, attempt_id, exc):
+        kind = classify_exception(exc)
+        logger.error("Login bootstrap failed (id=%s kind=%s): %s", attempt_id, kind, exc)
+        self.record_diag_event(f"AUTH ERROR id={attempt_id} kind={kind}")
+        self._login_in_progress = False
+        self._login_attempt_id = None
+        self._login_mode = None
+        self._cleanup_login_dialog()
+        self.show_output_notice("Login start failed.", "error", 2800)
+        self._show_simple_dialog("Login failed", f"[{kind}] {exc}")
+
+    def _on_login_failed_for_attempt(self, attempt_id, message):
+        if attempt_id != self._login_attempt_id:
+            return False
+        self.record_diag_event(f"AUTH FAILED id={attempt_id}")
+        logger.warning("Login failed (id=%s): %s", attempt_id, message)
+        if self._login_status_label is not None:
+            self._login_status_label.set_text(f"Authorization failed: {message}")
+        self._login_in_progress = False
+        self._login_attempt_id = None
+        self._login_mode = None
+        self._cleanup_login_dialog()
+        self.show_output_notice("Login failed. Please retry.", "error", 2800)
+        self._show_simple_dialog("Login failed", message)
+        return False
 
     def on_logout_clicked(self, btn):
         self.user_popover.popdown()
+        self._login_in_progress = False
+        self._login_attempt_id = None
+        self._login_mode = None
+        self._cleanup_login_dialog()
         self.backend.logout()
         self._apply_account_scope(force=True)
         self._home_sections_cache = None
@@ -1234,6 +1547,7 @@ class TidalApp(Adw.Application):
 
     def on_login_success(self):
         logger.info("Login successful.")
+        self.show_output_notice("Login successful.", "ok", 2000)
         self._apply_account_scope(force=True)
         self._home_sections_cache = None
         self._toggle_login_view(True)

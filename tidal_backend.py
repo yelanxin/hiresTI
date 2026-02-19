@@ -4,6 +4,7 @@ import os
 import json
 import time
 from datetime import datetime
+from urllib.parse import urlparse
 from app_errors import classify_exception
 
 logger = logging.getLogger(__name__)
@@ -53,12 +54,42 @@ class TidalBackend:
         self.session = tidalapi.Session()
         self._apply_global_config()
         login_url_obj, future = self.session.login_oauth()
-        if hasattr(login_url_obj, 'verification_uri_complete'):
-            url = login_url_obj.verification_uri_complete
-        else:
-            url = str(login_url_obj)
-        logger.info("OAuth URL prepared.")
-        return url, future
+        verification_uri_complete = getattr(login_url_obj, "verification_uri_complete", None)
+        verification_uri = getattr(login_url_obj, "verification_uri", None)
+        user_code = getattr(login_url_obj, "user_code", None)
+
+        raw_url = verification_uri_complete or verification_uri or str(login_url_obj or "")
+        normalized_url, normalized = self._normalize_oauth_url(raw_url)
+        if not normalized_url:
+            raise RuntimeError("OAuth URL is empty")
+
+        parsed = urlparse(normalized_url)
+        logger.info(
+            "OAuth URL prepared (scheme=%s host=%s normalized=%s has_user_code=%s).",
+            parsed.scheme,
+            parsed.netloc,
+            normalized,
+            bool(user_code),
+        )
+        return {
+            "url": normalized_url,
+            "future": future,
+            "user_code": str(user_code or "").strip(),
+            "verification_uri": str(verification_uri or "").strip(),
+            "normalized": normalized,
+        }
+
+    def _normalize_oauth_url(self, url):
+        raw = str(url or "").strip()
+        if not raw:
+            return "", False
+        normalized = raw
+        if normalized.startswith("//"):
+            normalized = f"https:{normalized}"
+        elif "://" not in normalized:
+            if normalized.startswith(("link.tidal.com/", "listen.tidal.com/", "tidal.com/", "www.")):
+                normalized = f"https://{normalized}"
+        return normalized, normalized != raw
 
     def finish_login(self, future):
         try:
@@ -70,7 +101,8 @@ class TidalBackend:
                 self._apply_global_config()
                 return True
         except Exception as e:
-            logger.error("Login failed: %s", e)
+            kind = classify_exception(e)
+            logger.error("Login failed [%s]: %s", kind, e)
         return False
 
     def check_login(self):
