@@ -4,13 +4,17 @@
 ![GTK4](https://img.shields.io/badge/UI-GTK4%20%2B%20Libadwaita-green)
 ![License](https://img.shields.io/badge/License-MIT-purple)
 
-Native Linux TIDAL desktop player built with GTK4 + Libadwaita + GStreamer.
+`hiresTI` is a native Linux desktop client for TIDAL, focused on stable playback, high-quality output paths, and a responsive GTK4/Libadwaita user experience.
 
-- Bit-perfect playback flow
-- Exclusive output mode support
-- Rich visualizer effects and themes
-- Local playlists/history
-- TIDAL OAuth login
+## Highlights
+
+- Native Linux UI with GTK4 + Libadwaita
+- TIDAL OAuth login and account-scoped library access
+- Bit-perfect playback flow with optional exclusive output controls
+- Fast collection browsing (Albums, Liked Songs, Artists, Queue, History)
+- Local playlist management with cover collage generation
+- Built-in queue drawer, lyrics support, and visualizer modules
+- Linux package build pipeline for DEB and RPM targets
 
 ## Screenshots
 ### Main Window
@@ -25,34 +29,44 @@ Native Linux TIDAL desktop player built with GTK4 + Libadwaita + GStreamer.
 ### Mini Mode
 <img src="screenshots/1.0.4-5.png" width="400">
 
+## Tech Stack
 
-## Requirements
+- Python 3.10+
+- GTK4 + Libadwaita (PyGObject)
+- GStreamer (playback pipeline)
+- `tidalapi` (TIDAL integration)
 
-Runtime (system packages):
+## Runtime Requirements
+
+Install these system packages first:
 
 - Python 3.10+
 - GTK4
 - Libadwaita
-- GStreamer + good/bad/ugly plugins
+- GStreamer core and plugins (`good` / `bad` / `ugly`)
 - PyGObject bindings
 
-Python packages (bundled in package script):
+Bundled Python dependencies used by packaging:
 
-- tidalapi
-- requests
-- urllib3
-- pystray
-- pillow
+- `tidalapi`
+- `requests`
+- `urllib3`
+- `pystray`
+- `pillow`
 
-## Install
+## Quick Start (Source)
 
-1. Downloading the binary App from release page.
+```bash
+python3 -m pip install -r requirements.txt
+python3 main.py
+```
+
+## Install Prebuilt Packages
 
 ### Debian / Ubuntu (DEB)
 
 ```bash
-sudo dpkg -i hiresti_<version>_all.deb
-sudo apt -f install
+sudo apt install ./hiresti_<version>_all.deb
 ```
 
 ### Fedora (RPM)
@@ -72,12 +86,6 @@ sudo dnf install ./hiresti-<version>-1.el9.<arch>.rpm
 ```bash
 sudo pacman -U ./hiresti-<version>-1-<arch>.pkg.tar.zst
 ```
-
-
-## Notes
-
-- Local data is stored under `~/.cache/hiresti`.
-- History and playlists are account-scoped after login (per TIDAL user id).
 
 ## License
 
