@@ -622,6 +622,13 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
     background: transparent;
 }
 
+.liked-artist-scroll-btn {
+    min-width: 28px;
+    min-height: 28px;
+    padding: 0;
+    margin-top: 2px;
+}
+
 .liked-artist-filter-btn {
     border-radius: 10px;
     border: 1px solid transparent;
