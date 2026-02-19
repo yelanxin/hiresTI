@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.0.9 - 2026-02-19
+Coverage: changes on 2026-02-19.
+
+### Added
+- Added `HIRES_DEBUG_BUTTONS=1` button metrics dump tooling for GTK size diagnostics around history click playback transitions.
+
+### Changed
+- Unified handle dimensions per latest UI adjustment:
+  - Queue side handle width set to `23`.
+  - Visualizer bottom handle height set to `23`.
+- Updated handle-related CSS minimum sizes to match the runtime widget requests above.
+- Adjusted player favorite button top margin from `-5` to `0` to avoid GTK button vertical min-size warnings.
+- Refined back-navigation behavior to correctly re-select `home`/selected nav row state when returning to `grid_view`.
+
+### Fixed
+- Fixed GTK warning during history track click flow:
+  - `GtkButton ... adjusted size vertical ... must not decrease below min ...`
+  - Root cause was negative top margin on `player-heart-btn`.
+
+### Packaging Output (1.0.9)
+- `hiresti_1.0.9_all.deb`
+- `hiresti-1.0.9-1.fedora.x86_64.rpm`
+- `hiresti-1.0.9-1.el9.x86_64.rpm`
+- `hiresti-1.0.9-1-x86_64.pkg.tar.zst`
+
 ## 1.0.4 - 2026-02-18
 Coverage: changes from 2026-02-11 to 2026-02-18.
 

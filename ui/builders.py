@@ -137,13 +137,13 @@ def build_body(app, container):
 
     app.queue_btn = Gtk.Button(icon_name="hiresti-queue-handle-left-symbolic", css_classes=["queue-handle-btn"])
     app.queue_btn.set_tooltip_text("Open Queue")
-    app.queue_btn.set_size_request(26, 50)
+    app.queue_btn.set_size_request(23, 50)
     app.queue_btn.set_valign(Gtk.Align.CENTER)
     app.queue_btn.set_vexpand(False)
     app.queue_btn.connect("clicked", app.toggle_queue_drawer)
 
     app.queue_handle_shell = Gtk.Box(css_classes=["queue-handle-shell"])
-    app.queue_handle_shell.set_size_request(26, 50)
+    app.queue_handle_shell.set_size_request(23, 50)
     app.queue_handle_shell.set_valign(Gtk.Align.CENTER)
     app.queue_handle_shell.set_vexpand(False)
     app.queue_handle_shell.append(app.queue_btn)
@@ -186,7 +186,7 @@ def build_body(app, container):
 
     app.viz_btn = Gtk.Button(icon_name="hiresti-pan-up-symbolic", css_classes=["flat", "viz-handle-btn"])
     app.viz_btn.set_tooltip_text("Waveform / Lyrics")
-    app.viz_btn.set_size_request(50, 21)
+    app.viz_btn.set_size_request(50, 23)
     app.viz_btn.connect("clicked", app.toggle_visualizer)
 
     app.viz_anchor = Gtk.Box(
@@ -431,7 +431,7 @@ def build_player_bar(app, container):
     app.lbl_title.set_hexpand(False)
     app.lbl_title.set_halign(Gtk.Align.START)
     app.track_fav_btn = Gtk.Button(css_classes=["flat", "circular", "player-heart-btn"], icon_name="hiresti-favorite-outline-symbolic", valign=Gtk.Align.START)
-    app.track_fav_btn.set_margin_top(-5)
+    app.track_fav_btn.set_margin_top(0)
     app.track_fav_btn.set_margin_start(5)
     app.track_fav_btn.set_tooltip_text("Favorite Track")
     app.track_fav_btn.set_sensitive(False)

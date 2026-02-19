@@ -208,7 +208,10 @@ def on_back_clicked(app, btn):
         if not app.nav_history and target_view == "grid_view":
             btn.set_sensitive(False)
             app.artist_fav_btn.set_visible(False)
-            if not app.nav_list.get_selected_row():
+            selected = app.nav_list.get_selected_row()
+            if selected:
+                app.on_nav_selected(None, selected)
+            else:
                 child = app.nav_list.get_first_child()
                 while child:
                     if hasattr(child, "nav_id") and child.nav_id == "home":
