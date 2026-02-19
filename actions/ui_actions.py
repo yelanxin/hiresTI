@@ -1419,10 +1419,24 @@ def render_liked_songs_dashboard(app, tracks=None):
     prev_page_btn = Gtk.Button(label="Prev", css_classes=["flat", "liked-action-btn"])
     next_page_btn = Gtk.Button(label="Next", css_classes=["flat", "liked-action-btn"])
     page_info_lbl = Gtk.Label(label="", css_classes=["dim-label"], xalign=0)
+    artist_scroll_prev_btn = Gtk.Button(
+        icon_name="go-previous-symbolic",
+        css_classes=["flat", "circular", "liked-artist-scroll-btn"],
+        valign=Gtk.Align.CENTER,
+    )
+    artist_scroll_prev_btn.set_tooltip_text("Scroll artists left")
+    artist_scroll_next_btn = Gtk.Button(
+        icon_name="go-next-symbolic",
+        css_classes=["flat", "circular", "liked-artist-scroll-btn"],
+        valign=Gtk.Align.CENTER,
+    )
+    artist_scroll_next_btn.set_tooltip_text("Scroll artists right")
     pager_bar.append(prev_page_btn)
     pager_bar.append(next_page_btn)
     pager_bar.append(page_info_lbl)
     pager_bar.append(Gtk.Box(hexpand=True))
+    pager_bar.append(artist_scroll_prev_btn)
+    pager_bar.append(artist_scroll_next_btn)
     app.collection_content_box.append(pager_bar)
 
     artist_groups = {}
@@ -1451,6 +1465,7 @@ def render_liked_songs_dashboard(app, tracks=None):
         key=lambda it: (-int(it.get("count", 0) or 0), str(it.get("name", "")).lower()),
     )
 
+    artist_filter_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
     artist_filter_scroll = Gtk.ScrolledWindow(hexpand=True, vexpand=False, css_classes=["liked-artist-filter-scroll"])
     artist_filter_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
     artist_filter_scroll.set_min_content_height(90)
@@ -1460,7 +1475,9 @@ def render_liked_songs_dashboard(app, tracks=None):
         css_classes=["liked-artist-filter-flow"],
     )
     artist_filter_scroll.set_child(artist_filter_flow)
-    app.collection_content_box.append(artist_filter_scroll)
+
+    artist_filter_row.append(artist_filter_scroll)
+    app.collection_content_box.append(artist_filter_row)
 
     app.liked_artist_filter_buttons = {}
 
@@ -1514,6 +1531,40 @@ def render_liked_songs_dashboard(app, tracks=None):
         app.liked_artist_filter_buttons[key] = btn
 
         artist_filter_flow.append(btn)
+
+    h_adj = artist_filter_scroll.get_hadjustment()
+
+    def _update_artist_scroll_btns(*_args):
+        if h_adj is None:
+            return
+        lower = float(h_adj.get_lower() or 0.0)
+        upper = float(h_adj.get_upper() or 0.0)
+        page = float(h_adj.get_page_size() or 0.0)
+        value = float(h_adj.get_value() or 0.0)
+        max_value = max(lower, upper - page)
+        has_overflow = upper > page + 1.0
+        artist_scroll_prev_btn.set_sensitive(has_overflow and value > lower + 1.0)
+        artist_scroll_next_btn.set_sensitive(has_overflow and value < max_value - 1.0)
+
+    def _scroll_artist_filter(direction):
+        if h_adj is None:
+            return
+        step = max(120.0, float(h_adj.get_page_size() or 0.0) * 0.75)
+        lower = float(h_adj.get_lower() or 0.0)
+        upper = float(h_adj.get_upper() or 0.0)
+        page = float(h_adj.get_page_size() or 0.0)
+        max_value = max(lower, upper - page)
+        cur = float(h_adj.get_value() or 0.0)
+        target = cur + (step * direction)
+        h_adj.set_value(max(lower, min(max_value, target)))
+        _update_artist_scroll_btns()
+
+    artist_scroll_prev_btn.connect("clicked", lambda _b: _scroll_artist_filter(-1))
+    artist_scroll_next_btn.connect("clicked", lambda _b: _scroll_artist_filter(1))
+    if h_adj is not None:
+        h_adj.connect("changed", _update_artist_scroll_btns)
+        h_adj.connect("value-changed", _update_artist_scroll_btns)
+    GLib.idle_add(_update_artist_scroll_btns)
 
     table_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
     app.collection_content_box.append(table_box)
