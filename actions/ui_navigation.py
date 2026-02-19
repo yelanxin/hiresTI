@@ -22,6 +22,7 @@ def on_nav_selected(app, box, row):
     while c := app.collection_content_box.get_first_child():
         app.collection_content_box.remove(c)
     app.queue_track_list = None
+    app.liked_track_list = None
 
     if row.nav_id == "home":
         app.grid_title_label.set_text("Home")
@@ -58,14 +59,40 @@ def on_nav_selected(app, box, row):
         return
 
     if row.nav_id == "collection":
-        app.grid_title_label.set_text("My Collection")
+        app.grid_title_label.set_text("My Albums")
         if hasattr(app, "grid_subtitle_label") and app.grid_subtitle_label is not None:
-            app.grid_subtitle_label.set_text("Recently played and saved albums")
-        app.create_album_flow()
+            app.grid_subtitle_label.set_text("Your saved albums")
+        loading = Gtk.Label(
+            label="Loading albums...",
+            xalign=0,
+            css_classes=["dim-label"],
+            margin_start=8,
+            margin_top=8,
+        )
+        app.collection_content_box.append(loading)
         if app.backend.user:
-            Thread(
-                target=lambda: GLib.idle_add(app.batch_load_albums, list(app.backend.get_recent_albums()))
-            ).start()
+            def task():
+                albums = list(app.backend.get_recent_albums())
+                GLib.idle_add(app.render_collection_dashboard, [], albums)
+
+            Thread(target=task, daemon=True).start()
+        else:
+            app.render_collection_dashboard([], [])
+        return
+
+    if row.nav_id == "liked_songs":
+        app.grid_title_label.set_text("Liked Songs")
+        if hasattr(app, "grid_subtitle_label") and app.grid_subtitle_label is not None:
+            app.grid_subtitle_label.set_text("Your TIDAL favorite tracks")
+        loading = Gtk.Label(
+            label="Loading liked songs...",
+            xalign=0,
+            css_classes=["dim-label"],
+            margin_start=8,
+            margin_top=8,
+        )
+        app.collection_content_box.append(loading)
+        app.refresh_liked_songs_dashboard()
         return
 
     if row.nav_id == "playlists":

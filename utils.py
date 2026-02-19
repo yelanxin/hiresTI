@@ -9,6 +9,11 @@ from threading import Thread
 from gi.repository import GLib, GdkPixbuf, Gdk
 
 logger = logging.getLogger(__name__)
+_TIDAL_IMAGE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+    "Referer": "https://listen.tidal.com/",
+    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+}
 
 
 def prune_image_cache(cache_dir, max_bytes=300 * 1024 * 1024, max_age_days=30):
@@ -107,7 +112,10 @@ def load_img(widget, url_provider, cache_dir, size=84):
     def fetch():
         try:
             u = url_provider() if callable(url_provider) else url_provider
-            if not u: return
+            if not u:
+                logger.info("load_img: empty image source (widget=%s, size=%s)", type(widget).__name__, size)
+                return
+            logger.info("load_img: start (widget=%s, size=%s, source=%s)", type(widget).__name__, size, u)
             
             widget._target_url = u
             f_path = None
@@ -121,11 +129,15 @@ def load_img(widget, url_provider, cache_dir, size=84):
             # 下载
             if not os.path.exists(f_path):
                 try:
-                    r = requests.get(u, timeout=10)
+                    req_kwargs = {"timeout": 10}
+                    if isinstance(u, str) and "resources.tidal.com/" in u:
+                        req_kwargs["headers"] = _TIDAL_IMAGE_HEADERS
+                    r = requests.get(u, **req_kwargs)
                     r.raise_for_status()
                     with open(f_path, 'wb') as f:
                         f.write(r.content)
-                except requests.RequestException:
+                except requests.RequestException as e:
+                    logger.warning("load_img: download failed (url=%s): %s", u, e)
                     return
 
             # 判断控件类型
@@ -156,9 +168,10 @@ def load_img(widget, url_provider, cache_dir, size=84):
                         if hasattr(widget, '_target_url') and widget._target_url == u:
                             widget.set_size_request(size, size)
                             widget.set_paintable(texture)
+                            logger.info("load_img: applied picture (source=%s)", u)
                     GLib.idle_add(apply_pic)
                 except Exception as e:
-                    logger.debug("Failed to apply picture texture from %s: %s", f_path, e)
+                    logger.warning("load_img: failed to apply picture texture from %s: %s", f_path, e)
 
             # --- 情况 B: Gtk.Image (用于播放栏/列表) ---
             else:
@@ -182,12 +195,13 @@ def load_img(widget, url_provider, cache_dir, size=84):
                                 # 强制锁定逻辑显示尺寸
                                 widget.set_pixel_size(size) 
                                 widget.set_from_pixbuf(scaled)
+                                logger.info("load_img: applied image (source=%s)", u)
                         GLib.idle_add(apply_img)
                 except Exception as e:
-                    logger.debug("Failed to apply image pixbuf from %s: %s", f_path, e)
+                    logger.warning("load_img: failed to apply image pixbuf from %s: %s", f_path, e)
 
         except Exception as e:
-            logger.debug("Image fetch failed: %s", e)
+            logger.warning("load_img: unexpected error: %s", e)
             
     Thread(target=fetch, daemon=True).start()
 
@@ -224,7 +238,10 @@ def _ensure_image_local_path(image_ref, cache_dir):
         return f_path
 
     try:
-        r = requests.get(image_ref, timeout=10)
+        req_kwargs = {"timeout": 10}
+        if isinstance(image_ref, str) and "resources.tidal.com/" in image_ref:
+            req_kwargs["headers"] = _TIDAL_IMAGE_HEADERS
+        r = requests.get(image_ref, **req_kwargs)
         r.raise_for_status()
         with open(f_path, "wb") as f:
             f.write(r.content)

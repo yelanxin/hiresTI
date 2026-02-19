@@ -249,11 +249,26 @@ class PlaylistManager:
             "name": (name or "New Playlist").strip() or "New Playlist",
             "created_at": now,
             "updated_at": now,
+            "cloud_playlist_id": None,
             "tracks": [],
         }
         playlists.insert(0, p)
         self._save(playlists)
         return p
+
+    def set_cloud_playlist_id(self, playlist_id, cloud_playlist_id):
+        playlists = self._load()
+        changed = False
+        for p in playlists:
+            if str(p.get("id")) != str(playlist_id):
+                continue
+            p["cloud_playlist_id"] = str(cloud_playlist_id or "").strip() or None
+            p["updated_at"] = int(time.time())
+            changed = True
+            break
+        if changed:
+            self._save(playlists)
+        return changed
 
     def add_track(self, playlist_id, track, cover_url=None, dedupe=False):
         if track is None:

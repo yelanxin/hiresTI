@@ -1,6 +1,7 @@
 from threading import Thread
 import logging
 import os
+import random
 from datetime import datetime
 import subprocess
 
@@ -10,7 +11,7 @@ gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk, GLib, Pango, Gdk, GObject
 
 import utils
-from ui.track_table import LAYOUT, build_tracks_header
+from ui.track_table import LAYOUT, build_tracks_header, append_header_action_spacers
 from app_errors import classify_exception, user_message
 
 logger = logging.getLogger(__name__)
@@ -395,7 +396,7 @@ def _populate_queue_rows(app, list_box, tracks, current_idx, compact=False):
 
         row_margin_y = 1 if compact else LAYOUT["row_margin_y"]
         col_gap = 5 if compact else LAYOUT["col_gap"]
-        row_margin_x = 3 if compact else LAYOUT["row_margin_x"]
+        row_margin_x = 0 if compact else LAYOUT["row_margin_x"]
         idx_width = 14 if compact else LAYOUT["index_width"]
         box = Gtk.Box(
             spacing=col_gap,
@@ -453,8 +454,17 @@ def _populate_queue_rows(app, list_box, tracks, current_idx, compact=False):
             else:
                 box.append(Gtk.Box(width_request=LAYOUT["time_width"]))
 
+        fav_btn = app.create_track_fav_button(t)
+        if compact:
+            fav_btn.set_margin_start(2)
+            fav_btn.set_margin_end(0)
+        box.append(fav_btn)
+
         rm_btn = Gtk.Button(icon_name="list-remove-symbolic", css_classes=["flat", "playlist-tool-btn", "queue-remove-btn"])
         rm_btn.set_tooltip_text("Remove from Queue")
+        if compact:
+            rm_btn.set_margin_start(0)
+            rm_btn.set_margin_end(0)
         rm_btn.connect("clicked", lambda _b, idx=i: app.on_queue_remove_track_clicked(idx))
         box.append(rm_btn)
 
@@ -664,7 +674,7 @@ def render_search_results(app, res):
     for art in artists:
         card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, css_classes=["card", "home-card"])
         img = Gtk.Image(pixel_size=100, css_classes=["circular-avatar"])
-        url = app.backend.get_artwork_url(art, 320)
+        url = app.backend.get_artist_artwork_url(art, 320)
         logger.debug("Artist '%s' image URL: %s", getattr(art, "name", "Unknown"), url)
         utils.load_img(img, url, app.cache_dir, 100)
         card.append(img)
@@ -781,6 +791,8 @@ def render_search_results(app, res):
         add_btn = Gtk.Button(icon_name="list-add-symbolic", css_classes=["flat", "circular", "history-scroll-btn"])
         add_btn.set_tooltip_text("Add to Playlist")
         add_btn.connect("clicked", lambda _b, tr=t: app.on_add_single_track_to_playlist(tr))
+        fav_btn = app.create_track_fav_button(t)
+        row_box.append(fav_btn)
         row_box.append(add_btn)
 
         lb_row = Gtk.ListBoxRow()
@@ -822,6 +834,8 @@ def render_search_results(app, res):
         add_btn = Gtk.Button(icon_name="list-add-symbolic", css_classes=["flat", "circular", "history-scroll-btn"])
         add_btn.set_tooltip_text("Add to Playlist")
         add_btn.connect("clicked", lambda _b, tr=t: app.on_add_single_track_to_playlist(tr))
+        fav_btn = app.create_track_fav_button(t)
+        row_box.append(fav_btn)
         row_box.append(add_btn)
 
         lb_row = Gtk.ListBoxRow()
@@ -952,6 +966,8 @@ def populate_tracks(app, tracks):
         add_btn = Gtk.Button(icon_name="list-add-symbolic", css_classes=["flat", "circular", "history-scroll-btn"])
         add_btn.set_tooltip_text("Add to Playlist")
         add_btn.connect("clicked", lambda _b, tr=t: app.on_add_single_track_to_playlist(tr))
+        fav_btn = app.create_track_fav_button(t)
+        box.append(fav_btn)
         box.append(add_btn)
 
         row.set_child(box)
@@ -996,7 +1012,7 @@ def batch_load_artists(app, artists, batch=10):
     for art in curr:
         v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, css_classes=["card", "home-card"])
         img = Gtk.Image(pixel_size=120, css_classes=["circular-avatar"])
-        utils.load_img(img, lambda a=art: app.backend.get_artwork_url(a, 320), app.cache_dir, 120)
+        utils.load_img(img, lambda a=art: app.backend.get_artist_artwork_url(a, 320), app.cache_dir, 120)
         v.append(img)
         v.append(
             Gtk.Label(
@@ -1239,6 +1255,76 @@ def render_history_dashboard(app):
     app.collection_content_box.append(sec_recent)
 
 
+def render_collection_dashboard(app, favorite_tracks=None, favorite_albums=None):
+    _clear_container(app.collection_content_box)
+    app.playlist_track_list = None
+    app.queue_track_list = None
+
+    albums = list(favorite_albums or [])
+
+    def _scroll_h(scroller, direction=1):
+        adj = scroller.get_hadjustment()
+        if adj is None:
+            return
+        page = max(120.0, float(adj.get_page_size()) * 0.85)
+        target = adj.get_value() + (page * direction)
+        lower = float(adj.get_lower())
+        upper = float(adj.get_upper()) - float(adj.get_page_size())
+        if target < lower:
+            target = lower
+        if target > upper:
+            target = upper
+        adj.set_value(target)
+
+    def _build_two_row_section(title_text, count_text):
+        section = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, css_classes=["home-section", "history-section"])
+        head = Gtk.Box(spacing=8, css_classes=["home-section-head"])
+        head.append(Gtk.Label(label=title_text, xalign=0, hexpand=True, css_classes=["home-section-title"]))
+        head.append(Gtk.Label(label=count_text, css_classes=["home-section-count"]))
+        left_btn = Gtk.Button(icon_name="go-previous-symbolic", css_classes=["flat", "circular", "history-scroll-btn"])
+        right_btn = Gtk.Button(icon_name="go-next-symbolic", css_classes=["flat", "circular", "history-scroll-btn"])
+        head.append(left_btn)
+        head.append(right_btn)
+        section.append(head)
+        scroller = Gtk.ScrolledWindow(hexpand=True, vexpand=False, css_classes=["history-row-scroller"])
+        scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
+        grid = Gtk.Grid(column_spacing=16, row_spacing=16)
+        scroller.set_child(grid)
+        left_btn.connect("clicked", lambda _b: _scroll_h(scroller, -1))
+        right_btn.connect("clicked", lambda _b: _scroll_h(scroller, 1))
+        _bind_horizontal_scroll_buttons(scroller, left_btn, right_btn)
+        section.append(scroller)
+        return section, grid
+
+    sec_albums, grid_albums = _build_two_row_section("Saved Albums", f"{len(albums)} items")
+    for i, alb in enumerate(albums):
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, css_classes=["card", "home-card", "history-card"])
+        img = Gtk.Image(pixel_size=120, css_classes=["album-cover-img"])
+        cover = app.backend.get_artwork_url(alb, 320)
+        if cover:
+            utils.load_img(img, cover, app.cache_dir, 120)
+        else:
+            img.set_from_icon_name("audio-x-generic-symbolic")
+        card.append(img)
+        card.append(
+            Gtk.Label(
+                label=getattr(alb, "name", "Unknown Album"),
+                halign=Gtk.Align.CENTER,
+                ellipsize=3,
+                wrap=True,
+                max_width_chars=14,
+                css_classes=["home-card-title"],
+            )
+        )
+        artist_name = getattr(getattr(alb, "artist", None), "name", "Unknown")
+        card.append(Gtk.Label(label=artist_name, halign=Gtk.Align.CENTER, ellipsize=3, css_classes=["dim-label", "home-card-subtitle"]))
+        btn = Gtk.Button(css_classes=["flat", "history-card-btn"])
+        btn.set_child(card)
+        btn.connect("clicked", lambda _b, a=alb: app.on_history_album_clicked(a))
+        grid_albums.attach(btn, i // 2, i % 2, 1, 1)
+    app.collection_content_box.append(sec_albums)
+
+
 def render_queue_dashboard(app):
     _clear_container(app.collection_content_box)
     app.playlist_track_list = None
@@ -1268,24 +1354,387 @@ def render_queue_dashboard(app):
         app.collection_content_box.append(hint)
         return
 
+    table_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+    app.collection_content_box.append(table_box)
+
     tracks_head, _head_btns = build_tracks_header(
         on_sort_title=lambda _b: None,
         on_sort_artist=lambda _b: None,
         on_sort_album=lambda _b: None,
         on_sort_time=lambda _b: None,
     )
-    app.collection_content_box.append(tracks_head)
+    append_header_action_spacers(tracks_head, ["fav", "remove"])
+    table_box.append(tracks_head)
 
-    list_box = Gtk.ListBox(css_classes=["boxed-list", "tracks-list"], margin_start=32, margin_end=32, margin_bottom=32)
+    list_box = Gtk.ListBox(css_classes=["tracks-list"], margin_start=0, margin_end=0, margin_bottom=32)
     list_box.queue_tracks = tracks
     list_box.connect("row-activated", app.on_queue_track_selected)
     app.queue_track_list = list_box
-    app.collection_content_box.append(list_box)
+    table_box.append(list_box)
 
     _populate_queue_rows(app, list_box, tracks, current_idx, compact=False)
 
     if hasattr(app, "_update_track_list_icon"):
         app._update_track_list_icon(target_list=list_box)
+
+
+def render_liked_songs_dashboard(app, tracks=None):
+    _clear_container(app.collection_content_box)
+    app.playlist_track_list = None
+    app.queue_track_list = None
+
+    all_tracks = list(tracks or [])
+    if hasattr(app, "grid_subtitle_label") and app.grid_subtitle_label is not None:
+        app.grid_subtitle_label.set_text(f"{len(all_tracks)} Liked Songs")
+    app.liked_tracks_data = all_tracks
+    app.liked_tracks_sort = getattr(app, "liked_tracks_sort", "recent")
+    app.liked_tracks_query = getattr(app, "liked_tracks_query", "")
+    app.liked_tracks_artist_filter = getattr(app, "liked_tracks_artist_filter", None)
+    app.liked_tracks_page_size = max(1, int(getattr(app, "liked_tracks_page_size", 50) or 50))
+    app.liked_tracks_page = max(0, int(getattr(app, "liked_tracks_page", 0) or 0))
+
+    toolbar = Gtk.Box(spacing=8, margin_start=0, margin_end=0, margin_top=6, margin_bottom=8)
+    search_entry = Gtk.Entry(hexpand=True)
+    search_entry.set_placeholder_text("Search in liked songs")
+    search_entry.set_text(app.liked_tracks_query or "")
+    toolbar.append(search_entry)
+    sort_label = Gtk.Label(label="Sort by", css_classes=["dim-label"], valign=Gtk.Align.CENTER)
+    toolbar.append(sort_label)
+    sort_dd = Gtk.DropDown(model=Gtk.StringList.new(["Recent", "Title", "Artist", "Album", "Duration"]))
+    sort_map = {"recent": 0, "title": 1, "artist": 2, "album": 3, "duration": 4}
+    sort_dd.set_selected(sort_map.get(app.liked_tracks_sort, 0))
+    toolbar.append(sort_dd)
+    play_all_btn = Gtk.Button(label="Play all", css_classes=["flat", "liked-action-btn", "liked-action-btn-primary"])
+    play_all_btn.set_tooltip_text("Play all liked songs in current view")
+    toolbar.append(play_all_btn)
+    shuffle_btn = Gtk.Button(label="Shuffle", css_classes=["flat", "liked-action-btn"])
+    shuffle_btn.set_tooltip_text("Shuffle current liked songs and play")
+    toolbar.append(shuffle_btn)
+    play_next_btn = Gtk.Button(label="Play next", css_classes=["flat", "liked-action-btn"])
+    play_next_btn.set_tooltip_text("Queue current liked songs to play next")
+    toolbar.append(play_next_btn)
+    app.collection_content_box.append(toolbar)
+
+    pager_bar = Gtk.Box(spacing=8, margin_start=0, margin_end=0, margin_bottom=8)
+    prev_page_btn = Gtk.Button(label="Prev", css_classes=["flat", "liked-action-btn"])
+    next_page_btn = Gtk.Button(label="Next", css_classes=["flat", "liked-action-btn"])
+    page_info_lbl = Gtk.Label(label="", css_classes=["dim-label"], xalign=0)
+    pager_bar.append(prev_page_btn)
+    pager_bar.append(next_page_btn)
+    pager_bar.append(page_info_lbl)
+    pager_bar.append(Gtk.Box(hexpand=True))
+    app.collection_content_box.append(pager_bar)
+
+    artist_groups = {}
+
+    def _artist_key(artist_obj):
+        aid = getattr(artist_obj, "id", None)
+        if aid is not None:
+            return f"id:{aid}"
+        name = str(getattr(artist_obj, "name", "Unknown") or "Unknown").strip().lower()
+        return f"name:{name}"
+
+    for t in all_tracks:
+        artist_obj = getattr(t, "artist", None)
+        key = _artist_key(artist_obj)
+        if key not in artist_groups:
+            artist_groups[key] = {
+                "key": key,
+                "artist": artist_obj,
+                "name": str(getattr(artist_obj, "name", "Unknown") or "Unknown"),
+                "count": 0,
+            }
+        artist_groups[key]["count"] += 1
+
+    artist_items = sorted(
+        artist_groups.values(),
+        key=lambda it: (-int(it.get("count", 0) or 0), str(it.get("name", "")).lower()),
+    )
+
+    artist_filter_scroll = Gtk.ScrolledWindow(hexpand=True, vexpand=False, css_classes=["liked-artist-filter-scroll"])
+    artist_filter_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
+    artist_filter_scroll.set_min_content_height(90)
+    artist_filter_flow = Gtk.FlowBox(
+        selection_mode=Gtk.SelectionMode.NONE,
+        max_children_per_line=999,
+        column_spacing=10,
+        row_spacing=8,
+        css_classes=["liked-artist-filter-flow"],
+    )
+    artist_filter_scroll.set_child(artist_filter_flow)
+    app.collection_content_box.append(artist_filter_scroll)
+
+    app.liked_artist_filter_buttons = {}
+
+    def _refresh_artist_filter_buttons():
+        selected = getattr(app, "liked_tracks_artist_filter", None)
+        for key, btn in dict(getattr(app, "liked_artist_filter_buttons", {}) or {}).items():
+            if selected and key == selected:
+                btn.add_css_class("active")
+            else:
+                btn.remove_css_class("active")
+
+    def _on_artist_filter_clicked(key):
+        current = getattr(app, "liked_tracks_artist_filter", None)
+        app.liked_tracks_artist_filter = None if current == key else key
+        app.liked_tracks_page = 0
+        _refresh_artist_filter_buttons()
+        _apply_filters()
+
+    for item in artist_items:
+        artist_obj = item.get("artist")
+        key = item.get("key")
+        name = str(item.get("name", "Unknown") or "Unknown")
+        count = int(item.get("count", 0) or 0)
+
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, halign=Gtk.Align.CENTER)
+        overlay = Gtk.Overlay()
+        img = Gtk.Image(css_classes=["circular-avatar", "liked-artist-filter-img"])
+        img.set_size_request(54, 54)
+        img.set_pixel_size(54)
+        art_url = app.backend.get_artist_artwork_url(artist_obj, 320) if artist_obj is not None else None
+        if art_url:
+            utils.load_img(img, art_url, app.cache_dir, 54)
+        else:
+            img.set_from_icon_name("avatar-default-symbolic")
+        overlay.set_child(img)
+
+        badge = Gtk.Label(label=str(count), css_classes=["liked-artist-count-badge"])
+        badge.set_halign(Gtk.Align.END)
+        badge.set_valign(Gtk.Align.END)
+        overlay.add_overlay(badge)
+        card.append(overlay)
+        card.append(Gtk.Label(label=name, css_classes=["dim-label"], max_width_chars=12, ellipsize=3))
+
+        btn = Gtk.Button(css_classes=["flat", "liked-artist-filter-btn"])
+        btn.set_tooltip_text(f"Show {name} tracks")
+        btn.set_child(card)
+        btn.connect("clicked", lambda _b, k=key: _on_artist_filter_clicked(k))
+        app.liked_artist_filter_buttons[key] = btn
+
+        child = Gtk.FlowBoxChild()
+        child.set_child(btn)
+        artist_filter_flow.append(child)
+
+    table_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+    app.collection_content_box.append(table_box)
+
+    tracks_head, head_btns = build_tracks_header(
+        on_sort_title=lambda _b: None,
+        on_sort_artist=lambda _b: None,
+        on_sort_album=lambda _b: None,
+        on_sort_time=lambda _b: None,
+    )
+    for key in ("title", "artist", "album", "time"):
+        lbl = head_btns.get(key)
+        if lbl is None:
+            continue
+        lbl.set_xalign(0.0)
+        lbl.set_halign(Gtk.Align.FILL)
+    append_header_action_spacers(tracks_head, ["fav", "add"])
+
+    table_box.append(tracks_head)
+
+    list_box = Gtk.ListBox(css_classes=["tracks-list"], margin_start=0, margin_end=0, margin_bottom=32)
+    app.liked_track_list = list_box
+    list_box.connect("row-activated", lambda box, row: app.on_history_track_clicked(getattr(box, "liked_tracks", []), getattr(row, "liked_track_index", -1)))
+    table_box.append(list_box)
+
+    def _play_liked_tracks(tracks, shuffle=False):
+        items = [t for t in list(tracks or []) if t is not None]
+        if not items:
+            return
+        queue = list(items)
+        if shuffle:
+            random.shuffle(queue)
+        app.current_track_list = queue
+        if hasattr(app, "_set_play_queue"):
+            app._set_play_queue(queue)
+        else:
+            app.play_queue = queue
+        app.play_track(0)
+
+    def _queue_liked_tracks_next(tracks):
+        items = [t for t in list(tracks or []) if t is not None]
+        if not items:
+            return
+        playing = getattr(app, "playing_track", None)
+        if playing is None:
+            _play_liked_tracks(items, shuffle=False)
+            return
+
+        base_queue = list(app._get_active_queue() if hasattr(app, "_get_active_queue") else (getattr(app, "play_queue", []) or []))
+        if not base_queue:
+            _play_liked_tracks(items, shuffle=False)
+            return
+
+        current_idx = int(getattr(app, "current_track_index", -1) or -1)
+        if current_idx < 0 or current_idx >= len(base_queue):
+            current_idx = 0
+        insert_at = min(len(base_queue), current_idx + 1)
+        new_queue = list(base_queue)
+        new_queue[insert_at:insert_at] = items
+        if hasattr(app, "_set_play_queue"):
+            app._set_play_queue(new_queue)
+        else:
+            app.play_queue = new_queue
+        if hasattr(app, "_refresh_queue_views"):
+            GLib.idle_add(app._refresh_queue_views)
+
+    play_all_btn.connect("clicked", lambda _b: _play_liked_tracks(getattr(list_box, "liked_tracks", []), shuffle=False))
+    shuffle_btn.connect("clicked", lambda _b: _play_liked_tracks(getattr(list_box, "liked_tracks", []), shuffle=True))
+    play_next_btn.connect("clicked", lambda _b: _queue_liked_tracks_next(getattr(list_box, "liked_tracks", [])))
+
+    def _apply_filters():
+        q = str(getattr(app, "liked_tracks_query", "") or "").strip().lower()
+        mode = getattr(app, "liked_tracks_sort", "recent")
+        artist_filter = getattr(app, "liked_tracks_artist_filter", None)
+        filtered = list(all_tracks)
+        if artist_filter:
+            filtered = [t for t in filtered if _artist_key(getattr(t, "artist", None)) == artist_filter]
+        if q:
+            def _match(t):
+                title = str(getattr(t, "name", "") or "").lower()
+                artist = str(getattr(getattr(t, "artist", None), "name", "") or "").lower()
+                album = str(getattr(getattr(t, "album", None), "name", "") or "").lower()
+                return q in title or q in artist or q in album
+            filtered = [t for t in filtered if _match(t)]
+
+        if mode == "title":
+            filtered.sort(key=lambda t: str(getattr(t, "name", "") or "").lower())
+        elif mode == "artist":
+            filtered.sort(key=lambda t: str(getattr(getattr(t, "artist", None), "name", "") or "").lower())
+        elif mode == "album":
+            filtered.sort(key=lambda t: str(getattr(getattr(t, "album", None), "name", "") or "").lower())
+        elif mode == "duration":
+            filtered.sort(key=lambda t: int(getattr(t, "duration", 0) or 0))
+        # recent => keep backend order
+
+        _clear_container(list_box)
+        list_box.liked_tracks = filtered
+
+        total = len(filtered)
+        page_size = max(1, int(getattr(app, "liked_tracks_page_size", 50) or 50))
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        page = int(getattr(app, "liked_tracks_page", 0) or 0)
+        if page >= total_pages:
+            page = total_pages - 1
+        if page < 0:
+            page = 0
+        app.liked_tracks_page = page
+        start = page * page_size
+        end = min(start + page_size, total)
+        page_items = filtered[start:end] if total > 0 else []
+
+        play_all_btn.set_sensitive(bool(filtered))
+        shuffle_btn.set_sensitive(bool(filtered))
+        play_next_btn.set_sensitive(bool(filtered))
+        prev_page_btn.set_sensitive(page > 0)
+        next_page_btn.set_sensitive(page < (total_pages - 1))
+        if total > 0:
+            page_info_lbl.set_text(f"Page {page + 1}/{total_pages}  ({start + 1}-{end} of {total})")
+        else:
+            page_info_lbl.set_text("Page 1/1  (0 songs)")
+
+        if not page_items:
+            row = Gtk.ListBoxRow()
+            row.set_selectable(False)
+            row.set_activatable(False)
+            row.set_child(Gtk.Label(label="No liked songs found.", xalign=0, css_classes=["dim-label"], margin_start=12, margin_top=12, margin_bottom=12))
+            list_box.append(row)
+            return
+
+        for i, t in enumerate(page_items):
+            abs_i = start + i
+            row = Gtk.ListBoxRow(css_classes=["track-row"])
+            row.liked_track_index = abs_i
+            row.track_id = getattr(t, "id", None)
+            box = Gtk.Box(
+                spacing=LAYOUT["col_gap"],
+                margin_top=LAYOUT["row_margin_y"],
+                margin_bottom=LAYOUT["row_margin_y"],
+                margin_start=0,
+                margin_end=0,
+            )
+            stack = Gtk.Stack()
+            stack.set_size_request(LAYOUT["index_width"], -1)
+            stack.add_css_class("track-index-stack")
+            idx = Gtk.Label(label=str(abs_i + 1), css_classes=["dim-label"])
+            stack.add_named(idx, "num")
+            icon = Gtk.Image(icon_name="media-playback-start-symbolic")
+            icon.add_css_class("accent")
+            stack.add_named(icon, "icon")
+            stack.set_visible_child_name("num")
+            box.append(stack)
+
+            title = str(getattr(t, "name", "Unknown Track") or "Unknown Track")
+            title_lbl = Gtk.Label(label=title, xalign=0, ellipsize=3, hexpand=True, css_classes=["track-title"])
+            title_lbl.set_tooltip_text(title)
+            box.append(title_lbl)
+
+            artist_name = str(getattr(getattr(t, "artist", None), "name", "Unknown") or "Unknown")
+            artist_lbl = Gtk.Label(label=artist_name, xalign=0, ellipsize=3, css_classes=["dim-label", "track-artist"])
+            artist_lbl.set_tooltip_text(artist_name)
+            artist_lbl.set_size_request(LAYOUT["artist_width"], -1)
+            artist_lbl.set_max_width_chars(16)
+            artist_lbl.set_margin_end(LAYOUT["cell_margin_end"])
+            box.append(artist_lbl)
+
+            album_name = str(getattr(getattr(t, "album", None), "name", "Unknown Album") or "Unknown Album")
+            album_lbl = Gtk.Label(label=album_name, xalign=0, ellipsize=3, css_classes=["dim-label", "track-album"])
+            album_lbl.set_tooltip_text(album_name)
+            album_lbl.set_size_request(LAYOUT["album_width"], -1)
+            album_lbl.set_max_width_chars(16)
+            album_lbl.set_margin_end(LAYOUT["cell_margin_end"])
+            box.append(album_lbl)
+
+            dur = int(getattr(t, "duration", 0) or 0)
+            m, s = divmod(max(0, dur), 60)
+            d = Gtk.Label(label=f"{m}:{s:02d}", xalign=0, css_classes=["dim-label", "track-duration"])
+            d.set_attributes(Pango.AttrList.from_string("font-features 'tnum=1'"))
+            d.set_size_request(LAYOUT["time_width"], -1)
+            d.set_halign(Gtk.Align.FILL)
+            box.append(d)
+
+            fav_btn = app.create_track_fav_button(t)
+            fav_btn.connect("clicked", lambda _b: GLib.timeout_add(260, app.refresh_liked_songs_dashboard))
+            box.append(fav_btn)
+
+            add_btn = Gtk.Button(icon_name="list-add-symbolic", css_classes=["flat", "circular", "history-scroll-btn"])
+            add_btn.set_tooltip_text("Add to Playlist")
+            add_btn.connect("clicked", lambda _b, tr=t: app.on_add_single_track_to_playlist(tr))
+            box.append(add_btn)
+            row.set_child(box)
+            list_box.append(row)
+
+        if hasattr(app, "_update_track_list_icon"):
+            app._update_track_list_icon(target_list=list_box)
+
+    def _on_search_changed(entry):
+        app.liked_tracks_query = entry.get_text()
+        app.liked_tracks_page = 0
+        _apply_filters()
+
+    def _on_sort_changed(dd, _pspec):
+        idx = int(dd.get_selected())
+        app.liked_tracks_sort = {0: "recent", 1: "title", 2: "artist", 3: "album", 4: "duration"}.get(idx, "recent")
+        app.liked_tracks_page = 0
+        _apply_filters()
+
+    def _on_prev_page(_btn):
+        app.liked_tracks_page = max(0, int(getattr(app, "liked_tracks_page", 0) or 0) - 1)
+        _apply_filters()
+
+    def _on_next_page(_btn):
+        app.liked_tracks_page = int(getattr(app, "liked_tracks_page", 0) or 0) + 1
+        _apply_filters()
+
+    search_entry.connect("changed", _on_search_changed)
+    sort_dd.connect("notify::selected", _on_sort_changed)
+    prev_page_btn.connect("clicked", _on_prev_page)
+    next_page_btn.connect("clicked", _on_next_page)
+    _refresh_artist_filter_buttons()
+    _apply_filters()
 
 
 def render_queue_drawer(app):
@@ -1329,12 +1778,16 @@ def render_playlists_home(app):
     app.playlist_track_list = None
 
     top = Gtk.Box(spacing=8, css_classes=["home-section-head"], margin_start=6, margin_end=6, margin_bottom=8)
-    top.append(Gtk.Label(label="Your Playlists", xalign=0, hexpand=True, css_classes=["home-section-title"]))
+    top.append(Gtk.Label(label="Playlists", xalign=0, hexpand=True, css_classes=["home-section-title"]))
     create_btn = Gtk.Button(icon_name="list-add-symbolic", css_classes=["playlist-add-top-btn"])
-    create_btn.set_tooltip_text("Create Playlist")
+    create_btn.set_tooltip_text("Create Local Playlist")
     create_btn.connect("clicked", app.on_create_playlist_clicked)
     top.append(create_btn)
     app.collection_content_box.append(top)
+
+    local_head = Gtk.Box(spacing=8, css_classes=["home-section-head"], margin_start=6, margin_end=6, margin_bottom=8, margin_top=6)
+    local_head.append(Gtk.Label(label="Local Playlists", xalign=0, hexpand=True, css_classes=["home-section-title"]))
+    app.collection_content_box.append(local_head)
 
     section_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, css_classes=["home-section", "home-generic-section"])
     flow = Gtk.FlowBox(
@@ -1388,7 +1841,7 @@ def render_playlists_home(app):
         flow.append(child)
 
     if not playlists:
-        hint = Gtk.Label(label="No playlists yet. Click New Playlist to create one.", xalign=0, css_classes=["dim-label"], margin_start=8, margin_top=8)
+        hint = Gtk.Label(label="No local playlists yet. Click New Playlist to create one.", xalign=0, css_classes=["dim-label"], margin_start=8, margin_top=8)
         app.collection_content_box.append(hint)
 
 
@@ -1494,6 +1947,8 @@ def render_playlist_detail(app, playlist_id):
         detail_box.append(empty)
         return
 
+    edit_mode = bool(getattr(app, "playlist_edit_mode", False))
+
     tracks_head, head_btns = build_tracks_header(
         on_sort_title=lambda _b: app.on_playlist_sort_clicked("title"),
         on_sort_artist=lambda _b: app.on_playlist_sort_clicked("artist"),
@@ -1504,17 +1959,20 @@ def render_playlist_detail(app, playlist_id):
         album_text=app._format_sort_label("Album", "album", getattr(app, "playlist_sort_field", None), getattr(app, "playlist_sort_asc", True)),
         time_text=app._format_sort_label("Time", "time", getattr(app, "playlist_sort_field", None), getattr(app, "playlist_sort_asc", True)),
     )
+    if edit_mode:
+        append_header_action_spacers(tracks_head, ["fav", "drag", "playlist_remove"])
+    else:
+        append_header_action_spacers(tracks_head, ["fav", "add"])
     title_head = head_btns["title"]
     artist_head = head_btns["artist"]
     album_head = head_btns["album"]
     dur_head = head_btns["time"]
     detail_box.append(tracks_head)
 
-    list_box = Gtk.ListBox(css_classes=["boxed-list", "tracks-list"], margin_start=32, margin_end=32, margin_bottom=32)
+    list_box = Gtk.ListBox(css_classes=["tracks-list"], margin_start=0, margin_end=0, margin_bottom=32)
     app.playlist_track_list = list_box
     list_box.playlist_tracks = tracks
     list_box.connect("row-activated", app.on_playlist_track_selected)
-    edit_mode = bool(getattr(app, "playlist_edit_mode", False))
     title_head.set_sensitive(not edit_mode)
     artist_head.set_sensitive(not edit_mode)
     album_head.set_sensitive(not edit_mode)
@@ -1564,6 +2022,8 @@ def render_playlist_detail(app, playlist_id):
             d.set_attributes(Pango.AttrList.from_string("font-features 'tnum=1'"))
             d.set_size_request(LAYOUT["time_width"], -1)
             box.append(d)
+        fav_btn = app.create_track_fav_button(t)
+        box.append(fav_btn)
         if edit_mode:
             drag_hint = Gtk.Image.new_from_icon_name("open-menu-symbolic")
             drag_hint.add_css_class("dim-label")
