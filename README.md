@@ -88,6 +88,12 @@ sudo dnf install ./hiresti-<version>-1.el9.<arch>.rpm
 sudo pacman -U ./hiresti-<version>-1-<arch>.pkg.tar.zst
 ```
 
+## Support
+
+If you run into issues, have feature requests, or want to report bugs, please open a GitHub issue:
+
+- https://github.com/yourrepo/hiresti/issues
+
 ## License
 
 MIT
