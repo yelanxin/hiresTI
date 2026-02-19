@@ -43,7 +43,7 @@ Install these system packages first:
 - Python 3.10+
 - GTK4
 - Libadwaita
-- GStreamer core and plugins (`good` / `bad` / `ugly`)
+- GStreamer core and plugins
 - PyGObject bindings
 
 Bundled Python dependencies used by packaging:
