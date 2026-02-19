@@ -1061,6 +1061,17 @@ class TidalApp(Adw.Application):
             if self.timeline_box is not None: self.timeline_box.set_visible(False)
             if self.vol_box is not None: self.vol_box.set_visible(False)
             if self.tech_box is not None: self.tech_box.set_visible(False)
+            # Relax fixed min widths so mini mode can stay compact.
+            if getattr(self, "player_left_panel", None) is not None:
+                self.player_left_panel.set_size_request(-1, -1)
+            if getattr(self, "player_right_panel", None) is not None:
+                self.player_right_panel.set_size_request(-1, -1)
+            if getattr(self, "info_area", None) is not None:
+                self.info_area.set_size_request(-1, -1)
+            if getattr(self, "player_text_box", None) is not None:
+                self.player_text_box.set_size_request(-1, -1)
+            if getattr(self, "art_img", None) is not None:
+                self.art_img.set_size_request(56, 56)
 
             self.win.set_decorated(False)
             self.win.set_resizable(False)
@@ -1078,6 +1089,18 @@ class TidalApp(Adw.Application):
             if self.timeline_box is not None: self.timeline_box.set_visible(True)
             if self.vol_box is not None: self.vol_box.set_visible(True)
             if self.tech_box is not None: self.tech_box.set_visible(True)
+            # Restore default player panel sizing.
+            panel_w = int(getattr(self, "player_side_panel_width", 340) or 340)
+            if getattr(self, "player_left_panel", None) is not None:
+                self.player_left_panel.set_size_request(panel_w, -1)
+            if getattr(self, "player_right_panel", None) is not None:
+                self.player_right_panel.set_size_request(panel_w, -1)
+            if getattr(self, "info_area", None) is not None:
+                self.info_area.set_size_request(panel_w, -1)
+            if getattr(self, "player_text_box", None) is not None:
+                self.player_text_box.set_size_request(240, -1)
+            if getattr(self, "art_img", None) is not None:
+                self.art_img.set_size_request(80, 80)
             
             self.bottom_bar.remove_css_class("mini-state")
             self.win.set_decorated(True)

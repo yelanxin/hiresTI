@@ -400,6 +400,7 @@ def build_player_bar(app, container):
     app.player_overlay.add_overlay(app.mini_controls)
 
     side_panel_width = 340
+    app.player_side_panel_width = side_panel_width
 
     left_panel = Gtk.Box()
     left_panel.set_hexpand(False)
@@ -455,6 +456,9 @@ def build_player_bar(app, container):
     left_clamp = Adw.Clamp(maximum_size=side_panel_width, tightening_threshold=240)
     left_clamp.set_child(app.info_area)
     left_panel.append(left_clamp)
+    app.player_left_panel = left_panel
+    app.player_left_clamp = left_clamp
+    app.player_text_box = text_box
     app.bottom_bar.set_start_widget(left_panel)
 
     center_panel = Gtk.Box()
@@ -540,6 +544,7 @@ def build_player_bar(app, container):
 
     right_panel.append(Gtk.Box(hexpand=True))
     right_panel.append(app.vol_box)
+    app.player_right_panel = right_panel
     app.bottom_bar.set_end_widget(right_panel)
 
     # Start/end use content width to avoid large dead space on wide windows.
