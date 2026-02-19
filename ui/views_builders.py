@@ -110,6 +110,8 @@ def build_grid_view(app):
 def toggle_login_view(app, logged_in):
     app.login_prompt_box.set_visible(not logged_in)
     app.alb_scroll.set_visible(logged_in)
+    if hasattr(app, "search_entry") and app.search_entry is not None:
+        app.search_entry.set_visible(logged_in)
     if hasattr(app, "sidebar_box") and app.sidebar_box is not None:
         app.sidebar_box.set_visible(logged_in)
     if not logged_in:
@@ -460,6 +462,20 @@ def build_search_view(app):
     app.res_trk_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, css_classes=["home-section"])
     trk_head = Gtk.Box(spacing=8)
     trk_head.append(Gtk.Label(label="Tracks", xalign=0, hexpand=True, css_classes=["home-section-title"]))
+    app.search_tracks_page_label = Gtk.Label(label="Page 1/1", css_classes=["dim-label"], valign=Gtk.Align.CENTER)
+    trk_head.append(app.search_tracks_page_label)
+    app.search_prev_page_btn = Gtk.Button(label="Prev", css_classes=["flat"])
+    app.search_prev_page_btn.set_sensitive(False)
+    app.search_prev_page_btn.connect("clicked", app.on_search_tracks_prev_page)
+    trk_head.append(app.search_prev_page_btn)
+    app.search_next_page_btn = Gtk.Button(label="Next", css_classes=["flat"])
+    app.search_next_page_btn.set_sensitive(False)
+    app.search_next_page_btn.connect("clicked", app.on_search_tracks_next_page)
+    trk_head.append(app.search_next_page_btn)
+    app.like_selected_tracks_btn = Gtk.Button(label="Like Selected", css_classes=["flat", "pill"])
+    app.like_selected_tracks_btn.set_sensitive(False)
+    app.like_selected_tracks_btn.connect("clicked", app.on_like_selected_search_tracks)
+    trk_head.append(app.like_selected_tracks_btn)
     app.add_selected_tracks_btn = Gtk.Button(label="Add Selected", css_classes=["flat", "pill"])
     app.add_selected_tracks_btn.set_sensitive(False)
     app.add_selected_tracks_btn.connect("clicked", app.on_add_selected_search_tracks)

@@ -802,11 +802,49 @@ def render_search_results(app, res):
 
     app.res_trk_box.set_visible(bool(tracks))
     app.search_track_data = tracks
-    for idx, t in enumerate(tracks):
+    app.search_tracks_page = 0
+    render_search_tracks_page(app)
+
+    logger.debug("Search rendering complete")
+
+
+def render_search_tracks_page(app):
+    tracks = list(getattr(app, "search_track_data", []) or [])
+    page_size = max(1, int(getattr(app, "search_tracks_page_size", 50) or 50))
+    total = len(tracks)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = int(getattr(app, "search_tracks_page", 0) or 0)
+    if page < 0:
+        page = 0
+    if page >= total_pages:
+        page = total_pages - 1
+    app.search_tracks_page = page
+
+    start = page * page_size
+    end = min(total, start + page_size)
+    page_items = tracks[start:end] if total > 0 else []
+
+    prev_btn = getattr(app, "search_prev_page_btn", None)
+    next_btn = getattr(app, "search_next_page_btn", None)
+    page_lbl = getattr(app, "search_tracks_page_label", None)
+    if prev_btn is not None:
+        prev_btn.set_sensitive(page > 0)
+    if next_btn is not None:
+        next_btn.set_sensitive(page < (total_pages - 1))
+    if page_lbl is not None:
+        if total > 0:
+            page_lbl.set_text(f"Page {page + 1}/{total_pages}")
+        else:
+            page_lbl.set_text("Page 1/1")
+
+    _clear_container(app.res_trk_list)
+    for i, t in enumerate(page_items):
+        abs_idx = start + i
         row_box = Gtk.Box(spacing=12, margin_top=8, margin_bottom=8, margin_start=12, margin_end=12)
         sel_cb = Gtk.CheckButton()
         sel_cb.set_valign(Gtk.Align.CENTER)
-        sel_cb.connect("toggled", lambda cb, i=idx: app.on_search_track_checkbox_toggled(cb, i, cb.get_active()))
+        sel_cb.set_active(abs_idx in (getattr(app, "search_selected_indices", set()) or set()))
+        sel_cb.connect("toggled", lambda cb, idx=abs_idx: app.on_search_track_checkbox_toggled(cb, idx, cb.get_active()))
         row_box.append(sel_cb)
         img = Gtk.Image(pixel_size=48, css_classes=["album-cover-img"])
         url = app.backend.get_artwork_url(t, 80)
@@ -840,10 +878,9 @@ def render_search_results(app, res):
 
         lb_row = Gtk.ListBoxRow()
         lb_row.add_css_class("track-row")
+        lb_row.search_track_index = abs_idx
         lb_row.set_child(row_box)
         app.res_trk_list.append(lb_row)
-
-    logger.debug("Search rendering complete")
 
 
 def show_album_details(app, alb):

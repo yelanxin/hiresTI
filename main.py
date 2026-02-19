@@ -151,7 +151,13 @@ class TidalApp(Adw.Application):
         self.search_content_box = None
         self.add_playlist_btn = None
         self.add_selected_tracks_btn = None
+        self.like_selected_tracks_btn = None
+        self.search_prev_page_btn = None
+        self.search_next_page_btn = None
+        self.search_tracks_page_label = None
         self.search_selected_indices = set()
+        self.search_tracks_page = 0
+        self.search_tracks_page_size = 50
         self.collection_base_margin_bottom = 32
         self.track_list_base_margin_bottom = 32
         self.search_base_margin_bottom = 32
@@ -436,6 +442,7 @@ class TidalApp(Adw.Application):
         self.ignore_device_change = False
         self._search_request_id = 0
         self._search_debounce_source = 0
+        self._liked_tracks_request_id = 0
         self._play_request_id = 0
         self._settings_save_source = 0
         self._playing_pulse_source = 0
@@ -773,6 +780,7 @@ class TidalApp(Adw.Application):
         self._build_player_bar(self.main_vbox)
         self._setup_theme_watch()
         self._restore_runtime_state()
+        self._set_login_view_pending()
 
         # === 恢复设置逻辑 ===
         is_bp = self.settings.get("bit_perfect", False)
@@ -1163,6 +1171,48 @@ class TidalApp(Adw.Application):
 
     def _toggle_login_view(self, logged_in):
         ui_views_builders.toggle_login_view(self, logged_in)
+        # Login state should not hide the player bar itself.
+        player_overlay = getattr(self, "player_overlay", None)
+        if player_overlay is not None:
+            player_overlay.set_visible(True)
+        bottom_bar = getattr(self, "bottom_bar", None)
+        if bottom_bar is not None:
+            bottom_bar.set_visible(True)
+        self._set_overlay_handles_visible(bool(logged_in))
+
+    def _set_login_view_pending(self):
+        # Startup session check in progress: avoid flashing logged-out prompt.
+        if hasattr(self, "login_prompt_box") and self.login_prompt_box is not None:
+            self.login_prompt_box.set_visible(False)
+        if hasattr(self, "alb_scroll") and self.alb_scroll is not None:
+            self.alb_scroll.set_visible(False)
+        if hasattr(self, "sidebar_box") and self.sidebar_box is not None:
+            self.sidebar_box.set_visible(False)
+        if hasattr(self, "search_entry") and self.search_entry is not None:
+            self.search_entry.set_visible(False)
+        self._set_overlay_handles_visible(False)
+
+    def _set_overlay_handles_visible(self, visible):
+        queue_anchor = getattr(self, "queue_anchor", None)
+        if queue_anchor is not None:
+            queue_anchor.set_visible(bool(visible))
+
+        viz_handle_box = getattr(self, "viz_handle_box", None)
+        if viz_handle_box is not None:
+            viz_handle_box.set_visible(bool(visible))
+
+        if visible:
+            return
+
+        # Ensure overlays are collapsed when hidden in logged-out state.
+        self.close_queue_drawer()
+        revealer = getattr(self, "viz_revealer", None)
+        if revealer is not None:
+            revealer.set_reveal_child(False)
+        btn = getattr(self, "viz_btn", None)
+        if btn is not None:
+            btn.set_icon_name("hiresti-pan-up-symbolic")
+            btn.remove_css_class("active")
 
     def _build_tracks_view(self):
         ui_views_builders.build_tracks_view(self)
@@ -1978,8 +2028,32 @@ class TidalApp(Adw.Application):
             if now - last_ts <= max(0.0, ttl):
                 return False
 
+        req_id = int(getattr(self, "_liked_tracks_request_id", 0) or 0) + 1
+        self._liked_tracks_request_id = req_id
+
+        def _is_stale():
+            return req_id != int(getattr(self, "_liked_tracks_request_id", 0) or 0)
+
+        def _apply_if_active(tracks):
+            current = self.nav_list.get_selected_row() if self.nav_list is not None else None
+            if not current or getattr(current, "nav_id", None) != "liked_songs":
+                return False
+            if _is_stale():
+                return False
+            self.render_liked_songs_dashboard(tracks)
+            return False
+
         def task():
-            tracks = list(self.backend.get_favorite_tracks(limit=500))
+            # Stage 1: get a small slice for fast first paint.
+            head_tracks = list(self.backend.get_favorite_tracks(limit=100))
+            if head_tracks and not _is_stale():
+                if len(head_tracks) > len(cached_tracks):
+                    GLib.idle_add(lambda: _apply_if_active(head_tracks))
+
+            # Stage 2: fetch full library in background.
+            tracks = list(self.backend.get_favorite_tracks(limit=20000))
+            if _is_stale():
+                return
             try:
                 self.backend.fav_track_ids = {
                     str(getattr(t, "id", ""))
@@ -1989,15 +2063,7 @@ class TidalApp(Adw.Application):
             except Exception:
                 pass
             self.liked_tracks_last_fetch_ts = time.time()
-
-            def _apply():
-                current = self.nav_list.get_selected_row() if self.nav_list is not None else None
-                if not current or getattr(current, "nav_id", None) != "liked_songs":
-                    return False
-                self.render_liked_songs_dashboard(tracks)
-                return False
-
-            GLib.idle_add(_apply)
+            GLib.idle_add(lambda: _apply_if_active(tracks))
 
         Thread(target=task, daemon=True).start()
         return False
@@ -2307,11 +2373,15 @@ class TidalApp(Adw.Application):
 
     def _update_search_batch_add_state(self):
         btn = getattr(self, "add_selected_tracks_btn", None)
-        if btn is None:
-            return
         count = len(getattr(self, "search_selected_indices", set()) or set())
-        btn.set_sensitive(count > 0)
-        btn.set_label(f"Add Selected ({count})" if count > 0 else "Add Selected")
+        user_ready = bool(getattr(self.backend, "user", None))
+        if btn is not None:
+            btn.set_sensitive(count > 0)
+            btn.set_label(f"Add Selected ({count})" if count > 0 else "Add Selected")
+        like_btn = getattr(self, "like_selected_tracks_btn", None)
+        if like_btn is not None:
+            like_btn.set_sensitive(user_ready and count > 0)
+            like_btn.set_label(f"Like Selected ({count})" if count > 0 else "Like Selected")
 
     def on_add_selected_search_tracks(self, _btn=None):
         selected = sorted(list(getattr(self, "search_selected_indices", set()) or []))
@@ -2322,6 +2392,66 @@ class TidalApp(Adw.Application):
         if not tracks:
             return
         self.on_add_tracks_to_playlist(tracks)
+
+    def on_like_selected_search_tracks(self, _btn=None):
+        if not getattr(self.backend, "user", None):
+            return
+        selected = sorted(list(getattr(self, "search_selected_indices", set()) or []))
+        tracks = []
+        for idx in selected:
+            if 0 <= idx < len(self.search_track_data):
+                tracks.append(self.search_track_data[idx])
+        if not tracks:
+            return
+
+        add_btn = getattr(self, "add_selected_tracks_btn", None)
+        like_btn = getattr(self, "like_selected_tracks_btn", None)
+        if add_btn is not None:
+            add_btn.set_sensitive(False)
+        if like_btn is not None:
+            like_btn.set_sensitive(False)
+
+        def do():
+            liked = 0
+            skipped = 0
+            failed = 0
+            fav_ids = getattr(self.backend, "fav_track_ids", set()) or set()
+            for t in tracks:
+                track_id = str(getattr(t, "id", "") or "").strip()
+                if not track_id:
+                    failed += 1
+                    continue
+                if track_id in fav_ids:
+                    skipped += 1
+                    continue
+                if self.backend.toggle_track_favorite(track_id, True):
+                    liked += 1
+                else:
+                    failed += 1
+
+            def apply():
+                self.refresh_visible_track_fav_buttons()
+                self.refresh_current_track_favorite_state()
+                self._update_search_batch_add_state()
+                msg = f"Liked {liked}"
+                if skipped:
+                    msg += f", skipped {skipped}"
+                if failed:
+                    msg += f", failed {failed}"
+                self.show_output_notice(msg, "ok" if failed == 0 else "warn", 2800)
+                return False
+
+            GLib.idle_add(apply)
+
+        Thread(target=do, daemon=True).start()
+
+    def on_search_tracks_prev_page(self, _btn=None):
+        self.search_tracks_page = max(0, int(getattr(self, "search_tracks_page", 0) or 0) - 1)
+        ui_actions.render_search_tracks_page(self)
+
+    def on_search_tracks_next_page(self, _btn=None):
+        self.search_tracks_page = int(getattr(self, "search_tracks_page", 0) or 0) + 1
+        ui_actions.render_search_tracks_page(self)
 
     def _prompt_playlist_name(self, title, initial_name, on_submit):
         dialog = Gtk.Dialog(title=title, transient_for=self.win, modal=True)
@@ -3026,7 +3156,7 @@ class TidalApp(Adw.Application):
 
     def on_search_track_selected(self, box, row):
         if not row: return
-        idx = row.get_index()
+        idx = getattr(row, "search_track_index", row.get_index())
 
         if idx < len(self.search_track_data):
             self.current_track_list = self.search_track_data
