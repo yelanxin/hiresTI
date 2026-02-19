@@ -49,6 +49,8 @@ Python packages (bundled in package script):
 
 ## Install
 
+1. Downloading the binary App from release page.
+
 ### Debian / Ubuntu (DEB)
 
 ```bash
