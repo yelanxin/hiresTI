@@ -228,6 +228,8 @@ def play_track(app, index):
     track = queue[index]
     app.playing_track = track
     app.playing_track_id = track.id
+    if hasattr(app, "refresh_current_track_favorite_state"):
+        GLib.idle_add(app.refresh_current_track_favorite_state)
 
     logger.info("Playing: %s", track.name)
 

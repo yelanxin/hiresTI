@@ -4,7 +4,7 @@ gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk
 
 import utils
-from ui.track_table import build_tracks_header
+from ui.track_table import build_tracks_header, append_header_action_spacers
 
 
 def build_grid_view(app):
@@ -27,7 +27,7 @@ def build_grid_view(app):
     )
     app.artist_fav_btn = Gtk.Button(
         css_classes=["heart-btn"],
-        icon_name="emblem-favorite-symbolic",
+        icon_name="hiresti-favorite-symbolic",
         visible=False,
     )
     app.artist_fav_btn.connect("clicked", app.on_artist_fav_clicked)
@@ -119,7 +119,7 @@ def toggle_login_view(app, logged_in):
 def build_tracks_view(app):
     trk_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["tracks-view"])
     trk_scroll = Gtk.ScrolledWindow(vexpand=True)
-    trk_content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+    trk_content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, margin_start=32, margin_end=32)
 
     app.album_header_box = Gtk.Box(spacing=24, css_classes=["album-header-box"])
     app.header_art = Gtk.Picture()
@@ -149,7 +149,7 @@ def build_tracks_view(app):
     info.append(app.header_artist)
     info.append(app.header_meta)
 
-    app.fav_btn = Gtk.Button(css_classes=["heart-btn"], icon_name="non-starred-symbolic", valign=Gtk.Align.CENTER)
+    app.fav_btn = Gtk.Button(css_classes=["heart-btn"], icon_name="hiresti-favorite-outline-symbolic", valign=Gtk.Align.CENTER)
     app.fav_btn.connect("clicked", app.on_fav_clicked)
     app.add_playlist_btn = Gtk.Button(icon_name="list-add-symbolic", css_classes=["flat", "circular", "history-scroll-btn"], valign=Gtk.Align.CENTER)
     app.add_playlist_btn.set_tooltip_text("Add Album Tracks to Playlist")
@@ -167,10 +167,11 @@ def build_tracks_view(app):
         on_sort_album=lambda _b: app.on_album_sort_clicked("album"),
         on_sort_time=lambda _b: app.on_album_sort_clicked("time"),
     )
+    append_header_action_spacers(tracks_head, ["fav", "add"])
     trk_content.append(tracks_head)
     app.album_sort_buttons = head_btns
 
-    app.track_list = Gtk.ListBox(css_classes=["boxed-list", "tracks-list"], margin_start=32, margin_end=32, margin_bottom=32)
+    app.track_list = Gtk.ListBox(css_classes=["tracks-list"], margin_start=0, margin_end=0, margin_bottom=32)
     app.track_list_base_margin_bottom = 32
     app.track_list.connect("row-activated", app.on_track_selected)
     trk_content.append(app.track_list)

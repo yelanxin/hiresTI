@@ -1,18 +1,9 @@
-# ui_config.py
-
-SIDEBAR_RATIO = 0.20  # <--- 修改这里：30% 宽度
+SIDEBAR_RATIO = 0.20
 VOLUME_RATIO  = 0.10 
-SIDEBAR_MIN_WIDTH = 260 # 稍微调宽一点最小宽度
+SIDEBAR_MIN_WIDTH = 260
 VOLUME_MIN_WIDTH = 150 
 WINDOW_WIDTH = 1100
 WINDOW_HEIGHT = 800
-# ui_config.py
-
-# ... 前面的变量定义保持不变 ...
-# ui_config.py
-
-# ... 前面的变量保持不变 ...
-# --- ui_config.py ---
 
 CSS_DATA = """
 .circular-avatar { border-radius: 9999px; }
@@ -226,7 +217,8 @@ CSS_DATA = """
 
 .queue-anchor .queue-drawer-list row {
     border-radius: 8px;
-    margin: 2px 2px;
+    margin: 2px 0;
+    box-shadow: none;
 }
 
 .queue-anchor .queue-drawer-list row:hover {
@@ -321,10 +313,8 @@ CSS_DATA = """
         padding: 0;
     }
 
-    /* 2. 按钮本体 - 核心去背景 */
+    /* 2. 按钮本体 */
     .mini-switcher button {
-        /* [关键] 必须清除 background-image，否则会有灰色渐变 */
-
         border: 1px solid alpha(currentColor, 0.2);
         box-shadow: none;
         text-shadow: none; /* 去掉文字阴影 */
@@ -454,7 +444,6 @@ CSS_DATA = """
         margin-bottom: 24px; margin-top: 8px; text-shadow: 0 0 15px rgba(255, 255, 255, 0.2);
     }
 
-/* 其他样式保持不变... */
 window.undecorated { background-color: transparent; }
 .player-overlay-container { background-color: transparent; }
 .card-bar.mini-state .player-ctrls-box { margin-top: 12px; margin-right: 20px; border-spacing: 15px; }
@@ -523,6 +512,16 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
 .heart-btn image { -gtk-icon-size: 32px; }
 .heart-btn:hover { color: alpha(currentColor, 0.6); background-color: alpha(currentColor, 0.05); transform: scale(1.1); }
 .heart-btn.active { color: #e91e63; opacity: 1; }
+
+.track-heart-btn { background: transparent; box-shadow: none; border: none; padding: 2px; min-width: 18px; min-height: 18px; border-radius: 99px; color: alpha(currentColor, 0.36); transition: all 0.2s; }
+.track-heart-btn image { -gtk-icon-size: 18px; }
+.track-heart-btn:hover { color: alpha(currentColor, 0.7); background-color: alpha(currentColor, 0.05); transform: scale(1.06); }
+.track-heart-btn.active { color: #e91e63; opacity: 1; }
+
+.player-heart-btn { background: transparent; box-shadow: none; border: none; padding: 2px; min-width: 24px; min-height: 24px; border-radius: 99px; color: alpha(currentColor, 0.34); margin-top: 0; transition: all 0.2s; }
+.player-heart-btn image { -gtk-icon-size: 20px; }
+.player-heart-btn:hover { color: alpha(currentColor, 0.7); background-color: alpha(currentColor, 0.05); transform: scale(1.05); }
+.player-heart-btn.active { color: #e91e63; opacity: 1; }
 .section-title { font-size: 20px; font-weight: 700; margin: 12px; }
 .tech-label { font-family: "Monospace"; font-size: 10px; font-weight: bold; color: @accent_color; background-color: alpha(@accent_bg_color, 0.12); padding: 3px; border-radius: 4px; margin-top: 0; }
 .settings-container { padding: 40px; }
@@ -585,6 +584,76 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
     font-family: "Monospace";
     font-size: 12px;
     font-weight: 700;
+}
+
+.liked-action-btn {
+    min-height: 23px;
+    padding: 0 12px;
+    border-radius: 999px;
+    border: 1px solid alpha(currentColor, 0.24);
+    background-color: alpha(currentColor, 0.04);
+    color: alpha(currentColor, 0.90);
+    box-shadow: none;
+}
+
+.liked-action-btn:hover {
+    background-color: alpha(currentColor, 0.08);
+    border-color: alpha(@accent_bg_color, 0.45);
+}
+
+.liked-action-btn:active {
+    background-color: alpha(currentColor, 0.12);
+}
+
+.liked-action-btn-primary {
+    background-color: alpha(@accent_bg_color, 0.20);
+    border-color: alpha(@accent_bg_color, 0.58);
+    color: @accent_fg_color;
+}
+
+.liked-action-btn-primary:hover {
+    background-color: alpha(@accent_bg_color, 0.28);
+    border-color: alpha(@accent_bg_color, 0.72);
+}
+
+.liked-artist-filter-scroll,
+.liked-artist-filter-scroll viewport,
+.liked-artist-filter-flow {
+    background: transparent;
+}
+
+.liked-artist-filter-btn {
+    border-radius: 10px;
+    border: 1px solid transparent;
+    padding: 4px 6px;
+    box-shadow: none;
+}
+
+.liked-artist-filter-btn:hover {
+    border-color: alpha(@accent_bg_color, 0.35);
+    background-color: alpha(currentColor, 0.04);
+}
+
+.liked-artist-filter-btn.active {
+    border-color: alpha(@accent_bg_color, 0.65);
+    background-color: alpha(@accent_bg_color, 0.14);
+}
+
+.liked-artist-filter-img {
+    min-width: 54px;
+    min-height: 54px;
+}
+
+.liked-artist-count-badge {
+    min-width: 16px;
+    padding: 1px 6px;
+    border-radius: 999px;
+    font-size: 10px;
+    font-weight: 700;
+    color: alpha(currentColor, 0.92);
+    background-color: alpha(currentColor, 0.62);
+    margin-right: 0;
+    margin-bottom: 0;
 }
 
 """

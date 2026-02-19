@@ -2,7 +2,6 @@ import os
 import logging
 import time
 from datetime import datetime, timedelta
-# [Fix] 屏蔽 MESA 驱动层非致命调试警告
 os.environ["MESA_LOG_LEVEL"] = "error"
 
 import gi
@@ -10,7 +9,7 @@ gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
 from gi.repository import Gtk, Adw, GLib, Gdk, Pango
 import webbrowser
-from threading import Thread
+from threading import Thread, current_thread, main_thread
 from tidal_backend import TidalBackend
 from audio_player import AudioPlayer
 from models import HistoryManager, PlaylistManager
@@ -39,7 +38,6 @@ except Exception:
     Image = None
 
 class TidalApp(Adw.Application):
-    # --- [新增] 播放模式常量 ---
     MODE_LOOP = 0     # 列表循环 (默认)
     MODE_ONE = 1      # 单曲循环
     MODE_SHUFFLE = 2  # 专辑/列表随机 (本地乱序)
@@ -61,7 +59,6 @@ class TidalApp(Adw.Application):
         3: "Smart Shuffle (Algorithm)"
     }
     LYRICS_FONT_PRESETS = ["Live", "Studio", "Compact"]
-    # [新增] 定义延迟档位配置
     LATENCY_OPTIONS = ["Safe (400ms)", "Standard (100ms)", "Low Latency (40ms)", "Aggressive (20ms)"]
     VIZ_BAR_OPTIONS = [4, 8, 16, 32, 48, 64, 96, 128]
     LATENCY_MAP = {
@@ -98,8 +95,10 @@ class TidalApp(Adw.Application):
         self.eq_btn = None
         self.eq_pop = None
         self.mode_btn = None
+        self.track_fav_btn = None
         self.track_list = None
         self.playlist_track_list = None
+        self.liked_track_list = None
         self.queue_track_list = None
         self.queue_drawer_list = None
         self.queue_count_label = None
@@ -120,6 +119,8 @@ class TidalApp(Adw.Application):
         self._output_notice_source = 0
         self._viz_handle_anim_source = 0
         self._viz_handle_settle_source = 0
+        self._viz_handle_resize_source = 0
+        self._viz_handle_resize_retries = 0
         self._last_output_state = None
         self._last_output_error = None
         self.network_status_label = None
@@ -162,6 +163,9 @@ class TidalApp(Adw.Application):
             self.search_content_box.set_margin_bottom(self.search_base_margin_bottom + extra)
 
     def record_diag_event(self, message):
+        if current_thread() is not main_thread():
+            GLib.idle_add(self.record_diag_event, message)
+            return
         ts = time.strftime("%H:%M:%S")
         self._diag_events.append(f"{ts} | {message}")
         if len(self._diag_events) > 120:
@@ -186,6 +190,9 @@ class TidalApp(Adw.Application):
         label.add_css_class(class_map.get(state, "status-idle"))
 
     def set_diag_health(self, kind, state, detail=None):
+        if current_thread() is not main_thread():
+            GLib.idle_add(self.set_diag_health, kind, state, detail)
+            return
         if kind not in self._diag_health:
             return
         prev = self._diag_health.get(kind)
@@ -349,8 +356,7 @@ class TidalApp(Adw.Application):
         if self.play_mode not in self.MODE_ICONS:
             self.play_mode = self.MODE_LOOP
         self.shuffle_indices = [] # 用来存随机播放的顺序列表
-        
-        # [修复点] 这里的 self.on_next_track 现在能在下面找到定义了
+
         self.player = AudioPlayer(
             on_eos_callback=self.on_next_track,
             on_tag_callback=self.update_tech_label,
@@ -362,7 +368,7 @@ class TidalApp(Adw.Application):
         self._viz_sync_last_saved_ms = int(self.settings.get("viz_sync_offset_ms", 0) or 0)
         self.player.visual_sync_offset_ms = self._viz_sync_last_saved_ms
 
-        self.lyrics_mgr = LyricsManager() # <--- 初始化管理器
+        self.lyrics_mgr = LyricsManager()
         logger.info("LyricsManager initialized")
 
         saved_profile = self.settings.get("latency_profile", "Standard (100ms)")
@@ -773,24 +779,31 @@ class TidalApp(Adw.Application):
         # Defer heavy output initialization until after first frame is presented.
         GLib.idle_add(lambda: (self.on_driver_changed(self.driver_dd, None), False)[1])
 
-        # [修复重点] 4. 如果启动时独占模式是开启的，必须强制禁用驱动选择框
         if is_ex:
             self.driver_dd.set_sensitive(False)
-            # 双重保险：确保 UI 选中的是 ALSA
             self._force_driver_selection("ALSA")
 
         self._restore_session_async()
 
-        # --- [新增] 键盘快捷键监听 ---
         key_controller = Gtk.EventControllerKey()
         key_controller.connect("key-pressed", self.on_key_pressed)
         self.win.add_controller(key_controller)
 
         self.win.present()
         self.win.connect("notify::default-width", self.update_layout_proportions)
+        self.win.connect("notify::default-height", self.update_layout_proportions)
+        # Fullscreen/restore can finish allocation a bit later; listen and re-align.
+        for prop in ("fullscreened", "maximized"):
+            try:
+                self.win.connect(f"notify::{prop}", self.update_layout_proportions)
+            except Exception:
+                pass
+        if getattr(self, "body_overlay", None) is not None:
+            self.body_overlay.connect("notify::width", self.update_layout_proportions)
+            self.body_overlay.connect("notify::height", self.update_layout_proportions)
         self.paned.connect("notify::position", self.on_paned_position_changed)
         GLib.idle_add(self._restore_paned_position_after_layout)
-        GLib.idle_add(lambda: (self._position_viz_handle(False), False)[1])
+        GLib.idle_add(lambda: (self._schedule_viz_handle_realign(), False)[1])
 
         GLib.timeout_add(20, self.update_ui_loop)
         GLib.timeout_add(1000, self._refresh_output_status_loop)
@@ -1188,6 +1201,8 @@ class TidalApp(Adw.Application):
         self._home_sections_cache = None
         self.stream_prefetch_cache.clear()
         self._toggle_login_view(False)
+        self.refresh_visible_track_fav_buttons()
+        self.refresh_current_track_favorite_state()
         while c := self.collection_content_box.get_first_child(): self.collection_content_box.remove(c)
         logger.info("User logged out.")
 
@@ -1196,6 +1211,8 @@ class TidalApp(Adw.Application):
         self._apply_account_scope(force=True)
         self._home_sections_cache = None
         self._toggle_login_view(True)
+        self.refresh_visible_track_fav_buttons()
+        self.refresh_current_track_favorite_state()
         self._restore_last_view()
 
     def on_bit_perfect_toggled(self, switch, state):
@@ -1219,7 +1236,6 @@ class TidalApp(Adw.Application):
         
         self.player.toggle_bit_perfect(True, exclusive_lock=state)
         
-        # [修复重点] 恢复互锁：独占开 -> Latency 可用；独占关 -> Latency 变灰
         self.latency_dd.set_sensitive(state)
 
         if state:
@@ -1391,14 +1407,8 @@ class TidalApp(Adw.Application):
         self.show_album_details(obj)
 
     def _play_single_track(self, track):
-        """
-        [修正版] 播放单个推荐曲目
-        """
-        # 1. 设置临时列表
         self.current_track_list = [track]
         self._set_play_queue([track])
-        
-        # 2. [关键] 调用 play_track(0) 播放列表里的第1首
         self.play_track(0)
 
     def show_album_details(self, alb):
@@ -1595,6 +1605,28 @@ class TidalApp(Adw.Application):
     def render_history_dashboard(self):
         ui_actions.render_history_dashboard(self)
 
+    def render_collection_dashboard(self, favorite_tracks=None, favorite_albums=None):
+        ui_actions.render_collection_dashboard(self, favorite_tracks, favorite_albums)
+
+    def render_liked_songs_dashboard(self, tracks=None):
+        ui_actions.render_liked_songs_dashboard(self, tracks)
+
+    def refresh_liked_songs_dashboard(self):
+        row = self.nav_list.get_selected_row() if self.nav_list is not None else None
+        if not row or getattr(row, "nav_id", None) != "liked_songs":
+            return False
+
+        if not getattr(self.backend, "user", None):
+            self.render_liked_songs_dashboard([])
+            return False
+
+        def task():
+            tracks = list(self.backend.get_favorite_tracks(limit=500))
+            GLib.idle_add(self.render_liked_songs_dashboard, tracks)
+
+        Thread(target=task, daemon=True).start()
+        return False
+
     def render_queue_dashboard(self):
         ui_actions.render_queue_dashboard(self)
 
@@ -1664,7 +1696,7 @@ class TidalApp(Adw.Application):
             self.grid_title_label.set_text("Playlists")
             self.grid_title_label.set_visible(True)
         if hasattr(self, "grid_subtitle_label") and self.grid_subtitle_label is not None:
-            self.grid_subtitle_label.set_text("Create and manage your own playlists")
+            self.grid_subtitle_label.set_text("Create and manage your local playlists")
             self.grid_subtitle_label.set_visible(True)
         ui_actions.render_playlists_home(self)
 
@@ -1682,6 +1714,48 @@ class TidalApp(Adw.Application):
         if self.back_btn is not None:
             self.back_btn.set_sensitive(True)
         self.render_playlist_detail(playlist_id)
+
+    def on_remote_playlist_card_clicked(self, playlist_obj):
+        if playlist_obj is None:
+            return
+        self.current_album = None
+        self.current_playlist_id = None
+        self.playlist_edit_mode = False
+        self.playlist_rename_mode = False
+        self.right_stack.set_visible_child_name("tracks")
+        if hasattr(self, "_remember_last_view"):
+            self._remember_last_view("tracks")
+        self.back_btn.set_sensitive(True)
+
+        title = getattr(playlist_obj, "name", "TIDAL Playlist")
+        creator = getattr(playlist_obj, "creator", None)
+        creator_name = getattr(creator, "name", "TIDAL")
+        self.header_kicker.set_text("Playlist")
+        self.header_title.set_text(title)
+        self.header_title.set_tooltip_text(title)
+        self.header_artist.set_text(creator_name)
+        self.header_artist.set_tooltip_text(creator_name)
+        self.header_meta.set_text("")
+        if self.fav_btn is not None:
+            self.fav_btn.set_visible(False)
+        if self.add_playlist_btn is not None:
+            self.add_playlist_btn.set_visible(True)
+        utils.load_img(self.header_art, lambda: self.backend.get_artwork_url(playlist_obj, 640), self.cache_dir, 160)
+
+        while c := self.track_list.get_first_child():
+            self.track_list.remove(c)
+
+        def task():
+            tracks = self.backend.get_tracks(playlist_obj) or []
+
+            def apply():
+                self.header_meta.set_text(f"{len(tracks)} Tracks" if tracks else "0 Tracks")
+                self.load_album_tracks(tracks)
+                return False
+
+            GLib.idle_add(apply)
+
+        Thread(target=task, daemon=True).start()
 
     def on_playlist_track_selected(self, box, row):
         if not row:
@@ -1708,11 +1782,67 @@ class TidalApp(Adw.Application):
                     max_n = n
         return f"Playlist {max_n + 1}"
 
+    def _show_simple_dialog(self, title, message):
+        dialog = Gtk.Dialog(title=title, transient_for=self.win, modal=True)
+        root = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=12,
+            margin_top=12,
+            margin_bottom=12,
+            margin_start=12,
+            margin_end=12,
+        )
+        root.append(Gtk.Label(label=str(message or ""), xalign=0, wrap=True))
+        action_row = Gtk.Box(spacing=8, halign=Gtk.Align.END)
+        ok_btn = Gtk.Button(label="OK")
+        ok_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.OK))
+        action_row.append(ok_btn)
+        root.append(action_row)
+        dialog.set_child(root)
+        dialog.connect("response", lambda d, _resp: d.destroy())
+        dialog.present()
+
     def on_create_playlist_clicked(self, _btn=None):
-        name = self._next_playlist_name()
-        p = self.playlist_mgr.create_playlist(name)
-        self.current_playlist_id = p.get("id")
-        self.render_playlists_home()
+        default_name = self._next_playlist_name()
+        dialog = Gtk.Dialog(title="Create Playlist", transient_for=self.win, modal=True)
+        root = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=12,
+            margin_top=12,
+            margin_bottom=12,
+            margin_start=12,
+            margin_end=12,
+        )
+        root.append(Gtk.Label(label="Playlist name:", xalign=0))
+        name_entry = Gtk.Entry(text=default_name)
+        name_entry.set_activates_default(True)
+        root.append(name_entry)
+
+        action_row = Gtk.Box(spacing=8, halign=Gtk.Align.END)
+        cancel_btn = Gtk.Button(label="Cancel")
+        create_btn = Gtk.Button(label="Create")
+        create_btn.add_css_class("suggested-action")
+        cancel_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.CANCEL))
+        create_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.OK))
+        action_row.append(cancel_btn)
+        action_row.append(create_btn)
+        root.append(action_row)
+        dialog.set_child(root)
+
+        def _on_response(d, resp):
+            if resp != Gtk.ResponseType.OK:
+                d.destroy()
+                return
+
+            name = str(name_entry.get_text() or "").strip() or default_name
+            d.destroy()
+
+            p = self.playlist_mgr.create_playlist(name)
+            self.current_playlist_id = p.get("id")
+            self.render_playlists_home()
+
+        dialog.connect("response", _on_response)
+        dialog.present()
 
     def _prompt_playlist_pick(self, on_pick):
         playlists = self.playlist_mgr.list_playlists() if hasattr(self, "playlist_mgr") else []
@@ -1952,6 +2082,7 @@ class TidalApp(Adw.Application):
                 pass
             if self.play_btn is not None:
                 self.play_btn.set_icon_name("media-playback-start-symbolic")
+            self.refresh_current_track_favorite_state()
             GLib.idle_add(self._refresh_queue_views)
             return
 
@@ -1981,6 +2112,7 @@ class TidalApp(Adw.Application):
             pass
         if self.play_btn is not None:
             self.play_btn.set_icon_name("media-playback-start-symbolic")
+        self.refresh_current_track_favorite_state()
         GLib.idle_add(self._refresh_queue_views)
 
     def build_daily_mixes(self, days=7, per_day=8):
@@ -2143,21 +2275,13 @@ class TidalApp(Adw.Application):
         playback_stream_actions.load_cover_art(self, cover_id_or_url)
 
     def _update_list_ui(self, index):
-        """
-        [新增] 强制更新列表选中状态
-        """
+        """更新列表选中状态。"""
         if self.list_box is None: return
 
         try:
-            # 1. 获取对应的行
             row = self.list_box.get_row_at_index(index)
             if row:
-                # 2. 选中该行 (这通常会触发 on_row_selected 信号，更新高亮)
                 self.list_box.select_row(row)
-
-                # 3. 滚动到该行 (防止切歌后当前歌曲在屏幕外)
-                # 注意：这需要 list_box 在 ScrolledWindow 里，且有对应调整对象
-                # 这里只做基础选中，不做强制滚动防止报错
         except Exception as e:
             logger.warning("List update failed: %s", e)
 
@@ -2170,16 +2294,12 @@ class TidalApp(Adw.Application):
         lyrics_playback_actions.play_track(self, index)
 
     def _get_tidal_image_url(self, uuid, width=320, height=320):
-        """
-        [新增] 将 Tidal UUID 转换为可访问的 HTTP URL
-        例如: b3517800-fbba... -> https://resources.tidal.com/images/b3517800/fbba/.../320x320.jpg
-        """
+        """将 TIDAL UUID 转换为可访问的图片 URL。"""
         if not uuid: return None
         if isinstance(uuid, str) and ("http" in uuid or "file://" in uuid):
-            return uuid # 已经是 URL 了，直接返回
+            return uuid
 
         try:
-            # 替换横杠为斜杠
             path = uuid.replace("-", "/")
             return f"https://resources.tidal.com/images/{path}/{width}x{height}.jpg"
         except Exception as e:
@@ -2260,7 +2380,30 @@ class TidalApp(Adw.Application):
         else:
             s_px = max(int(self.win.get_width() * ui_config.SIDEBAR_RATIO), 240)
         self.paned.set_position(s_px)
-        GLib.idle_add(lambda: (self._align_viz_handle_to_play_button(), False)[1])
+        GLib.idle_add(lambda: (self._schedule_viz_handle_realign(), False)[1])
+
+    def _schedule_viz_handle_realign(self):
+        # Immediate pass + delayed retries to survive fullscreen/restore re-allocation jitter.
+        expanded = bool(getattr(self, "viz_revealer", None) is not None and self.viz_revealer.get_reveal_child())
+        self._position_viz_handle(expanded)
+
+        if self._viz_handle_resize_source:
+            GLib.source_remove(self._viz_handle_resize_source)
+            self._viz_handle_resize_source = 0
+
+        self._viz_handle_resize_retries = 2
+
+        def _retry():
+            expanded_now = bool(getattr(self, "viz_revealer", None) is not None and self.viz_revealer.get_reveal_child())
+            self._position_viz_handle(expanded_now)
+            self._viz_handle_resize_retries -= 1
+            if self._viz_handle_resize_retries <= 0:
+                self._viz_handle_resize_source = 0
+                return False
+            return True
+
+        self._viz_handle_resize_source = GLib.timeout_add(120, _retry)
+        return False
 
     def on_paned_position_changed(self, _paned, _param):
         if self.paned is None:
@@ -2273,9 +2416,156 @@ class TidalApp(Adw.Application):
 
     def _update_fav_icon(self, btn, is_active):
         if is_active:
-            btn.set_icon_name("emblem-favorite-symbolic"); btn.add_css_class("active")
+            btn.set_icon_name("hiresti-favorite-symbolic"); btn.add_css_class("active")
         else:
-            btn.set_icon_name("non-starred-symbolic"); btn.remove_css_class("active")
+            btn.set_icon_name("hiresti-favorite-outline-symbolic"); btn.remove_css_class("active")
+
+    def refresh_current_track_favorite_state(self):
+        btn = getattr(self, "track_fav_btn", None)
+        track = getattr(self, "playing_track", None)
+        user = getattr(self.backend, "user", None)
+        if btn is None:
+            return
+        if not track or getattr(track, "id", None) is None:
+            self._update_fav_icon(btn, False)
+            btn.set_sensitive(False)
+            btn.set_visible(False)
+            return
+        btn.set_visible(True)
+        if not user:
+            self._update_fav_icon(btn, False)
+            btn.set_sensitive(False)
+            return
+
+        track_id = str(track.id)
+        btn.set_sensitive(False)
+
+        def do():
+            is_fav = self.backend.is_track_favorite(track_id)
+
+            def apply():
+                current = getattr(getattr(self, "playing_track", None), "id", None)
+                if str(current) != track_id:
+                    return False
+                self._update_fav_icon(btn, is_fav)
+                btn.set_sensitive(True)
+                return False
+
+            GLib.idle_add(apply)
+
+        Thread(target=do, daemon=True).start()
+
+    def create_track_fav_button(self, track, css_classes=None):
+        classes = css_classes or ["flat", "circular", "track-heart-btn"]
+        btn = Gtk.Button(icon_name="hiresti-favorite-outline-symbolic", css_classes=classes, valign=Gtk.Align.CENTER)
+        btn.set_tooltip_text("Favorite Track")
+        btn._is_track_fav_btn = True
+        track_id = getattr(track, "id", None)
+        btn._track_fav_id = str(track_id) if track_id is not None else None
+        btn.connect("clicked", self.on_track_row_fav_clicked)
+        self._refresh_track_fav_button(btn)
+        return btn
+
+    def _refresh_track_fav_button(self, btn):
+        track_id = getattr(btn, "_track_fav_id", None)
+        user = getattr(self.backend, "user", None)
+        if not track_id or not user:
+            self._update_fav_icon(btn, False)
+            btn.set_sensitive(False)
+            return
+
+        btn.set_sensitive(False)
+
+        def do():
+            is_fav = self.backend.is_track_favorite(track_id)
+
+            def apply():
+                if getattr(btn, "_track_fav_id", None) != track_id:
+                    return False
+                self._update_fav_icon(btn, is_fav)
+                btn.set_sensitive(True)
+                return False
+
+            GLib.idle_add(apply)
+
+        Thread(target=do, daemon=True).start()
+
+    def on_track_row_fav_clicked(self, btn):
+        track_id = getattr(btn, "_track_fav_id", None)
+        if not track_id or not getattr(self.backend, "user", None):
+            return
+
+        is_currently_active = "active" in btn.get_css_classes()
+        is_add = not is_currently_active
+        btn.set_sensitive(False)
+
+        def do():
+            ok = self.backend.toggle_track_favorite(track_id, is_add)
+
+            def apply():
+                if getattr(btn, "_track_fav_id", None) != track_id:
+                    return False
+                if ok:
+                    self._update_fav_icon(btn, is_add)
+                    if str(getattr(getattr(self, "playing_track", None), "id", "")) == track_id:
+                        self.refresh_current_track_favorite_state()
+                    self.refresh_visible_track_fav_buttons()
+                    self.refresh_liked_songs_dashboard()
+                btn.set_sensitive(True)
+                return False
+
+            GLib.idle_add(apply)
+
+        Thread(target=do, daemon=True).start()
+
+    def refresh_visible_track_fav_buttons(self):
+        roots = [
+            getattr(self, "track_list", None),
+            getattr(self, "playlist_track_list", None),
+            getattr(self, "liked_track_list", None),
+            getattr(self, "queue_track_list", None),
+            getattr(self, "queue_drawer_list", None),
+            getattr(self, "res_trk_list", None),
+            getattr(self, "res_hist_list", None),
+        ]
+
+        def walk(widget):
+            if widget is None:
+                return
+            if isinstance(widget, Gtk.Button) and getattr(widget, "_is_track_fav_btn", False):
+                self._refresh_track_fav_button(widget)
+            child = widget.get_first_child() if hasattr(widget, "get_first_child") else None
+            while child:
+                walk(child)
+                child = child.get_next_sibling()
+
+        for root in roots:
+            walk(root)
+
+    def on_track_fav_clicked(self, btn):
+        track = getattr(self, "playing_track", None)
+        if track is None or getattr(track, "id", None) is None or not getattr(self.backend, "user", None):
+            return
+        track_id = str(track.id)
+        is_currently_active = "active" in btn.get_css_classes()
+        is_add = not is_currently_active
+        btn.set_sensitive(False)
+
+        def do():
+            ok = self.backend.toggle_track_favorite(track_id, is_add)
+
+            def apply():
+                current = getattr(getattr(self, "playing_track", None), "id", None)
+                if str(current) != track_id:
+                    return False
+                if ok:
+                    self._update_fav_icon(btn, is_add)
+                btn.set_sensitive(True)
+                return False
+
+            GLib.idle_add(apply)
+
+        Thread(target=do, daemon=True).start()
 
     def on_fav_clicked(self, btn):
         if not self.current_album: return
@@ -2311,18 +2601,12 @@ class TidalApp(Adw.Application):
         ui_actions.render_search_results(self, res)
 
     def on_search_track_selected(self, box, row):
-        """
-        [修正版] 点击搜索结果歌曲
-        """
         if not row: return
         idx = row.get_index()
-        
+
         if idx < len(self.search_track_data):
-            # 1. 切换播放列表为搜索结果
             self.current_track_list = self.search_track_data
             self._set_play_queue(self.search_track_data)
-            
-            # 2. [关键] 统一调用 play_track
             self.play_track(idx)
 
     def on_search_history_track_selected(self, box, row):
@@ -2337,20 +2621,13 @@ class TidalApp(Adw.Application):
         self.play_track(idx)
 
     def on_track_selected(self, box, row):
-        """
-        [修正版] 点击主列表歌曲
-        """
         if not row: return
-        
-        # 1. 获取点击的索引
+
         idx = row.get_index()
         self._set_play_queue(getattr(self, "current_track_list", []))
-        
-        # 2. [关键] 必须调用 play_track，因为歌词逻辑都在那里面！
-        # 不要在这里自己写播放代码，否则会漏掉歌词功能
+
         self.play_track(idx)
 
-    # [已修复] 补全 on_back_clicked
     def on_back_clicked(self, btn):
         ui_navigation.on_back_clicked(self, btn)
 

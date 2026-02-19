@@ -17,6 +17,17 @@ class TidalBackend:
         self.quality = self._get_best_quality()
         self._apply_global_config() 
         self.fav_album_ids = set()
+        self.fav_track_ids = set()
+        self._artist_artwork_cache = {}
+        self._artist_placeholder_uuids = {
+            "1e01cdb6-f15d-4d8b-8440-a047976c1cac",
+        }
+        extra_placeholder_ids = str(os.getenv("HIRESTI_ARTIST_PLACEHOLDER_UUIDS", "") or "").strip()
+        if extra_placeholder_ids:
+            for raw in extra_placeholder_ids.split(","):
+                val = raw.strip().lower()
+                if val:
+                    self._artist_placeholder_uuids.add(val)
         self.lyrics_cache = {}
         self.max_lyrics_cache = 300
         # Circuit breaker for unstable mix endpoint.
@@ -131,6 +142,14 @@ class TidalBackend:
             self.fav_album_ids = {str(a.id) for a in res}
         except Exception as e:
             logger.debug("Failed to refresh favorite ids: %s", e)
+        try:
+            if not self.user:
+                return
+            favs = self.user.favorites.tracks()
+            res = favs() if callable(favs) else favs
+            self.fav_track_ids = {str(t.id) for t in res}
+        except Exception as e:
+            logger.debug("Failed to refresh favorite track ids: %s", e)
 
     def is_favorite(self, album_id):
         return str(album_id) in self.fav_album_ids
@@ -143,6 +162,9 @@ class TidalBackend:
         except Exception as e:
             logger.debug("Failed to check artist favorite status for %s: %s", artist_id, e)
             return False
+
+    def is_track_favorite(self, track_id):
+        return str(track_id) in self.fav_track_ids
 
     def toggle_album_favorite(self, album_id, add=True):
         try:
@@ -166,6 +188,30 @@ class TidalBackend:
             logger.warning("Failed to toggle artist favorite for %s (add=%s): %s", artist_id, add, e)
             return False
 
+    def toggle_track_favorite(self, track_id, add=True):
+        try:
+            fav = self.user.favorites
+            if add:
+                if hasattr(fav, "add_track"):
+                    fav.add_track(track_id)
+                elif hasattr(fav, "add_tracks"):
+                    fav.add_tracks([track_id])
+                else:
+                    raise AttributeError("favorites API has no add_track(s)")
+                self.fav_track_ids.add(str(track_id))
+            else:
+                if hasattr(fav, "remove_track"):
+                    fav.remove_track(track_id)
+                elif hasattr(fav, "remove_tracks"):
+                    fav.remove_tracks([track_id])
+                else:
+                    raise AttributeError("favorites API has no remove_track(s)")
+                self.fav_track_ids.discard(str(track_id))
+            return True
+        except Exception as e:
+            logger.warning("Failed to toggle track favorite for %s (add=%s): %s", track_id, add, e)
+            return False
+
     def get_favorites(self):
         try: 
             res = self.user.favorites.artists()
@@ -181,6 +227,246 @@ class TidalBackend:
         except Exception as e:
             logger.warning("Failed to fetch recent albums: %s", e)
             return []
+
+    def get_favorite_tracks(self, limit=50):
+        try:
+            if not self.user:
+                return []
+            target = max(0, int(limit))
+            if target <= 0:
+                return []
+
+            tracks_api = getattr(self.user.favorites, "tracks", None)
+            if not callable(tracks_api):
+                return []
+
+            def _normalize(seq):
+                if isinstance(seq, list):
+                    return seq
+                return list(seq or [])
+
+            def _fetch_page(offset, page_size):
+                call_specs = (
+                    {"limit": page_size, "offset": offset},
+                    {"offset": offset, "limit": page_size},
+                    {"limit": page_size},
+                    {},
+                )
+                for kwargs in call_specs:
+                    try:
+                        res = tracks_api(**kwargs) if kwargs else tracks_api()
+                    except TypeError:
+                        continue
+                    page = res() if callable(res) else res
+                    return _normalize(page), kwargs
+                # Fallback: plain call if all signature probes failed.
+                res = tracks_api()
+                page = res() if callable(res) else res
+                return _normalize(page), {}
+
+            page_size = min(100, max(1, target))
+            merged = []
+            seen_ids = set()
+            offset = 0
+            while len(merged) < target:
+                page, used_kwargs = _fetch_page(offset, page_size)
+                if not page:
+                    break
+
+                new_added = 0
+                for tr in page:
+                    tid = getattr(tr, "id", None)
+                    key = f"id:{tid}" if tid is not None else f"obj:{id(tr)}"
+                    if key in seen_ids:
+                        continue
+                    seen_ids.add(key)
+                    merged.append(tr)
+                    new_added += 1
+                    if len(merged) >= target:
+                        break
+
+                # Stop if paging is unsupported or no forward progress.
+                if "offset" not in used_kwargs or new_added == 0:
+                    break
+                if len(page) < page_size:
+                    break
+
+                offset += len(page)
+                if offset > 10000:
+                    break
+
+            return merged[:target]
+        except Exception as e:
+            logger.warning("Failed to fetch favorite tracks: %s", e)
+            return []
+
+    def get_user_playlists(self, limit=80):
+        if not self.user:
+            return []
+        merged = []
+        seen = set()
+
+        def _push(items):
+            if items is None:
+                return
+            seq = items() if callable(items) else items
+            for p in (seq or []):
+                pid = str(getattr(p, "id", "") or "")
+                if not pid or pid in seen:
+                    continue
+                seen.add(pid)
+                merged.append(p)
+
+        try:
+            if hasattr(self.user, "playlists"):
+                _push(self.user.playlists())
+        except Exception as e:
+            logger.debug("Failed to fetch user playlists: %s", e)
+
+        try:
+            fav = getattr(self.user, "favorites", None)
+            if fav is not None and hasattr(fav, "playlists"):
+                _push(fav.playlists())
+        except Exception as e:
+            logger.debug("Failed to fetch favorite playlists: %s", e)
+
+        return merged[: max(0, int(limit))]
+
+    def _resolve_user_playlist(self, playlist_or_id):
+        if playlist_or_id is None:
+            return None
+        if hasattr(playlist_or_id, "add"):
+            return playlist_or_id
+        pid = getattr(playlist_or_id, "id", playlist_or_id)
+        if not pid:
+            return None
+        try:
+            return self.session.playlist(pid)
+        except Exception as e:
+            logger.warning("Failed to resolve playlist %s: %s", pid, e)
+            return None
+
+    def create_cloud_playlist(self, name, description=""):
+        if not self.user:
+            logger.warning("Cannot create cloud playlist while not logged in.")
+            return None
+        title = str(name or "").strip() or "New Playlist"
+        desc = str(description or "")
+        try:
+            pl = self.user.create_playlist(title, desc)
+            logger.info("Cloud playlist created: id=%s name=%r", getattr(pl, "id", None), title)
+            return pl
+        except Exception as e:
+            logger.warning("Failed to create cloud playlist %r: %s", title, e)
+            return None
+
+    def add_tracks_to_cloud_playlist(self, playlist_or_id, tracks, dedupe=True, batch_size=100):
+        pl = self._resolve_user_playlist(playlist_or_id)
+        if pl is None:
+            return {"ok": False, "playlist_id": None, "requested": 0, "added": 0, "skipped_invalid": 0}
+        if not hasattr(pl, "add"):
+            logger.warning("Resolved playlist does not support add(): id=%s", getattr(pl, "id", None))
+            return {"ok": False, "playlist_id": getattr(pl, "id", None), "requested": 0, "added": 0, "skipped_invalid": 0}
+
+        raw_ids = []
+        skipped_invalid = 0
+        for t in list(tracks or []):
+            tid = None
+            if isinstance(t, (str, int)):
+                tid = str(t).strip()
+            elif isinstance(t, dict):
+                tid = str(t.get("track_id") or t.get("id") or "").strip()
+            else:
+                tid = str(getattr(t, "id", "") or "").strip()
+            if not tid:
+                skipped_invalid += 1
+                continue
+            raw_ids.append(tid)
+
+        if not raw_ids:
+            return {"ok": True, "playlist_id": getattr(pl, "id", None), "requested": 0, "added": 0, "skipped_invalid": skipped_invalid}
+
+        track_ids = raw_ids
+        if dedupe:
+            # Keep order while removing duplicates from incoming list.
+            seen = set()
+            unique = []
+            for tid in raw_ids:
+                if tid in seen:
+                    continue
+                seen.add(tid)
+                unique.append(tid)
+            track_ids = unique
+
+            # Skip existing tracks in target playlist.
+            existing = set()
+            try:
+                existing_tracks = pl.tracks(limit=None)
+                for et in list(existing_tracks or []):
+                    eid = str(getattr(et, "id", "") or "").strip()
+                    if eid:
+                        existing.add(eid)
+            except Exception as e:
+                logger.debug("Failed to prefetch existing cloud playlist tracks for dedupe: %s", e)
+            if existing:
+                track_ids = [tid for tid in track_ids if tid not in existing]
+
+        if not track_ids:
+            return {"ok": True, "playlist_id": getattr(pl, "id", None), "requested": len(raw_ids), "added": 0, "skipped_invalid": skipped_invalid}
+
+        bs = max(1, int(batch_size or 100))
+        added = 0
+        try:
+            for i in range(0, len(track_ids), bs):
+                chunk = track_ids[i : i + bs]
+                pl.add(chunk, allow_duplicates=not dedupe)
+                added += len(chunk)
+            return {
+                "ok": True,
+                "playlist_id": getattr(pl, "id", None),
+                "requested": len(raw_ids),
+                "added": added,
+                "skipped_invalid": skipped_invalid,
+            }
+        except Exception as e:
+            logger.warning("Failed adding tracks to cloud playlist %s: %s", getattr(pl, "id", None), e)
+            return {
+                "ok": False,
+                "playlist_id": getattr(pl, "id", None),
+                "requested": len(raw_ids),
+                "added": added,
+                "skipped_invalid": skipped_invalid,
+            }
+
+    def sync_local_playlist_to_cloud(self, local_playlist, cloud_playlist_id=None, dedupe=True):
+        name = str((local_playlist or {}).get("name", "") or "").strip() or "New Playlist"
+        tracks = list((local_playlist or {}).get("tracks", []) or [])
+        target = self._resolve_user_playlist(cloud_playlist_id) if cloud_playlist_id else None
+        created = False
+        if target is None:
+            target = self.create_cloud_playlist(name, "Synced from HiresTI local playlist")
+            created = bool(target is not None)
+        if target is None:
+            return {
+                "ok": False,
+                "cloud_playlist_id": None,
+                "cloud_playlist_name": None,
+                "created": False,
+                "requested": len(tracks),
+                "added": 0,
+                "skipped_invalid": 0,
+            }
+
+        add_res = self.add_tracks_to_cloud_playlist(target, tracks, dedupe=dedupe, batch_size=100)
+        return {
+            "ok": bool(add_res.get("ok")),
+            "cloud_playlist_id": getattr(target, "id", None),
+            "cloud_playlist_name": getattr(target, "name", name),
+            "created": created,
+            "requested": int(add_res.get("requested", 0)),
+            "added": int(add_res.get("added", 0)),
+            "skipped_invalid": int(add_res.get("skipped_invalid", 0)),
+        }
 
     def get_albums(self, art):
         try:
@@ -440,7 +726,27 @@ class TidalBackend:
                     try:
                         return val(width=size, height=size)
                     except Exception as e:
-                        logger.debug("Artwork provider '%s' failed for %s: %s", attr, type(obj).__name__, e)
+                        logger.debug("Artwork provider '%s'(w/h) failed for %s: %s", attr, type(obj).__name__, e)
+                    try:
+                        out = val(size)
+                        if isinstance(out, str) and out:
+                            if "http" in out:
+                                return out
+                            if len(out) > 20:
+                                uuid = out
+                                break
+                    except Exception:
+                        pass
+                    try:
+                        out = val()
+                        if isinstance(out, str) and out:
+                            if "http" in out:
+                                return out
+                            if len(out) > 20:
+                                uuid = out
+                                break
+                    except Exception:
+                        pass
             
             # 检查 images 集合
             if hasattr(obj, 'images') and obj.images:
@@ -451,7 +757,7 @@ class TidalBackend:
                     logger.debug("Failed to resolve artwork from images on %s: %s", type(obj).__name__, e)
 
             # 属性探测
-            check_attrs = ['picture_id', 'cover_id', 'picture', 'cover', 'image']
+            check_attrs = ['picture_id', 'cover_id', 'picture', 'cover', 'image', 'avatar', 'square_image']
             for attr in check_attrs:
                 val = getattr(obj, attr, None)
                 if not (val and isinstance(val, str)):
@@ -463,6 +769,37 @@ class TidalBackend:
                     break
         
         # 3. 如果还是没找到，且是单曲，尝试用专辑封面
+        # 3a. 对于 Playlist，部分对象是轻量快照，可能没有实时封面字段。
+        #     按 id 重新拉一次完整对象再尝试取图。
+        if not uuid and "Playlist" in type(obj).__name__:
+            pl_id = getattr(obj, "id", None)
+            if pl_id:
+                try:
+                    full_pl = self.session.playlist(pl_id)
+                    if full_pl:
+                        # 先走通用扫描，避免重复执行整段提取逻辑。
+                        scanned = self._scan_image_like_attrs(full_pl, size=size)
+                        if scanned:
+                            return scanned
+                        for attr in ("picture", "square_picture", "wide_image", "image", "cover"):
+                            val = getattr(full_pl, attr, None)
+                            if callable(val):
+                                for args in ((size, size), (size,), tuple()):
+                                    try:
+                                        out = val(*args)
+                                    except Exception:
+                                        continue
+                                    url = self._coerce_image_ref_to_url(out, size)
+                                    if url:
+                                        return url
+                            else:
+                                url = self._coerce_image_ref_to_url(val, size)
+                                if url:
+                                    return url
+                except Exception as e:
+                    logger.debug("Playlist artwork refresh failed for %s: %s", pl_id, e)
+
+        # 3b. 如果还是没找到，且是单曲，尝试用专辑封面
         if not uuid and hasattr(obj, 'album') and obj.album:
             return self.get_artwork_url(obj.album, size)
 
@@ -472,6 +809,188 @@ class TidalBackend:
             return f"https://resources.tidal.com/images/{path}/{size}x{size}.jpg"
             
         return None
+
+    def _coerce_image_ref_to_url(self, value, size):
+        if not isinstance(value, str):
+            return None
+        raw = value.strip()
+        if not raw:
+            return None
+        if raw.startswith("http://") or raw.startswith("https://"):
+            return raw
+        if len(raw) > 20:
+            path = raw.replace("-", "/")
+            return f"https://resources.tidal.com/images/{path}/{size}x{size}.jpg"
+        return None
+
+    def _extract_tidal_image_uuid(self, url):
+        if not isinstance(url, str):
+            return None
+        if "resources.tidal.com/images/" not in url:
+            return None
+        tail = url.split("/images/", 1)[-1]
+        parts = tail.split("/")
+        if len(parts) < 5:
+            return None
+        return "-".join(parts[:5]).strip().lower()
+
+    def _is_placeholder_artist_artwork_url(self, url):
+        img_uuid = self._extract_tidal_image_uuid(url)
+        if not img_uuid:
+            return False
+        return img_uuid in self._artist_placeholder_uuids
+
+    def _scan_image_like_attrs(self, obj, size=320):
+        if obj is None:
+            return None
+        keywords = ("image", "cover", "picture", "avatar", "art")
+        for name in dir(obj):
+            low = str(name).lower()
+            if not any(k in low for k in keywords):
+                continue
+            if low.startswith("_"):
+                continue
+            try:
+                val = getattr(obj, name)
+            except Exception:
+                continue
+            if callable(val):
+                for args in ((size, size), (size,), tuple()):
+                    try:
+                        out = val(*args)
+                    except Exception:
+                        continue
+                    url = self._coerce_image_ref_to_url(out, size)
+                    if url:
+                        return url
+            else:
+                url = self._coerce_image_ref_to_url(val, size)
+                if url:
+                    return url
+        return None
+
+    def get_artist_artwork_url(self, artist_obj, size=320):
+        cache_key = None
+        artist_id = getattr(artist_obj, "id", None)
+        artist_name_raw = str(getattr(artist_obj, "name", "") or "").strip()
+        if artist_id is not None:
+            cache_key = f"id:{artist_id}:{int(size)}"
+        else:
+            artist_name = artist_name_raw.lower()
+            if artist_name:
+                cache_key = f"name:{artist_name}:{int(size)}"
+        if cache_key and cache_key in self._artist_artwork_cache:
+            cached = self._artist_artwork_cache[cache_key]
+            if cached:
+                logger.info(
+                    "Artist artwork cache hit: id=%s name=%r size=%s url=%s",
+                    artist_id,
+                    artist_name_raw,
+                    size,
+                    cached,
+                )
+                return cached
+            # Do not keep negative cache entries forever; allow retry.
+            self._artist_artwork_cache.pop(cache_key, None)
+
+        def _album_cover_fallback(*artist_candidates):
+            for cand in artist_candidates:
+                if cand is None:
+                    continue
+                try:
+                    albums = self.get_albums(cand) or []
+                except Exception:
+                    albums = []
+                for alb in list(albums)[:8]:
+                    u = self.get_artwork_url(alb, size) or self._scan_image_like_attrs(alb, size)
+                    if u:
+                        return u
+            return None
+
+        chosen_url = None
+        try:
+            logger.info(
+                "Resolving artist artwork: id=%s name=%r size=%s",
+                artist_id,
+                artist_name_raw,
+                size,
+            )
+            u = self.get_artwork_url(artist_obj, size)
+            if u and self._is_placeholder_artist_artwork_url(u):
+                logger.info(
+                    "Skip placeholder artist artwork from source object: id=%s name=%r url=%s",
+                    artist_id,
+                    artist_name_raw,
+                    u,
+                )
+                u = None
+            if u:
+                logger.info("Artist artwork resolved from source object: id=%s name=%r url=%s", artist_id, artist_name_raw, u)
+                chosen_url = u
+                return chosen_url
+            artist_id = getattr(artist_obj, "id", None)
+            full_artist = None
+            if artist_id:
+                full_artist = self.session.artist(artist_id)
+                u = self.get_artwork_url(full_artist, size) or self._scan_image_like_attrs(full_artist, size)
+                if u and self._is_placeholder_artist_artwork_url(u):
+                    logger.info(
+                        "Skip placeholder artist artwork from full artist object: id=%s name=%r url=%s",
+                        artist_id,
+                        artist_name_raw,
+                        u,
+                    )
+                    u = None
+                if u:
+                    logger.info("Artist artwork resolved from full artist object: id=%s name=%r url=%s", artist_id, artist_name_raw, u)
+                    chosen_url = u
+                    return chosen_url
+            # Last fallback: resolve by name from search results and retry image extraction.
+            artist_name = artist_name_raw
+            target = None
+            if artist_name:
+                candidates = self.search_artist(artist_name) or []
+                logger.info(
+                    "Artist artwork name-search candidates: id=%s name=%r count=%s",
+                    artist_id,
+                    artist_name,
+                    len(candidates),
+                )
+                low = artist_name.lower()
+                for c in candidates:
+                    n = str(getattr(c, "name", "") or "").strip().lower()
+                    if n == low:
+                        target = c
+                        break
+                if target is None and candidates:
+                    target = candidates[0]
+                if target is not None:
+                    u = self.get_artwork_url(target, size) or self._scan_image_like_attrs(target, size)
+                    if u and self._is_placeholder_artist_artwork_url(u):
+                        logger.info(
+                            "Skip placeholder artist artwork from search target: id=%s name=%r url=%s",
+                            artist_id,
+                            artist_name_raw,
+                            u,
+                        )
+                        u = None
+                    if u:
+                        logger.info("Artist artwork resolved from search target: id=%s name=%r url=%s", artist_id, artist_name_raw, u)
+                        chosen_url = u
+                        return chosen_url
+            # Final fallback: use one album cover of this artist.
+            chosen_url = _album_cover_fallback(artist_obj, full_artist, target)
+            if chosen_url:
+                logger.info("Artist artwork resolved from album fallback: id=%s name=%r url=%s", artist_id, artist_name_raw, chosen_url)
+            else:
+                logger.warning("Artist artwork resolution failed: id=%s name=%r size=%s", artist_id, artist_name_raw, size)
+            return chosen_url
+        except Exception as e:
+            logger.debug("Failed artist artwork fallback for %s: %s", getattr(artist_obj, "id", "?"), e)
+            return None
+        finally:
+            if cache_key and chosen_url:
+                self._artist_artwork_cache[cache_key] = chosen_url
 
     def get_stream_url(self, track):
         try:
@@ -620,4 +1139,5 @@ class TidalBackend:
         self.user = None
         self.session = tidalapi.Session()
         self.fav_album_ids = set()
+        self.fav_track_ids = set()
         self._apply_global_config()

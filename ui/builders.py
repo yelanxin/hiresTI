@@ -112,7 +112,7 @@ def build_body(app, container):
     app.queue_revealer.set_vexpand(True)
 
     app.queue_drawer_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0, css_classes=["queue-drawer"])
-    app.queue_drawer_box.set_size_request(180, 500)
+    app.queue_drawer_box.set_size_request(240, 500)
     app.queue_drawer_box.set_vexpand(True)
 
     q_head = Gtk.Box(spacing=8, margin_start=12, margin_end=12, margin_top=10, margin_bottom=10)
@@ -122,7 +122,7 @@ def build_body(app, container):
     app.queue_clear_btn = None
     app.queue_drawer_box.append(q_head)
 
-    app.queue_drawer_list = Gtk.ListBox(css_classes=["boxed-list", "tracks-list", "queue-drawer-list"])
+    app.queue_drawer_list = Gtk.ListBox(css_classes=["tracks-list", "queue-drawer-list"])
     app.queue_drawer_list.connect("row-activated", app.on_queue_track_selected)
     q_scroll = Gtk.ScrolledWindow(vexpand=True, hexpand=True)
     q_scroll.add_css_class("queue-drawer-scroll")
@@ -344,7 +344,8 @@ def build_body(app, container):
 
     nav_items = [
         ("home", "hiresti-home-symbolic", "Home"),
-        ("collection", "hiresti-collection-symbolic", "My Collection"),
+        ("collection", "hiresti-collection-symbolic", "My Albums"),
+        ("liked_songs", "hiresti-favorite-symbolic", "Liked Songs"),
         ("artists", "hiresti-artists-symbolic", "Artists"),
         ("playlists", "hiresti-playlists-symbolic", "Playlists"),
         ("history", "hiresti-history-symbolic", "History"),
@@ -398,12 +399,16 @@ def build_player_bar(app, container):
     app.mini_controls.append(m_close)
     app.player_overlay.add_overlay(app.mini_controls)
 
+    side_panel_width = 340
+
     left_panel = Gtk.Box()
     left_panel.set_hexpand(False)
     left_panel.set_halign(Gtk.Align.START)
+    left_panel.set_size_request(side_panel_width, -1)
 
     app.info_area = Gtk.Box(spacing=14, valign=Gtk.Align.CENTER, halign=Gtk.Align.START)
     app.info_area.set_hexpand(False)
+    app.info_area.set_size_request(side_panel_width, -1)
     app.art_img = Gtk.Image()
     app.art_img.set_size_request(80, 80)
     app.art_img.set_margin_top(6)
@@ -415,10 +420,22 @@ def build_player_bar(app, container):
     app.art_img.add_controller(gest)
 
     text_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER, spacing=0)
+    text_box.set_hexpand(True)
+    text_box.set_size_request(240, -1)
+    title_row = Gtk.Box(spacing=2, valign=Gtk.Align.CENTER, hexpand=True)
     app.lbl_title = Gtk.Label(xalign=0, css_classes=["player-title"], ellipsize=3)
     app.lbl_title.set_single_line_mode(True)
-    app.lbl_title.set_width_chars(20)
-    app.lbl_title.set_max_width_chars(20)
+    app.lbl_title.set_width_chars(-1)
+    app.lbl_title.set_max_width_chars(-1)
+    app.lbl_title.set_hexpand(False)
+    app.lbl_title.set_halign(Gtk.Align.START)
+    app.track_fav_btn = Gtk.Button(css_classes=["flat", "circular", "player-heart-btn"], icon_name="hiresti-favorite-outline-symbolic", valign=Gtk.Align.START)
+    app.track_fav_btn.set_margin_top(-5)
+    app.track_fav_btn.set_margin_start(5)
+    app.track_fav_btn.set_tooltip_text("Favorite Track")
+    app.track_fav_btn.set_sensitive(False)
+    app.track_fav_btn.set_visible(False)
+    app.track_fav_btn.connect("clicked", app.on_track_fav_clicked)
     app.lbl_artist = Gtk.Label(xalign=0, css_classes=["player-artist"], ellipsize=3)
     app.lbl_artist.set_single_line_mode(True)
     app.lbl_artist.set_width_chars(20)
@@ -427,13 +444,15 @@ def build_player_bar(app, container):
     app.lbl_album.set_single_line_mode(True)
     app.lbl_album.set_width_chars(20)
     app.lbl_album.set_max_width_chars(20)
-    text_box.append(app.lbl_title)
+    title_row.append(app.lbl_title)
+    title_row.append(app.track_fav_btn)
+    text_box.append(title_row)
     text_box.append(app.lbl_artist)
     text_box.append(app.lbl_album)
 
     app.info_area.append(app.art_img)
     app.info_area.append(text_box)
-    left_clamp = Adw.Clamp(maximum_size=340, tightening_threshold=240)
+    left_clamp = Adw.Clamp(maximum_size=side_panel_width, tightening_threshold=240)
     left_clamp.set_child(app.info_area)
     left_panel.append(left_clamp)
     app.bottom_bar.set_start_widget(left_panel)
@@ -495,6 +514,8 @@ def build_player_bar(app, container):
     right_panel = Gtk.Box()
     right_panel.set_hexpand(False)
     right_panel.set_halign(Gtk.Align.END)
+    # Keep start/end widths symmetric so transport controls stay truly centered.
+    right_panel.set_size_request(side_panel_width, -1)
 
     app.vol_box = Gtk.Box(spacing=4, valign=Gtk.Align.CENTER)
     app.vol_box.set_hexpand(False)
@@ -517,6 +538,7 @@ def build_player_bar(app, container):
     app.vol_btn.connect("clicked", lambda b: app.vol_pop.popup())
     app.vol_box.append(app.vol_btn)
 
+    right_panel.append(Gtk.Box(hexpand=True))
     right_panel.append(app.vol_box)
     app.bottom_bar.set_end_widget(right_panel)
 

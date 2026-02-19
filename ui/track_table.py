@@ -10,10 +10,10 @@ LAYOUT = {
     "album_width": 170,
     "time_width": 64,
     "col_gap": 16,
-    "head_margin_x": 32,
+    "head_margin_x": 0,
     "head_margin_bottom": 6,
     "row_margin_y": 6,
-    "row_margin_x": 12,
+    "row_margin_x": 0,
     "cell_margin_end": 12,
 }
 
@@ -50,7 +50,7 @@ def build_tracks_header(
         margin_bottom=LAYOUT["head_margin_bottom"],
         css_classes=["tracks-table-head"],
     )
-    idx_head = Gtk.Label(label="#", xalign=0, css_classes=["tracks-head-label", "tracks-head-index"])
+    idx_head = Gtk.Label(label="#", xalign=0.5, css_classes=["tracks-head-label", "tracks-head-index"])
     idx_head.set_size_request(LAYOUT["index_width"], -1)
     title_head = create_head_click_label(title_text, on_sort_title, xalign=0.0, hexpand=True)
     title_head.set_halign(Gtk.Align.FILL)
@@ -69,3 +69,60 @@ def build_tracks_header(
     head.append(album_head)
     head.append(dur_head)
     return head, {"title": title_head, "artist": artist_head, "album": album_head, "time": dur_head}
+
+
+def _build_header_action_spacer(kind):
+    if kind == "fav":
+        w = Gtk.Button(
+            icon_name="hiresti-favorite-outline-symbolic",
+            css_classes=["flat", "circular", "track-heart-btn"],
+        )
+        w.set_sensitive(False)
+        w.set_focusable(False)
+        w.set_opacity(0.0)
+        return w
+
+    if kind == "add":
+        w = Gtk.Button(
+            icon_name="list-add-symbolic",
+            css_classes=["flat", "circular", "history-scroll-btn"],
+        )
+        w.set_sensitive(False)
+        w.set_focusable(False)
+        w.set_opacity(0.0)
+        return w
+
+    if kind == "remove":
+        w = Gtk.Button(
+            icon_name="list-remove-symbolic",
+            css_classes=["flat", "playlist-tool-btn", "queue-remove-btn"],
+        )
+        w.set_sensitive(False)
+        w.set_focusable(False)
+        w.set_opacity(0.0)
+        return w
+
+    if kind == "playlist_remove":
+        w = Gtk.Button(
+            icon_name="user-trash-symbolic",
+            css_classes=["flat", "playlist-tool-btn"],
+        )
+        w.set_sensitive(False)
+        w.set_focusable(False)
+        w.set_opacity(0.0)
+        return w
+
+    if kind == "drag":
+        w = Gtk.Image.new_from_icon_name("open-menu-symbolic")
+        w.add_css_class("dim-label")
+        w.set_opacity(0.0)
+        return w
+
+    w = Gtk.Box()
+    w.set_size_request(1, -1)
+    return w
+
+
+def append_header_action_spacers(head, kinds):
+    for kind in list(kinds or []):
+        head.append(_build_header_action_spacer(kind))
