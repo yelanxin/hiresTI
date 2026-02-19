@@ -1492,11 +1492,14 @@ def render_liked_songs_dashboard(app, tracks=None):
         img = Gtk.Image(css_classes=["circular-avatar", "liked-artist-filter-img"])
         img.set_size_request(54, 54)
         img.set_pixel_size(54)
-        art_url = app.backend.get_artist_artwork_url(artist_obj, 320) if artist_obj is not None else None
-        if art_url:
-            utils.load_img(img, art_url, app.cache_dir, 54)
-        else:
-            img.set_from_icon_name("avatar-default-symbolic")
+        img.set_from_icon_name("avatar-default-symbolic")
+        if artist_obj is not None:
+            utils.load_img(
+                img,
+                lambda a=artist_obj: app.backend.get_artist_artwork_url(a, 320),
+                app.cache_dir,
+                54,
+            )
         overlay.set_child(img)
 
         badge = Gtk.Label(label=str(count), css_classes=["liked-artist-count-badge"])

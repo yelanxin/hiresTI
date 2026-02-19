@@ -882,7 +882,7 @@ class TidalBackend:
         if cache_key and cache_key in self._artist_artwork_cache:
             cached = self._artist_artwork_cache[cache_key]
             if cached:
-                logger.info(
+                logger.debug(
                     "Artist artwork cache hit: id=%s name=%r size=%s url=%s",
                     artist_id,
                     artist_name_raw,
@@ -909,7 +909,7 @@ class TidalBackend:
 
         chosen_url = None
         try:
-            logger.info(
+            logger.debug(
                 "Resolving artist artwork: id=%s name=%r size=%s",
                 artist_id,
                 artist_name_raw,
@@ -917,7 +917,7 @@ class TidalBackend:
             )
             u = self.get_artwork_url(artist_obj, size)
             if u and self._is_placeholder_artist_artwork_url(u):
-                logger.info(
+                logger.debug(
                     "Skip placeholder artist artwork from source object: id=%s name=%r url=%s",
                     artist_id,
                     artist_name_raw,
@@ -925,7 +925,7 @@ class TidalBackend:
                 )
                 u = None
             if u:
-                logger.info("Artist artwork resolved from source object: id=%s name=%r url=%s", artist_id, artist_name_raw, u)
+                logger.debug("Artist artwork resolved from source object: id=%s name=%r url=%s", artist_id, artist_name_raw, u)
                 chosen_url = u
                 return chosen_url
             artist_id = getattr(artist_obj, "id", None)
@@ -934,7 +934,7 @@ class TidalBackend:
                 full_artist = self.session.artist(artist_id)
                 u = self.get_artwork_url(full_artist, size) or self._scan_image_like_attrs(full_artist, size)
                 if u and self._is_placeholder_artist_artwork_url(u):
-                    logger.info(
+                    logger.debug(
                         "Skip placeholder artist artwork from full artist object: id=%s name=%r url=%s",
                         artist_id,
                         artist_name_raw,
@@ -942,7 +942,7 @@ class TidalBackend:
                     )
                     u = None
                 if u:
-                    logger.info("Artist artwork resolved from full artist object: id=%s name=%r url=%s", artist_id, artist_name_raw, u)
+                    logger.debug("Artist artwork resolved from full artist object: id=%s name=%r url=%s", artist_id, artist_name_raw, u)
                     chosen_url = u
                     return chosen_url
             # Last fallback: resolve by name from search results and retry image extraction.
@@ -950,7 +950,7 @@ class TidalBackend:
             target = None
             if artist_name:
                 candidates = self.search_artist(artist_name) or []
-                logger.info(
+                logger.debug(
                     "Artist artwork name-search candidates: id=%s name=%r count=%s",
                     artist_id,
                     artist_name,
@@ -967,7 +967,7 @@ class TidalBackend:
                 if target is not None:
                     u = self.get_artwork_url(target, size) or self._scan_image_like_attrs(target, size)
                     if u and self._is_placeholder_artist_artwork_url(u):
-                        logger.info(
+                        logger.debug(
                             "Skip placeholder artist artwork from search target: id=%s name=%r url=%s",
                             artist_id,
                             artist_name_raw,
@@ -975,15 +975,15 @@ class TidalBackend:
                         )
                         u = None
                     if u:
-                        logger.info("Artist artwork resolved from search target: id=%s name=%r url=%s", artist_id, artist_name_raw, u)
+                        logger.debug("Artist artwork resolved from search target: id=%s name=%r url=%s", artist_id, artist_name_raw, u)
                         chosen_url = u
                         return chosen_url
             # Final fallback: use one album cover of this artist.
             chosen_url = _album_cover_fallback(artist_obj, full_artist, target)
             if chosen_url:
-                logger.info("Artist artwork resolved from album fallback: id=%s name=%r url=%s", artist_id, artist_name_raw, chosen_url)
+                logger.debug("Artist artwork resolved from album fallback: id=%s name=%r url=%s", artist_id, artist_name_raw, chosen_url)
             else:
-                logger.warning("Artist artwork resolution failed: id=%s name=%r size=%s", artist_id, artist_name_raw, size)
+                logger.debug("Artist artwork resolution failed: id=%s name=%r size=%s", artist_id, artist_name_raw, size)
             return chosen_url
         except Exception as e:
             logger.debug("Failed artist artwork fallback for %s: %s", getattr(artist_obj, "id", "?"), e)
