@@ -2,7 +2,7 @@
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![GTK4](https://img.shields.io/badge/UI-GTK4%20%2B%20Libadwaita-green)
-![License](https://img.shields.io/badge/License-MIT-purple)
+![License](https://img.shields.io/badge/License-GPL--3.0-purple)
 
 `hiresTI` is a native Linux desktop client for TIDAL, focused on stable playback, high-quality output paths, and a responsive GTK4/Libadwaita user experience.
 
@@ -96,4 +96,4 @@ If you run into issues, have feature requests, or want to report bugs, please op
 
 ## License
 
-MIT
+GPL-3.0
