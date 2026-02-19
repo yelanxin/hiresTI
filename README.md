@@ -13,9 +13,6 @@ Native Linux TIDAL desktop player built with GTK4 + Libadwaita + GStreamer.
 - TIDAL OAuth login
 
 ## Screenshots
-
-Replace the image paths below with your own screenshots.
-
 ### Main Window
 ![Main Window](screenshots/1.0.4-1.png)
 
