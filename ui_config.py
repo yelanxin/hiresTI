@@ -7,6 +7,10 @@ WINDOW_HEIGHT = 800
 
 CSS_DATA = """
 .circular-avatar { border-radius: 9999px; }
+button.flat,
+button.circular {
+    min-height: 28px;
+}
 
 /* 侧边栏基础样式 */
 .sidebar-header { font-size: 13px; font-weight: 800; opacity: 0.5; margin: 16px 12px 8px 12px; text-transform: uppercase; letter-spacing: 1px; }
@@ -119,7 +123,7 @@ CSS_DATA = """
     border-bottom: none;
     background-image: none;
     box-shadow: none;
-    min-height: 21px;
+    min-height: 23px;
     min-width: 50px;
     padding: 0;
 }
@@ -174,7 +178,7 @@ CSS_DATA = """
     background: transparent;
     background-image: none;
     box-shadow: none;
-    min-width: 26px;
+    min-width: 23px;
     min-height: 50px;
     padding: 0;
     color: rgba(18, 22, 30, 0.96);
@@ -447,7 +451,7 @@ CSS_DATA = """
 window.undecorated { background-color: transparent; }
 .player-overlay-container { background-color: transparent; }
 .card-bar.mini-state .player-ctrls-box { margin-top: 12px; margin-right: 20px; border-spacing: 15px; }
-.card-bar.mini-state .player-ctrls-box button.flat { min-height: 32px; min-width: 32px; padding: 0; color: alpha(currentColor, 0.7); background: transparent; }
+.card-bar.mini-state .player-ctrls-box button.flat { min-height: 28px; min-width: 28px; padding: 0; color: alpha(currentColor, 0.7); background: transparent; }
 .card-bar.mini-state .player-ctrls-box .pill { min-height: 42px; min-width: 42px; padding: 0; background-color: @accent_color; color: white; border-radius: 99px; box-shadow: 0 2px 5px alpha(black, 0.2); }
 .card-bar.mini-state .player-ctrls-box .pill:hover { filter: brightness(1.1); transform: scale(1.05); }
 .card-bar.mini-state .player-ctrls-box button image { -gtk-icon-size: 16px; }
@@ -479,12 +483,29 @@ window.undecorated { background-color: transparent; }
 .player-ctrls-box .transport-main-btn image {
     -gtk-icon-size: 18px;
 }
-.pill { margin: 10px; padding: 10px; min-width: 25px; min-height: 25px; border-radius: 99px; }
+.pill { margin: 10px; padding: 10px; min-width: 28px; min-height: 28px; border-radius: 99px; }
 flowboxchild { background-color: transparent; padding: 0; margin: 0; }
 .card { background-color: transparent; border: none; box-shadow: none; padding: 8px; min-width: 130px; transition: background-color 0.2s; }
 .card:hover { background-color: alpha(currentColor, 0.06); }
 .card:hover label { color: @accent_color; }
 .history-card-btn .card:hover { background-color: transparent; }
+.history-scroll-btn {
+    min-width: 28px;
+    min-height: 28px;
+    padding: 2px;
+}
+.history-card-btn {
+    min-height: 28px;
+    padding: 0;
+}
+.home-scroll-btn,
+.playlist-tool-btn,
+.player-side-btn,
+.transport-btn {
+    min-width: 28px;
+    min-height: 28px;
+    padding: 2px;
+}
 .album-cover-img { border-radius: 8px; -gtk-icon-transform: scale(1);}
 .header-art { border-radius: 12px; }
 .album-header-box { padding: 32px; margin-bottom: 10px; }
@@ -597,7 +618,7 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
 }
 
 .liked-action-btn {
-    min-height: 23px;
+    min-height: 28px;
     padding: 0 12px;
     border-radius: 999px;
     border: 1px solid alpha(currentColor, 0.24);
@@ -635,7 +656,7 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
 .liked-artist-scroll-btn {
     min-width: 28px;
     min-height: 28px;
-    padding: 0;
+    padding: 2px 0;
     margin-top: 2px;
 }
 

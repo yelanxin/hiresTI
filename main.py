@@ -2419,7 +2419,56 @@ class TidalApp(Adw.Application):
             return
         self.current_track_list = tracks
         self._set_play_queue(tracks)
+        self._debug_dump_button_metrics("history-click:before-play")
         self.play_track(index)
+        GLib.timeout_add(120, lambda: self._debug_dump_button_metrics("history-click:after-play"))
+
+    def _debug_dump_button_metrics(self, tag="ui"):
+        if os.getenv("HIRES_DEBUG_BUTTONS", "0") != "1":
+            return False
+        if not getattr(self, "win", None):
+            return False
+
+        rows = []
+
+        def _walk(widget):
+            if isinstance(widget, Gtk.Button):
+                classes = ",".join(widget.get_css_classes() or [])
+                try:
+                    min_h, nat_h, _min_b, _nat_b = widget.measure(Gtk.Orientation.VERTICAL, -1)
+                except Exception:
+                    min_h, nat_h = -1, -1
+                try:
+                    alloc_h = widget.get_allocated_height()
+                except Exception:
+                    alloc_h = -1
+                ptr = hex(hash(widget))
+                rows.append((ptr, classes, min_h, nat_h, alloc_h))
+            child = widget.get_first_child()
+            while child is not None:
+                _walk(child)
+                child = child.get_next_sibling()
+
+        try:
+            _walk(self.win)
+        except Exception as e:
+            logger.warning("BTNDBG %s failed: %s", tag, e)
+            return False
+
+        rows.sort(key=lambda r: (r[2], r[3], r[4]))
+        logger.warning("BTNDBG %s count=%d", tag, len(rows))
+        for ptr, classes, min_h, nat_h, alloc_h in rows:
+            if nat_h <= 32 or min_h <= 32 or alloc_h <= 32:
+                logger.warning(
+                    "BTNDBG %s ptr=%s cls=[%s] min_h=%s nat_h=%s alloc_h=%s",
+                    tag,
+                    ptr,
+                    classes,
+                    min_h,
+                    nat_h,
+                    alloc_h,
+                )
+        return False
 
     def on_queue_track_selected(self, box, row):
         if not row:
