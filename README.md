@@ -27,7 +27,7 @@
 ![Settings](screenshots/1.0.5-8.png)
 ### Mini Mode
 <img src="screenshots/1.0.4-5.png" width="400">
-<img src="screenshots/1.0.5-6.png" width="600">
+<img src="screenshots/1.0.5-6.png" width="500">
 
 
 ## Tech Stack
