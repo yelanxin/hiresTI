@@ -1635,6 +1635,14 @@ class TidalApp(Adw.Application):
 
         def task():
             tracks = list(self.backend.get_favorite_tracks(limit=500))
+            try:
+                self.backend.fav_track_ids = {
+                    str(getattr(t, "id", ""))
+                    for t in tracks
+                    if getattr(t, "id", None) is not None
+                }
+            except Exception:
+                pass
             self.liked_tracks_last_fetch_ts = time.time()
 
             def _apply():

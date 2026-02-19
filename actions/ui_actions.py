@@ -1454,11 +1454,9 @@ def render_liked_songs_dashboard(app, tracks=None):
     artist_filter_scroll = Gtk.ScrolledWindow(hexpand=True, vexpand=False, css_classes=["liked-artist-filter-scroll"])
     artist_filter_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
     artist_filter_scroll.set_min_content_height(90)
-    artist_filter_flow = Gtk.FlowBox(
-        selection_mode=Gtk.SelectionMode.NONE,
-        max_children_per_line=999,
-        column_spacing=10,
-        row_spacing=8,
+    artist_filter_flow = Gtk.Box(
+        orientation=Gtk.Orientation.HORIZONTAL,
+        spacing=10,
         css_classes=["liked-artist-filter-flow"],
     )
     artist_filter_scroll.set_child(artist_filter_flow)
@@ -1515,9 +1513,7 @@ def render_liked_songs_dashboard(app, tracks=None):
         btn.connect("clicked", lambda _b, k=key: _on_artist_filter_clicked(k))
         app.liked_artist_filter_buttons[key] = btn
 
-        child = Gtk.FlowBoxChild()
-        child.set_child(btn)
-        artist_filter_flow.append(child)
+        artist_filter_flow.append(btn)
 
     table_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
     app.collection_content_box.append(table_box)
