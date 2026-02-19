@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.0.10 - 2026-02-19
+Coverage: changes after 1.0.9 on 2026-02-19.
+
+### Added
+- Added search tracks pagination controls with `50` items per page (`Prev` / `Next` / page indicator).
+- Added search-page batch action button: `Like Selected`.
+- Added progressive fallback for stream URL quality resolution:
+  - Try selected quality first (e.g. `HI_RES_LOSSLESS`),
+  - then fallback to `LOSSLESS`,
+  - then `HIGH` when needed.
+
+### Changed
+- Improved compatibility for `tidalapi` quality enum variants (legacy and newer naming).
+- Increased search API result fetch window for tracks to support pagination.
+- Startup login-view rendering now avoids flashing logged-out UI for already logged-in users.
+
+### Fixed
+- Fixed incomplete liked-library fetch behavior by adding robust pagination for favorite artists/albums/tracks.
+- Fixed search track row activation under pagination to play the correct absolute track index.
+- Fixed logged-out UI state consistency:
+  - hide search input,
+  - hide overlay handles,
+  - keep bottom player bar visible.
+- Removed album-page header batch-like control after UX review (kept search batch-like flow only).
+
+### Packaging Output (1.0.10)
+- `hiresti_1.0.10_all.deb`
+- `hiresti-1.0.10-1.fedora.x86_64.rpm`
+- `hiresti-1.0.10-1.el9.x86_64.rpm`
+- `hiresti-1.0.10-1-x86_64.pkg.tar.zst`
+
 ## 1.0.9 - 2026-02-19
 Coverage: changes on 2026-02-19.
 
