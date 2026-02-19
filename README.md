@@ -87,6 +87,26 @@ sudo dnf install ./hiresti-<version>-1.el9.<arch>.rpm
 sudo pacman -U ./hiresti-<version>-1-<arch>.pkg.tar.zst
 ```
 
+## Upgrade Guide
+
+### Fedora / EL9 RPM upgrades
+
+Use upgrade mode when moving to a newer version:
+
+```bash
+sudo dnf upgrade ./hiresti-<version>-1.fedora.<arch>.rpm
+```
+
+or:
+
+```bash
+sudo rpm -Uvh ./hiresti-<version>-1.fedora.<arch>.rpm
+```
+
+For EL9 packages, replace `fedora` with `el9`.
+
+Do not use `rpm -i` for upgrades, because it installs side-by-side and can cause file conflict errors.
+
 ## Support
 
 If you run into issues, have feature requests, or want to report bugs, please open a GitHub issue:
