@@ -14,7 +14,6 @@
 - Fast collection browsing (Albums, Liked Songs, Artists, Queue, History)
 - Local playlist management with cover collage generation
 - Built-in queue drawer, lyrics support, and visualizer modules
-- Linux package build pipeline for DEB and RPM targets
 
 ## Screenshots
 ### Main Window
