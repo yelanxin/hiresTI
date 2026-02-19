@@ -145,9 +145,13 @@ class TidalBackend:
         try:
             if not self.user:
                 return
-            favs = self.user.favorites.tracks()
-            res = favs() if callable(favs) else favs
-            self.fav_track_ids = {str(t.id) for t in res}
+            # Use paginated fetch to avoid keeping only the first page of favorite track ids.
+            tracks = self.get_favorite_tracks(limit=5000)
+            self.fav_track_ids = {
+                str(getattr(t, "id", ""))
+                for t in (tracks or [])
+                if getattr(t, "id", None) is not None
+            }
         except Exception as e:
             logger.debug("Failed to refresh favorite track ids: %s", e)
 
