@@ -2,7 +2,7 @@
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![GTK4](https://img.shields.io/badge/UI-GTK4%20%2B%20Libadwaita-green)
-![License](https://img.shields.io/badge/License-MIT-purple)
+![License](https://img.shields.io/badge/License-GPL--3.0-purple)
 ![Status](https://img.shields.io/badge/Status-v1.0-orange)
 
 ![Logo](icons/hicolor/64x64/apps/hiresti.png)
@@ -50,3 +50,7 @@ sudo dpkg -i hiresti_1.0.0_all.deb
 # 使用 dnf 安装（推荐，自动处理依赖）
 sudo dnf install ./hiresti-1.0.0-1.x86_64.rpm
 ```
+
+## License
+
+GPL-3.0
