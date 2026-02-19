@@ -74,15 +74,6 @@ sudo dnf install ./hiresti-<version>-1.el9.<arch>.rpm
 sudo pacman -U ./hiresti-<version>-1-<arch>.pkg.tar.zst
 ```
 
-## Project Structure
-
-- `main.py`: app lifecycle and orchestration
-- `ui/`: GTK widget builders
-- `actions/`: UI and playback actions
-- `visualizer.py`: spectrum effects/themes
-- `audio_player.py`: playback + output control
-- `models.py`: local history/playlists storage
-- `package.sh`: DEB/RPM build script
 
 ## Notes
 
