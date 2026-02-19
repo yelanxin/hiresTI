@@ -464,7 +464,9 @@ class TidalApp(Adw.Application):
         self.save_settings()
         if self.player is not None:
             self.player.cleanup()
-        super().do_shutdown()
+        # Call explicit parent vfunc to avoid introspection edge-cases when
+        # shutting down from headless/error paths.
+        Adw.Application.do_shutdown(self)
 
     def save_settings(self):
         try:
@@ -738,8 +740,14 @@ class TidalApp(Adw.Application):
         if self.window_created: 
             self.win.present()
             return
-        
-        icon_theme = Gtk.IconTheme.get_for_display(Gdk.Display.get_default())
+
+        display = Gdk.Display.get_default()
+        if display is None:
+            logger.error("No graphical display detected; cannot start GTK UI.")
+            self.quit()
+            return
+
+        icon_theme = Gtk.IconTheme.get_for_display(display)
         icons_path = os.path.join(os.path.dirname(__file__), "icons")
         if os.path.exists(icons_path):
             icon_theme.add_search_path(icons_path)
@@ -748,7 +756,7 @@ class TidalApp(Adw.Application):
         logo_svg = os.path.join(os.path.dirname(__file__), "icons", "hicolor", "scalable", "apps", "hiresti.svg")
         css_data = ui_config.CSS_DATA.replace("__HIRESTI_LOGO_SVG__", logo_svg.replace("\\", "/"))
         provider.load_from_data(css_data.encode())
-        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        Gtk.StyleContext.add_provider_for_display(display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
         self.win = Adw.ApplicationWindow(application=self, title="hiresTI Desktop", default_width=ui_config.WINDOW_WIDTH, default_height=ui_config.WINDOW_HEIGHT)
         self.window_created = True
