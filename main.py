@@ -99,6 +99,9 @@ class TidalApp(Adw.Application):
         self.track_list = None
         self.playlist_track_list = None
         self.liked_track_list = None
+        self.liked_tracks_data = []
+        self.liked_tracks_last_fetch_ts = 0.0
+        self.liked_tracks_cache_ttl_sec = 30.0
         self.queue_track_list = None
         self.queue_drawer_list = None
         self.queue_count_label = None
@@ -1620,9 +1623,28 @@ class TidalApp(Adw.Application):
             self.render_liked_songs_dashboard([])
             return False
 
+        # Render cached data immediately to avoid perceived UI stall when revisiting this page.
+        cached_tracks = list(getattr(self, "liked_tracks_data", []) or [])
+        now = time.time()
+        ttl = float(getattr(self, "liked_tracks_cache_ttl_sec", 30.0) or 30.0)
+        last_ts = float(getattr(self, "liked_tracks_last_fetch_ts", 0.0) or 0.0)
+        if cached_tracks:
+            self.render_liked_songs_dashboard(cached_tracks)
+            if now - last_ts <= max(0.0, ttl):
+                return False
+
         def task():
             tracks = list(self.backend.get_favorite_tracks(limit=500))
-            GLib.idle_add(self.render_liked_songs_dashboard, tracks)
+            self.liked_tracks_last_fetch_ts = time.time()
+
+            def _apply():
+                current = self.nav_list.get_selected_row() if self.nav_list is not None else None
+                if not current or getattr(current, "nav_id", None) != "liked_songs":
+                    return False
+                self.render_liked_songs_dashboard(tracks)
+                return False
+
+            GLib.idle_add(_apply)
 
         Thread(target=task, daemon=True).start()
         return False

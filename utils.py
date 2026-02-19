@@ -113,9 +113,9 @@ def load_img(widget, url_provider, cache_dir, size=84):
         try:
             u = url_provider() if callable(url_provider) else url_provider
             if not u:
-                logger.info("load_img: empty image source (widget=%s, size=%s)", type(widget).__name__, size)
+                logger.debug("load_img: empty image source (widget=%s, size=%s)", type(widget).__name__, size)
                 return
-            logger.info("load_img: start (widget=%s, size=%s, source=%s)", type(widget).__name__, size, u)
+            logger.debug("load_img: start (widget=%s, size=%s, source=%s)", type(widget).__name__, size, u)
             
             widget._target_url = u
             f_path = None
@@ -168,7 +168,7 @@ def load_img(widget, url_provider, cache_dir, size=84):
                         if hasattr(widget, '_target_url') and widget._target_url == u:
                             widget.set_size_request(size, size)
                             widget.set_paintable(texture)
-                            logger.info("load_img: applied picture (source=%s)", u)
+                            logger.debug("load_img: applied picture (source=%s)", u)
                     GLib.idle_add(apply_pic)
                 except Exception as e:
                     logger.warning("load_img: failed to apply picture texture from %s: %s", f_path, e)
@@ -195,7 +195,7 @@ def load_img(widget, url_provider, cache_dir, size=84):
                                 # 强制锁定逻辑显示尺寸
                                 widget.set_pixel_size(size) 
                                 widget.set_from_pixbuf(scaled)
-                                logger.info("load_img: applied image (source=%s)", u)
+                                logger.debug("load_img: applied image (source=%s)", u)
                         GLib.idle_add(apply_img)
                 except Exception as e:
                     logger.warning("load_img: failed to apply image pixbuf from %s: %s", f_path, e)
