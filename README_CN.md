@@ -25,6 +25,10 @@ HiresTI 是一款专为发烧友设计的原生、现代 Linux Tidal 桌面客�
 
 🎹 媒体键: 原生支持播放/暂停、下一曲和上一曲媒体键。
 
+☁️ 云端歌单与文件夹: 支持云端 Playlist 管理与 Folder 分组，支持封面拼贴预览。
+
+📌 版本说明: 从 v1.1.0 开始已移除本地 Playlist，仅保留云端 Playlist。
+
 ## 📸 Screenshots
 
 | Album Detail | Setting |

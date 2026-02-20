@@ -12,7 +12,7 @@
 - TIDAL OAuth login and account-scoped library access
 - Bit-perfect playback flow with optional exclusive output controls
 - Fast collection browsing (Albums, Liked Songs, Artists, Queue, History)
-- Local playlist management with cover collage generation
+- Cloud playlist management with folder support and cover collage previews
 - Built-in queue drawer, lyrics support, and visualizer modules
 
 ## Screenshots
@@ -88,6 +88,11 @@ sudo pacman -U ./hiresti-<version>-1-<arch>.pkg.tar.zst
 ```
 
 ## Upgrade Guide
+
+### Playlist migration note
+
+Starting from `v1.1.0`, local playlists are removed.
+Only cloud playlists are supported.
 
 ### Fedora / EL9 RPM upgrades
 
