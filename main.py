@@ -519,7 +519,6 @@ class TidalApp(Adw.Application):
             application_name="HiresTI",
             application_icon="hiresti",
             version=str(getattr(self, "app_version", "dev")),
-            developer_name="code by Yelanxin",
             developers=["Yelanxin"],
             website="https://github.com/yelanxin/hiresTI",
             issue_url="https://github.com/yelanxin/hiresTI/issues",
