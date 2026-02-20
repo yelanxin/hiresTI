@@ -1,5 +1,46 @@
 # Changelog
 
+## 1.1.0 - 2026-02-20
+Coverage: changes after 1.0.10 on 2026-02-20.
+
+### Warning
+- Local playlists have been removed in this release.
+- Only cloud playlists are supported now.
+- If you used local playlists in previous versions, please migrate to cloud playlists before upgrading.
+
+### Added
+- Added cloud playlist-focused management flow.
+- Added playlist folders:
+  - create / rename / delete,
+  - folder cover collage preview (up to 4 playlist covers),
+  - folder item count badge.
+- Added playlist/folder creation entry via unified `+` menu.
+- Added Rust visualizer core bundling step to packaging output.
+
+### Changed
+- Reworked playlist pages to align with other list/detail pages.
+- Moved playlist edit/delete actions from list cards to playlist detail header area.
+- Updated visualizer rendering pipeline with broader GL path coverage and Rust preprocessing hooks.
+- Refined visualizer transitions (fade-in and cache-to-live blending on enable).
+- Updated About dialog content and removed author line.
+
+### Fixed
+- Fixed playlist/folder back navigation regressions in nested navigation paths.
+- Fixed folder/playlist UI edge cases (menu placement, layout, warning-prone sizing).
+- Fixed mini mode toggle crash (`is_mini_mode` attribute init issue).
+- Fixed multiple GL shader/runtime regressions and fallback behavior.
+- Fixed image-loading reliability issues and several GTK warnings.
+
+### Performance
+- Reduced CPU usage across common playback scenarios and multiple visualizer effects.
+- Improved GL rendering stability and reduced CPU spikes in several modes.
+
+### Packaging Output (1.1.0)
+- `hiresti_1.1.0_all.deb`
+- `hiresti-1.1.0-1.fedora.x86_64.rpm`
+- `hiresti-1.1.0-1.el9.x86_64.rpm`
+- `hiresti-1.1.0-1-x86_64.pkg.tar.zst`
+
 ## 1.0.10 - 2026-02-19
 Coverage: changes after 1.0.9 on 2026-02-19.
 
