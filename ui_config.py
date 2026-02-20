@@ -489,6 +489,37 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
 .card:hover { background-color: alpha(currentColor, 0.06); }
 .card:hover label { color: @accent_color; }
 .history-card-btn .card:hover { background-color: transparent; }
+.playlist-folder-cover {
+    min-width: 130px;
+    min-height: 130px;
+    border-radius: 16px;
+    border: 1px solid alpha(currentColor, 0.14);
+    background:
+        linear-gradient(160deg, alpha(@accent_bg_color, 0.22), alpha(@accent_bg_color, 0.06)),
+        linear-gradient(0deg, alpha(currentColor, 0.05), alpha(currentColor, 0.05));
+    box-shadow: inset 0 1px 0 alpha(white, 0.04);
+    padding: 4px;
+}
+.playlist-folder-collage {
+    min-width: 120px;
+    min-height: 120px;
+}
+.playlist-folder-cell {
+    border-radius: 10px;
+    background-color: alpha(currentColor, 0.06);
+}
+.playlist-folder-preview-img {
+    border-radius: 10px;
+}
+.playlist-folder-badge {
+    min-width: 16px;
+    padding: 1px 6px;
+    border-radius: 999px;
+    font-size: 10px;
+    font-weight: 700;
+    color: alpha(currentColor, 0.92);
+    background-color: alpha(currentColor, 0.62);
+}
 .history-scroll-btn {
     min-width: 28px;
     min-height: 28px;
@@ -692,6 +723,26 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
     background-color: alpha(currentColor, 0.62);
     margin-right: 0;
     margin-bottom: 0;
+}
+
+/* Unified rounded list surfaces across list pages */
+.tracks-list,
+.boxed-list {
+    background-color: alpha(currentColor, 0.04);
+    border: 1px solid alpha(currentColor, 0.10);
+    border-radius: 12px;
+    padding: 6px;
+}
+
+.tracks-list row,
+.boxed-list row {
+    border-radius: 10px;
+    margin: 2px 0;
+}
+
+.tracks-list row:hover,
+.boxed-list row:hover {
+    background-color: alpha(currentColor, 0.06);
 }
 
 """

@@ -3,6 +3,7 @@ import logging
 import os
 import json
 import time
+import requests
 from datetime import datetime
 from urllib.parse import urlparse
 from app_errors import classify_exception
@@ -12,6 +13,7 @@ logger = logging.getLogger(__name__)
 class TidalBackend:
     def __init__(self):
         self.session = tidalapi.Session()
+        self._tune_http_pool()
         self.token_file = os.path.expanduser("~/.cache/hiresti_token.json")
         self.legacy_token_file = os.path.expanduser("~/.cache/hiresti_token.pkl")
         self.user = None
@@ -34,6 +36,29 @@ class TidalBackend:
         self.max_lyrics_cache = 300
         # Circuit breaker for unstable mix endpoint.
         self._mix_fail_until = {}
+
+    def _tune_http_pool(self):
+        """
+        Raise requests/urllib3 pool size for high-volume library fetches.
+        This avoids noisy 'Connection pool is full, discarding connection' warnings
+        when many background tasks hit api.tidal.com in parallel.
+        """
+        try:
+            req_obj = getattr(self.session, "request", None)
+            sess = getattr(req_obj, "session", None)
+            if sess is None:
+                return
+            pool_size = int(os.getenv("HIRESTI_HTTP_POOL_SIZE", "64") or 64)
+            pool_size = max(10, min(256, pool_size))
+            adapter = requests.adapters.HTTPAdapter(
+                pool_connections=pool_size,
+                pool_maxsize=pool_size,
+            )
+            sess.mount("https://", adapter)
+            sess.mount("http://", adapter)
+            logger.info("HTTP pool tuned for tidalapi session: size=%s", pool_size)
+        except Exception as e:
+            logger.debug("Failed tuning tidalapi HTTP pool: %s", e)
 
     def _resolve_quality(self, candidates, fallback="LOSSLESS"):
         """
@@ -546,12 +571,273 @@ class TidalBackend:
         title = str(name or "").strip() or "New Playlist"
         desc = str(description or "")
         try:
-            pl = self.user.create_playlist(title, desc)
+            pl = self.user.create_playlist(title, desc, parent_id="root")
             logger.info("Cloud playlist created: id=%s name=%r", getattr(pl, "id", None), title)
             return pl
         except Exception as e:
             logger.warning("Failed to create cloud playlist %r: %s", title, e)
             return None
+
+    def create_cloud_playlist_in_folder(self, name, description="", parent_folder_id="root"):
+        if not self.user:
+            logger.warning("Cannot create cloud playlist while not logged in.")
+            return None
+        title = str(name or "").strip() or "New Playlist"
+        desc = str(description or "")
+        parent_id = str(parent_folder_id or "root")
+        try:
+            pl = self.user.create_playlist(title, desc, parent_id=parent_id)
+            logger.info(
+                "Cloud playlist created: id=%s name=%r folder=%s",
+                getattr(pl, "id", None),
+                title,
+                parent_id,
+            )
+            return pl
+        except Exception as e:
+            logger.warning("Failed to create cloud playlist %r in folder %s: %s", title, parent_id, e)
+            return None
+
+    def create_cloud_folder(self, name, parent_folder_id="root"):
+        if not self.user:
+            logger.warning("Cannot create cloud folder while not logged in.")
+            return None
+        title = str(name or "").strip() or "New Folder"
+        parent_id = str(parent_folder_id or "root")
+        try:
+            folder = self.user.create_folder(title, parent_id=parent_id)
+            logger.info(
+                "Cloud folder created: id=%s name=%r parent=%s",
+                getattr(folder, "id", None),
+                title,
+                parent_id,
+            )
+            return folder
+        except Exception as e:
+            logger.warning("Failed to create cloud folder %r in parent %s: %s", title, parent_id, e)
+            return None
+
+    def _resolve_user_folder(self, folder_or_id):
+        if folder_or_id is None:
+            return None
+        if hasattr(folder_or_id, "rename") and hasattr(folder_or_id, "remove"):
+            return folder_or_id
+        fid = str(getattr(folder_or_id, "id", folder_or_id) or "").strip()
+        if not fid:
+            return None
+        try:
+            for item in self.get_all_playlist_folders(limit=5000, max_depth=12):
+                if str(item.get("id", "")) == fid:
+                    obj = item.get("obj")
+                    if obj is not None:
+                        return obj
+        except Exception as e:
+            logger.debug("Folder resolve scan failed for %s: %s", fid, e)
+        return None
+
+    def rename_cloud_folder(self, folder_or_id, name):
+        folder = self._resolve_user_folder(folder_or_id)
+        new_name = str(name or "").strip()
+        if folder is None or not new_name:
+            return {"ok": False, "folder_id": getattr(folder, "id", None) if folder is not None else None}
+        try:
+            ok = bool(folder.rename(new_name))
+            if ok:
+                try:
+                    folder.name = new_name
+                except Exception:
+                    pass
+            return {"ok": ok, "folder_id": getattr(folder, "id", None), "name": new_name}
+        except Exception as e:
+            logger.warning("Failed renaming folder %s: %s", getattr(folder, "id", None), e)
+            return {"ok": False, "folder_id": getattr(folder, "id", None), "name": new_name}
+
+    def delete_cloud_folder(self, folder_or_id):
+        folder = self._resolve_user_folder(folder_or_id)
+        if folder is None:
+            return {"ok": False, "folder_id": None}
+        try:
+            ok = bool(folder.remove())
+            return {"ok": ok, "folder_id": getattr(folder, "id", None)}
+        except Exception as e:
+            logger.warning("Failed deleting folder %s: %s", getattr(folder, "id", None), e)
+            return {"ok": False, "folder_id": getattr(folder, "id", None)}
+
+    def _fetch_playlist_folders_page(self, parent_folder_id="root", limit=50, offset=0):
+        if not self.user or not hasattr(self.user, "favorites"):
+            return []
+        fav = self.user.favorites
+        if not hasattr(fav, "playlist_folders"):
+            return []
+        return list(
+            fav.playlist_folders(
+                limit=int(limit),
+                offset=int(offset),
+                parent_folder_id=str(parent_folder_id or "root"),
+            )
+            or []
+        )
+
+    def get_playlist_folders(self, parent_folder_id="root", limit=1000):
+        out = []
+        page_size = 50
+        offset = 0
+        max_items = max(0, int(limit or 0))
+        while len(out) < max_items:
+            try:
+                page = self._fetch_playlist_folders_page(parent_folder_id=parent_folder_id, limit=page_size, offset=offset)
+            except Exception as e:
+                logger.warning("Failed fetching playlist folders (parent=%s): %s", parent_folder_id, e)
+                break
+            if not page:
+                break
+            out.extend(page)
+            if len(page) < page_size:
+                break
+            offset += len(page)
+        return out[:max_items]
+
+    def get_playlists_in_folder(self, parent_folder=None, limit=1000):
+        max_items = max(0, int(limit or 0))
+        if max_items <= 0:
+            return []
+
+        out = []
+        page_size = 50
+
+        # Root folder.
+        if parent_folder is None or str(parent_folder) == "root":
+            if not self.user or not hasattr(self.user, "favorites"):
+                return []
+            fav = self.user.favorites
+            if not hasattr(fav, "playlists"):
+                return []
+            offset = 0
+            while len(out) < max_items:
+                try:
+                    page = list(fav.playlists(limit=page_size, offset=offset) or [])
+                except Exception as e:
+                    logger.warning("Failed fetching root playlists: %s", e)
+                    break
+                if not page:
+                    break
+                out.extend(page)
+                if len(page) < page_size:
+                    break
+                offset += len(page)
+            return out[:max_items]
+
+        folder = parent_folder
+        if not hasattr(folder, "items"):
+            try:
+                folder = self.session.folder(getattr(parent_folder, "id", parent_folder))
+            except Exception as e:
+                logger.warning("Failed resolving folder %s: %s", parent_folder, e)
+                return []
+
+        offset = 0
+        while len(out) < max_items:
+            try:
+                page = list(folder.items(offset=offset, limit=page_size) or [])
+            except Exception as e:
+                logger.warning("Failed fetching playlists for folder %s: %s", getattr(folder, "id", None), e)
+                break
+            if not page:
+                break
+            out.extend(page)
+            if len(page) < page_size:
+                break
+            offset += len(page)
+        return out[:max_items]
+
+    def get_playlists_and_folders(self, parent_folder=None, limit=1000):
+        parent_id = "root" if parent_folder is None else str(getattr(parent_folder, "id", parent_folder) or "root")
+        folders = self.get_playlist_folders(parent_folder_id=parent_id, limit=limit)
+        playlists = self.get_playlists_in_folder(parent_folder=parent_folder, limit=limit)
+        return {"folders": folders, "playlists": playlists}
+
+    def get_folder_preview_artworks(self, folder_or_id, limit=4, size=320):
+        urls = []
+        max_items = max(1, int(limit or 4))
+        folder = folder_or_id
+        if folder is None:
+            return urls
+        if not hasattr(folder, "items"):
+            try:
+                folder = self.session.folder(getattr(folder_or_id, "id", folder_or_id))
+            except Exception as e:
+                logger.debug("Failed to resolve folder for preview artwork %s: %s", folder_or_id, e)
+                return urls
+        try:
+            items = list(folder.items(offset=0, limit=max_items) or [])
+            for pl in items:
+                u = self.get_artwork_url(pl, size=size)
+                if u:
+                    urls.append(u)
+                if len(urls) >= max_items:
+                    break
+        except Exception as e:
+            logger.debug(
+                "Failed to fetch folder preview artworks for folder %s: %s",
+                getattr(folder, "id", None),
+                e,
+            )
+        return urls[:max_items]
+
+    def get_all_playlist_folders(self, limit=1000, max_depth=8):
+        results = []
+        queue = [("root", "", 0)]
+        seen = set(["root"])
+        while queue and len(results) < int(limit):
+            parent_id, parent_path, depth = queue.pop(0)
+            if depth >= int(max_depth):
+                continue
+            children = self.get_playlist_folders(parent_folder_id=parent_id, limit=1000)
+            for f in children:
+                fid = str(getattr(f, "id", "") or "")
+                if not fid or fid in seen:
+                    continue
+                seen.add(fid)
+                name = str(getattr(f, "name", "") or "Folder")
+                path = f"{parent_path}/{name}" if parent_path else name
+                results.append({"id": fid, "name": name, "path": path, "obj": f, "parent_id": parent_id})
+                queue.append((fid, path, depth + 1))
+                if len(results) >= int(limit):
+                    break
+        return results
+
+    def move_cloud_playlist_to_folder(self, playlist_or_id, target_folder_id="root"):
+        pl = self._resolve_user_playlist(playlist_or_id)
+        if pl is None:
+            return {"ok": False, "playlist_id": None, "target_folder_id": str(target_folder_id or "root")}
+
+        pid = str(getattr(pl, "id", "") or "").strip()
+        trn = str(getattr(pl, "trn", "") or "").strip() or (f"trn:playlist:{pid}" if pid else "")
+        if not trn:
+            return {"ok": False, "playlist_id": pid or None, "target_folder_id": str(target_folder_id or "root")}
+
+        endpoint = "my-collection/playlists/folders/move"
+        params = {"folderId": str(target_folder_id or "root"), "trns": trn}
+        try:
+            res = self.session.request.request(
+                "PUT",
+                endpoint,
+                base_url=self.session.config.api_v2_location,
+                params=params,
+            )
+            return {
+                "ok": bool(getattr(res, "ok", False)),
+                "playlist_id": pid or None,
+                "target_folder_id": str(target_folder_id or "root"),
+            }
+        except Exception as e:
+            logger.warning(
+                "Failed moving playlist %s to folder %s: %s",
+                pid or getattr(pl, "id", None),
+                target_folder_id,
+                e,
+            )
+            return {"ok": False, "playlist_id": pid or None, "target_folder_id": str(target_folder_id or "root")}
 
     def add_tracks_to_cloud_playlist(self, playlist_or_id, tracks, dedupe=True, batch_size=100):
         pl = self._resolve_user_playlist(playlist_or_id)
@@ -630,6 +916,164 @@ class TidalBackend:
                 "added": added,
                 "skipped_invalid": skipped_invalid,
             }
+
+    def remove_tracks_from_cloud_playlist(self, playlist_or_id, tracks_or_ids):
+        pl = self._resolve_user_playlist(playlist_or_id)
+        if pl is None:
+            return {"ok": False, "playlist_id": None, "requested": 0, "removed": 0, "skipped_invalid": 0}
+
+        raw_ids = []
+        skipped_invalid = 0
+        for t in list(tracks_or_ids or []):
+            tid = None
+            if isinstance(t, (str, int)):
+                tid = str(t).strip()
+            elif isinstance(t, dict):
+                tid = str(t.get("track_id") or t.get("id") or "").strip()
+            else:
+                tid = str(getattr(t, "id", "") or "").strip()
+            if not tid:
+                skipped_invalid += 1
+                continue
+            raw_ids.append(tid)
+
+        if not raw_ids:
+            return {
+                "ok": True,
+                "playlist_id": getattr(pl, "id", None),
+                "requested": 0,
+                "removed": 0,
+                "skipped_invalid": skipped_invalid,
+            }
+
+        # Keep order while de-duplicating requested ids.
+        seen = set()
+        track_ids = []
+        for tid in raw_ids:
+            if tid in seen:
+                continue
+            seen.add(tid)
+            track_ids.append(tid)
+
+        removed = 0
+        try:
+            if hasattr(pl, "delete_by_id"):
+                ok = bool(pl.delete_by_id(track_ids))
+                removed = len(track_ids) if ok else 0
+                return {
+                    "ok": ok,
+                    "playlist_id": getattr(pl, "id", None),
+                    "requested": len(raw_ids),
+                    "removed": removed,
+                    "skipped_invalid": skipped_invalid,
+                }
+
+            # Fallback for playlist objects that do not expose editable API.
+            logger.warning("Cloud playlist does not support delete_by_id(): id=%s", getattr(pl, "id", None))
+            return {
+                "ok": False,
+                "playlist_id": getattr(pl, "id", None),
+                "requested": len(raw_ids),
+                "removed": 0,
+                "skipped_invalid": skipped_invalid,
+            }
+        except Exception as e:
+            logger.warning("Failed removing tracks from cloud playlist %s: %s", getattr(pl, "id", None), e)
+            return {
+                "ok": False,
+                "playlist_id": getattr(pl, "id", None),
+                "requested": len(raw_ids),
+                "removed": removed,
+                "skipped_invalid": skipped_invalid,
+            }
+
+    def rename_cloud_playlist(self, playlist_or_id, name, description=None):
+        pl = self._resolve_user_playlist(playlist_or_id)
+        new_name = str(name or "").strip()
+        if pl is None or not new_name:
+            return {"ok": False, "playlist_id": getattr(pl, "id", None) if pl is not None else None}
+        if not hasattr(pl, "edit"):
+            logger.warning("Cloud playlist does not support edit(): id=%s", getattr(pl, "id", None))
+            return {"ok": False, "playlist_id": getattr(pl, "id", None)}
+        try:
+            desc = description
+            if desc is None:
+                desc = getattr(pl, "description", "") or ""
+            ok = bool(pl.edit(title=new_name, description=desc))
+            if ok:
+                # Keep in-memory object aligned even if caller still holds old instance.
+                try:
+                    pl.name = new_name
+                except Exception:
+                    pass
+            return {"ok": ok, "playlist_id": getattr(pl, "id", None), "name": new_name}
+        except Exception as e:
+            logger.warning("Failed renaming cloud playlist %s: %s", getattr(pl, "id", None), e)
+            return {"ok": False, "playlist_id": getattr(pl, "id", None), "name": new_name}
+
+    def update_cloud_playlist(self, playlist_or_id, name=None, description=None, is_public=None):
+        pl = self._resolve_user_playlist(playlist_or_id)
+        if pl is None:
+            return {"ok": False, "playlist_id": None}
+
+        ok = True
+        new_name = str(name or getattr(pl, "name", "") or "").strip()
+        new_desc = str(description if description is not None else (getattr(pl, "description", "") or ""))
+
+        if hasattr(pl, "edit"):
+            try:
+                ok = bool(pl.edit(title=new_name, description=new_desc)) and ok
+                if ok:
+                    try:
+                        pl.name = new_name
+                        pl.description = new_desc
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.warning("Failed editing cloud playlist %s: %s", getattr(pl, "id", None), e)
+                ok = False
+
+        if is_public is not None:
+            desired_public = bool(is_public)
+            current_public = bool(getattr(pl, "public", False))
+            if desired_public != current_public:
+                try:
+                    if desired_public and hasattr(pl, "set_playlist_public"):
+                        ok = bool(pl.set_playlist_public()) and ok
+                    elif (not desired_public) and hasattr(pl, "set_playlist_private"):
+                        ok = bool(pl.set_playlist_private()) and ok
+                    else:
+                        logger.warning("Cloud playlist does not support public/private toggle: id=%s", getattr(pl, "id", None))
+                        ok = False
+                    try:
+                        pl.public = desired_public
+                    except Exception:
+                        pass
+                except Exception as e:
+                    logger.warning("Failed updating cloud playlist visibility %s: %s", getattr(pl, "id", None), e)
+                    ok = False
+
+        return {
+            "ok": bool(ok),
+            "playlist_id": getattr(pl, "id", None),
+            "name": new_name,
+            "description": new_desc,
+            "public": bool(getattr(pl, "public", False)),
+        }
+
+    def delete_cloud_playlist(self, playlist_or_id):
+        pl = self._resolve_user_playlist(playlist_or_id)
+        if pl is None:
+            return {"ok": False, "playlist_id": None}
+        if not hasattr(pl, "delete"):
+            logger.warning("Cloud playlist does not support delete(): id=%s", getattr(pl, "id", None))
+            return {"ok": False, "playlist_id": getattr(pl, "id", None)}
+        try:
+            ok = bool(pl.delete())
+            return {"ok": ok, "playlist_id": getattr(pl, "id", None)}
+        except Exception as e:
+            logger.warning("Failed deleting cloud playlist %s: %s", getattr(pl, "id", None), e)
+            return {"ok": False, "playlist_id": getattr(pl, "id", None)}
 
     def sync_local_playlist_to_cloud(self, local_playlist, cloud_playlist_id=None, dedupe=True):
         name = str((local_playlist or {}).get("name", "") or "").strip() or "New Playlist"
@@ -898,7 +1342,23 @@ class TidalBackend:
         """
         if isinstance(obj, dict) and 'obj' in obj: obj = obj['obj']
         if not obj: return None
-        
+
+        # Playlist artwork is often exposed via object methods/typed fields;
+        # UUID-to-resources URL synthesis can fail with 403 on some objects.
+        if "Playlist" in type(obj).__name__:
+            scanned = self._scan_image_like_attrs(obj, size=size)
+            if scanned:
+                return scanned
+            pl_id = getattr(obj, "id", None)
+            if pl_id:
+                try:
+                    full_pl = self.session.playlist(pl_id)
+                    scanned_full = self._scan_image_like_attrs(full_pl, size=size)
+                    if scanned_full:
+                        return scanned_full
+                except Exception as e:
+                    logger.debug("Playlist artwork refresh failed for %s: %s", pl_id, e)
+
         uuid = None
 
         # 1. 优先检查 cover_url (LocalAlbum 历史记录对象使用此属性)
@@ -913,7 +1373,7 @@ class TidalBackend:
         # 2. 如果没找到，尝试常规 Tidal 对象的属性 (picture/cover/images)
         if not uuid:
             # 尝试调用方法
-            for attr in ['picture', 'cover']:
+            for attr in ['picture', 'cover', 'image', 'square_image', 'square_picture', 'wide_image']:
                 val = getattr(obj, attr, None)
                 if val and callable(val):
                     try:
@@ -962,37 +1422,6 @@ class TidalBackend:
                     break
         
         # 3. 如果还是没找到，且是单曲，尝试用专辑封面
-        # 3a. 对于 Playlist，部分对象是轻量快照，可能没有实时封面字段。
-        #     按 id 重新拉一次完整对象再尝试取图。
-        if not uuid and "Playlist" in type(obj).__name__:
-            pl_id = getattr(obj, "id", None)
-            if pl_id:
-                try:
-                    full_pl = self.session.playlist(pl_id)
-                    if full_pl:
-                        # 先走通用扫描，避免重复执行整段提取逻辑。
-                        scanned = self._scan_image_like_attrs(full_pl, size=size)
-                        if scanned:
-                            return scanned
-                        for attr in ("picture", "square_picture", "wide_image", "image", "cover"):
-                            val = getattr(full_pl, attr, None)
-                            if callable(val):
-                                for args in ((size, size), (size,), tuple()):
-                                    try:
-                                        out = val(*args)
-                                    except Exception:
-                                        continue
-                                    url = self._coerce_image_ref_to_url(out, size)
-                                    if url:
-                                        return url
-                            else:
-                                url = self._coerce_image_ref_to_url(val, size)
-                                if url:
-                                    return url
-                except Exception as e:
-                    logger.debug("Playlist artwork refresh failed for %s: %s", pl_id, e)
-
-        # 3b. 如果还是没找到，且是单曲，尝试用专辑封面
         if not uuid and hasattr(obj, 'album') and obj.album:
             return self.get_artwork_url(obj.album, size)
 
@@ -1062,7 +1491,7 @@ class TidalBackend:
                     return url
         return None
 
-    def get_artist_artwork_url(self, artist_obj, size=320):
+    def get_artist_artwork_url(self, artist_obj, size=320, local_only=False):
         cache_key = None
         artist_id = getattr(artist_obj, "id", None)
         artist_name_raw = str(getattr(artist_obj, "name", "") or "").strip()
@@ -1122,6 +1551,13 @@ class TidalBackend:
                 chosen_url = u
                 return chosen_url
             artist_id = getattr(artist_obj, "id", None)
+            if bool(local_only):
+                logger.debug(
+                    "Artist artwork local-only mode, skip remote fallback: id=%s name=%r",
+                    artist_id,
+                    artist_name_raw,
+                )
+                return None
             full_artist = None
             if artist_id:
                 full_artist = self.session.artist(artist_id)

@@ -1,12 +1,17 @@
 import gi
+import logging
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Gtk, Adw, Pango
 
 from visualizer import SpectrumVisualizer
+from visualizer_gpu import SpectrumVisualizerGPU
+from visualizer_glarea import SpectrumVisualizerGLArea
 from background_viz import BackgroundVisualizer
 import ui_config
+
+logger = logging.getLogger(__name__)
 
 
 def build_header(app, container):
@@ -74,9 +79,14 @@ def build_header(app, container):
         app.tools_pop.popdown()
         app.on_settings_clicked(_btn)
 
+    def _on_about_clicked(_btn):
+        app.tools_pop.popdown()
+        app.on_about_clicked(_btn)
+
     tools_box.append(_tool_row("hiresti-shortcuts-symbolic", "Keyboard Shortcuts", _on_shortcuts_clicked))
     tools_box.append(_tool_row("hiresti-tech-symbolic", "Signal Path / Tech Info", _on_signal_path_clicked))
     tools_box.append(_tool_row("hiresti-gear-symbolic", "Settings", _on_settings_clicked))
+    tools_box.append(_tool_row("help-about-symbolic", "About", _on_about_clicked))
     app.tools_pop.set_child(tools_box)
     app.tools_btn.connect("clicked", lambda _b: app.tools_pop.popup())
 
@@ -236,7 +246,21 @@ def build_body(app, container):
     app.viz_switcher.set_stack(app.viz_stack)
     app.viz_stack.connect("notify::visible-child-name", app.on_viz_page_changed)
 
-    app.viz = SpectrumVisualizer()
+    try:
+        app.viz = SpectrumVisualizerGLArea()
+        app._viz_backend_key = "gl"
+        logger.info("Visualizer backend selected: GLArea")
+    except Exception as e_gl:
+        logger.warning("GLArea visualizer unavailable, falling back: %s", e_gl)
+        try:
+            app.viz = SpectrumVisualizerGPU()
+            app._viz_backend_key = "gpu"
+            logger.info("Visualizer backend selected: Snapshot GPU fallback")
+        except Exception as e_gpu:
+            logger.warning("Snapshot GPU visualizer unavailable, falling back: %s", e_gpu)
+            app.viz = SpectrumVisualizer()
+            app._viz_backend_key = "cairo"
+            logger.info("Visualizer backend selected: Cairo fallback")
     app.viz.set_num_bars(32)
     app.viz.set_valign(Gtk.Align.FILL)
     app.viz_stack.add_titled(app.viz, "spectrum", "Spectrum")
@@ -247,13 +271,22 @@ def build_body(app, container):
     app.viz_bars_dd.set_valign(Gtk.Align.CENTER)
     app.viz_bars_dd.connect("notify::selected", app.on_viz_bars_changed)
 
+    app.viz_policy_dd = Gtk.DropDown(model=Gtk.StringList.new(app.VIZ_BACKEND_POLICIES))
+    app.viz_policy_dd.add_css_class("viz-theme-dd")
+    app.viz_policy_dd.set_valign(Gtk.Align.CENTER)
+    app.viz_policy_dd.connect("notify::selected", app.on_viz_backend_policy_changed)
+
     app.viz_theme_dd = Gtk.DropDown(model=Gtk.StringList.new(app.viz.get_theme_names()))
     app.viz_theme_dd.add_css_class("viz-theme-dd")
     app.viz_theme_dd.add_css_class("viz-right-last")
     app.viz_theme_dd.set_valign(Gtk.Align.CENTER)
     app.viz_theme_dd.connect("notify::selected", app.on_spectrum_theme_changed)
 
-    app.viz_effect_dd = Gtk.DropDown(model=Gtk.StringList.new(app.viz.get_effect_names()))
+    effect_names = list(app.viz.get_effect_names() or [])
+    if "Dots" not in effect_names:
+        effect_names.append("Dots")
+    logger.info("Visualizer effects available: %s", effect_names)
+    app.viz_effect_dd = Gtk.DropDown(model=Gtk.StringList.new(effect_names))
     app.viz_effect_dd.add_css_class("viz-theme-dd")
     app.viz_effect_dd.set_valign(Gtk.Align.CENTER)
     app.viz_effect_dd.connect("notify::selected", app.on_viz_effect_changed)
@@ -283,6 +316,7 @@ def build_body(app, container):
     right_ctrl_box.set_halign(Gtk.Align.END)
     theme_row.append(right_ctrl_box)
     right_ctrl_box.append(app.viz_bars_dd)
+    right_ctrl_box.append(app.viz_policy_dd)
     right_ctrl_box.append(app.viz_profile_dd)
     right_ctrl_box.append(app.viz_effect_dd)
     right_ctrl_box.append(app.viz_theme_dd)

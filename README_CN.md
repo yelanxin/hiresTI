@@ -54,3 +54,24 @@ sudo dnf install ./hiresti-1.0.0-1.x86_64.rpm
 ## License
 
 GPL-3.0
+
+## 问题排查与日志反馈
+
+如果遇到问题，请优先通过命令行启动并采集日志，然后在 Issue 中反馈：
+
+```bash
+hiresti 2>&1 | tee /tmp/hiresti.log
+```
+
+如果需要 GTK 调试日志：
+
+```bash
+G_MESSAGES_DEBUG=all hiresti 2>&1 | tee /tmp/hiresti-gtk.log
+```
+
+提交 Issue 时建议附带：
+
+- 发行版与桌面环境（例如 Ubuntu 24.04 + KDE）
+- 软件版本号
+- 复现步骤
+- 关键日志片段（或上述完整日志文件）

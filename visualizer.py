@@ -3,6 +3,10 @@ gi.require_version('Gtk', '4.0')
 from gi.repository import Gtk, GLib
 import cairo
 import math
+import logging
+from rust_viz import RustVizCore
+
+logger = logging.getLogger(__name__)
 
 class SpectrumVisualizer(Gtk.DrawingArea):
     """
@@ -15,11 +19,12 @@ class SpectrumVisualizer(Gtk.DrawingArea):
         self.theme_name = "Aurora (Default)"
         self.effect_name = "Dots"
         self.effects = [
+            "Bars",
             "Wave",
             "Fill",
             "Mirror",
             "Dots",
-            "Radial",
+            "Neon",
             "Peak",
             "Trail",
             "Pulse",
@@ -27,7 +32,6 @@ class SpectrumVisualizer(Gtk.DrawingArea):
             "Burst",
             "Stars",
             "Ribbon",
-            "Fall",
             "Spiral",
             "Pro Bars",
             "Pro Line",
@@ -64,6 +68,16 @@ class SpectrumVisualizer(Gtk.DrawingArea):
                 "peak_hold_frames": 6,
                 "peak_fall": 0.03,
                 "beat_mul": 1.24,
+            },
+            "Insane": {
+                "gain_mul": 1.32,
+                "spacing_mul": 0.88,
+                "grid_mul": 1.28,
+                "smooth": 0.62,
+                "trail_decay": 0.84,
+                "peak_hold_frames": 4,
+                "peak_fall": 0.04,
+                "beat_mul": 1.42,
             },
         }
         self.themes = {
@@ -262,6 +276,29 @@ class SpectrumVisualizer(Gtk.DrawingArea):
         self._bass_target = 0.0
         self.bass_level = 0.0
         self.phase = 0.0
+        self._rust_core = RustVizCore()
+        self._logged_rust_path = False
+        self._logged_python_fallback = False
+        self._logged_rust_bins = False
+        self._logged_python_bins = False
+        self._logged_rust_spiral = False
+        self._logged_python_spiral = False
+        self._logged_rust_neon = False
+        self._logged_python_neon = False
+        self._logged_rust_neon_rings = False
+        self._logged_python_neon_rings = False
+        self._logged_rust_line = False
+        self._logged_python_line = False
+        self._logged_rust_fall = False
+        self._logged_python_fall = False
+        self._logged_rust_pro_fall = False
+        self._logged_python_pro_fall = False
+        self._logged_rust_pro_fall_img = False
+        self._logged_python_pro_fall_img = False
+        self._logged_rust_fall_img = False
+        self._logged_python_fall_img = False
+        self._logged_rust_dots_img = False
+        self._logged_python_dots_img = False
         
         # 启动动画循环 (约 60fps)
         GLib.timeout_add(16, self._on_animation_tick)
@@ -312,40 +349,35 @@ class SpectrumVisualizer(Gtk.DrawingArea):
         
         # 1. 强制转列表并反转 (解决高频在左的问题)
         magnitudes = list(magnitudes)
-        
-        # [调试诊断] 打印当前的最大音量值
-        # 如果终端里一直打印 -60 左右，说明数据正常，只是声音小
-        # 如果什么都不打印，说明数据传输断了 (audio_player.py 有问题)
-        peak = max(magnitudes)
-        # print(f"DEBUG: Peak dB = {peak:.2f}") # 如果需要调试可以取消这行的注释
-
-        new_heights = []
         actual_count = min(len(magnitudes), self.num_bars)
-
-        # 2. [宽容模式] 
-        # 将底线设为 -90dB，确保 -60dB 的声音也能显示出来
-        db_min = -60.0
-        db_range = 60.0 # 范围 -90 到 0
-
-        for i in range(actual_count):
-            val = magnitudes[i]
-            
-            # 3. 简单暴力的映射逻辑
-            if val <= db_min:
-                h = 0.0
-            else:
-                # 公式：(当前值 + 90) / 90
-                # 如果 val 是 -60，结果就是 30/90 = 0.33 (能看见！)
-                h = (val - db_min) / db_range
-            
-            # 4. 视觉优化
-            # 次方越小(0.6)，小声音显示得越高
-            h = math.pow(max(0.0, h), 1) 
-            
-            new_heights.append(max(0.0, min(1.0, h)))
-
-        while len(new_heights) < self.num_bars:
-            new_heights.append(0.0)
+        new_heights = None
+        if self._rust_core.available:
+            if not self._logged_rust_path:
+                logger.info("Spectrum preprocessing path: Rust")
+                self._logged_rust_path = True
+            new_heights = self._rust_core.process_spectrum(
+                magnitudes,
+                self.num_bars,
+                db_min=-60.0,
+                db_range=60.0,
+            )
+        if new_heights is None:
+            if not self._logged_python_fallback:
+                logger.info("Spectrum preprocessing path: Python fallback")
+                self._logged_python_fallback = True
+            new_heights = []
+            db_min = -60.0
+            db_range = 60.0
+            for i in range(actual_count):
+                val = magnitudes[i]
+                if val <= db_min:
+                    h = 0.0
+                else:
+                    h = (val - db_min) / db_range
+                h = math.pow(max(0.0, h), 1)
+                new_heights.append(max(0.0, min(1.0, h)))
+            while len(new_heights) < self.num_bars:
+                new_heights.append(0.0)
 
         self.target_heights = new_heights
         bass_count = max(1, min(actual_count, self.num_bars // 8))
@@ -400,7 +432,9 @@ class SpectrumVisualizer(Gtk.DrawingArea):
         gradient = self._make_gradient(height, theme)
 
         effect = self.effect_name
-        if effect == "Wave":
+        if effect == "Bars":
+            self._draw_bars(cr, width, height, gain, gradient, bar_w, spacing)
+        elif effect == "Wave":
             self._draw_wave_line(cr, width, height, gain, gradient, filled=False)
         elif effect == "Fill":
             self._draw_wave_line(cr, width, height, gain, gradient, filled=True)
@@ -408,8 +442,8 @@ class SpectrumVisualizer(Gtk.DrawingArea):
             self._draw_mirror_bars(cr, width, height, gain, gradient, bar_w, spacing)
         elif effect == "Dots":
             self._draw_dot_matrix(cr, width, height, gain, bar_w, spacing, theme["gradient"])
-        elif effect == "Radial":
-            self._draw_radial(cr, width, height, gain, theme)
+        elif effect == "Neon":
+            self._draw_neon_tunnel(cr, width, height, gain, theme["gradient"])
         elif effect == "Peak":
             self._draw_bars(cr, width, height, gain, gradient, bar_w, spacing)
             self._draw_peak_caps(cr, width, height, gain, bar_w, spacing)
@@ -427,8 +461,6 @@ class SpectrumVisualizer(Gtk.DrawingArea):
             self._draw_starscape(cr, width, height, gain, theme["gradient"])
         elif effect == "Ribbon":
             self._draw_ribbon(cr, width, height, gain, theme["gradient"])
-        elif effect == "Fall":
-            self._draw_waterfall(cr, width, height, gain, theme["gradient"])
         elif effect == "Spiral":
             self._draw_spiral(cr, width, height, gain, theme["gradient"])
         elif effect == "Pro Bars":
@@ -527,6 +559,10 @@ class SpectrumVisualizer(Gtk.DrawingArea):
             cr.fill()
 
     def _draw_dot_matrix(self, cr, width, height, gain, bar_w, spacing, grad):
+        n = self.num_bars
+        if n <= 0:
+            return
+        # Keep Dots on classic Cairo path: lower CPU than full-frame image synthesis.
         dot_h = 4.0
         gap = 3.0
         for i in range(self.num_bars):
@@ -564,6 +600,234 @@ class SpectrumVisualizer(Gtk.DrawingArea):
             r, g, b, a = self._color_from_gradient(grad, i / float(max(1, n - 1)))
             cr.set_source_rgba(r, g, b, a)
             cr.set_line_width(2.0)
+            cr.move_to(x1, y1)
+            cr.line_to(x2, y2)
+            cr.stroke()
+
+    def _draw_neon_tunnel(self, cr, width, height, gain, grad):
+        n = self.num_bars
+        if n <= 0:
+            return
+        curve_mul = {
+            "Soft": 0.70,
+            "Dynamic": 1.00,
+            "Extreme": 1.38,
+        }.get(self.profile_name, 1.00)
+        cx = width * 0.5
+        cy = height * 0.54
+        bass = max(0.0, min(1.0, self.bass_level * 1.25))
+        size = min(width, height)
+        full_span = math.hypot(width, height)
+
+        # Subtle vignette for the classic neon tunnel contrast.
+        bg = cairo.RadialGradient(cx, cy, size * 0.08, cx, cy, full_span * 0.72)
+        c0 = self._color_from_gradient(grad, 0.72)
+        c1 = self._color_from_gradient(grad, 0.95)
+        bg.add_color_stop_rgba(0.0, c0[0] * 0.10, c0[1] * 0.08, c0[2] * 0.14, 0.22)
+        bg.add_color_stop_rgba(1.0, c1[0] * 0.02, c1[1] * 0.02, c1[2] * 0.03, 0.0)
+        cr.set_source(bg)
+        cr.rectangle(0, 0, width, height)
+        cr.fill()
+
+        # Fluid "paint-mix" streams converging towards the tunnel center.
+        flow_layers = 8
+        outer_r = full_span * 0.60
+        inner_r = size * 0.06
+        seg_n = 64
+        for li in range(flow_layers):
+            t = li / float(max(1, flow_layers - 1))
+            c = self._color_from_gradient(grad, (0.12 + (0.78 * t)) % 1.0)
+            alpha = 0.040 + (0.050 * (1.0 - t)) + (0.020 * bass)
+            base_ang = (li * (2.0 * math.pi / flow_layers)) + (self.phase * 0.10)
+            lane_w = (0.22 + (0.08 * math.sin((self.phase * 0.35) + li))) * (1.0 - (0.25 * t)) * (0.90 + (0.35 * curve_mul))
+            phase1 = (self.phase * (0.62 + (0.06 * li))) + (li * 1.17)
+            phase2 = (self.phase * (0.47 + (0.05 * li))) - (li * 0.83)
+
+            cr.new_path()
+            for si in range(seg_n + 1):
+                s = si / float(seg_n)
+                r = outer_r - ((outer_r - inner_r) * (s ** 1.10))
+                twist = (
+                    (1.55 * (1.0 - s))
+                    + (0.42 * math.sin((s * 8.0) + phase1))
+                    + (0.18 * math.sin((s * 17.0) + phase2))
+                ) * curve_mul
+                ang_center = base_ang + twist
+                spread = lane_w * (0.32 + (0.68 * (1.0 - s)))
+                ang = ang_center - spread
+                x = cx + (math.cos(ang) * r)
+                y = cy + (math.sin(ang) * r)
+                if si == 0:
+                    cr.move_to(x, y)
+                else:
+                    cr.line_to(x, y)
+            for si in range(seg_n, -1, -1):
+                s = si / float(seg_n)
+                r = outer_r - ((outer_r - inner_r) * (s ** 1.10))
+                twist = (
+                    (1.55 * (1.0 - s))
+                    + (0.42 * math.sin((s * 8.0) + phase1))
+                    + (0.18 * math.sin((s * 17.0) + phase2))
+                ) * curve_mul
+                ang_center = base_ang + twist
+                spread = lane_w * (0.32 + (0.68 * (1.0 - s)))
+                ang = ang_center + spread
+                x = cx + (math.cos(ang) * r)
+                y = cy + (math.sin(ang) * r)
+                cr.line_to(x, y)
+            cr.close_path()
+            cr.set_source_rgba(c[0], c[1], c[2], alpha)
+            cr.fill()
+
+        # Tunnel rings.
+        ring_count = max(6, int(self.num_bars))
+        base = size * 0.04
+        depth_span = full_span * 0.62
+        drift = self.phase * 0.85
+        ring_points = None
+        if self._rust_core.available:
+            ring_points = self._rust_core.build_neon_ring_points(
+                ring_count=ring_count,
+                width=float(width),
+                height=float(height),
+                phase=float(self.phase),
+                bass=float(bass * curve_mul),
+                seg_n=180,
+            )
+            if ring_points is not None and not self._logged_rust_neon_rings:
+                logger.info("Neon ring-generation path: Rust")
+                self._logged_rust_neon_rings = True
+        if ring_points:
+            cr.set_line_join(cairo.LineJoin.ROUND)
+            cr.set_line_cap(cairo.LineCap.ROUND)
+            open_path = False
+            cur_style = None
+            for px, py, alpha, lw, color_t, start_flag in ring_points:
+                style = (alpha, lw, color_t)
+                if start_flag >= 0.5:
+                    if open_path:
+                        cr.close_path()
+                        cr.stroke()
+                    col = self._color_from_gradient(grad, color_t)
+                    cr.set_source_rgba(col[0], col[1], col[2], min(0.68, alpha))
+                    cr.set_line_width(lw)
+                    cr.new_path()
+                    cr.move_to(px, py)
+                    open_path = True
+                    cur_style = style
+                else:
+                    if not open_path:
+                        col = self._color_from_gradient(grad, color_t)
+                        cr.set_source_rgba(col[0], col[1], col[2], min(0.68, alpha))
+                        cr.set_line_width(lw)
+                        cr.new_path()
+                        cr.move_to(px, py)
+                        open_path = True
+                        cur_style = style
+                    elif style != cur_style:
+                        cr.close_path()
+                        cr.stroke()
+                        col = self._color_from_gradient(grad, color_t)
+                        cr.set_source_rgba(col[0], col[1], col[2], min(0.68, alpha))
+                        cr.set_line_width(lw)
+                        cr.new_path()
+                        cr.move_to(px, py)
+                        cur_style = style
+                    else:
+                        cr.line_to(px, py)
+            if open_path:
+                cr.close_path()
+                cr.stroke()
+        else:
+            if not self._logged_python_neon_rings:
+                logger.info("Neon ring-generation path: Python fallback")
+                self._logged_python_neon_rings = True
+            for ri in range(ring_count):
+                z = ((ri / float(ring_count)) + (drift * 0.10)) % 1.0
+                radius = base + ((1.0 - z) ** 1.65) * depth_span
+                t = 1.0 - z
+                col = self._color_from_gradient(grad, 0.05 + (0.90 * t))
+                alpha = 0.10 + (0.42 * (t ** 1.8)) + (0.10 * bass * t)
+                lw = 0.8 + (2.6 * (t ** 1.4))
+                cr.set_source_rgba(col[0], col[1], col[2], min(0.68, alpha))
+                cr.set_line_width(lw)
+                cr.set_line_join(cairo.LineJoin.ROUND)
+                cr.set_line_cap(cairo.LineCap.ROUND)
+                seg_n = 180
+                warp_amp = (10.0 + (42.0 * t)) * (1.0 + (1.10 * bass)) * curve_mul
+                f1 = 2.6 + (2.8 * t)
+                f2 = 6.4 + (4.4 * (1.0 - t))
+                phase = (self.phase * (1.2 + (0.25 * t))) + (ri * 0.19)
+                start_a = (
+                    (ri * 2.399963229728653)
+                    + (self.phase * 0.17)
+                    + (t * 1.1)
+                ) % (2.0 * math.pi)
+                cr.new_path()
+                for si in range(seg_n):
+                    a = start_a + ((2.0 * math.pi) * (si / float(seg_n)))
+                    wobble_raw = (
+                        math.sin((a * f1) + phase) * warp_amp
+                        + math.sin((a * f2) - (phase * 1.35)) * (warp_amp * 0.72)
+                    )
+                    wobble = max(-radius * 0.34, min(radius * 0.34, wobble_raw))
+                    rr = max(2.0, radius + wobble)
+                    px = cx + (math.cos(a) * rr)
+                    py = cy + (math.sin(a) * rr)
+                    if si == 0:
+                        cr.move_to(px, py)
+                    else:
+                        cr.line_to(px, py)
+                cr.close_path()
+                cr.stroke()
+
+        # Beat pulse in tunnel center.
+        if bass > 0.03:
+            pr = base * (1.2 + (2.8 * bass))
+            pulse = cairo.RadialGradient(cx, cy, pr * 0.25, cx, cy, pr)
+            hot = self._color_from_gradient(grad, 0.18)
+            pulse.add_color_stop_rgba(0.0, hot[0], hot[1], hot[2], 0.42 * bass)
+            pulse.add_color_stop_rgba(1.0, hot[0], hot[1], hot[2], 0.0)
+            cr.set_source(pulse)
+            cr.arc(cx, cy, pr, 0, 2 * math.pi)
+            cr.fill()
+
+        # Radial spokes driven by spectrum bins.
+        spokes = None
+        if self._rust_core.available:
+            spokes = self._rust_core.build_neon_spokes(
+                bins=self.current_heights,
+                width=float(width),
+                height=float(height),
+                phase=float(self.phase),
+                gain=float(gain),
+                max_points=max(64, n),
+            )
+            if spokes is not None and not self._logged_rust_neon:
+                logger.info("Neon spoke-generation path: Rust")
+                self._logged_rust_neon = True
+        if spokes is None:
+            if not self._logged_python_neon:
+                logger.info("Neon spoke-generation path: Python fallback")
+                self._logged_python_neon = True
+            max_len = full_span * 0.62
+            spokes = []
+            for i in range(n):
+                lvl = max(0.0, min(self.current_heights[i] * gain, 1.0))
+                if lvl < 0.02:
+                    continue
+                angle = ((2.0 * math.pi) * (i / float(n))) + (self.phase * 0.30)
+                ln = (size * 0.06) + (lvl * max_len)
+                x2 = cx + math.cos(angle) * ln
+                y2 = cy + math.sin(angle) * ln
+                tt = i / float(max(1, n - 1))
+                spokes.append((cx, cy, x2, y2, lvl, tt))
+
+        for x1, y1, x2, y2, lvl, tt in spokes:
+            col = self._color_from_gradient(grad, tt)
+            a = min(0.95, 0.20 + (0.78 * lvl))
+            cr.set_source_rgba(col[0], col[1], col[2], a)
+            cr.set_line_width(1.0 + (1.6 * lvl))
             cr.move_to(x1, y1)
             cr.line_to(x2, y2)
             cr.stroke()
@@ -828,48 +1092,187 @@ class SpectrumVisualizer(Gtk.DrawingArea):
         bar_w = max(1.0, (width - (n - 1) * spacing) / n)
         step_y = 4.0
         layers = int(max(8, min(36, height // step_y)))
-        for l in range(layers):
-            fade = 1.0 - (l / float(max(1, layers - 1)))
-            y_off = l * step_y
-            for i in range(n):
-                lvl = max(0.0, min(self.current_heights[i] * gain, 1.0))
-                if lvl < 0.01:
-                    continue
-                active = lvl * height
-                if y_off > active:
-                    continue
-                x = i * (bar_w + spacing)
-                y = height - y_off - 2.0
-                if y < 0:
-                    continue
-                r, g, b, a = self._color_from_gradient(grad, i / float(max(1, n - 1)))
-                cr.set_source_rgba(r, g, b, max(0.05, a * 0.55 * fade))
-                cr.rectangle(x, y, bar_w, 2.0)
-                cr.fill()
+
+        # Rust fast path: generate full RGBA frame, then single Cairo paint.
+        if self._rust_core.available:
+            bar_colors = [self._color_from_gradient(grad, i / float(max(1, n - 1))) for i in range(n)]
+            rgba_pack = self._rust_core.build_fall_rgba(
+                levels=self.current_heights,
+                gain=float(gain),
+                height_px=int(max(1, height)),
+                step_y_px=int(step_y),
+                thickness_px=2,
+                bar_colors_rgba=bar_colors,
+            )
+            if rgba_pack is not None:
+                if not self._logged_rust_fall_img:
+                    logger.info("Fall image-generation path: Rust")
+                    self._logged_rust_fall_img = True
+                rgba_bytes, img_w, img_h = rgba_pack
+                stride = img_w * 4
+                try:
+                    surf = cairo.ImageSurface.create_for_data(
+                        rgba_bytes,
+                        cairo.FORMAT_ARGB32,
+                        img_w,
+                        img_h,
+                        stride,
+                    )
+                    cr.save()
+                    cr.scale(width / float(max(1, img_w)), 1.0)
+                    cr.set_source_surface(surf, 0.0, 0.0)
+                    src = cr.get_source()
+                    try:
+                        src.set_filter(cairo.FILTER_NEAREST)
+                    except Exception:
+                        pass
+                    cr.paint()
+                    cr.restore()
+                    return
+                except Exception:
+                    pass
+        if not self._logged_python_fall_img:
+            logger.info("Fall image-generation path: Python fallback")
+            self._logged_python_fall_img = True
+
+        cells = None
+        if self._rust_core.available:
+            cells = self._rust_core.build_fall_cells(
+                levels=self.current_heights,
+                gain=float(gain),
+                height=float(height),
+                step_y=float(step_y),
+                layers=int(layers),
+            )
+            if cells is not None and not self._logged_rust_fall:
+                logger.info("Fall cell-generation path: Rust")
+                self._logged_rust_fall = True
+        if cells is None:
+            if not self._logged_python_fall:
+                logger.info("Fall cell-generation path: Python fallback")
+                self._logged_python_fall = True
+            cells = []
+            for l in range(layers):
+                fade = 1.0 - (l / float(max(1, layers - 1)))
+                y_off = l * step_y
+                for i in range(n):
+                    lvl = max(0.0, min(self.current_heights[i] * gain, 1.0))
+                    if lvl < 0.01:
+                        continue
+                    active = lvl * height
+                    if y_off > active:
+                        continue
+                    y = height - y_off - 2.0
+                    if y < 0:
+                        continue
+                    cells.append((i, y, fade))
+
+        for i, y, fade in cells:
+            if i < 0 or i >= n:
+                continue
+            x = i * (bar_w + spacing)
+            r, g, b, a = self._color_from_gradient(grad, i / float(max(1, n - 1)))
+            cr.set_source_rgba(r, g, b, max(0.05, a * 0.55 * fade))
+            cr.rectangle(x, y, bar_w, 2.0)
+            cr.fill()
 
     def _draw_spiral(self, cr, width, height, gain, grad):
-        n = self.num_bars
+        if self.num_bars <= 0:
+            return
+        bins = self._build_log_bins(self.current_heights, 64)
+        n = len(bins)
         if n <= 0:
             return
-        cx, cy = width * 0.5, height * 0.56
-        base = min(width, height) * 0.08
-        span = min(width, height) * 0.42
-        for i in range(n):
-            lvl = max(0.0, min(self.current_heights[i] * gain, 1.0))
-            if lvl < 0.01:
-                continue
-            t = i / float(max(1, n - 1))
-            angle = (self.phase * 1.2) + (t * 7.2 * math.pi)
-            radius = base + (t * span * (0.35 + (lvl * 0.75)))
-            x = cx + math.cos(angle) * radius
-            y = cy + math.sin(angle) * radius
+        cx, cy = width * 0.5, height * 0.54
+        full_span = math.hypot(width, height)
+        points = None
+        if self._rust_core.available:
+            points = self._rust_core.build_spiral_points(
+                bins=bins,
+                width=float(width),
+                height=float(height),
+                phase=float(self.phase),
+                gain=float(gain),
+                max_points=240,
+            )
+            if points is not None and not self._logged_rust_spiral:
+                logger.info("Spiral point-generation path: Rust")
+                self._logged_rust_spiral = True
+        if points is None:
+            if not self._logged_python_spiral:
+                logger.info("Spiral point-generation path: Python fallback")
+                self._logged_python_spiral = True
+            base = min(width, height) * 0.015
+            span = full_span * 0.52
+            sample_n = 240
+            max_bin = max(0.001, max(bins))
+            points = []
+            for si in range(sample_n):
+                t = si / float(max(1, sample_n - 1))
+                src = min(n - 1, int(t * n))
+                raw = max(0.0, min(bins[src] * gain, 1.0))
+                lvl = max(0.0, min(raw / max_bin, 1.0))
+                if lvl < 0.004:
+                    continue
+                angle = (self.phase * 1.2) + (t * 14.0 * math.pi)
+                radius = base + (t * span * (0.42 + (lvl * 0.72)))
+                x = cx + math.cos(angle) * radius
+                y = cy + math.sin(angle) * radius
+                points.append((x, y, lvl, t))
+
+        # Paint-mix swirl background rotating with the spiral.
+        swirl_layers = 6
+        seg_n = 96
+        outer_r = full_span * 0.42
+        inner_r = min(width, height) * 0.05
+        for li in range(swirl_layers):
+            lt = li / float(max(1, swirl_layers - 1))
+            col = self._color_from_gradient(grad, (0.12 + (0.76 * lt)) % 1.0)
+            alpha = 0.03 + (0.045 * (1.0 - lt))
+            phase = (self.phase * (0.58 + (0.08 * li))) + (li * 1.03)
+            lane = 0.18 + (0.08 * (1.0 - lt))
+            cr.new_path()
+            for si in range(seg_n + 1):
+                s = si / float(seg_n)
+                r = outer_r - ((outer_r - inner_r) * (s ** 1.08))
+                ang_c = phase + (s * (8.4 + (2.2 * lt))) + (math.sin((s * 12.0) + phase) * 0.28)
+                spread = lane * (0.32 + (0.68 * (1.0 - s)))
+                a = ang_c - spread
+                x = cx + (math.cos(a) * r)
+                y = cy + (math.sin(a) * r)
+                if si == 0:
+                    cr.move_to(x, y)
+                else:
+                    cr.line_to(x, y)
+            for si in range(seg_n, -1, -1):
+                s = si / float(seg_n)
+                r = outer_r - ((outer_r - inner_r) * (s ** 1.08))
+                ang_c = phase + (s * (8.4 + (2.2 * lt))) + (math.sin((s * 12.0) + phase) * 0.28)
+                spread = lane * (0.32 + (0.68 * (1.0 - s)))
+                a = ang_c + spread
+                cr.line_to(cx + (math.cos(a) * r), cy + (math.sin(a) * r))
+            cr.close_path()
+            cr.set_source_rgba(col[0], col[1], col[2], alpha)
+            cr.fill()
+
+        for x, y, lvl, t in points:
             r, g, b, a = self._color_from_gradient(grad, t)
-            dot = 1.2 + (lvl * 2.8)
-            cr.set_source_rgba(r, g, b, max(0.14, a * 0.82))
+            dot = 0.8 + (lvl * 2.0)
+            cr.set_source_rgba(r, g, b, max(0.11, a * 0.70))
             cr.arc(x, y, dot, 0, 2 * math.pi)
             cr.fill()
 
     def _build_log_bins(self, values, out_count):
+        if self._rust_core.available:
+            out = self._rust_core.build_log_bins(values, out_count)
+            if out is not None:
+                if not self._logged_rust_bins:
+                    logger.info("Log-bin preprocessing path: Rust")
+                    self._logged_rust_bins = True
+                return out
+        if not self._logged_python_bins:
+            logger.info("Log-bin preprocessing path: Python fallback")
+            self._logged_python_bins = True
         in_count = len(values)
         if in_count <= 0 or out_count <= 0:
             return []
@@ -954,13 +1357,28 @@ class SpectrumVisualizer(Gtk.DrawingArea):
         n = len(bins)
         if n <= 1:
             return
-        step_x = width / float(max(1, n - 1))
-        points = []
-        for i in range(n):
-            lvl = max(0.0, min(bins[i] * gain, 1.0))
-            x = i * step_x
-            y = height - (lvl * height)
-            points.append((x, y))
+        points = None
+        if self._rust_core.available:
+            points = self._rust_core.build_line_points(
+                bins=bins,
+                width=float(width),
+                height=float(height),
+                gain=float(gain),
+            )
+            if points is not None and not self._logged_rust_line:
+                logger.info("Pro Line point-generation path: Rust")
+                self._logged_rust_line = True
+        if points is None:
+            if not self._logged_python_line:
+                logger.info("Pro Line point-generation path: Python fallback")
+                self._logged_python_line = True
+            step_x = width / float(max(1, n - 1))
+            points = []
+            for i in range(n):
+                lvl = max(0.0, min(bins[i] * gain, 1.0))
+                x = i * step_x
+                y = height - (lvl * height)
+                points.append((x, y))
 
         fill_grad = cairo.LinearGradient(0, 0, 0, height)
         c0 = self._color_from_gradient(grad, 0.20)
@@ -1005,14 +1423,63 @@ class SpectrumVisualizer(Gtk.DrawingArea):
         # Palette LUT to avoid repeated gradient interpolation per cell.
         palette_n = 96
         palette = [self._color_from_gradient(grad, i / float(palette_n - 1)) for i in range(palette_n)]
+
+        # Rust fast path: generate full RGBA frame, then single Cairo paint.
+        if self._rust_core.available:
+            rgba_pack = self._rust_core.build_pro_fall_rgba(frames, float(gain), palette)
+            if rgba_pack is not None:
+                if not self._logged_rust_pro_fall_img:
+                    logger.info("Pro Fall image-generation path: Rust")
+                    self._logged_rust_pro_fall_img = True
+                rgba_bytes, img_w, img_h = rgba_pack
+                stride = img_w * 4
+                try:
+                    surf = cairo.ImageSurface.create_for_data(
+                        rgba_bytes,
+                        cairo.FORMAT_ARGB32,
+                        img_w,
+                        img_h,
+                        stride,
+                    )
+                    cr.save()
+                    cr.scale(width / float(max(1, img_w)), height / float(max(1, img_h)))
+                    cr.set_source_surface(surf, 0.0, 0.0)
+                    src = cr.get_source()
+                    try:
+                        src.set_filter(cairo.FILTER_BILINEAR)
+                    except Exception:
+                        pass
+                    cr.paint()
+                    cr.restore()
+                    return
+                except Exception:
+                    # Fall through to Python path.
+                    pass
+
+        if not self._logged_python_pro_fall_img:
+            logger.info("Pro Fall image-generation path: Python fallback")
+            self._logged_python_pro_fall_img = True
         for c, bins in enumerate(reversed(frames)):
             x = width - ((c + 1) * step_x)
             age = 1.0 - (c / float(max(1, cols)))
             age = pow(max(0.0, age), 1.25)
-            for r, raw in enumerate(bins):
-                lvl = max(0.0, min(raw * gain, 1.0))
-                if lvl < 0.008:
-                    continue
+            active_rows = None
+            if self._rust_core.available:
+                active_rows = self._rust_core.build_pro_fall_column(bins, float(gain))
+                if active_rows is not None and not self._logged_rust_pro_fall:
+                    logger.info("Pro Fall column-generation path: Rust")
+                    self._logged_rust_pro_fall = True
+            if active_rows is None:
+                if not self._logged_python_pro_fall:
+                    logger.info("Pro Fall column-generation path: Python fallback")
+                    self._logged_python_pro_fall = True
+                active_rows = []
+                for r, raw in enumerate(bins):
+                    lvl = max(0.0, min(raw * gain, 1.0))
+                    if lvl < 0.008:
+                        continue
+                    active_rows.append((r, lvl))
+            for r, lvl in active_rows:
                 y = height - ((r + 1) * cell_h)
                 idx = int(pow(lvl, 0.86) * (palette_n - 1))
                 rr, gg, bb, aa = palette[idx]

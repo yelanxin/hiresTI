@@ -99,6 +99,8 @@ def on_nav_selected(app, box, row):
         app.grid_title_label.set_text("Playlists")
         if hasattr(app, "grid_subtitle_label") and app.grid_subtitle_label is not None:
             app.grid_subtitle_label.set_text("Create and manage your own playlists")
+        app.current_playlist_folder = None
+        app.current_playlist_folder_stack = []
         app.render_playlists_home()
         return
 
@@ -183,19 +185,42 @@ def on_artist_clicked(app, artist):
 
 
 def on_back_clicked(app, btn):
-    row = app.nav_list.get_selected_row()
-    if (
-        row
-        and hasattr(row, "nav_id")
-        and row.nav_id == "playlists"
-        and getattr(app, "current_playlist_id", None)
-    ):
+    # Highest priority: when currently inside playlist detail, always go back to playlist list.
+    if getattr(app, "current_remote_playlist", None) is not None:
+        app.current_remote_playlist = None
+        app.render_playlists_home()
+        btn.set_sensitive(bool(getattr(app, "current_playlist_folder_stack", []) or []))
+        return
+
+    if getattr(app, "current_playlist_id", None):
         app.current_playlist_id = None
         app.playlist_edit_mode = False
         app.playlist_rename_mode = False
         app.render_playlists_home()
-        btn.set_sensitive(False)
+        btn.set_sensitive(bool(getattr(app, "current_playlist_folder_stack", []) or []))
         return
+
+    row = app.nav_list.get_selected_row()
+    # Fallback: if we're in playlists nav and currently on tracks detail view,
+    # always return to playlists list even when detail state fields were lost.
+    if row and hasattr(row, "nav_id") and row.nav_id == "playlists":
+        if getattr(app.right_stack, "get_visible_child_name", None):
+            if app.right_stack.get_visible_child_name() == "tracks":
+                app.current_remote_playlist = None
+                app.current_playlist_id = None
+                app.playlist_edit_mode = False
+                app.playlist_rename_mode = False
+                app.render_playlists_home()
+                btn.set_sensitive(bool(getattr(app, "current_playlist_folder_stack", []) or []))
+                return
+
+    if row and hasattr(row, "nav_id") and row.nav_id == "playlists":
+        # In playlists list view: navigate folder hierarchy upwards.
+        folder_stack = list(getattr(app, "current_playlist_folder_stack", []) or [])
+        if folder_stack:
+            app.on_playlist_folder_up_clicked()
+            btn.set_sensitive(bool(getattr(app, "current_playlist_folder_stack", []) or []))
+            return
 
     if app.nav_history:
         target_view = app.nav_history.pop()

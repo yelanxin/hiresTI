@@ -52,6 +52,11 @@ class AudioPlayer:
         self._viz_start_guard_until = 0.0
         self._viz_epoch = 0
         self._viz_debug_last_ts = 0.0
+        self.spectrum_enabled = False
+        self._spectrum_bands_active = 64
+        self._spectrum_bands_idle = 16
+        self._spectrum_interval_active_ns = 33000000
+        self._spectrum_interval_idle_ns = 220000000
 
         # 声卡与独占模式管理变量
         self.borrowed_pa_card = None
@@ -108,14 +113,15 @@ class AudioPlayer:
             return
 
         # 2. 现在才能配置属性
-        self.spectrum.set_property("bands", 128)
-        
-        # Keep stable sync cadence; visual punch is handled in BackgroundVisualizer.
-        self.spectrum.set_property("interval", 30000000)
+        # Keep these runtime-stable to avoid native race/crash in some stacks.
+        self.spectrum.set_property("bands", int(self._spectrum_bands_active))
+        self.spectrum.set_property("interval", int(self._spectrum_interval_active_ns))
         
         spec_props = [p.name for p in self.spectrum.list_properties()]
-        if 'message' in spec_props: self.spectrum.set_property("message", True)
-        elif 'post-messages' in spec_props: self.spectrum.set_property("post-messages", True)
+        if 'message' in spec_props:
+            self.spectrum.set_property("message", bool(self.spectrum_enabled))
+        elif 'post-messages' in spec_props:
+            self.spectrum.set_property("post-messages", bool(self.spectrum_enabled))
 
         # 3. 构建并链接 Bin
         self.filter_bin = Gst.Bin.new("filter_bin")
@@ -130,6 +136,23 @@ class AudioPlayer:
             self.filter_bin.add_pad(Gst.GhostPad.new("sink", sink_pad))
             self.filter_bin.add_pad(Gst.GhostPad.new("src", src_pad))
             self.pipeline.set_property("audio-filter", self.filter_bin)
+
+    def set_spectrum_enabled(self, enabled):
+        enabled = bool(enabled)
+        self.spectrum_enabled = enabled
+        if not hasattr(self, "spectrum") or self.spectrum is None:
+            return
+        try:
+            # Runtime mutation of spectrum caps/timing can race with the streaming thread
+            # on some stacks (observed native SIGSEGV in gobject/gstreamer path).
+            # Keep bands/interval stable after setup; only toggle message emission.
+            spec_props = [p.name for p in self.spectrum.list_properties()]
+            if "message" in spec_props:
+                self.spectrum.set_property("message", enabled)
+            elif "post-messages" in spec_props:
+                self.spectrum.set_property("post-messages", enabled)
+        except Exception as e:
+            logger.debug("Failed to toggle spectrum messages: %s", e)
 
     def set_alsa_latency(self, buffer_ms, latency_ms):
         self.alsa_buffer_time = int(buffer_ms * 1000)   # 毫秒转微秒
@@ -610,20 +633,12 @@ class AudioPlayer:
         return Gst.PadProbeReturn.OK
 
     def _on_bus_message(self, bus, msg):
+        if not self.spectrum_enabled:
+            return
         if msg.type == Gst.MessageType.ELEMENT:
             s = msg.get_structure()
             if s and s.get_name() == "spectrum":
-                magnitudes = []
-                try:
-                    s_str = s.to_string()
-                    import re
-                    match = re.search(r'magnitude=.*?[\{<]\s*(.*?)\s*[\}>]', s_str)
-                    
-                    if match:
-                        raw_data = match.group(1) 
-                        magnitudes = [float(x.strip()) for x in raw_data.split(', ') if x.strip()]
-                except Exception as e:
-                    logger.debug("Failed to parse spectrum message: %s", e)
+                magnitudes = self._extract_spectrum_magnitudes(s)
 
                 if magnitudes and self.on_spectrum_callback:
                     epoch = self._viz_epoch
@@ -640,6 +655,44 @@ class AudioPlayer:
                         GLib.idle_add(self._dispatch_spectrum, magnitudes, pos_s, epoch)
                     else:
                         GLib.timeout_add(delay_ms, self._dispatch_spectrum, magnitudes, pos_s, epoch)
+
+    def _extract_spectrum_magnitudes(self, s):
+        """Parse spectrum magnitude list with low overhead."""
+        if not s:
+            return []
+        try:
+            if not s.has_field("magnitude"):
+                return []
+            raw = s.get_value("magnitude")
+            if raw is None:
+                return []
+
+            # Common fast paths first.
+            if isinstance(raw, (list, tuple)):
+                return [float(v) for v in raw]
+            if hasattr(raw, "__iter__"):
+                return [float(v) for v in raw]
+
+            # Some bindings expose a boxed value array; try index access.
+            out = []
+            if hasattr(raw, "__len__") and hasattr(raw, "__getitem__"):
+                for i in range(len(raw)):
+                    out.append(float(raw[i]))
+                if out:
+                    return out
+        except Exception:
+            pass
+
+        # Last resort compatibility path for uncommon GI representations.
+        try:
+            s_str = s.to_string()
+            m = re.search(r"magnitude=.*?[\{<]\s*(.*?)\s*[\}>]", s_str)
+            if not m:
+                return []
+            raw_data = m.group(1)
+            return [float(x.strip()) for x in raw_data.split(", ") if x.strip()]
+        except Exception:
+            return []
 
     def _extract_spectrum_message_pos_s(self, s):
         """Try to extract the spectrum frame time (seconds) from message structure."""
