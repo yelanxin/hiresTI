@@ -907,6 +907,16 @@ def show_album_details(app, alb):
     utils.load_img(app.header_art, lambda: app.backend.get_artwork_url(alb, 640), app.cache_dir, 160)
     is_fav = app.backend.is_favorite(getattr(alb, "id", ""))
     app._update_fav_icon(app.fav_btn, is_fav)
+    if app.remote_playlist_edit_btn is not None:
+        app.remote_playlist_edit_btn.set_visible(False)
+    if getattr(app, "remote_playlist_visibility_btn", None) is not None:
+        app.remote_playlist_visibility_btn.set_visible(False)
+    if app.remote_playlist_more_btn is not None:
+        app.remote_playlist_more_btn.set_visible(False)
+    if app.fav_btn is not None:
+        app.fav_btn.set_visible(True)
+    if app.add_playlist_btn is not None:
+        app.add_playlist_btn.set_visible(True)
 
     while c := app.track_list.get_first_child():
         app.track_list.remove(c)
@@ -1000,12 +1010,19 @@ def populate_tracks(app, tracks):
             lbl_dur.set_size_request(LAYOUT["time_width"], -1)
             box.append(lbl_dur)
 
-        add_btn = Gtk.Button(icon_name="list-add-symbolic", css_classes=["flat", "circular", "history-scroll-btn"])
-        add_btn.set_tooltip_text("Add to Playlist")
-        add_btn.connect("clicked", lambda _b, tr=t: app.on_add_single_track_to_playlist(tr))
         fav_btn = app.create_track_fav_button(t)
         box.append(fav_btn)
-        box.append(add_btn)
+        current_remote = getattr(app, "current_remote_playlist", None)
+        if current_remote is not None:
+            rm_btn = Gtk.Button(icon_name="user-trash-symbolic", css_classes=["flat", "playlist-tool-btn"])
+            rm_btn.set_tooltip_text("Remove from Playlist")
+            rm_btn.connect("clicked", lambda _b, tr=t: app.on_remove_single_track_from_remote_playlist(tr))
+            box.append(rm_btn)
+        else:
+            add_btn = Gtk.Button(icon_name="list-add-symbolic", css_classes=["flat", "circular", "history-scroll-btn"])
+            add_btn.set_tooltip_text("Add to Playlist")
+            add_btn.connect("clicked", lambda _b, tr=t: app.on_add_single_track_to_playlist(tr))
+            box.append(add_btn)
 
         row.set_child(box)
         app.track_list.append(row)
@@ -1501,6 +1518,8 @@ def render_liked_songs_dashboard(app, tracks=None):
         artist_groups.values(),
         key=lambda it: (-int(it.get("count", 0) or 0), str(it.get("name", "")).lower()),
     )
+    max_artist_filters = 120
+    artist_items = artist_items[:max_artist_filters]
 
     artist_filter_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
     artist_filter_scroll = Gtk.ScrolledWindow(hexpand=True, vexpand=False, css_classes=["liked-artist-filter-scroll"])
@@ -1548,7 +1567,7 @@ def render_liked_songs_dashboard(app, tracks=None):
         if artist_obj is not None:
             utils.load_img(
                 img,
-                lambda a=artist_obj: app.backend.get_artist_artwork_url(a, 320),
+                lambda a=artist_obj: app.backend.get_artist_artwork_url(a, 320, local_only=True),
                 app.cache_dir,
                 54,
             )
@@ -1864,19 +1883,61 @@ def render_playlists_home(app):
     _clear_container(app.collection_content_box)
     app.playlist_track_list = None
 
-    top = Gtk.Box(spacing=8, css_classes=["home-section-head"], margin_start=6, margin_end=6, margin_bottom=8)
-    top.append(Gtk.Label(label="Playlists", xalign=0, hexpand=True, css_classes=["home-section-title"]))
-    create_btn = Gtk.Button(icon_name="list-add-symbolic", css_classes=["playlist-add-top-btn"])
-    create_btn.set_tooltip_text("Create Local Playlist")
-    create_btn.connect("clicked", app.on_create_playlist_clicked)
-    top.append(create_btn)
-    app.collection_content_box.append(top)
-
-    local_head = Gtk.Box(spacing=8, css_classes=["home-section-head"], margin_start=6, margin_end=6, margin_bottom=8, margin_top=6)
-    local_head.append(Gtk.Label(label="Local Playlists", xalign=0, hexpand=True, css_classes=["home-section-title"]))
-    app.collection_content_box.append(local_head)
-
     section_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, css_classes=["home-section", "home-generic-section"])
+
+    head = Gtk.Box(spacing=8, css_classes=["home-section-head"], margin_start=6, margin_end=6, margin_bottom=8, margin_top=6)
+    stack = list(getattr(app, "current_playlist_folder_stack", []) or [])
+    if stack:
+        crumbs = " / ".join([str(x.get("name", "Folder")) for x in stack])
+        title_txt = f"Folders / {crumbs}"
+    else:
+        title_txt = "Your Playlists"
+    head.append(Gtk.Label(label=title_txt, xalign=0, hexpand=True, css_classes=["home-section-title"]))
+    count_lbl = Gtk.Label(label="Loading...", css_classes=["home-section-count"])
+    head.append(count_lbl)
+    up_btn = Gtk.Button(icon_name="go-up-symbolic", css_classes=["flat", "playlist-add-top-btn"])
+    up_btn.set_tooltip_text("Up Folder")
+    up_btn.set_sensitive(bool(stack))
+    up_btn.connect("clicked", app.on_playlist_folder_up_clicked)
+    head.append(up_btn)
+    if stack:
+        rename_folder_btn = Gtk.Button(icon_name="document-edit-symbolic", css_classes=["playlist-add-top-btn"])
+        rename_folder_btn.set_tooltip_text("Rename Current Folder")
+        rename_folder_btn.connect("clicked", lambda _b: app.on_playlist_folder_rename_clicked())
+        head.append(rename_folder_btn)
+        delete_folder_btn = Gtk.Button(icon_name="user-trash-symbolic", css_classes=["playlist-add-top-btn"])
+        delete_folder_btn.set_tooltip_text("Delete Current Folder")
+        delete_folder_btn.connect("clicked", lambda _b: app.on_playlist_folder_delete_clicked())
+        head.append(delete_folder_btn)
+    if not stack:
+        create_btn = Gtk.MenuButton(icon_name="list-add-symbolic", css_classes=["playlist-add-top-btn"])
+        create_btn.set_tooltip_text("Create...")
+        create_pop = Gtk.Popover()
+        create_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=4,
+            margin_top=8,
+            margin_bottom=8,
+            margin_start=8,
+            margin_end=8,
+        )
+        new_folder_btn = Gtk.Button(label="New Folder", css_classes=["flat"])
+        new_folder_btn.connect("clicked", lambda _b: (create_pop.popdown(), app.on_create_playlist_folder_clicked()))
+        create_box.append(new_folder_btn)
+
+        new_playlist_btn = Gtk.Button(label="New Playlist", css_classes=["flat"])
+        new_playlist_btn.connect("clicked", lambda _b: (create_pop.popdown(), app.on_create_playlist_clicked()))
+        create_box.append(new_playlist_btn)
+
+        create_pop.set_child(create_box)
+        create_btn.set_popover(create_pop)
+    else:
+        create_btn = Gtk.Button(icon_name="list-add-symbolic", css_classes=["playlist-add-top-btn"])
+        create_btn.set_tooltip_text("Create Playlist")
+        create_btn.connect("clicked", app.on_create_playlist_clicked)
+    head.append(create_btn)
+    section_box.append(head)
+
     flow = Gtk.FlowBox(
         valign=Gtk.Align.START,
         max_children_per_line=30,
@@ -1888,48 +1949,139 @@ def render_playlists_home(app):
     section_box.append(flow)
     app.collection_content_box.append(section_box)
 
-    playlists = app.playlist_mgr.list_playlists() if hasattr(app, "playlist_mgr") else []
-    for p in playlists:
-        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, css_classes=["card", "home-card"])
-        img = Gtk.Image(css_classes=["album-cover-img", "playlist-cover-img"])
-        img.set_size_request(130, 130)
-        refs = app.playlist_mgr.get_cover_refs(p, limit=4)
-        collage_dir = os.path.join(app.cache_dir, "playlist_covers")
-        collage = utils.generate_auto_collage_cover(
-            refs,
-            image_cache_dir=app.cache_dir,
-            collage_cache_dir=collage_dir,
-            key_prefix=f"playlist_{p.get('id', 'x')}_{p.get('updated_at', 0)}",
-            size=256,
-            overlay_alpha=0.34,
-            overlay_style="mix",
-        )
-        if collage:
-            utils.load_img(img, collage, app.cache_dir, 130)
-        else:
-            img.set_pixel_size(130)
-            img.set_from_icon_name("audio-x-generic-symbolic")
-        card.append(img)
-        card.append(
-            Gtk.Label(
-                label=p.get("name", "Untitled Playlist"),
-                ellipsize=3,
-                halign=Gtk.Align.CENTER,
-                wrap=True,
-                max_width_chars=16,
-                css_classes=["home-card-title"],
-            )
-        )
-        btn = Gtk.Button(css_classes=["flat", "history-card-btn"])
-        btn.set_child(card)
-        btn.connect("clicked", lambda _b, pid=p.get("id"): app.on_playlist_card_clicked(pid))
-        child = Gtk.FlowBoxChild()
-        child.set_child(btn)
-        flow.append(child)
+    loading = Gtk.Label(label="Loading playlists...", xalign=0, css_classes=["dim-label"], margin_start=8, margin_top=8)
+    section_box.append(loading)
 
-    if not playlists:
-        hint = Gtk.Label(label="No local playlists yet. Click New Playlist to create one.", xalign=0, css_classes=["dim-label"], margin_start=8, margin_top=8)
-        app.collection_content_box.append(hint)
+    def task():
+        parent_folder = getattr(app, "current_playlist_folder", None)
+        payload = dict(app.backend.get_playlists_and_folders(parent_folder=parent_folder, limit=1000) or {})
+        folders = list(payload.get("folders", []) or [])
+        playlists = list(payload.get("playlists", []) or [])
+
+        def apply():
+            count_lbl.set_text(f"{len(folders)} folders • {len(playlists)} playlists")
+            if loading.get_parent() is section_box:
+                section_box.remove(loading)
+
+            for f in folders:
+                card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, css_classes=["card", "home-card"])
+                overlay = Gtk.Overlay()
+                cover = Gtk.Box(css_classes=["playlist-folder-cover"])
+                cover.set_size_request(130, 130)
+                overlay.set_child(cover)
+
+                collage = Gtk.Grid(css_classes=["playlist-folder-collage"])
+                collage.set_row_homogeneous(True)
+                collage.set_column_homogeneous(True)
+                collage.set_size_request(130, 130)
+                preview_urls = list(app.backend.get_folder_preview_artworks(f, limit=4, size=320) or [])
+                for idx in range(4):
+                    cell = Gtk.Box(css_classes=["playlist-folder-cell"])
+                    img = Gtk.Image(css_classes=["album-cover-img", "playlist-cover-img", "playlist-folder-preview-img"])
+                    img.set_size_request(62, 62)
+                    img.set_pixel_size(62)
+                    if idx < len(preview_urls):
+                        utils.load_img(img, preview_urls[idx], app.cache_dir, 62)
+                        img.set_opacity(1.0)
+                    else:
+                        img.set_from_icon_name("audio-x-generic-symbolic")
+                        img.set_opacity(0.35)
+                    cell.append(img)
+                    collage.attach(cell, idx % 2, idx // 2, 1, 1)
+                collage.set_row_spacing(2)
+                collage.set_column_spacing(2)
+                cover.append(collage)
+
+                folder_items = int(getattr(f, "total_number_of_items", 0) or 0)
+                badge = Gtk.Label(label=str(folder_items), css_classes=["playlist-folder-badge"])
+                badge.set_halign(Gtk.Align.END)
+                badge.set_valign(Gtk.Align.START)
+                badge.set_margin_end(0)
+                badge.set_margin_top(3)
+                overlay.add_overlay(badge)
+                overlay.set_clip_overlay(badge, False)
+                card.append(overlay)
+                card.append(
+                    Gtk.Label(
+                        label=getattr(f, "name", None) or "Folder",
+                        ellipsize=3,
+                        halign=Gtk.Align.CENTER,
+                        wrap=True,
+                        max_width_chars=16,
+                        css_classes=["home-card-title"],
+                    )
+                )
+                open_btn = Gtk.Button(css_classes=["flat", "history-card-btn"])
+                open_btn.set_child(card)
+                open_btn.connect("clicked", lambda _b, fd=f: app.on_playlist_folder_card_clicked(fd))
+                more_btn = Gtk.MenuButton(icon_name="open-menu-symbolic", css_classes=["flat", "circular", "history-scroll-btn"])
+                more_btn.set_halign(Gtk.Align.END)
+                more_btn.set_valign(Gtk.Align.END)
+                more_btn.set_margin_end(6)
+                more_btn.set_margin_bottom(29)
+                more_btn.set_tooltip_text("Folder actions")
+                pop = Gtk.Popover()
+                pop_box = Gtk.Box(
+                    orientation=Gtk.Orientation.VERTICAL,
+                    spacing=4,
+                    margin_top=8,
+                    margin_bottom=8,
+                    margin_start=8,
+                    margin_end=8,
+                )
+                rename_btn = Gtk.Button(label="Rename Folder", css_classes=["flat"])
+                rename_btn.connect("clicked", lambda _b, fd=f, p=pop: (p.popdown(), app.on_playlist_folder_rename_clicked(fd)))
+                pop_box.append(rename_btn)
+                delete_btn = Gtk.Button(label="Delete Folder", css_classes=["flat"])
+                delete_btn.connect("clicked", lambda _b, fd=f, p=pop: (p.popdown(), app.on_playlist_folder_delete_clicked(fd)))
+                pop_box.append(delete_btn)
+                pop.set_child(pop_box)
+                more_btn.set_popover(pop)
+                wrapper_ov = Gtk.Overlay()
+                wrapper_ov.set_child(open_btn)
+                wrapper_ov.add_overlay(more_btn)
+                wrapper_ov.set_clip_overlay(more_btn, False)
+                child = Gtk.FlowBoxChild()
+                child.set_child(wrapper_ov)
+                flow.append(child)
+
+            for p in playlists:
+                card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, css_classes=["card", "home-card"])
+                img = Gtk.Image(css_classes=["album-cover-img", "playlist-cover-img"])
+                img.set_size_request(130, 130)
+                utils.load_img(img, lambda pl=p: app.backend.get_artwork_url(pl, 320), app.cache_dir, 130)
+                card.append(img)
+                card.append(
+                    Gtk.Label(
+                        label=getattr(p, "name", None) or "Untitled Playlist",
+                        ellipsize=3,
+                        halign=Gtk.Align.CENTER,
+                        wrap=True,
+                        max_width_chars=16,
+                        css_classes=["home-card-title"],
+                    )
+                )
+                open_btn = Gtk.Button(css_classes=["flat", "history-card-btn"])
+                open_btn.set_child(card)
+                open_btn.connect("clicked", lambda _b, pl=p: app.on_remote_playlist_card_clicked(pl))
+                child = Gtk.FlowBoxChild()
+                child.set_child(open_btn)
+                flow.append(child)
+
+            if not playlists and not folders:
+                hint = Gtk.Label(
+                    label="No folders or playlists found here. Create one to get started.",
+                    xalign=0,
+                    css_classes=["dim-label"],
+                    margin_start=8,
+                    margin_top=8,
+                )
+                section_box.append(hint)
+            return False
+
+        GLib.idle_add(apply)
+
+    Thread(target=task, daemon=True).start()
 
 
 def render_playlist_detail(app, playlist_id):

@@ -113,6 +113,27 @@ If you run into issues, have feature requests, or want to report bugs, please op
 
 - https://github.com/yelanxin/hiresTI/issues
 
+## Troubleshooting With Logs
+
+If you hit a problem, please start the app from terminal and attach logs in your issue:
+
+```bash
+hiresti 2>&1 | tee /tmp/hiresti.log
+```
+
+For GTK debug output:
+
+```bash
+G_MESSAGES_DEBUG=all hiresti 2>&1 | tee /tmp/hiresti-gtk.log
+```
+
+When reporting, include:
+
+- your distro and desktop environment
+- app version
+- steps to reproduce
+- relevant log snippets (or the full log file path above)
+
 ## License
 
 GPL-3.0

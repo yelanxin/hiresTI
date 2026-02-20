@@ -137,8 +137,16 @@ def load_img(widget, url_provider, cache_dir, size=84):
                     with open(f_path, 'wb') as f:
                         f.write(r.content)
                 except requests.RequestException as e:
-                    logger.warning("load_img: download failed (url=%s): %s", u, e)
-                    return
+                    # Retry once with browser-like headers for CDN/proxy edge cases.
+                    try:
+                        retry_kwargs = {"timeout": 10, "headers": _TIDAL_IMAGE_HEADERS}
+                        r = requests.get(u, **retry_kwargs)
+                        r.raise_for_status()
+                        with open(f_path, 'wb') as f:
+                            f.write(r.content)
+                    except requests.RequestException:
+                        logger.warning("load_img: download failed (url=%s): %s", u, e)
+                        return
 
             # 判断控件类型
             w_type = type(widget).__name__

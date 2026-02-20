@@ -3,6 +3,7 @@ import logging
 import time
 import shutil
 import subprocess
+import platform
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
 os.environ["MESA_LOG_LEVEL"] = "error"
@@ -21,6 +22,9 @@ import utils
 import ui_config
 from ui import builders as ui_builders
 from ui import views_builders as ui_views_builders
+from visualizer import SpectrumVisualizer
+from visualizer_glarea import SpectrumVisualizerGLArea
+from visualizer_gpu import SpectrumVisualizerGPU
 from actions import ui_actions
 from actions import ui_navigation
 from actions import playback_actions
@@ -70,6 +74,7 @@ class TidalApp(Adw.Application):
     LYRICS_FONT_PRESETS = ["Live", "Studio", "Compact"]
     LATENCY_OPTIONS = ["Safe (400ms)", "Standard (100ms)", "Low Latency (40ms)", "Aggressive (20ms)"]
     VIZ_BAR_OPTIONS = [4, 8, 16, 32, 48, 64, 96, 128]
+    VIZ_BACKEND_POLICIES = ["Perf", "Quality"]
     LATENCY_MAP = {
         "Safe (400ms)":      (400, 40),  # Buffer, Latency
         "Standard (100ms)":  (100, 10),
@@ -89,6 +94,7 @@ class TidalApp(Adw.Application):
         self.viz_bars_dd = None
         self.viz_effect_dd = None
         self.viz_profile_dd = None
+        self.viz_policy_dd = None
         self.lyrics_font_dd = None
         self.lyrics_motion_dd = None
         self.lyrics_font_label = None
@@ -101,6 +107,12 @@ class TidalApp(Adw.Application):
         self.bg_viz = None
         self.lyrics_tab_root = None
         self.viz = None
+        self._viz_backend_key = None
+        self._viz_ui_syncing = False
+        self._viz_effect_apply_source = None
+        self._viz_profile_apply_source = None
+        self._viz_theme_apply_source = None
+        self._viz_policy_apply_source = None
         self.eq_btn = None
         self.eq_pop = None
         self.mode_btn = None
@@ -121,6 +133,9 @@ class TidalApp(Adw.Application):
         self.viz_anchor = None
         self.viz_handle_box = None
         self.current_album = None
+        self.current_remote_playlist = None
+        self.current_playlist_folder = None
+        self.current_playlist_folder_stack = []
         self.current_selected_artist = None
         self.list_box = None
         self.output_status_label = None
@@ -133,6 +148,12 @@ class TidalApp(Adw.Application):
         self._viz_handle_settle_source = 0
         self._viz_handle_resize_source = 0
         self._viz_handle_resize_retries = 0
+        self._viz_fade_source = 0
+        self._last_spectrum_frame = None
+        self._viz_seed_frame = None
+        self._viz_warmup_until = 0.0
+        self._viz_warmup_duration_s = 2.0
+        self._ui_loop_source = 0
         self._last_output_state = None
         self._last_output_error = None
         self.network_status_label = None
@@ -148,8 +169,13 @@ class TidalApp(Adw.Application):
         self._login_dialog = None
         self._login_qr_tempfile = None
         self._login_status_label = None
+        self._session_restore_pending = False
         self.search_content_box = None
         self.add_playlist_btn = None
+        self.remote_playlist_edit_btn = None
+        self.remote_playlist_visibility_btn = None
+        self.remote_playlist_more_btn = None
+        self.remote_playlist_more_pop = None
         self.add_selected_tracks_btn = None
         self.like_selected_tracks_btn = None
         self.search_prev_page_btn = None
@@ -354,6 +380,7 @@ class TidalApp(Adw.Application):
         super().__init__(application_id="com.hiresti.player")
         GLib.set_application_name("HiresTI")
         GLib.set_prgname("HiresTI")
+        self.app_version = self._detect_app_version()
         self.backend = TidalBackend()
         self._cache_root = os.path.expanduser("~/.cache/hiresti")
         self._account_scope = "guest"
@@ -450,11 +477,56 @@ class TidalApp(Adw.Application):
         self._home_sections_cache = None
         self.stream_prefetch_cache = {}
         self._init_ui_refs()
-        
-        # Mini Mode 状态与尺寸记忆
+        # Mini mode state must be initialized at startup.
         self.is_mini_mode = False
         self.saved_width = ui_config.WINDOW_WIDTH
         self.saved_height = ui_config.WINDOW_HEIGHT
+
+    def _detect_app_version(self):
+        env_ver = str(os.environ.get("HIRESTI_VERSION", "")).strip()
+        if env_ver:
+            return env_ver
+        try:
+            root = os.path.dirname(os.path.abspath(__file__))
+            ver_file = os.path.join(root, "version.txt")
+            if os.path.exists(ver_file):
+                with open(ver_file, "r", encoding="utf-8") as f:
+                    version = str(f.read()).strip()
+                    if version:
+                        return version
+            changelog = os.path.join(root, "CHANGELOG.md")
+            with open(changelog, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("## "):
+                        head = line[3:].strip()
+                        version = head.split(" - ", 1)[0].strip()
+                        if version:
+                            return version
+                        break
+        except Exception:
+            pass
+        return "dev"
+
+    def on_about_clicked(self, _btn=None):
+        info_lines = [
+            "A desktop TIDAL client focused on audio quality and visual experience.",
+            f"Python: {platform.python_version()}",
+        ]
+        about = Adw.AboutWindow(
+            transient_for=getattr(self, "win", None),
+            modal=True,
+            application_name="HiresTI",
+            application_icon="hiresti",
+            version=str(getattr(self, "app_version", "dev")),
+            developer_name="code by Yelanxin",
+            developers=["Yelanxin"],
+            website="https://github.com/yelanxin/hiresTI",
+            issue_url="https://github.com/yelanxin/hiresTI/issues",
+            license_type=Gtk.License.GPL_3_0,
+            comments="\n".join(info_lines),
+        )
+        about.present()
 
     def do_shutdown(self):
         logger.info("Shutting down application...")
@@ -468,6 +540,10 @@ class TidalApp(Adw.Application):
         if pulse:
             GLib.source_remove(pulse)
             self._playing_pulse_source = 0
+        ui_loop = getattr(self, "_ui_loop_source", 0)
+        if ui_loop:
+            GLib.source_remove(ui_loop)
+            self._ui_loop_source = 0
         self.save_settings()
         if self.player is not None:
             self.player.cleanup()
@@ -526,10 +602,11 @@ class TidalApp(Adw.Application):
         if isinstance(saved_paned, int) and saved_paned > 0 and self.paned is not None:
             self.paned.set_position(saved_paned)
 
-        self._apply_spectrum_theme_by_index(self.settings.get("spectrum_theme", 0), update_dropdown=True)
+        self._apply_viz_backend_policy_by_index(self.settings.get("viz_backend_policy", 0), update_dropdown=True)
         self._apply_viz_bars_by_count(self.settings.get("viz_bar_count", 32), update_dropdown=True)
         self._apply_viz_profile_by_index(self.settings.get("viz_profile", 1), update_dropdown=True)
         self._apply_viz_effect_by_index(self.settings.get("viz_effect", 3), update_dropdown=True)
+        self._apply_spectrum_theme_by_index(self.settings.get("spectrum_theme", 0), update_dropdown=True)
         self._apply_lyrics_font_preset_by_index(self.settings.get("lyrics_font_preset", 1), update_dropdown=True)
         self._apply_lyrics_motion_by_index(self.settings.get("lyrics_bg_motion", 1), update_dropdown=True)
         self._apply_lyrics_offset_ms(self.settings.get("lyrics_user_offset_ms", 0))
@@ -580,7 +657,135 @@ class TidalApp(Adw.Application):
         if update_dropdown and self.viz_bars_dd is not None:
             self.viz_bars_dd.set_selected(self.VIZ_BAR_OPTIONS.index(c))
 
+    def _drop_down_names(self, dd):
+        names = []
+        if dd is None:
+            return names
+        model = dd.get_model()
+        if model is None:
+            return names
+        n = model.get_n_items()
+        for i in range(n):
+            try:
+                names.append(model.get_string(i))
+            except Exception:
+                pass
+        return names
+
+    def _selected_name_from_dropdown(self, dd):
+        names = self._drop_down_names(dd)
+        if not names:
+            return None
+        idx = int(dd.get_selected())
+        if idx < 0 or idx >= len(names):
+            return None
+        return names[idx]
+
+    def _build_visualizer_for_backend(self, backend_key):
+        order = []
+        if backend_key == "cairo":
+            order = [("cairo", SpectrumVisualizer), ("gl", SpectrumVisualizerGLArea), ("gpu", SpectrumVisualizerGPU)]
+        elif backend_key == "gpu":
+            order = [("gpu", SpectrumVisualizerGPU), ("gl", SpectrumVisualizerGLArea), ("cairo", SpectrumVisualizer)]
+        else:
+            order = [("gl", SpectrumVisualizerGLArea), ("gpu", SpectrumVisualizerGPU), ("cairo", SpectrumVisualizer)]
+        for key, ctor in order:
+            try:
+                return ctor(), key
+            except Exception as e:
+                logger.warning("Visualizer backend %s unavailable, falling back: %s", key, e)
+        raise RuntimeError("No visualizer backend available")
+
+    def _resolve_viz_backend_key(self, effect_name=None):
+        if not effect_name:
+            effect_name = self._selected_name_from_dropdown(self.viz_effect_dd)
+        try:
+            idx = int(self.settings.get("viz_backend_policy", 0))
+        except Exception:
+            idx = 0
+        idx = max(0, min(len(self.VIZ_BACKEND_POLICIES) - 1, idx))
+        policy = self.VIZ_BACKEND_POLICIES[idx]
+        if policy.startswith("Quality"):
+            return "cairo"
+        if policy.startswith("Performance"):
+            return "gl"
+        return "gl"
+
+    def _sync_viz_dropdown_models(self, theme_name=None, effect_name=None, profile_name=None):
+        self._viz_ui_syncing = True
+        try:
+            if self.viz_theme_dd is not None:
+                t_names = self.viz.get_theme_names() or []
+                self.viz_theme_dd.set_model(Gtk.StringList.new(t_names))
+                if t_names:
+                    idx = t_names.index(theme_name) if theme_name in t_names else 0
+                    self.viz_theme_dd.set_selected(idx)
+            if self.viz_effect_dd is not None:
+                e_names = self.viz.get_effect_names() or []
+                self.viz_effect_dd.set_model(Gtk.StringList.new(e_names))
+                if e_names:
+                    idx = e_names.index(effect_name) if effect_name in e_names else 0
+                    self.viz_effect_dd.set_selected(idx)
+            if self.viz_profile_dd is not None:
+                p_names = self.viz.get_profile_names() or []
+                self.viz_profile_dd.set_model(Gtk.StringList.new(p_names))
+                if p_names:
+                    idx = p_names.index(profile_name) if profile_name in p_names else min(1, len(p_names) - 1)
+                    self.viz_profile_dd.set_selected(idx)
+        finally:
+            self._viz_ui_syncing = False
+
+    def _rebuild_visualizer_backend(self, backend_key, effect_name=None):
+        if self.viz_stack is None:
+            return
+        if effect_name is None:
+            effect_name = self._selected_name_from_dropdown(self.viz_effect_dd)
+        theme_name = self._selected_name_from_dropdown(self.viz_theme_dd)
+        profile_name = self._selected_name_from_dropdown(self.viz_profile_dd)
+        bar_count = int(self.settings.get("viz_bar_count", 32) or 32)
+        vis_name = self.viz_stack.get_visible_child_name() if self.viz_stack is not None else "spectrum"
+
+        new_viz, actual_key = self._build_visualizer_for_backend(backend_key)
+        new_viz.set_num_bars(bar_count)
+        new_viz.set_valign(Gtk.Align.FILL)
+        if theme_name and theme_name in (new_viz.get_theme_names() or []):
+            new_viz.set_theme(theme_name)
+        if profile_name and profile_name in (new_viz.get_profile_names() or []):
+            new_viz.set_profile(profile_name)
+        if effect_name and effect_name in (new_viz.get_effect_names() or []):
+            new_viz.set_effect(effect_name)
+
+        if self.viz is not None:
+            try:
+                self.viz_stack.remove(self.viz)
+            except Exception:
+                pass
+        self.viz = new_viz
+        self._viz_backend_key = actual_key
+        self.viz_stack.add_titled(self.viz, "spectrum", "Spectrum")
+        if vis_name:
+            self.viz_stack.set_visible_child_name(vis_name)
+        self._sync_viz_dropdown_models(theme_name=theme_name, effect_name=effect_name, profile_name=profile_name)
+        logger.info("Visualizer backend switched: %s (requested=%s effect=%s)", actual_key, backend_key, effect_name)
+
+    def _apply_viz_backend_policy_by_index(self, idx, update_dropdown=False):
+        if not isinstance(idx, int) or idx < 0 or idx >= len(self.VIZ_BACKEND_POLICIES):
+            idx = 0
+        self.settings["viz_backend_policy"] = idx
+        if update_dropdown and self.viz_policy_dd is not None:
+            self._viz_ui_syncing = True
+            try:
+                self.viz_policy_dd.set_selected(idx)
+            finally:
+                self._viz_ui_syncing = False
+        effect_name = self._selected_name_from_dropdown(self.viz_effect_dd)
+        desired = self._resolve_viz_backend_key(effect_name)
+        if desired != self._viz_backend_key:
+            self._rebuild_visualizer_backend(desired, effect_name=effect_name)
+
     def on_viz_bars_changed(self, dd, _param):
+        if self._viz_ui_syncing:
+            return
         idx = dd.get_selected()
         if idx < 0 or idx >= len(self.VIZ_BAR_OPTIONS):
             return
@@ -606,17 +811,57 @@ class TidalApp(Adw.Application):
         names = self.viz.get_effect_names()
         if not names:
             return
-        if not isinstance(idx, int) or idx < 0 or idx >= len(names):
+        if not isinstance(idx, int):
             idx = 0
-        self.viz.set_effect(names[idx])
-        self.settings["viz_effect"] = idx
+        effect_name = None
+        dd_names = self._drop_down_names(self.viz_effect_dd)
+        if 0 <= idx < len(dd_names):
+            effect_name = dd_names[idx]
+        if not effect_name:
+            if idx < 0 or idx >= len(names):
+                idx = 0
+            effect_name = names[idx]
+        desired = self._resolve_viz_backend_key(effect_name)
+        if desired != self._viz_backend_key:
+            self._rebuild_visualizer_backend(desired, effect_name=effect_name)
+            names = self.viz.get_effect_names() or []
+        if effect_name not in names:
+            effect_name = names[0] if names else None
+        if effect_name:
+            self.viz.set_effect(effect_name)
+            eff_idx = names.index(effect_name)
+        else:
+            eff_idx = 0
+        self.settings["viz_effect"] = eff_idx
         if update_dropdown and self.viz_effect_dd is not None:
-            self.viz_effect_dd.set_selected(idx)
+            self._viz_ui_syncing = True
+            try:
+                self.viz_effect_dd.set_selected(eff_idx)
+            finally:
+                self._viz_ui_syncing = False
 
     def on_viz_effect_changed(self, dd, _param):
+        if self._viz_ui_syncing:
+            return
         idx = dd.get_selected()
-        self._apply_viz_effect_by_index(idx, update_dropdown=False)
-        self.schedule_save_settings()
+        if self._viz_effect_apply_source:
+            try:
+                GLib.source_remove(self._viz_effect_apply_source)
+            except Exception:
+                pass
+            self._viz_effect_apply_source = None
+
+        def _apply_effect_later():
+            self._viz_effect_apply_source = None
+            if self._viz_ui_syncing:
+                return False
+            logger.debug("Applying visualizer effect (deferred): idx=%s", idx)
+            self._apply_viz_effect_by_index(idx, update_dropdown=False)
+            self.schedule_save_settings()
+            return False
+
+        # Avoid mutating dropdown model/stack synchronously in GTK activate callback.
+        self._viz_effect_apply_source = GLib.idle_add(_apply_effect_later)
 
     def _apply_viz_profile_by_index(self, idx, update_dropdown=False):
         if self.viz is None:
@@ -632,14 +877,70 @@ class TidalApp(Adw.Application):
             self.viz_profile_dd.set_selected(idx)
 
     def on_viz_profile_changed(self, dd, _param):
+        if self._viz_ui_syncing:
+            return
         idx = dd.get_selected()
-        self._apply_viz_profile_by_index(idx, update_dropdown=False)
-        self.schedule_save_settings()
+        if self._viz_profile_apply_source:
+            try:
+                GLib.source_remove(self._viz_profile_apply_source)
+            except Exception:
+                pass
+            self._viz_profile_apply_source = None
+
+        def _apply_profile_later():
+            self._viz_profile_apply_source = None
+            if self._viz_ui_syncing:
+                return False
+            logger.debug("Applying visualizer profile (deferred): idx=%s", idx)
+            self._apply_viz_profile_by_index(idx, update_dropdown=False)
+            self.schedule_save_settings()
+            return False
+
+        self._viz_profile_apply_source = GLib.idle_add(_apply_profile_later)
 
     def on_spectrum_theme_changed(self, dd, _param):
+        if self._viz_ui_syncing:
+            return
         idx = dd.get_selected()
-        self._apply_spectrum_theme_by_index(idx, update_dropdown=False)
-        self.schedule_save_settings()
+        if self._viz_theme_apply_source:
+            try:
+                GLib.source_remove(self._viz_theme_apply_source)
+            except Exception:
+                pass
+            self._viz_theme_apply_source = None
+
+        def _apply_theme_later():
+            self._viz_theme_apply_source = None
+            if self._viz_ui_syncing:
+                return False
+            logger.debug("Applying visualizer theme (deferred): idx=%s", idx)
+            self._apply_spectrum_theme_by_index(idx, update_dropdown=False)
+            self.schedule_save_settings()
+            return False
+
+        self._viz_theme_apply_source = GLib.idle_add(_apply_theme_later)
+
+    def on_viz_backend_policy_changed(self, dd, _param):
+        if self._viz_ui_syncing:
+            return
+        idx = dd.get_selected()
+        if self._viz_policy_apply_source:
+            try:
+                GLib.source_remove(self._viz_policy_apply_source)
+            except Exception:
+                pass
+            self._viz_policy_apply_source = None
+
+        def _apply_policy_later():
+            self._viz_policy_apply_source = None
+            if self._viz_ui_syncing:
+                return False
+            logger.debug("Applying visualizer policy (deferred): idx=%s", idx)
+            self._apply_viz_backend_policy_by_index(idx, update_dropdown=False)
+            self.schedule_save_settings()
+            return False
+
+        self._viz_policy_apply_source = GLib.idle_add(_apply_policy_later)
 
     def _apply_lyrics_font_preset_by_index(self, idx, update_dropdown=False):
         if self.lyrics_vbox is None:
@@ -700,6 +1001,8 @@ class TidalApp(Adw.Application):
         self.viz_theme_dd.set_visible(is_spectrum)
         if self.viz_bars_dd is not None:
             self.viz_bars_dd.set_visible(is_spectrum)
+        if self.viz_policy_dd is not None:
+            self.viz_policy_dd.set_visible(is_spectrum)
         if self.viz_profile_dd is not None:
             self.viz_profile_dd.set_visible(is_spectrum)
         if self.viz_effect_dd is not None:
@@ -841,7 +1144,7 @@ class TidalApp(Adw.Application):
         GLib.idle_add(self._restore_paned_position_after_layout)
         GLib.idle_add(lambda: (self._schedule_viz_handle_realign(), False)[1])
 
-        GLib.timeout_add(20, self.update_ui_loop)
+        self._schedule_update_ui_loop(40)
         GLib.timeout_add(1000, self._refresh_output_status_loop)
         self._init_tray_icon()
 
@@ -1078,6 +1381,12 @@ class TidalApp(Adw.Application):
 
 
     def toggle_mini_mode(self, btn):
+        if not hasattr(self, "is_mini_mode"):
+            self.is_mini_mode = False
+        if not hasattr(self, "saved_width"):
+            self.saved_width = ui_config.WINDOW_WIDTH
+        if not hasattr(self, "saved_height"):
+            self.saved_height = ui_config.WINDOW_HEIGHT
         # 0. 隐藏抽屉
         if self.viz_revealer is not None:
             self._set_visualizer_expanded(False)
@@ -1170,7 +1479,11 @@ class TidalApp(Adw.Application):
         ui_views_builders.build_grid_view(self)
 
     def _toggle_login_view(self, logged_in):
+        self._session_restore_pending = False
         ui_views_builders.toggle_login_view(self, logged_in)
+        paned = getattr(self, "paned", None)
+        if paned is not None:
+            paned.set_visible(True)
         # Login state should not hide the player bar itself.
         player_overlay = getattr(self, "player_overlay", None)
         if player_overlay is not None:
@@ -1182,6 +1495,10 @@ class TidalApp(Adw.Application):
 
     def _set_login_view_pending(self):
         # Startup session check in progress: avoid flashing logged-out prompt.
+        self._session_restore_pending = True
+        paned = getattr(self, "paned", None)
+        if paned is not None:
+            paned.set_visible(False)
         if hasattr(self, "login_prompt_box") and self.login_prompt_box is not None:
             self.login_prompt_box.set_visible(False)
         if hasattr(self, "alb_scroll") and self.alb_scroll is not None:
@@ -1190,6 +1507,12 @@ class TidalApp(Adw.Application):
             self.sidebar_box.set_visible(False)
         if hasattr(self, "search_entry") and self.search_entry is not None:
             self.search_entry.set_visible(False)
+        player_overlay = getattr(self, "player_overlay", None)
+        if player_overlay is not None:
+            player_overlay.set_visible(False)
+        bottom_bar = getattr(self, "bottom_bar", None)
+        if bottom_bar is not None:
+            bottom_bar.set_visible(False)
         self._set_overlay_handles_visible(False)
 
     def _set_overlay_handles_visible(self, visible):
@@ -1208,11 +1531,7 @@ class TidalApp(Adw.Application):
         self.close_queue_drawer()
         revealer = getattr(self, "viz_revealer", None)
         if revealer is not None:
-            revealer.set_reveal_child(False)
-        btn = getattr(self, "viz_btn", None)
-        if btn is not None:
-            btn.set_icon_name("hiresti-pan-up-symbolic")
-            btn.remove_css_class("active")
+            self._set_visualizer_expanded(False)
 
     def _build_tracks_view(self):
         ui_views_builders.build_tracks_view(self)
@@ -1242,13 +1561,38 @@ class TidalApp(Adw.Application):
     def on_spectrum_data(self, magnitudes, position_s=None):
         if not magnitudes:
             return
+        frame = list(magnitudes)
+        self._last_spectrum_frame = frame
         if not self.viz_revealer.get_reveal_child():
             return
+        now = time.monotonic()
+        if self._viz_warmup_until > now and self._viz_seed_frame:
+            t = 1.0 - ((self._viz_warmup_until - now) / max(1e-6, float(self._viz_warmup_duration_s)))
+            t = max(0.0, min(1.0, t))
+            frame = self._blend_spectrum_frames(self._viz_seed_frame, frame, t)
+        elif self._viz_warmup_until <= now:
+            self._viz_seed_frame = None
+            self._viz_warmup_until = 0.0
         current_page = self.viz_stack.get_visible_child_name()
         if current_page == "lyrics" and self.bg_viz is not None:
-            self.bg_viz.update_energy(magnitudes)
+            self.bg_viz.update_energy(frame)
         if current_page == "spectrum" and self.viz is not None:
-            self.viz.update_data(magnitudes)
+            self.viz.update_data(frame)
+
+    def _blend_spectrum_frames(self, seed, live, t):
+        if not seed:
+            return list(live or [])
+        if not live:
+            return list(seed)
+        a = list(seed)
+        b = list(live)
+        n = max(len(a), len(b))
+        if len(a) < n:
+            a.extend([a[-1] if a else 0.0] * (n - len(a)))
+        if len(b) < n:
+            b.extend([b[-1] if b else 0.0] * (n - len(b)))
+        k = max(0.0, min(1.0, float(t)))
+        return [a[i] + ((b[i] - a[i]) * k) for i in range(n)]
 
     def _lock_volume_controls(self, locked):
         """
@@ -1810,6 +2154,7 @@ class TidalApp(Adw.Application):
         self.play_track(0)
 
     def show_album_details(self, alb):
+        self.current_remote_playlist = None
         ui_actions.show_album_details(self, alb)
 
     def _sort_tracks(self, tracks, field, asc=True):
@@ -2133,18 +2478,201 @@ class TidalApp(Adw.Application):
         return False
 
     def render_playlists_home(self):
+        self.current_remote_playlist = None
+        if self.right_stack is not None:
+            self.right_stack.set_visible_child_name("grid_view")
+            if hasattr(self, "_remember_last_view"):
+                self._remember_last_view("grid_view")
+        folder_stack = list(getattr(self, "current_playlist_folder_stack", []) or [])
+        if self.back_btn is not None:
+            self.back_btn.set_sensitive(bool(folder_stack))
+        if self.remote_playlist_edit_btn is not None:
+            self.remote_playlist_edit_btn.set_visible(False)
+        if self.remote_playlist_visibility_btn is not None:
+            self.remote_playlist_visibility_btn.set_visible(False)
+        if self.remote_playlist_more_btn is not None:
+            self.remote_playlist_more_btn.set_visible(False)
         if hasattr(self, "grid_title_label") and self.grid_title_label is not None:
             self.grid_title_label.set_text("Playlists")
             self.grid_title_label.set_visible(True)
         if hasattr(self, "grid_subtitle_label") and self.grid_subtitle_label is not None:
-            self.grid_subtitle_label.set_text("Create and manage your local playlists")
+            self.grid_subtitle_label.set_text("Browse and manage your cloud playlists")
             self.grid_subtitle_label.set_visible(True)
         ui_actions.render_playlists_home(self)
+
+    def on_playlist_folder_card_clicked(self, folder_obj):
+        if folder_obj is None:
+            return
+        fid = str(getattr(folder_obj, "id", "") or "")
+        if not fid:
+            return
+        self.current_playlist_folder = folder_obj
+        stack = list(getattr(self, "current_playlist_folder_stack", []) or [])
+        if stack and str(stack[-1].get("id", "")) == fid:
+            pass
+        else:
+            stack.append({"id": fid, "name": str(getattr(folder_obj, "name", "") or "Folder"), "obj": folder_obj})
+        self.current_playlist_folder_stack = stack
+        self.render_playlists_home()
+
+    def on_playlist_folder_up_clicked(self, _btn=None):
+        stack = list(getattr(self, "current_playlist_folder_stack", []) or [])
+        if not stack:
+            self.current_playlist_folder = None
+            self.render_playlists_home()
+            return
+        stack.pop()
+        self.current_playlist_folder_stack = stack
+        if stack:
+            self.current_playlist_folder = stack[-1].get("obj")
+        else:
+            self.current_playlist_folder = None
+        self.render_playlists_home()
+
+    def on_create_playlist_folder_clicked(self, _btn=None):
+        if not getattr(self.backend, "user", None):
+            self._show_simple_dialog("Login Required", "Please login first.")
+            return
+
+        def _submit(name):
+            folder_name = str(name or "").strip() or "New Folder"
+            parent_id = "root"
+            if getattr(self, "current_playlist_folder", None) is not None:
+                parent_id = str(getattr(self.current_playlist_folder, "id", "root") or "root")
+            self.show_output_notice("Creating folder...", "ok", 1500)
+
+            def task():
+                f = self.backend.create_cloud_folder(folder_name, parent_folder_id=parent_id)
+
+                def apply():
+                    if f is None:
+                        self.show_output_notice("Failed to create folder.", "warn", 2600)
+                    else:
+                        self.show_output_notice("Folder created.", "ok", 2200)
+                        self.render_playlists_home()
+                    return False
+
+                GLib.idle_add(apply)
+
+            Thread(target=task, daemon=True).start()
+
+        self._prompt_playlist_name(
+            "New Folder",
+            "New Folder",
+            _submit,
+            subtitle="Create a folder to organize your cloud playlists.",
+            placeholder="Folder name",
+            save_label="Create",
+            dialog_size=(480, 220),
+        )
+
+    def on_playlist_folder_rename_clicked(self, folder_obj=None):
+        folder_obj = folder_obj or getattr(self, "current_playlist_folder", None)
+        if folder_obj is None:
+            return
+        old_name = str(getattr(folder_obj, "name", "") or "Folder")
+
+        def _submit(name):
+            new_name = str(name or "").strip()
+            if not new_name or new_name == old_name:
+                return
+            self.show_output_notice("Renaming folder...", "ok", 1500)
+
+            def task():
+                res = self.backend.rename_cloud_folder(folder_obj, new_name)
+
+                def apply():
+                    if bool(res.get("ok")):
+                        self.show_output_notice("Folder renamed.", "ok", 2200)
+                        stack = list(getattr(self, "current_playlist_folder_stack", []) or [])
+                        for item in stack:
+                            if str(item.get("id", "")) == str(getattr(folder_obj, "id", "") or ""):
+                                item["name"] = new_name
+                        self.current_playlist_folder_stack = stack
+                        self.render_playlists_home()
+                    else:
+                        self.show_output_notice("Failed to rename folder.", "warn", 2600)
+                    return False
+
+                GLib.idle_add(apply)
+
+            Thread(target=task, daemon=True).start()
+
+        self._prompt_playlist_name(
+            "Rename Folder",
+            old_name,
+            _submit,
+            subtitle="Update folder name for your cloud playlists.",
+            placeholder="Folder name",
+            save_label="Rename",
+            dialog_size=(480, 220),
+        )
+
+    def on_playlist_folder_delete_clicked(self, folder_obj=None):
+        folder_obj = folder_obj or getattr(self, "current_playlist_folder", None)
+        if folder_obj is None:
+            return
+        fname = str(getattr(folder_obj, "name", "") or "this folder")
+        dialog = Gtk.Dialog(title="Delete Folder", transient_for=self.win, modal=True)
+        root = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=12,
+            margin_top=12,
+            margin_bottom=12,
+            margin_start=12,
+            margin_end=12,
+        )
+        root.append(Gtk.Label(label=f"Delete '{fname}' permanently?", xalign=0))
+        action_row = Gtk.Box(spacing=8, halign=Gtk.Align.END)
+        cancel_btn = Gtk.Button(label="Cancel")
+        delete_btn = Gtk.Button(label="Delete")
+        cancel_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.CANCEL))
+        delete_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.OK))
+        action_row.append(cancel_btn)
+        action_row.append(delete_btn)
+        root.append(action_row)
+        dialog.set_child(root)
+
+        def _on_response(d, resp):
+            if resp != Gtk.ResponseType.OK:
+                d.destroy()
+                return
+            d.destroy()
+            self.show_output_notice("Deleting folder...", "ok", 1600)
+
+            def task():
+                res = self.backend.delete_cloud_folder(folder_obj)
+
+                def apply():
+                    if bool(res.get("ok")):
+                        self.show_output_notice("Folder deleted.", "ok", 2200)
+                        fid = str(getattr(folder_obj, "id", "") or "")
+                        stack = [x for x in list(getattr(self, "current_playlist_folder_stack", []) or []) if str(x.get("id", "")) != fid]
+                        self.current_playlist_folder_stack = stack
+                        self.current_playlist_folder = stack[-1].get("obj") if stack else None
+                        self.render_playlists_home()
+                    else:
+                        self.show_output_notice("Failed to delete folder.", "warn", 2800)
+                    return False
+
+                GLib.idle_add(apply)
+
+            Thread(target=task, daemon=True).start()
+
+        dialog.connect("response", _on_response)
+        dialog.present()
 
     def render_playlist_detail(self, playlist_id):
         ui_actions.render_playlist_detail(self, playlist_id)
 
     def on_playlist_card_clicked(self, playlist_id):
+        self.current_remote_playlist = None
+        if self.remote_playlist_edit_btn is not None:
+            self.remote_playlist_edit_btn.set_visible(False)
+        if self.remote_playlist_visibility_btn is not None:
+            self.remote_playlist_visibility_btn.set_visible(False)
+        if self.remote_playlist_more_btn is not None:
+            self.remote_playlist_more_btn.set_visible(False)
         self.current_playlist_id = playlist_id
         self.playlist_edit_mode = False
         self.playlist_rename_mode = False
@@ -2159,6 +2687,7 @@ class TidalApp(Adw.Application):
     def on_remote_playlist_card_clicked(self, playlist_obj):
         if playlist_obj is None:
             return
+        self.current_remote_playlist = playlist_obj
         self.current_album = None
         self.current_playlist_id = None
         self.playlist_edit_mode = False
@@ -2170,7 +2699,7 @@ class TidalApp(Adw.Application):
 
         title = getattr(playlist_obj, "name", "TIDAL Playlist")
         creator = getattr(playlist_obj, "creator", None)
-        creator_name = getattr(creator, "name", "TIDAL")
+        creator_name = str(getattr(creator, "name", None) or "TIDAL")
         self.header_kicker.set_text("Playlist")
         self.header_title.set_text(title)
         self.header_title.set_tooltip_text(title)
@@ -2181,6 +2710,13 @@ class TidalApp(Adw.Application):
             self.fav_btn.set_visible(False)
         if self.add_playlist_btn is not None:
             self.add_playlist_btn.set_visible(True)
+        if self.remote_playlist_edit_btn is not None:
+            self.remote_playlist_edit_btn.set_visible(True)
+        if self.remote_playlist_visibility_btn is not None:
+            self.remote_playlist_visibility_btn.set_visible(True)
+        if self.remote_playlist_more_btn is not None:
+            self.remote_playlist_more_btn.set_visible(True)
+        self._refresh_remote_playlist_visibility_button(playlist_obj)
         utils.load_img(self.header_art, lambda: self.backend.get_artwork_url(playlist_obj, 640), self.cache_dir, 160)
 
         while c := self.track_list.get_first_child():
@@ -2192,6 +2728,365 @@ class TidalApp(Adw.Application):
             def apply():
                 self.header_meta.set_text(f"{len(tracks)} Tracks" if tracks else "0 Tracks")
                 self.load_album_tracks(tracks)
+                return False
+
+            GLib.idle_add(apply)
+
+        Thread(target=task, daemon=True).start()
+
+    def _refresh_remote_playlist_visibility_button(self, playlist_obj=None):
+        btn = getattr(self, "remote_playlist_visibility_btn", None)
+        if btn is None:
+            return
+        pl = playlist_obj or getattr(self, "current_remote_playlist", None)
+        if pl is None:
+            btn.set_visible(False)
+            return
+        is_public = bool(getattr(pl, "public", False))
+        btn.set_icon_name("changes-allow-symbolic" if is_public else "changes-prevent-symbolic")
+        btn.set_tooltip_text("Click to make private" if is_public else "Click to make public")
+        try:
+            if is_public:
+                btn.add_css_class("liked-action-btn-primary")
+            else:
+                btn.remove_css_class("liked-action-btn-primary")
+        except Exception:
+            pass
+
+    def on_remote_playlist_toggle_public_clicked(self, _btn=None, playlist_obj=None):
+        pl = playlist_obj or getattr(self, "current_remote_playlist", None)
+        if pl is None:
+            return
+        target_public = not bool(getattr(pl, "public", False))
+        self.show_output_notice("Updating playlist visibility...", "ok", 1800)
+
+        def task():
+            res = self.backend.update_cloud_playlist(pl, is_public=target_public)
+
+            def apply():
+                if bool(res.get("ok")):
+                    try:
+                        pl.public = target_public
+                    except Exception:
+                        pass
+                    self._refresh_remote_playlist_visibility_button(pl)
+                    self.show_output_notice(
+                        "Playlist is now public." if target_public else "Playlist is now private.",
+                        "ok",
+                        2200,
+                    )
+                else:
+                    self.show_output_notice("Failed to update playlist visibility.", "warn", 3200)
+                return False
+
+            GLib.idle_add(apply)
+
+        Thread(target=task, daemon=True).start()
+
+    def _open_cloud_playlist_editor(
+        self,
+        dialog_title,
+        save_label,
+        initial_title,
+        initial_desc="",
+        initial_public=False,
+        playlist_obj=None,
+        folder_options=None,
+        initial_folder_id="root",
+        on_submit=None,
+    ):
+        dialog = Gtk.Dialog(title=dialog_title, transient_for=self.win, modal=True)
+        dialog.set_default_size(586, 413)
+        root = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=12,
+            margin_top=14,
+            margin_bottom=14,
+            margin_start=14,
+            margin_end=14,
+        )
+        content = Gtk.Box(spacing=16)
+
+        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        cover = Gtk.Image(css_classes=["album-cover-img", "playlist-cover-img"])
+        cover.set_size_request(147, 147)
+        if playlist_obj is not None:
+            utils.load_img(cover, lambda: self.backend.get_artwork_url(playlist_obj, 640), self.cache_dir, 147)
+        else:
+            cover.set_from_icon_name("audio-x-generic-symbolic")
+        left.append(cover)
+        change_btn = Gtk.Button(label="Change image")
+        change_btn.set_sensitive(False)
+        change_btn.set_tooltip_text("Not available in this version")
+        left.append(change_btn)
+        content.append(left)
+
+        right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, hexpand=True)
+        right.append(Gtk.Label(label="Title", xalign=0))
+        title_entry = Gtk.Entry(text=str(initial_title or ""))
+        right.append(title_entry)
+
+        folder_dd = None
+        folder_ids = []
+        if folder_options:
+            right.append(Gtk.Label(label="Folder", xalign=0))
+            folder_labels = [str(item[1] or "Root") for item in folder_options]
+            folder_ids = [str(item[0] or "root") for item in folder_options]
+            folder_dd = Gtk.DropDown(model=Gtk.StringList.new(folder_labels))
+            selected_idx = 0
+            target_id = str(initial_folder_id or "root")
+            for i, fid in enumerate(folder_ids):
+                if fid == target_id:
+                    selected_idx = i
+                    break
+            folder_dd.set_selected(selected_idx)
+            right.append(folder_dd)
+
+        right.append(Gtk.Label(label="Description", xalign=0))
+        desc_view = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR, vexpand=True)
+        desc_buf = desc_view.get_buffer()
+        desc_buf.set_text(str(initial_desc or ""))
+        desc_scroll = Gtk.ScrolledWindow(vexpand=True, min_content_height=120)
+        desc_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        desc_scroll.set_child(desc_view)
+        right.append(desc_scroll)
+        count_lbl = Gtk.Label(xalign=0, css_classes=["dim-label"])
+        right.append(count_lbl)
+
+        public_row = Gtk.Box(spacing=8, margin_top=6)
+        public_lbl_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
+        public_lbl_box.append(Gtk.Label(label="Make it public", xalign=0))
+        public_lbl_box.append(Gtk.Label(label="Your playlist will be visible on your profile and accessible by anyone.", xalign=0, css_classes=["dim-label"]))
+        public_switch = Gtk.Switch(active=bool(initial_public), halign=Gtk.Align.END, valign=Gtk.Align.CENTER)
+        public_row.append(public_lbl_box)
+        public_row.append(public_switch)
+        right.append(public_row)
+
+        content.append(right)
+        root.append(content)
+
+        action_row = Gtk.Box(spacing=8, halign=Gtk.Align.END)
+        cancel_btn = Gtk.Button(label="Cancel")
+        save_btn = Gtk.Button(label=save_label)
+        save_btn.add_css_class("suggested-action")
+        cancel_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.CANCEL))
+        save_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.OK))
+        action_row.append(cancel_btn)
+        action_row.append(save_btn)
+        root.append(action_row)
+        dialog.set_child(root)
+
+        def _update_count(_buf=None):
+            txt = desc_buf.get_text(desc_buf.get_start_iter(), desc_buf.get_end_iter(), True) or ""
+            count_lbl.set_text(f"{len(txt)}/500 characters")
+            if len(txt) > 500:
+                count_lbl.add_css_class("status-error")
+            else:
+                count_lbl.remove_css_class("status-error")
+            return False
+
+        desc_buf.connect("changed", _update_count)
+        _update_count()
+
+        def _on_response(d, resp):
+            if resp != Gtk.ResponseType.OK:
+                d.destroy()
+                return
+            title = str(title_entry.get_text() or "").strip()
+            desc = desc_buf.get_text(desc_buf.get_start_iter(), desc_buf.get_end_iter(), True) or ""
+            is_public = bool(public_switch.get_active())
+            selected_folder_id = str(initial_folder_id or "root")
+            if folder_dd is not None and folder_ids:
+                idx = int(folder_dd.get_selected())
+                if 0 <= idx < len(folder_ids):
+                    selected_folder_id = folder_ids[idx]
+            d.destroy()
+            if not title:
+                self.show_output_notice("Playlist title cannot be empty.", "warn", 2600)
+                return
+            if len(desc) > 500:
+                self.show_output_notice("Description is too long (max 500).", "warn", 2600)
+                return
+            if callable(on_submit):
+                on_submit(title, desc, is_public, selected_folder_id)
+
+        dialog.connect("response", _on_response)
+        dialog.present()
+
+    def on_remote_playlist_rename_clicked(self, playlist_obj=None):
+        pl = playlist_obj or getattr(self, "current_remote_playlist", None)
+        if pl is None:
+            return
+        title_init = str(getattr(pl, "name", None) or "Untitled Playlist")
+        desc_init = str(getattr(pl, "description", None) or "")
+        public_init = bool(getattr(pl, "public", False))
+
+        def _submit(title, desc, is_public, _folder_id):
+            self.show_output_notice("Saving playlist...", "ok", 1800)
+
+            def task():
+                res = self.backend.update_cloud_playlist(pl, name=title, description=desc, is_public=is_public)
+
+                def apply():
+                    if bool(res.get("ok")):
+                        try:
+                            pl.name = title
+                            pl.description = desc
+                            pl.public = is_public
+                        except Exception:
+                            pass
+                        self.show_output_notice("Playlist updated.", "ok", 2400)
+                        if getattr(self, "current_remote_playlist", None) is not None and getattr(self.current_remote_playlist, "id", None) == getattr(pl, "id", None):
+                            self.on_remote_playlist_card_clicked(pl)
+                    else:
+                        self.show_output_notice("Failed to update playlist.", "warn", 3200)
+                    return False
+
+                GLib.idle_add(apply)
+
+            Thread(target=task, daemon=True).start()
+
+        self._open_cloud_playlist_editor(
+            dialog_title="Edit playlist",
+            save_label="Save",
+            initial_title=title_init,
+            initial_desc=desc_init,
+            initial_public=public_init,
+            playlist_obj=pl,
+            on_submit=_submit,
+        )
+
+    def on_remote_playlist_delete_clicked(self, playlist_obj=None):
+        pl = playlist_obj or getattr(self, "current_remote_playlist", None)
+        if pl is None:
+            return
+        pname = str(getattr(pl, "name", None) or "this playlist")
+        dialog = Gtk.Dialog(title="Delete Playlist", transient_for=self.win, modal=True)
+        root = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=12,
+            margin_top=12,
+            margin_bottom=12,
+            margin_start=12,
+            margin_end=12,
+        )
+        root.append(Gtk.Label(label=f"Delete '{pname}' permanently?", xalign=0))
+        action_row = Gtk.Box(spacing=8, halign=Gtk.Align.END)
+        cancel_btn = Gtk.Button(label="Cancel")
+        delete_btn = Gtk.Button(label="Delete")
+        cancel_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.CANCEL))
+        delete_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.OK))
+        action_row.append(cancel_btn)
+        action_row.append(delete_btn)
+        root.append(action_row)
+        dialog.set_child(root)
+
+        def _on_response(d, resp):
+            if resp != Gtk.ResponseType.OK:
+                d.destroy()
+                return
+            d.destroy()
+            self.show_output_notice("Deleting playlist...", "ok", 1600)
+
+            def task():
+                res = self.backend.delete_cloud_playlist(pl)
+
+                def apply():
+                    if bool(res.get("ok")):
+                        self.show_output_notice("Playlist deleted.", "ok", 2200)
+                        if getattr(self, "current_remote_playlist", None) is not None and getattr(self.current_remote_playlist, "id", None) == getattr(pl, "id", None):
+                            self.current_remote_playlist = None
+                        self.render_playlists_home()
+                    else:
+                        self.show_output_notice("Failed to delete playlist.", "warn", 3000)
+                    return False
+
+                GLib.idle_add(apply)
+
+            Thread(target=task, daemon=True).start()
+
+        dialog.connect("response", _on_response)
+        dialog.present()
+
+    def on_remote_playlist_move_to_folder_clicked(self, playlist_obj=None):
+        pl = playlist_obj or getattr(self, "current_remote_playlist", None)
+        if pl is None:
+            return
+        folders = [{"id": "root", "path": "Root"}] + list(self.backend.get_all_playlist_folders(limit=1000) or [])
+        options = [(str(f.get("id", "root")), str(f.get("path", "Root"))) for f in folders]
+        if not options:
+            self.show_output_notice("No folders available.", "warn", 2400)
+            return
+        dialog = Gtk.Dialog(title="Move to Folder", transient_for=self.win, modal=True)
+        root = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=12,
+            margin_top=12,
+            margin_bottom=12,
+            margin_start=12,
+            margin_end=12,
+        )
+        root.append(Gtk.Label(label="Select destination folder:", xalign=0))
+        dd = Gtk.DropDown(model=Gtk.StringList.new([label for _fid, label in options]))
+        dd.set_selected(0)
+        root.append(dd)
+        action_row = Gtk.Box(spacing=8, halign=Gtk.Align.END)
+        cancel_btn = Gtk.Button(label="Cancel")
+        move_btn = Gtk.Button(label="Move")
+        move_btn.add_css_class("suggested-action")
+        cancel_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.CANCEL))
+        move_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.OK))
+        action_row.append(cancel_btn)
+        action_row.append(move_btn)
+        root.append(action_row)
+        dialog.set_child(root)
+
+        def _on_response(d, resp):
+            if resp != Gtk.ResponseType.OK:
+                d.destroy()
+                return
+            idx = int(dd.get_selected())
+            target_id = options[idx][0] if 0 <= idx < len(options) else "root"
+            d.destroy()
+            self.show_output_notice("Moving playlist...", "ok", 1800)
+
+            def task():
+                res = self.backend.move_cloud_playlist_to_folder(pl, target_folder_id=target_id)
+
+                def apply():
+                    if bool(res.get("ok")):
+                        self.show_output_notice("Playlist moved.", "ok", 2200)
+                        self.current_remote_playlist = None
+                        self.current_playlist_folder = None
+                        self.current_playlist_folder_stack = []
+                        self.render_playlists_home()
+                    else:
+                        self.show_output_notice("Failed to move playlist.", "warn", 2800)
+                    return False
+
+                GLib.idle_add(apply)
+
+            Thread(target=task, daemon=True).start()
+
+        dialog.connect("response", _on_response)
+        dialog.present()
+
+    def on_remove_single_track_from_remote_playlist(self, track):
+        pl = getattr(self, "current_remote_playlist", None)
+        if pl is None or track is None:
+            return
+
+        def task():
+            res = self.backend.remove_tracks_from_cloud_playlist(pl, [track])
+
+            def apply():
+                if bool(res.get("ok")):
+                    removed = int(res.get("removed", 0) or 0)
+                    self.show_output_notice(f"Removed {removed} track", "ok", 2200)
+                    # Refresh current remote playlist view
+                    self.on_remote_playlist_card_clicked(pl)
+                else:
+                    self.show_output_notice("Failed to remove track from playlist.", "warn", 2800)
                 return False
 
             GLib.idle_add(apply)
@@ -2210,18 +3105,7 @@ class TidalApp(Adw.Application):
         self.play_track(idx)
 
     def _next_playlist_name(self):
-        playlists = self.playlist_mgr.list_playlists() if hasattr(self, "playlist_mgr") else []
-        max_n = 0
-        for p in playlists:
-            name = str(p.get("name", "") or "").strip()
-            if not name.startswith("Playlist "):
-                continue
-            suffix = name[len("Playlist "):].strip()
-            if suffix.isdigit():
-                n = int(suffix)
-                if n > max_n:
-                    max_n = n
-        return f"Playlist {max_n + 1}"
+        return "New Playlist"
 
     def _show_simple_dialog(self, title, message):
         dialog = Gtk.Dialog(title=title, transient_for=self.win, modal=True)
@@ -2244,52 +3128,62 @@ class TidalApp(Adw.Application):
         dialog.present()
 
     def on_create_playlist_clicked(self, _btn=None):
+        if not getattr(self.backend, "user", None):
+            self._show_simple_dialog("Login Required", "Please login first.")
+            return
         default_name = self._next_playlist_name()
-        dialog = Gtk.Dialog(title="Create Playlist", transient_for=self.win, modal=True)
-        root = Gtk.Box(
-            orientation=Gtk.Orientation.VERTICAL,
-            spacing=12,
-            margin_top=12,
-            margin_bottom=12,
-            margin_start=12,
-            margin_end=12,
+        folder_rows = [{"id": "root", "path": "Root"}] + list(self.backend.get_all_playlist_folders(limit=1000) or [])
+        folder_options = [(str(row.get("id", "root")), str(row.get("path", "Root"))) for row in folder_rows]
+        initial_folder_id = "root"
+        if getattr(self, "current_playlist_folder", None) is not None:
+            initial_folder_id = str(getattr(self.current_playlist_folder, "id", "root") or "root")
+
+        def _submit(name, desc, is_public, folder_id):
+            self.show_output_notice("Creating cloud playlist...", "ok", 1600)
+
+            def task():
+                pl = self.backend.create_cloud_playlist_in_folder(name, desc, parent_folder_id=folder_id)
+                if pl is not None and bool(is_public):
+                    try:
+                        self.backend.update_cloud_playlist(pl, is_public=True)
+                    except Exception:
+                        pass
+
+                def apply():
+                    if pl is None:
+                        self.show_output_notice("Failed to create cloud playlist.", "warn", 2600)
+                        return False
+                    self.show_output_notice(f"Created playlist: {getattr(pl, 'name', name)}", "ok", 2200)
+                    self.render_playlists_home()
+                    return False
+
+                GLib.idle_add(apply)
+
+            Thread(target=task, daemon=True).start()
+
+        self._open_cloud_playlist_editor(
+            dialog_title="Create playlist",
+            save_label="Create",
+            initial_title=default_name,
+            initial_desc="Created from HiresTI",
+            initial_public=False,
+            playlist_obj=None,
+            folder_options=folder_options,
+            initial_folder_id=initial_folder_id,
+            on_submit=_submit,
         )
-        root.append(Gtk.Label(label="Playlist name:", xalign=0))
-        name_entry = Gtk.Entry(text=default_name)
-        name_entry.set_activates_default(True)
-        root.append(name_entry)
-
-        action_row = Gtk.Box(spacing=8, halign=Gtk.Align.END)
-        cancel_btn = Gtk.Button(label="Cancel")
-        create_btn = Gtk.Button(label="Create")
-        create_btn.add_css_class("suggested-action")
-        cancel_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.CANCEL))
-        create_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.OK))
-        action_row.append(cancel_btn)
-        action_row.append(create_btn)
-        root.append(action_row)
-        dialog.set_child(root)
-
-        def _on_response(d, resp):
-            if resp != Gtk.ResponseType.OK:
-                d.destroy()
-                return
-
-            name = str(name_entry.get_text() or "").strip() or default_name
-            d.destroy()
-
-            p = self.playlist_mgr.create_playlist(name)
-            self.current_playlist_id = p.get("id")
-            self.render_playlists_home()
-
-        dialog.connect("response", _on_response)
-        dialog.present()
 
     def _prompt_playlist_pick(self, on_pick):
-        playlists = self.playlist_mgr.list_playlists() if hasattr(self, "playlist_mgr") else []
+        if not getattr(self.backend, "user", None):
+            self._show_simple_dialog("Login Required", "Please login first.")
+            return
+        playlists = list(self.backend.get_user_playlists(limit=1000) or [])
         if not playlists:
-            created = self.playlist_mgr.create_playlist(self._next_playlist_name())
-            on_pick(created.get("id"), True)
+            created = self.backend.create_cloud_playlist(self._next_playlist_name(), "Created from HiresTI")
+            if created is not None:
+                on_pick(created, True)
+            else:
+                self.show_output_notice("Failed to create cloud playlist.", "warn", 2600)
             return
 
         dialog = Gtk.Dialog(title="Add to Playlist", transient_for=self.win, modal=True)
@@ -2304,7 +3198,7 @@ class TidalApp(Adw.Application):
         box_wrap = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
         box_wrap.append(Gtk.Label(label="Select a playlist:", xalign=0))
 
-        names = [p.get("name", "Untitled Playlist") for p in playlists]
+        names = [getattr(p, "name", None) or "Untitled Playlist" for p in playlists]
         dd = Gtk.DropDown(model=Gtk.StringList.new(names))
         dd.set_selected(0)
         box_wrap.append(dd)
@@ -2328,10 +3222,13 @@ class TidalApp(Adw.Application):
             if resp == Gtk.ResponseType.OK:
                 idx = dd.get_selected()
                 if 0 <= idx < len(playlists):
-                    on_pick(playlists[idx].get("id"), dedupe_ck.get_active())
+                    on_pick(playlists[idx], dedupe_ck.get_active())
             elif resp == Gtk.ResponseType.APPLY:
-                created = self.playlist_mgr.create_playlist(self._next_playlist_name())
-                on_pick(created.get("id"), dedupe_ck.get_active())
+                created = self.backend.create_cloud_playlist(self._next_playlist_name(), "Created from HiresTI")
+                if created is not None:
+                    on_pick(created, dedupe_ck.get_active())
+                else:
+                    self.show_output_notice("Failed to create cloud playlist.", "warn", 2600)
             d.destroy()
 
         dialog.connect("response", _on_response)
@@ -2342,12 +3239,28 @@ class TidalApp(Adw.Application):
         if not items:
             return
 
-        def _do_add(playlist_id, dedupe):
-            for t in items:
-                cover_url = self.backend.get_artwork_url(t, 320)
-                self.playlist_mgr.add_track(playlist_id, t, cover_url=cover_url, dedupe=dedupe)
-            if self.current_playlist_id and str(self.current_playlist_id) == str(playlist_id):
-                self.render_playlist_detail(playlist_id)
+        def _do_add(playlist_obj, dedupe):
+            self.show_output_notice("Adding tracks to cloud playlist...", "ok", 1800)
+
+            def task():
+                res = self.backend.add_tracks_to_cloud_playlist(playlist_obj, items, dedupe=bool(dedupe), batch_size=100)
+
+                def apply():
+                    if bool(res.get("ok")):
+                        added = int(res.get("added", 0) or 0)
+                        requested = int(res.get("requested", 0) or 0)
+                        skipped = max(0, requested - added)
+                        msg = f"Added {added} tracks"
+                        if skipped:
+                            msg += f" (skipped {skipped})"
+                        self.show_output_notice(msg, "ok", 2600)
+                    else:
+                        self.show_output_notice("Failed to add tracks to cloud playlist.", "warn", 3000)
+                    return False
+
+                GLib.idle_add(apply)
+
+            Thread(target=task, daemon=True).start()
 
         self._prompt_playlist_pick(_do_add)
 
@@ -2453,22 +3366,42 @@ class TidalApp(Adw.Application):
         self.search_tracks_page = int(getattr(self, "search_tracks_page", 0) or 0) + 1
         ui_actions.render_search_tracks_page(self)
 
-    def _prompt_playlist_name(self, title, initial_name, on_submit):
+    def _prompt_playlist_name(
+        self,
+        title,
+        initial_name,
+        on_submit,
+        subtitle=None,
+        placeholder=None,
+        save_label="Save",
+        dialog_size=None,
+    ):
         dialog = Gtk.Dialog(title=title, transient_for=self.win, modal=True)
+        if dialog_size:
+            try:
+                dialog.set_default_size(int(dialog_size[0]), int(dialog_size[1]))
+            except Exception:
+                pass
         root = Gtk.Box(
             orientation=Gtk.Orientation.VERTICAL,
-            spacing=12,
-            margin_top=12,
-            margin_bottom=12,
-            margin_start=12,
-            margin_end=12,
+            spacing=14,
+            margin_top=14,
+            margin_bottom=14,
+            margin_start=14,
+            margin_end=14,
         )
+        title_lbl = Gtk.Label(label=str(title or ""), xalign=0, css_classes=["home-section-title"])
+        root.append(title_lbl)
+        if subtitle:
+            root.append(Gtk.Label(label=str(subtitle), xalign=0, css_classes=["dim-label"]))
         entry = Gtk.Entry(text=initial_name or "")
+        if placeholder:
+            entry.set_placeholder_text(str(placeholder))
         entry.connect("activate", lambda _e: dialog.response(Gtk.ResponseType.OK))
         root.append(entry)
         action_row = Gtk.Box(spacing=8, halign=Gtk.Align.END)
         cancel_btn = Gtk.Button(label="Cancel")
-        save_btn = Gtk.Button(label="Save")
+        save_btn = Gtk.Button(label=str(save_label or "Save"), css_classes=["suggested-action"])
         cancel_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.CANCEL))
         save_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.OK))
         action_row.append(cancel_btn)
@@ -2483,6 +3416,7 @@ class TidalApp(Adw.Application):
 
         dialog.connect("response", _on_response)
         dialog.present()
+        entry.grab_focus()
 
     def on_playlist_start_inline_rename(self, playlist_id):
         self.playlist_rename_mode = True
@@ -2924,6 +3858,31 @@ class TidalApp(Adw.Application):
     def update_ui_loop(self):
         return lyrics_playback_actions.update_ui_loop(self)
 
+    def _get_ui_loop_interval_ms(self):
+        if not self.playing_track_id:
+            return 220
+        if self.viz_revealer is not None and self.viz_revealer.get_reveal_child():
+            if self.viz_stack is not None and self.viz_stack.get_visible_child_name() == "lyrics":
+                return 25
+            return 40
+        return 120
+
+    def _schedule_update_ui_loop(self, delay_ms=None):
+        source = getattr(self, "_ui_loop_source", 0)
+        if source:
+            GLib.source_remove(source)
+            self._ui_loop_source = 0
+        next_delay = int(delay_ms if delay_ms is not None else self._get_ui_loop_interval_ms())
+
+        def _tick():
+            self._ui_loop_source = 0
+            keep_running = bool(self.update_ui_loop())
+            if keep_running:
+                self._schedule_update_ui_loop()
+            return False
+
+        self._ui_loop_source = GLib.timeout_add(max(20, next_delay), _tick)
+
     def update_layout_proportions(self, w, p):
         try:
             saved_paned = int(self.settings.get("paned_position", 0) or 0)
@@ -3249,6 +4208,11 @@ class TidalApp(Adw.Application):
         self.schedule_save_settings()
 
     def _set_visualizer_expanded(self, expanded):
+        if expanded:
+            self._viz_seed_frame = list(self._last_spectrum_frame) if self._last_spectrum_frame else None
+            self._viz_warmup_until = time.monotonic() + float(self._viz_warmup_duration_s)
+        if self.player is not None and hasattr(self.player, "set_spectrum_enabled"):
+            self.player.set_spectrum_enabled(expanded)
         # 触发 Revealer 动画 (上下滑动)
         self.viz_revealer.set_reveal_child(expanded)
         self._apply_overlay_scroll_padding(expanded)
@@ -3257,6 +4221,13 @@ class TidalApp(Adw.Application):
             GLib.source_remove(self._viz_handle_settle_source)
             self._viz_handle_settle_source = 0
         if expanded:
+            self._set_viz_content_opacity(0.0)
+            self._start_viz_fade_in(2000)
+            if self._viz_seed_frame:
+                if getattr(self, "viz", None) is not None:
+                    self.viz.update_data(self._viz_seed_frame)
+                if getattr(self, "bg_viz", None) is not None:
+                    self.bg_viz.update_energy(self._viz_seed_frame)
             def _settle_handle():
                 self._viz_handle_settle_source = 0
                 self._position_viz_handle(True)
@@ -3271,8 +4242,45 @@ class TidalApp(Adw.Application):
             if self.viz is not None:
                 self.viz.queue_draw()
         else:
+            if self._last_spectrum_frame:
+                self._viz_seed_frame = list(self._last_spectrum_frame)
             self.viz_btn.set_icon_name("hiresti-pan-up-symbolic")
             self.viz_btn.remove_css_class("active")
+            if self._viz_fade_source:
+                GLib.source_remove(self._viz_fade_source)
+                self._viz_fade_source = 0
+            self._set_viz_content_opacity(0.0)
+
+    def _set_viz_content_opacity(self, alpha):
+        a = max(0.0, min(1.0, float(alpha)))
+        if getattr(self, "viz", None) is not None:
+            self.viz.set_opacity(a)
+        if getattr(self, "bg_viz", None) is not None:
+            # Keep lyrics background always visible enough; avoid "all black" when
+            # fade state gets out of sync with GLArea rendering.
+            self.bg_viz.set_opacity(max(0.35, a))
+
+    def _start_viz_fade_in(self, duration_ms=1000):
+        if self._viz_fade_source:
+            GLib.source_remove(self._viz_fade_source)
+            self._viz_fade_source = 0
+        start_us = GLib.get_monotonic_time()
+        duration_us = max(1, int(duration_ms) * 1000)
+
+        def _tick():
+            revealer = getattr(self, "viz_revealer", None)
+            if revealer is None or not revealer.get_reveal_child():
+                self._viz_fade_source = 0
+                return False
+            elapsed = GLib.get_monotonic_time() - start_us
+            t = max(0.0, min(1.0, elapsed / float(duration_us)))
+            self._set_viz_content_opacity(t)
+            if t >= 1.0:
+                self._viz_fade_source = 0
+                return False
+            return True
+
+        self._viz_fade_source = GLib.timeout_add(16, _tick)
 
     def _position_viz_handle(self, expanded):
         box = getattr(self, "viz_handle_box", None)

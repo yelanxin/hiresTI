@@ -192,10 +192,50 @@ def build_tracks_view(app):
     app.add_playlist_btn = Gtk.Button(icon_name="list-add-symbolic", css_classes=["flat", "circular", "history-scroll-btn"], valign=Gtk.Align.CENTER)
     app.add_playlist_btn.set_tooltip_text("Add Album Tracks to Playlist")
     app.add_playlist_btn.connect("clicked", app.on_add_current_album_to_playlist)
+    app.remote_playlist_edit_btn = Gtk.Button(icon_name="document-edit-symbolic", css_classes=["flat", "circular", "history-scroll-btn"], valign=Gtk.Align.CENTER)
+    app.remote_playlist_edit_btn.set_tooltip_text("Edit Playlist")
+    app.remote_playlist_edit_btn.set_visible(False)
+    app.remote_playlist_edit_btn.connect("clicked", lambda _b: app.on_remote_playlist_rename_clicked())
+    app.remote_playlist_visibility_btn = Gtk.Button(icon_name="changes-prevent-symbolic", css_classes=["flat", "circular", "history-scroll-btn"], valign=Gtk.Align.CENTER)
+    app.remote_playlist_visibility_btn.set_tooltip_text("Set public/private")
+    app.remote_playlist_visibility_btn.set_visible(False)
+    app.remote_playlist_visibility_btn.connect("clicked", lambda _b: app.on_remote_playlist_toggle_public_clicked())
+    app.remote_playlist_more_btn = Gtk.Button(icon_name="open-menu-symbolic", css_classes=["flat", "circular", "history-scroll-btn"], valign=Gtk.Align.CENTER)
+    app.remote_playlist_more_btn.set_tooltip_text("More")
+    app.remote_playlist_more_btn.set_visible(False)
+    app.remote_playlist_more_pop = Gtk.Popover()
+    app.remote_playlist_more_pop.set_parent(app.remote_playlist_more_btn)
+    more_box = Gtk.Box(
+        orientation=Gtk.Orientation.VERTICAL,
+        spacing=4,
+        margin_top=8,
+        margin_bottom=8,
+        margin_start=8,
+        margin_end=8,
+    )
+    move_btn = Gtk.Button(css_classes=["flat"])
+    move_row = Gtk.Box(spacing=8)
+    move_row.append(Gtk.Image.new_from_icon_name("folder-open-symbolic"))
+    move_row.append(Gtk.Label(label="Move to Folder", xalign=0))
+    move_btn.set_child(move_row)
+    move_btn.connect("clicked", lambda _b: (app.remote_playlist_more_pop.popdown(), app.on_remote_playlist_move_to_folder_clicked()))
+    more_box.append(move_btn)
+    del_btn = Gtk.Button(css_classes=["flat"])
+    del_row = Gtk.Box(spacing=8)
+    del_row.append(Gtk.Image.new_from_icon_name("user-trash-symbolic"))
+    del_row.append(Gtk.Label(label="Delete Playlist", xalign=0))
+    del_btn.set_child(del_row)
+    del_btn.connect("clicked", lambda _b: (app.remote_playlist_more_pop.popdown(), app.on_remote_playlist_delete_clicked()))
+    more_box.append(del_btn)
+    app.remote_playlist_more_pop.set_child(more_box)
+    app.remote_playlist_more_btn.connect("clicked", lambda _b: app.remote_playlist_more_pop.popup())
 
     app.album_header_box.append(app.header_art)
     app.album_header_box.append(info)
     app.album_header_box.append(app.add_playlist_btn)
+    app.album_header_box.append(app.remote_playlist_edit_btn)
+    app.album_header_box.append(app.remote_playlist_visibility_btn)
+    app.album_header_box.append(app.remote_playlist_more_btn)
     app.album_header_box.append(app.fav_btn)
     trk_content.append(app.album_header_box)
 

@@ -3,7 +3,7 @@ import os
 from typing import Any
 
 
-CURRENT_SETTINGS_VERSION = 1
+CURRENT_SETTINGS_VERSION = 2
 
 DEFAULT_SETTINGS = {
     "settings_version": CURRENT_SETTINGS_VERSION,
@@ -18,6 +18,7 @@ DEFAULT_SETTINGS = {
     "last_view": "grid_view",
     "viz_expanded": False,
     "spectrum_theme": 0,
+    "viz_backend_policy": 0,
     "viz_bar_count": 32,
     "viz_profile": 1,
     "viz_effect": 3,
@@ -91,6 +92,7 @@ def _as_int_dict(
 
 def normalize_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
     raw = raw or {}
+    raw_settings_version = _as_int(raw.get("settings_version"), 0, minimum=0)
     normalized = dict(DEFAULT_SETTINGS)
     normalized["driver"] = _as_str(raw.get("driver"), DEFAULT_SETTINGS["driver"])
     normalized["device"] = _as_str(raw.get("device"), DEFAULT_SETTINGS["device"])
@@ -103,21 +105,19 @@ def normalize_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
     normalized["last_view"] = _as_str(raw.get("last_view"), DEFAULT_SETTINGS["last_view"])
     normalized["viz_expanded"] = _as_bool(raw.get("viz_expanded"), DEFAULT_SETTINGS["viz_expanded"])
     normalized["spectrum_theme"] = _as_int(raw.get("spectrum_theme"), DEFAULT_SETTINGS["spectrum_theme"], minimum=0, maximum=64)
+    normalized["viz_backend_policy"] = _as_int(raw.get("viz_backend_policy"), DEFAULT_SETTINGS["viz_backend_policy"], minimum=0, maximum=1)
     normalized["viz_bar_count"] = _as_int(raw.get("viz_bar_count"), DEFAULT_SETTINGS["viz_bar_count"], minimum=4, maximum=128)
-    normalized["viz_profile"] = _as_int(raw.get("viz_profile"), DEFAULT_SETTINGS["viz_profile"], minimum=0, maximum=2)
+    # Current profile options: Soft/Dynamic/Extreme/Insane => 0..3
+    normalized["viz_profile"] = _as_int(raw.get("viz_profile"), DEFAULT_SETTINGS["viz_profile"], minimum=0, maximum=3)
+    # Current effect options after removing Radial and Fall: 17 entries => 0..16
     raw_viz_effect = raw.get("viz_effect")
-    # Compatibility with historical effect index changes:
-    # - old 14 (Infrared Waterfall RTL) -> 13 after removing Infrared RTL
-    # - old 13 (IR Waterfall) -> 15 (Pro Analyzer Waterfall) after removing IR Waterfall
-    # - old 14/15/16 shift down by 1 after removing IR Waterfall
-    if raw_viz_effect == 13:
-        raw_viz_effect = 15
-    elif raw_viz_effect == 14:
-        raw_viz_effect = 13
-    elif raw_viz_effect == 15:
-        raw_viz_effect = 14
-    elif raw_viz_effect == 16:
-        raw_viz_effect = 15
+    if isinstance(raw_viz_effect, int):
+        if raw_settings_version < 1 and raw_viz_effect >= 6:
+            # Legacy shift: old list contained Radial at index 5.
+            raw_viz_effect -= 1
+        if raw_settings_version < 2 and raw_viz_effect >= 14:
+            # Legacy shift: v1 list contained Fall at index 13.
+            raw_viz_effect -= 1
     normalized["viz_effect"] = _as_int(raw_viz_effect, DEFAULT_SETTINGS["viz_effect"], minimum=0, maximum=16)
     normalized["lyrics_font_preset"] = _as_int(raw.get("lyrics_font_preset"), DEFAULT_SETTINGS["lyrics_font_preset"], minimum=0, maximum=2)
     normalized["lyrics_bg_motion"] = _as_int(raw.get("lyrics_bg_motion"), DEFAULT_SETTINGS["lyrics_bg_motion"], minimum=0, maximum=2)
