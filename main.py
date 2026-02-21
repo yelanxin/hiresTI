@@ -2441,12 +2441,14 @@ class TidalApp(Adw.Application):
         if revealer is None:
             return
         show = not revealer.get_reveal_child()
-        if show:
-            self.render_queue_drawer()
         revealer.set_reveal_child(show)
         if getattr(self, "queue_backdrop", None) is not None:
             self.queue_backdrop.set_visible(show)
         self._sync_queue_handle_state(show)
+        if show:
+            # Let reveal animation start first; defer queue row rendering so
+            # first-frame animation is not blocked by list build work.
+            GLib.timeout_add(120, lambda: (self.render_queue_drawer(), False)[1])
 
     def close_queue_drawer(self):
         revealer = getattr(self, "queue_revealer", None)
@@ -4220,8 +4222,11 @@ class TidalApp(Adw.Application):
             GLib.source_remove(self._viz_handle_settle_source)
             self._viz_handle_settle_source = 0
         if expanded:
-            self._set_viz_content_opacity(0.0)
-            self._start_viz_fade_in(2000)
+            # Temporarily disable visualizer content fade-in for latency A/B test.
+            if self._viz_fade_source:
+                GLib.source_remove(self._viz_fade_source)
+                self._viz_fade_source = 0
+            self._set_viz_content_opacity(1.0)
             if self._viz_seed_frame:
                 if getattr(self, "viz", None) is not None:
                     self.viz.update_data(self._viz_seed_frame)

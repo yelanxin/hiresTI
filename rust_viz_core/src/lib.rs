@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::slice;
 
 pub struct VizProcessor {
@@ -686,4 +687,185 @@ pub extern "C" fn build_dots_rgba(
         }
     }
     need
+}
+
+#[no_mangle]
+pub extern "C" fn count_artist_keys(
+    keys_ptr: *const u64,
+    keys_len: usize,
+    out_keys_ptr: *mut u64,
+    out_counts_ptr: *mut u32,
+    out_len: usize,
+) -> usize {
+    if keys_ptr.is_null() || out_keys_ptr.is_null() || out_counts_ptr.is_null() || out_len == 0 {
+        return 0;
+    }
+    let keys = unsafe { slice::from_raw_parts(keys_ptr, keys_len) };
+    let out_keys = unsafe { slice::from_raw_parts_mut(out_keys_ptr, out_len) };
+    let out_counts = unsafe { slice::from_raw_parts_mut(out_counts_ptr, out_len) };
+
+    let mut counts: HashMap<u64, u32> = HashMap::new();
+    for &k in keys {
+        let entry = counts.entry(k).or_insert(0);
+        *entry = entry.saturating_add(1);
+    }
+
+    let mut pairs: Vec<(u64, u32)> = counts.into_iter().collect();
+    pairs.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    let n = pairs.len().min(out_len);
+    for i in 0..n {
+        out_keys[i] = pairs[i].0;
+        out_counts[i] = pairs[i].1;
+    }
+    n
+}
+
+#[no_mangle]
+pub extern "C" fn filter_sort_indices_no_query(
+    artist_keys_ptr: *const u64,
+    title_rank_ptr: *const u32,
+    artist_rank_ptr: *const u32,
+    album_rank_ptr: *const u32,
+    durations_ptr: *const u32,
+    len: usize,
+    sort_mode: u32,
+    artist_filter_key: u64,
+    use_artist_filter: u8,
+    out_indices_ptr: *mut u32,
+    out_len: usize,
+) -> usize {
+    if artist_keys_ptr.is_null()
+        || title_rank_ptr.is_null()
+        || artist_rank_ptr.is_null()
+        || album_rank_ptr.is_null()
+        || durations_ptr.is_null()
+        || out_indices_ptr.is_null()
+        || out_len == 0
+    {
+        return 0;
+    }
+
+    let artist_keys = unsafe { slice::from_raw_parts(artist_keys_ptr, len) };
+    let title_rank = unsafe { slice::from_raw_parts(title_rank_ptr, len) };
+    let artist_rank = unsafe { slice::from_raw_parts(artist_rank_ptr, len) };
+    let album_rank = unsafe { slice::from_raw_parts(album_rank_ptr, len) };
+    let durations = unsafe { slice::from_raw_parts(durations_ptr, len) };
+    let out = unsafe { slice::from_raw_parts_mut(out_indices_ptr, out_len) };
+
+    let mut idxs: Vec<usize> = Vec::with_capacity(len);
+    if use_artist_filter != 0 {
+        for i in 0..len {
+            if artist_keys[i] == artist_filter_key {
+                idxs.push(i);
+            }
+        }
+    } else {
+        idxs.extend(0..len);
+    }
+
+    match sort_mode {
+        1 => idxs.sort_unstable_by(|&a, &b| title_rank[a].cmp(&title_rank[b]).then_with(|| a.cmp(&b))),
+        2 => idxs.sort_unstable_by(|&a, &b| artist_rank[a].cmp(&artist_rank[b]).then_with(|| a.cmp(&b))),
+        3 => idxs.sort_unstable_by(|&a, &b| album_rank[a].cmp(&album_rank[b]).then_with(|| a.cmp(&b))),
+        4 => idxs.sort_unstable_by(|&a, &b| durations[a].cmp(&durations[b]).then_with(|| a.cmp(&b))),
+        _ => {}
+    }
+
+    let n = idxs.len().min(out_len);
+    for i in 0..n {
+        out[i] = idxs[i] as u32;
+    }
+    n
+}
+
+fn bytes_contains(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if needle.len() > haystack.len() {
+        return false;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+#[no_mangle]
+pub extern "C" fn filter_sort_indices_with_query(
+    search_blob_ptr: *const u8,
+    search_blob_len: usize,
+    search_offsets_ptr: *const u32,
+    search_lens_ptr: *const u32,
+    artist_keys_ptr: *const u64,
+    title_rank_ptr: *const u32,
+    artist_rank_ptr: *const u32,
+    album_rank_ptr: *const u32,
+    durations_ptr: *const u32,
+    len: usize,
+    sort_mode: u32,
+    artist_filter_key: u64,
+    use_artist_filter: u8,
+    query_ptr: *const u8,
+    query_len: usize,
+    out_indices_ptr: *mut u32,
+    out_len: usize,
+) -> usize {
+    if search_blob_ptr.is_null()
+        || search_offsets_ptr.is_null()
+        || search_lens_ptr.is_null()
+        || artist_keys_ptr.is_null()
+        || title_rank_ptr.is_null()
+        || artist_rank_ptr.is_null()
+        || album_rank_ptr.is_null()
+        || durations_ptr.is_null()
+        || query_ptr.is_null()
+        || out_indices_ptr.is_null()
+        || out_len == 0
+    {
+        return 0;
+    }
+
+    let search_blob = unsafe { slice::from_raw_parts(search_blob_ptr, search_blob_len) };
+    let search_offsets = unsafe { slice::from_raw_parts(search_offsets_ptr, len) };
+    let search_lens = unsafe { slice::from_raw_parts(search_lens_ptr, len) };
+    let artist_keys = unsafe { slice::from_raw_parts(artist_keys_ptr, len) };
+    let title_rank = unsafe { slice::from_raw_parts(title_rank_ptr, len) };
+    let artist_rank = unsafe { slice::from_raw_parts(artist_rank_ptr, len) };
+    let album_rank = unsafe { slice::from_raw_parts(album_rank_ptr, len) };
+    let durations = unsafe { slice::from_raw_parts(durations_ptr, len) };
+    let query = unsafe { slice::from_raw_parts(query_ptr, query_len) };
+    let out = unsafe { slice::from_raw_parts_mut(out_indices_ptr, out_len) };
+
+    let mut idxs: Vec<usize> = Vec::with_capacity(len);
+    for i in 0..len {
+        if use_artist_filter != 0 && artist_keys[i] != artist_filter_key {
+            continue;
+        }
+        let off = search_offsets[i] as usize;
+        let ln = search_lens[i] as usize;
+        if off >= search_blob_len {
+            continue;
+        }
+        let end = off.saturating_add(ln).min(search_blob_len);
+        if end <= off {
+            continue;
+        }
+        let text = &search_blob[off..end];
+        if bytes_contains(text, query) {
+            idxs.push(i);
+        }
+    }
+
+    match sort_mode {
+        1 => idxs.sort_unstable_by(|&a, &b| title_rank[a].cmp(&title_rank[b]).then_with(|| a.cmp(&b))),
+        2 => idxs.sort_unstable_by(|&a, &b| artist_rank[a].cmp(&artist_rank[b]).then_with(|| a.cmp(&b))),
+        3 => idxs.sort_unstable_by(|&a, &b| album_rank[a].cmp(&album_rank[b]).then_with(|| a.cmp(&b))),
+        4 => idxs.sort_unstable_by(|&a, &b| durations[a].cmp(&durations[b]).then_with(|| a.cmp(&b))),
+        _ => {}
+    }
+
+    let n = idxs.len().min(out_len);
+    for i in 0..n {
+        out[i] = idxs[i] as u32;
+    }
+    n
 }

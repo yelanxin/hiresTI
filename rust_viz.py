@@ -205,6 +205,69 @@ class RustVizCore:
         except Exception:
             logger.info("Rust viz core lacks build_dots_rgba symbol; using Python fallback for dots image.")
 
+        self._count_artist_keys = None
+        try:
+            count_keys = self._lib.count_artist_keys
+            count_keys.argtypes = [
+                ctypes.POINTER(ctypes.c_uint64),  # keys ptr
+                ctypes.c_size_t,                  # keys len
+                ctypes.POINTER(ctypes.c_uint64),  # out keys ptr
+                ctypes.POINTER(ctypes.c_uint32),  # out counts ptr
+                ctypes.c_size_t,                  # out len
+            ]
+            count_keys.restype = ctypes.c_size_t
+            self._count_artist_keys = count_keys
+        except Exception:
+            logger.info("Rust viz core lacks count_artist_keys symbol; using Python fallback for artist counts.")
+
+        self._filter_sort_indices_no_query = None
+        try:
+            filt = self._lib.filter_sort_indices_no_query
+            filt.argtypes = [
+                ctypes.POINTER(ctypes.c_uint64),  # artist keys ptr
+                ctypes.POINTER(ctypes.c_uint32),  # title rank ptr
+                ctypes.POINTER(ctypes.c_uint32),  # artist rank ptr
+                ctypes.POINTER(ctypes.c_uint32),  # album rank ptr
+                ctypes.POINTER(ctypes.c_uint32),  # durations ptr
+                ctypes.c_size_t,                  # len
+                ctypes.c_uint32,                  # sort mode
+                ctypes.c_uint64,                  # artist filter key
+                ctypes.c_uint8,                   # use artist filter
+                ctypes.POINTER(ctypes.c_uint32),  # out indices ptr
+                ctypes.c_size_t,                  # out len
+            ]
+            filt.restype = ctypes.c_size_t
+            self._filter_sort_indices_no_query = filt
+        except Exception:
+            logger.info("Rust viz core lacks filter_sort_indices_no_query symbol; using Python fallback for collection filters.")
+
+        self._filter_sort_indices_with_query = None
+        try:
+            filtq = self._lib.filter_sort_indices_with_query
+            filtq.argtypes = [
+                ctypes.POINTER(ctypes.c_ubyte),   # search blob ptr
+                ctypes.c_size_t,                  # search blob len
+                ctypes.POINTER(ctypes.c_uint32),  # search offsets ptr
+                ctypes.POINTER(ctypes.c_uint32),  # search lens ptr
+                ctypes.POINTER(ctypes.c_uint64),  # artist keys ptr
+                ctypes.POINTER(ctypes.c_uint32),  # title rank ptr
+                ctypes.POINTER(ctypes.c_uint32),  # artist rank ptr
+                ctypes.POINTER(ctypes.c_uint32),  # album rank ptr
+                ctypes.POINTER(ctypes.c_uint32),  # durations ptr
+                ctypes.c_size_t,                  # len
+                ctypes.c_uint32,                  # sort mode
+                ctypes.c_uint64,                  # artist filter key
+                ctypes.c_uint8,                   # use artist filter
+                ctypes.POINTER(ctypes.c_ubyte),   # query ptr
+                ctypes.c_size_t,                  # query len
+                ctypes.POINTER(ctypes.c_uint32),  # out indices ptr
+                ctypes.c_size_t,                  # out len
+            ]
+            filtq.restype = ctypes.c_size_t
+            self._filter_sort_indices_with_query = filtq
+        except Exception:
+            logger.info("Rust viz core lacks filter_sort_indices_with_query symbol; using Python fallback for query filters.")
+
         newp = self._lib.viz_processor_new
         newp.argtypes = [
             ctypes.c_size_t,  # num bars
@@ -729,6 +792,146 @@ class RustVizCore:
         if written <= 0:
             return None
         return (bytearray(out_arr[:written]), width_px, hpx)
+
+    def count_artist_keys(self, keys: Iterable[int]) -> Optional[List[tuple]]:
+        if self._lib is None or self._count_artist_keys is None:
+            return None
+        vals = [int(v) & ((1 << 64) - 1) for v in (keys or [])]
+        if not vals:
+            return []
+        n = len(vals)
+        in_buf = (ctypes.c_uint64 * n)(*vals)
+        out_keys = (ctypes.c_uint64 * n)()
+        out_counts = (ctypes.c_uint32 * n)()
+        written = int(self._count_artist_keys(in_buf, n, out_keys, out_counts, n))
+        if written <= 0:
+            return []
+        out = []
+        for i in range(min(written, n)):
+            out.append((int(out_keys[i]), int(out_counts[i])))
+        return out
+
+    def filter_sort_indices_no_query(
+        self,
+        artist_keys: Iterable[int],
+        title_rank: Iterable[int],
+        artist_rank: Iterable[int],
+        album_rank: Iterable[int],
+        durations: Iterable[int],
+        sort_mode: int,
+        artist_filter_key: int = 0,
+        use_artist_filter: bool = False,
+    ) -> Optional[List[int]]:
+        if self._lib is None or self._filter_sort_indices_no_query is None:
+            return None
+        keys = [int(v) & ((1 << 64) - 1) for v in (artist_keys or [])]
+        n = len(keys)
+        if n <= 0:
+            return []
+        title_vals = [int(v) & 0xFFFFFFFF for v in (title_rank or [])]
+        artist_vals = [int(v) & 0xFFFFFFFF for v in (artist_rank or [])]
+        album_vals = [int(v) & 0xFFFFFFFF for v in (album_rank or [])]
+        dur_vals = [int(v) & 0xFFFFFFFF for v in (durations or [])]
+        if len(title_vals) != n or len(artist_vals) != n or len(album_vals) != n or len(dur_vals) != n:
+            return None
+        keys_buf = (ctypes.c_uint64 * n)(*keys)
+        title_buf = (ctypes.c_uint32 * n)(*title_vals)
+        artist_buf = (ctypes.c_uint32 * n)(*artist_vals)
+        album_buf = (ctypes.c_uint32 * n)(*album_vals)
+        dur_buf = (ctypes.c_uint32 * n)(*dur_vals)
+        out_buf = (ctypes.c_uint32 * n)()
+        written = int(
+            self._filter_sort_indices_no_query(
+                keys_buf,
+                title_buf,
+                artist_buf,
+                album_buf,
+                dur_buf,
+                ctypes.c_size_t(n),
+                ctypes.c_uint32(int(sort_mode) & 0xFFFFFFFF),
+                ctypes.c_uint64(int(artist_filter_key) & ((1 << 64) - 1)),
+                ctypes.c_uint8(1 if use_artist_filter else 0),
+                out_buf,
+                ctypes.c_size_t(n),
+            )
+        )
+        if written <= 0:
+            return []
+        return [int(out_buf[i]) for i in range(min(written, n))]
+
+    def filter_sort_indices_with_query(
+        self,
+        search_blob: bytes,
+        search_offsets: Iterable[int],
+        search_lens: Iterable[int],
+        artist_keys: Iterable[int],
+        title_rank: Iterable[int],
+        artist_rank: Iterable[int],
+        album_rank: Iterable[int],
+        durations: Iterable[int],
+        sort_mode: int,
+        query: str,
+        artist_filter_key: int = 0,
+        use_artist_filter: bool = False,
+    ) -> Optional[List[int]]:
+        if self._lib is None or self._filter_sort_indices_with_query is None:
+            return None
+        blob = bytes(search_blob or b"")
+        query_bytes = str(query or "").encode("utf-8", "ignore")
+        if not blob or not query_bytes:
+            return None
+
+        offsets = [int(v) & 0xFFFFFFFF for v in (search_offsets or [])]
+        lens = [int(v) & 0xFFFFFFFF for v in (search_lens or [])]
+        keys = [int(v) & ((1 << 64) - 1) for v in (artist_keys or [])]
+        n = len(keys)
+        if n <= 0 or len(offsets) != n or len(lens) != n:
+            return None
+
+        title_vals = [int(v) & 0xFFFFFFFF for v in (title_rank or [])]
+        artist_vals = [int(v) & 0xFFFFFFFF for v in (artist_rank or [])]
+        album_vals = [int(v) & 0xFFFFFFFF for v in (album_rank or [])]
+        dur_vals = [int(v) & 0xFFFFFFFF for v in (durations or [])]
+        if len(title_vals) != n or len(artist_vals) != n or len(album_vals) != n or len(dur_vals) != n:
+            return None
+
+        blob_len = len(blob)
+        blob_buf = (ctypes.c_ubyte * blob_len).from_buffer_copy(blob)
+        query_len = len(query_bytes)
+        query_buf = (ctypes.c_ubyte * query_len).from_buffer_copy(query_bytes)
+        off_buf = (ctypes.c_uint32 * n)(*offsets)
+        len_buf = (ctypes.c_uint32 * n)(*lens)
+        keys_buf = (ctypes.c_uint64 * n)(*keys)
+        title_buf = (ctypes.c_uint32 * n)(*title_vals)
+        artist_buf = (ctypes.c_uint32 * n)(*artist_vals)
+        album_buf = (ctypes.c_uint32 * n)(*album_vals)
+        dur_buf = (ctypes.c_uint32 * n)(*dur_vals)
+        out_buf = (ctypes.c_uint32 * n)()
+
+        written = int(
+            self._filter_sort_indices_with_query(
+                blob_buf,
+                ctypes.c_size_t(blob_len),
+                off_buf,
+                len_buf,
+                keys_buf,
+                title_buf,
+                artist_buf,
+                album_buf,
+                dur_buf,
+                ctypes.c_size_t(n),
+                ctypes.c_uint32(int(sort_mode) & 0xFFFFFFFF),
+                ctypes.c_uint64(int(artist_filter_key) & ((1 << 64) - 1)),
+                ctypes.c_uint8(1 if use_artist_filter else 0),
+                query_buf,
+                ctypes.c_size_t(query_len),
+                out_buf,
+                ctypes.c_size_t(n),
+            )
+        )
+        if written <= 0:
+            return []
+        return [int(out_buf[i]) for i in range(min(written, n))]
 
     def _load_library(self):
         here = Path(__file__).resolve().parent

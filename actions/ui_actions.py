@@ -4,6 +4,7 @@ import os
 import random
 from datetime import datetime
 import subprocess
+from hashlib import blake2b
 
 import gi
 
@@ -11,11 +12,73 @@ gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk, GLib, Pango, Gdk, GObject
 
 import utils
+from rust_viz import RustVizCore
 from ui.track_table import LAYOUT, build_tracks_header, append_header_action_spacers
 from app_errors import classify_exception, user_message
 
 logger = logging.getLogger(__name__)
 MAX_SEARCH_HISTORY = 10
+_RUST_COLLECTION_CORE = None
+
+
+def _get_rust_collection_core():
+    global _RUST_COLLECTION_CORE
+    if _RUST_COLLECTION_CORE is None:
+        try:
+            _RUST_COLLECTION_CORE = RustVizCore()
+        except Exception:
+            _RUST_COLLECTION_CORE = False
+    return _RUST_COLLECTION_CORE if _RUST_COLLECTION_CORE is not False else None
+
+
+def _stable_u64_from_text(text):
+    raw = str(text or "").encode("utf-8", "ignore")
+    digest = blake2b(raw, digest_size=8).digest()
+    return int.from_bytes(digest, byteorder="little", signed=False)
+
+
+def _build_rank(values):
+    order = sorted(range(len(values)), key=lambda i: (values[i], i))
+    rank = [0] * len(values)
+    for r, i in enumerate(order):
+        rank[i] = r
+    return rank
+
+
+def sort_objects_by_name_fast(items, context="items"):
+    objs = list(items or [])
+    n = len(objs)
+    if n <= 1:
+        return objs
+
+    names_lc = [str(getattr(o, "name", "") or "").lower() for o in objs]
+    title_rank = _build_rank(names_lc)
+    zeros = [0] * n
+    indices = None
+
+    rust_core = _get_rust_collection_core()
+    if rust_core is not None and getattr(rust_core, "available", False):
+        try:
+            indices = rust_core.filter_sort_indices_no_query(
+                artist_keys=zeros,
+                title_rank=title_rank,
+                artist_rank=zeros,
+                album_rank=zeros,
+                durations=zeros,
+                sort_mode=1,  # title
+                artist_filter_key=0,
+                use_artist_filter=False,
+            )
+            logger.info("Collection name sort path: Rust (%s, total=%s)", context, n)
+        except Exception:
+            indices = None
+            logger.exception("Rust name sort failed; fallback to Python (%s)", context)
+
+    if indices is None:
+        logger.info("Collection name sort path: Python-fallback (%s, total=%s)", context, n)
+        indices = sorted(range(n), key=lambda i: (names_lc[i], i))
+
+    return [objs[i] for i in indices if 0 <= int(i) < n]
 
 try:
     from opencc import OpenCC
@@ -560,6 +623,7 @@ def _run_search(app, q):
         query_variants = [q]
 
     _remember_query(app, q)
+    app.search_active_query = q
     app.nav_history.clear()
     app.right_stack.set_visible_child_name("search_view")
     if hasattr(app, "_remember_last_view"):
@@ -802,6 +866,58 @@ def render_search_results(app, res):
 
     app.res_trk_box.set_visible(bool(tracks))
     app.search_track_data = tracks
+    app.search_track_order_indices = None
+
+    # Rust fast path: reorder/filter merged track results by active query for paging/rendering.
+    search_query = str(getattr(app, "search_active_query", "") or "").strip().lower()
+    if tracks and search_query:
+        rust_core = _get_rust_collection_core()
+        if rust_core is not None and getattr(rust_core, "available", False):
+            try:
+                blob = bytearray()
+                offsets = []
+                lens = []
+                keys = []
+                title_rank = list(range(len(tracks)))
+                artist_rank = list(range(len(tracks)))
+                album_rank = list(range(len(tracks)))
+                durations = [int(getattr(t, "duration", 0) or 0) for t in tracks]
+                for i, t in enumerate(tracks):
+                    title = str(getattr(t, "name", "") or "").lower()
+                    artist = str(getattr(getattr(t, "artist", None), "name", "") or "").lower()
+                    album = str(getattr(getattr(t, "album", None), "name", "") or "").lower()
+                    s = f"{title}\n{artist}\n{album}".encode("utf-8", "ignore")
+                    offsets.append(len(blob))
+                    lens.append(len(s))
+                    blob.extend(s)
+                    # no artist filter for global search results
+                    keys.append(0)
+                idxs = rust_core.filter_sort_indices_with_query(
+                    search_blob=bytes(blob),
+                    search_offsets=offsets,
+                    search_lens=lens,
+                    artist_keys=keys,
+                    title_rank=title_rank,
+                    artist_rank=artist_rank,
+                    album_rank=album_rank,
+                    durations=durations,
+                    sort_mode=0,
+                    query=search_query,
+                    artist_filter_key=0,
+                    use_artist_filter=False,
+                )
+                if idxs is not None:
+                    app.search_track_order_indices = [i for i in idxs if 0 <= int(i) < len(tracks)]
+                    logger.info(
+                        "Search tracks paging/order path: Rust (query_len=%s, total=%s, ordered=%s)",
+                        len(search_query),
+                        len(tracks),
+                        len(app.search_track_order_indices),
+                    )
+            except Exception:
+                app.search_track_order_indices = None
+                logger.exception("Rust search track ordering failed; fallback to Python order")
+
     app.search_tracks_page = 0
     render_search_tracks_page(app)
 
@@ -810,8 +926,25 @@ def render_search_results(app, res):
 
 def render_search_tracks_page(app):
     tracks = list(getattr(app, "search_track_data", []) or [])
+    order = list(getattr(app, "search_track_order_indices", []) or [])
+    if order:
+        logger.info(
+            "Search tracks page render: Rust-order active (page=%s, page_size=%s, ordered_total=%s)",
+            int(getattr(app, "search_tracks_page", 0) or 0) + 1,
+            int(getattr(app, "search_tracks_page_size", 50) or 50),
+            len(order),
+        )
+        ordered_pairs = [(int(i), tracks[int(i)]) for i in order if 0 <= int(i) < len(tracks)]
+    else:
+        logger.info(
+            "Search tracks page render: Python-order active (page=%s, page_size=%s, total=%s)",
+            int(getattr(app, "search_tracks_page", 0) or 0) + 1,
+            int(getattr(app, "search_tracks_page_size", 50) or 50),
+            len(tracks),
+        )
+        ordered_pairs = list(enumerate(tracks))
     page_size = max(1, int(getattr(app, "search_tracks_page_size", 50) or 50))
-    total = len(tracks)
+    total = len(ordered_pairs)
     total_pages = max(1, (total + page_size - 1) // page_size)
     page = int(getattr(app, "search_tracks_page", 0) or 0)
     if page < 0:
@@ -822,7 +955,7 @@ def render_search_tracks_page(app):
 
     start = page * page_size
     end = min(total, start + page_size)
-    page_items = tracks[start:end] if total > 0 else []
+    page_items = ordered_pairs[start:end] if total > 0 else []
 
     prev_btn = getattr(app, "search_prev_page_btn", None)
     next_btn = getattr(app, "search_next_page_btn", None)
@@ -838,8 +971,9 @@ def render_search_tracks_page(app):
             page_lbl.set_text("Page 1/1")
 
     _clear_container(app.res_trk_list)
-    for i, t in enumerate(page_items):
-        abs_idx = start + i
+    for i, pair in enumerate(page_items):
+        abs_idx = int(pair[0])
+        t = pair[1]
         row_box = Gtk.Box(spacing=12, margin_top=8, margin_bottom=8, margin_start=12, margin_end=12)
         sel_cb = Gtk.CheckButton()
         sel_cb.set_valign(Gtk.Align.CENTER)
@@ -1433,6 +1567,7 @@ def render_queue_dashboard(app):
 
 
 def render_liked_songs_dashboard(app, tracks=None):
+    logger.info("Liked songs dashboard opened: tracks=%s", len(list(tracks or [])))
     _clear_container(app.collection_content_box)
     app.playlist_track_list = None
     app.queue_track_list = None
@@ -1493,31 +1628,109 @@ def render_liked_songs_dashboard(app, tracks=None):
     pager_bar.append(artist_scroll_next_btn)
     app.collection_content_box.append(pager_bar)
 
-    artist_groups = {}
-
-    def _artist_key(artist_obj):
+    def _artist_key_and_u64(artist_obj):
         aid = getattr(artist_obj, "id", None)
         if aid is not None:
-            return f"id:{aid}"
+            try:
+                aid_int = int(aid)
+                key = f"id:{aid_int}"
+                # Keep id-keys in high bit space to avoid name-hash collisions.
+                return key, ((1 << 63) | (aid_int & ((1 << 63) - 1)))
+            except Exception:
+                pass
         name = str(getattr(artist_obj, "name", "Unknown") or "Unknown").strip().lower()
-        return f"name:{name}"
+        key = f"name:{name}"
+        return key, (_stable_u64_from_text(key) & ((1 << 63) - 1))
 
+    artist_meta = {}
+    artist_key_strs = []
+    artist_key_u64 = []
+    title_lc = []
+    artist_lc = []
+    album_lc = []
+    durations = []
+    key_to_u64 = {}
+    u64_to_key = {}
+    key_collision = False
     for t in all_tracks:
         artist_obj = getattr(t, "artist", None)
-        key = _artist_key(artist_obj)
-        if key not in artist_groups:
-            artist_groups[key] = {
-                "key": key,
+        key_str, key_u64 = _artist_key_and_u64(artist_obj)
+        key_to_u64[key_str] = key_u64
+        prev = u64_to_key.get(key_u64)
+        if prev is None:
+            u64_to_key[key_u64] = key_str
+        elif prev != key_str:
+            key_collision = True
+        if key_str not in artist_meta:
+            artist_meta[key_str] = {
+                "key": key_str,
                 "artist": artist_obj,
                 "name": str(getattr(artist_obj, "name", "Unknown") or "Unknown"),
-                "count": 0,
             }
-        artist_groups[key]["count"] += 1
+        artist_key_strs.append(key_str)
+        artist_key_u64.append(key_u64)
+        title_lc.append(str(getattr(t, "name", "") or "").lower())
+        artist_lc.append(str(getattr(artist_obj, "name", "") or "").lower())
+        album_lc.append(str(getattr(getattr(t, "album", None), "name", "") or "").lower())
+        durations.append(int(getattr(t, "duration", 0) or 0))
 
-    artist_items = sorted(
-        artist_groups.values(),
-        key=lambda it: (-int(it.get("count", 0) or 0), str(it.get("name", "")).lower()),
-    )
+    title_rank = _build_rank(title_lc)
+    artist_rank = _build_rank(artist_lc)
+    album_rank = _build_rank(album_lc)
+    sort_mode_id = {"recent": 0, "title": 1, "artist": 2, "album": 3, "duration": 4}
+
+    # Build a compact UTF-8 blob for Rust query filtering.
+    search_blob = bytearray()
+    search_offsets = []
+    search_lens = []
+    for i in range(len(all_tracks)):
+        s = f"{title_lc[i]}\n{artist_lc[i]}\n{album_lc[i]}"
+        b = s.encode("utf-8", "ignore")
+        search_offsets.append(len(search_blob))
+        search_lens.append(len(b))
+        search_blob.extend(b)
+
+    artist_counts = None
+    rust_core = _get_rust_collection_core()
+    if rust_core is not None and getattr(rust_core, "available", False) and not key_collision:
+        try:
+            artist_counts = rust_core.count_artist_keys(artist_key_u64)
+            logger.info("Liked songs artist aggregation path: Rust")
+        except Exception:
+            artist_counts = None
+            logger.exception("Rust artist aggregation failed; fallback to Python")
+
+    if artist_counts is not None:
+        artist_items = []
+        for key_u64, count in artist_counts:
+            key_str = u64_to_key.get(int(key_u64))
+            if not key_str:
+                continue
+            meta = artist_meta.get(key_str, {})
+            artist_items.append(
+                {
+                    "key": key_str,
+                    "artist": meta.get("artist"),
+                    "name": str(meta.get("name", "Unknown") or "Unknown"),
+                    "count": int(count),
+                }
+            )
+    else:
+        artist_groups = {}
+        for i, key_str in enumerate(artist_key_strs):
+            if key_str not in artist_groups:
+                meta = artist_meta.get(key_str, {})
+                artist_groups[key_str] = {
+                    "key": key_str,
+                    "artist": meta.get("artist"),
+                    "name": str(meta.get("name", "Unknown") or "Unknown"),
+                    "count": 0,
+                }
+            artist_groups[key_str]["count"] += 1
+        artist_items = sorted(
+            artist_groups.values(),
+            key=lambda it: (-int(it.get("count", 0) or 0), str(it.get("name", "")).lower()),
+        )
     max_artist_filters = 120
     artist_items = artist_items[:max_artist_filters]
 
@@ -1695,26 +1908,92 @@ def render_liked_songs_dashboard(app, tracks=None):
         q = str(getattr(app, "liked_tracks_query", "") or "").strip().lower()
         mode = getattr(app, "liked_tracks_sort", "recent")
         artist_filter = getattr(app, "liked_tracks_artist_filter", None)
-        filtered = list(all_tracks)
-        if artist_filter:
-            filtered = [t for t in filtered if _artist_key(getattr(t, "artist", None)) == artist_filter]
-        if q:
-            def _match(t):
-                title = str(getattr(t, "name", "") or "").lower()
-                artist = str(getattr(getattr(t, "artist", None), "name", "") or "").lower()
-                album = str(getattr(getattr(t, "album", None), "name", "") or "").lower()
-                return q in title or q in artist or q in album
-            filtered = [t for t in filtered if _match(t)]
+        filtered_indices = None
 
-        if mode == "title":
-            filtered.sort(key=lambda t: str(getattr(t, "name", "") or "").lower())
-        elif mode == "artist":
-            filtered.sort(key=lambda t: str(getattr(getattr(t, "artist", None), "name", "") or "").lower())
-        elif mode == "album":
-            filtered.sort(key=lambda t: str(getattr(getattr(t, "album", None), "name", "") or "").lower())
-        elif mode == "duration":
-            filtered.sort(key=lambda t: int(getattr(t, "duration", 0) or 0))
-        # recent => keep backend order
+        # Fast path: when query is empty, offload filter/sort to Rust.
+        if not q and rust_core is not None and getattr(rust_core, "available", False):
+            try:
+                use_filter = bool(artist_filter and artist_filter in key_to_u64)
+                filter_key = int(key_to_u64.get(artist_filter, 0))
+                filtered_indices = rust_core.filter_sort_indices_no_query(
+                    artist_keys=artist_key_u64,
+                    title_rank=title_rank,
+                    artist_rank=artist_rank,
+                    album_rank=album_rank,
+                    durations=durations,
+                    sort_mode=int(sort_mode_id.get(mode, 0)),
+                    artist_filter_key=filter_key,
+                    use_artist_filter=use_filter,
+                )
+                logger.info(
+                    "Liked songs filter/sort path: Rust-noquery (mode=%s, artist_filter=%s, total=%s, result=%s)",
+                    mode,
+                    "on" if use_filter else "off",
+                    len(all_tracks),
+                    len(filtered_indices or []),
+                )
+            except Exception:
+                filtered_indices = None
+                logger.exception("Rust liked-songs filter/sort failed; fallback to Python")
+
+        if filtered_indices is None and q and rust_core is not None and getattr(rust_core, "available", False):
+            try:
+                use_filter = bool(artist_filter and artist_filter in key_to_u64)
+                filter_key = int(key_to_u64.get(artist_filter, 0))
+                filtered_indices = rust_core.filter_sort_indices_with_query(
+                    search_blob=bytes(search_blob),
+                    search_offsets=search_offsets,
+                    search_lens=search_lens,
+                    artist_keys=artist_key_u64,
+                    title_rank=title_rank,
+                    artist_rank=artist_rank,
+                    album_rank=album_rank,
+                    durations=durations,
+                    sort_mode=int(sort_mode_id.get(mode, 0)),
+                    query=q,
+                    artist_filter_key=filter_key,
+                    use_artist_filter=use_filter,
+                )
+                logger.info(
+                    "Liked songs filter/sort path: Rust-query (mode=%s, artist_filter=%s, query_len=%s, total=%s, result=%s)",
+                    mode,
+                    "on" if use_filter else "off",
+                    len(q),
+                    len(all_tracks),
+                    len(filtered_indices or []),
+                )
+            except Exception:
+                filtered_indices = None
+                logger.exception("Rust liked-songs query filter/sort failed; fallback to Python")
+
+        if filtered_indices is None:
+            logger.info(
+                "Liked songs filter/sort path: Python-fallback (mode=%s, query_len=%s, artist_filter=%s, total=%s)",
+                mode,
+                len(q),
+                "on" if bool(artist_filter) else "off",
+                len(all_tracks),
+            )
+            filtered_indices = list(range(len(all_tracks)))
+            if artist_filter:
+                filtered_indices = [i for i in filtered_indices if artist_key_strs[i] == artist_filter]
+            if q:
+                filtered_indices = [
+                    i
+                    for i in filtered_indices
+                    if (q in title_lc[i] or q in artist_lc[i] or q in album_lc[i])
+                ]
+            if mode == "title":
+                filtered_indices.sort(key=lambda i: title_rank[i])
+            elif mode == "artist":
+                filtered_indices.sort(key=lambda i: artist_rank[i])
+            elif mode == "album":
+                filtered_indices.sort(key=lambda i: album_rank[i])
+            elif mode == "duration":
+                filtered_indices.sort(key=lambda i: durations[i])
+            # recent => keep backend order
+
+        filtered = [all_tracks[i] for i in filtered_indices]
 
         _clear_container(list_box)
         list_box.liked_tracks = filtered
@@ -1856,8 +2135,17 @@ def render_queue_drawer(app):
     if clear_btn is not None:
         clear_btn.set_sensitive(bool(tracks))
 
+    # Fast path: when queue content and playback index are unchanged, keep
+    # existing row widgets to avoid costly full rebuild on drawer open.
+    sig_ids = tuple(str(getattr(t, "id", f"obj:{id(t)}")) for t in tracks)
+    sig = (sig_ids, current_idx)
+    prev_sig = getattr(app, "_queue_drawer_render_sig", None)
+    if prev_sig == sig and list_box.get_first_child() is not None:
+        return
+
     _clear_container(list_box)
     if not tracks:
+        app._queue_drawer_render_sig = sig
         row = Gtk.ListBoxRow()
         row.set_selectable(False)
         row.set_activatable(False)
@@ -1875,6 +2163,7 @@ def render_queue_drawer(app):
         return
 
     _populate_queue_rows(app, list_box, tracks, current_idx, compact=True)
+    app._queue_drawer_render_sig = sig
     if hasattr(app, "_update_track_list_icon"):
         app._update_track_list_icon(target_list=list_box)
 
