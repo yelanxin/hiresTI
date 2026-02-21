@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.1.1 - 2026-02-21
+Coverage: incremental fixes and performance refinements after 1.1.0.
+
+### Changed
+- Improved Queue drawer responsiveness:
+  - open animation starts immediately before heavy list refresh work,
+  - avoided redundant queue-drawer rebuild when queue data is unchanged.
+- Added Rust-accelerated collection name-sort path for:
+  - Favorite Artists page load,
+  - Artist albums page load.
+- Added logging for Rust/Python path visibility in collection and paging flows.
+- Kept visualizer panel opening without content fade-in (fade disabled) for lower UI latency.
+
+### Fixed
+- Fixed queue drawer perceived "late start" behavior on toggle/hotkey in heavy UI scenarios.
+
+### Packaging Output (1.1.1)
+- `hiresti_1.1.1_all.deb`
+- `hiresti-1.1.1-1.fedora.x86_64.rpm`
+- `hiresti-1.1.1-1.el9.x86_64.rpm`
+- `hiresti-1.1.1-1-x86_64.pkg.tar.zst`
+
 ## 1.1.0 - 2026-02-20
 Coverage: changes after 1.0.10 on 2026-02-20.
 

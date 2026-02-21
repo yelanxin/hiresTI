@@ -1,6 +1,10 @@
 from threading import Thread
+import logging
 
 from gi.repository import GLib, Gtk
+from actions import ui_actions
+
+logger = logging.getLogger(__name__)
 
 
 def on_nav_selected(app, box, row):
@@ -151,7 +155,13 @@ def on_nav_selected(app, box, row):
             app.grid_subtitle_label.set_text("Artists you follow and love")
         app.create_album_flow()
         if app.backend.user:
-            Thread(target=lambda: GLib.idle_add(app.batch_load_artists, app.backend.get_favorites())).start()
+            def task():
+                artists = list(app.backend.get_favorites() or [])
+                artists = ui_actions.sort_objects_by_name_fast(artists, context="favorite_artists")
+                logger.info("Artists page prepared: total=%s", len(artists))
+                GLib.idle_add(app.batch_load_artists, artists)
+
+            Thread(target=task, daemon=True).start()
 
 
 def on_artist_clicked(app, artist):
@@ -181,7 +191,13 @@ def on_artist_clicked(app, artist):
         app.collection_content_box.remove(c)
 
     app.create_album_flow()
-    Thread(target=lambda: GLib.idle_add(app.batch_load_albums, list(app.backend.get_albums(artist))), daemon=True).start()
+    def task():
+        albums = list(app.backend.get_albums(artist) or [])
+        albums = ui_actions.sort_objects_by_name_fast(albums, context="artist_albums")
+        logger.info("Artist albums prepared: artist=%s total=%s", getattr(artist, "name", "Unknown"), len(albums))
+        GLib.idle_add(app.batch_load_albums, albums)
+
+    Thread(target=task, daemon=True).start()
 
 
 def on_back_clicked(app, btn):
