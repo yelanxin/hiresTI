@@ -17,6 +17,20 @@
       high-quality output paths, and a responsive GTK4/Libadwaita UI.
     </p>
   </description>
+  <screenshots>
+    <screenshot type="default">
+      <caption>Home view with library and recommendations</caption>
+      <image>https://raw.githubusercontent.com/yelanxin/hiresTI/main/screenshots/flathub/01-home.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Now playing view with lyrics and transport controls</caption>
+      <image>https://raw.githubusercontent.com/yelanxin/hiresTI/main/screenshots/flathub/02-playing.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Audio settings including output and quality options</caption>
+      <image>https://raw.githubusercontent.com/yelanxin/hiresTI/main/screenshots/flathub/03-setting.png</image>
+    </screenshot>
+  </screenshots>
   <categories>
     <category>AudioVideo</category>
     <category>Audio</category>
