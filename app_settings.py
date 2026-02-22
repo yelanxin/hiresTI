@@ -30,6 +30,7 @@ DEFAULT_SETTINGS = {
     "paned_position": 0,
     "search_history": [],
     "audio_cache_tracks": 20,
+    "output_auto_rebind_once": False,
 }
 
 
@@ -127,6 +128,7 @@ def normalize_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
     normalized["paned_position"] = _as_int(raw.get("paned_position"), DEFAULT_SETTINGS["paned_position"], minimum=0)
     normalized["search_history"] = _as_str_list(raw.get("search_history"), DEFAULT_SETTINGS["search_history"])
     normalized["audio_cache_tracks"] = _as_int(raw.get("audio_cache_tracks"), DEFAULT_SETTINGS["audio_cache_tracks"], minimum=0, maximum=200)
+    normalized["output_auto_rebind_once"] = _as_bool(raw.get("output_auto_rebind_once"), DEFAULT_SETTINGS["output_auto_rebind_once"])
     normalized["settings_version"] = CURRENT_SETTINGS_VERSION
 
     # Exclusive lock requires bit-perfect mode.

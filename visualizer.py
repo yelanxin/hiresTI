@@ -4,6 +4,7 @@ from gi.repository import Gtk, GLib
 import cairo
 import math
 import logging
+import os
 from rust_viz import RustVizCore
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,25 @@ class SpectrumVisualizer(Gtk.DrawingArea):
             "Pro Fall",
         ]
         self.profile_name = "Dynamic"
+        self._effect_code_map = {
+            "Bars": 0,
+            "Wave": 1,
+            "Fill": 2,
+            "Mirror": 3,
+            "Dots": 4,
+            "Neon": 5,
+            "Peak": 6,
+            "Trail": 7,
+            "Pulse": 8,
+            "Stereo": 9,
+            "Burst": 10,
+            "Stars": 11,
+            "Ribbon": 12,
+            "Spiral": 13,
+            "Pro Bars": 14,
+            "Pro Line": 15,
+            "Pro Fall": 16,
+        }
         self.profiles = {
             "Soft": {
                 "gain_mul": 0.84,
@@ -277,6 +297,13 @@ class SpectrumVisualizer(Gtk.DrawingArea):
         self.bass_level = 0.0
         self.phase = 0.0
         self._rust_core = RustVizCore()
+        self._rust_bars_rgba_enabled = str(os.getenv("HIRESTI_RUST_BARS_RGBA", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+        self._rust_bars_renderer = None
+        self._bars_color_cache_key = None
+        self._bars_color_cache = None
+        self._bars_img_cache_key = None
+        self._bars_img_cache_pack = None
+        self._bars_img_last_ts = 0.0
         self._logged_rust_path = False
         self._logged_python_fallback = False
         self._logged_rust_bins = False
@@ -299,9 +326,23 @@ class SpectrumVisualizer(Gtk.DrawingArea):
         self._logged_python_fall_img = False
         self._logged_rust_dots_img = False
         self._logged_python_dots_img = False
+        self._logged_rust_bars_img = False
+        self._logged_python_bars_img = False
+        self._theme_cfg = self.themes["Aurora (Default)"]
+        self._profile_cfg = self.profiles["Dynamic"]
+        self._effect_code = 0
+        self._refresh_theme_cache()
+        self._refresh_profile_cache()
+        self._refresh_effect_cache()
+        self._active = True
         
         # 启动动画循环 (约 60fps)
         GLib.timeout_add(16, self._on_animation_tick)
+
+    def set_active(self, active):
+        self._active = bool(active)
+        if self._active:
+            self.queue_draw()
 
     def get_theme_names(self):
         return list(self.themes.keys())
@@ -312,19 +353,31 @@ class SpectrumVisualizer(Gtk.DrawingArea):
     def get_profile_names(self):
         return list(self.profiles.keys())
 
+    def _refresh_theme_cache(self):
+        self._theme_cfg = self.themes[self.theme_name] if self.theme_name in self.themes else self.themes["Aurora (Default)"]
+
+    def _refresh_profile_cache(self):
+        self._profile_cfg = self.profiles[self.profile_name] if self.profile_name in self.profiles else self.profiles["Dynamic"]
+
+    def _refresh_effect_cache(self):
+        self._effect_code = int(self._effect_code_map.get(self.effect_name, 0))
+
     def set_theme(self, theme_name):
         if theme_name in self.themes:
             self.theme_name = theme_name
+            self._refresh_theme_cache()
             self.queue_draw()
 
     def set_effect(self, effect_name):
         if effect_name in self.effects:
             self.effect_name = effect_name
+            self._refresh_effect_cache()
             self.queue_draw()
 
     def set_profile(self, profile_name):
         if profile_name in self.profiles:
             self.profile_name = profile_name
+            self._refresh_profile_cache()
             self.queue_draw()
 
     def set_num_bars(self, count):
@@ -384,7 +437,9 @@ class SpectrumVisualizer(Gtk.DrawingArea):
         self._bass_target = sum(new_heights[:bass_count]) / float(bass_count)
 
     def _on_animation_tick(self):
-        profile = self.profiles.get(self.profile_name, self.profiles["Dynamic"])
+        if not self._active:
+            return True
+        profile = self._profile_cfg
         changed = False
         self.phase += 0.045
         bass_response = max(0.12, min(0.62, 0.28 * float(profile["beat_mul"])))
@@ -418,8 +473,8 @@ class SpectrumVisualizer(Gtk.DrawingArea):
         return True
 
     def _draw_callback(self, area, cr, width, height, data=None):
-        theme = self.themes.get(self.theme_name, self.themes["Aurora (Default)"])
-        profile = self.profiles.get(self.profile_name, self.profiles["Dynamic"])
+        theme = self._theme_cfg
+        profile = self._profile_cfg
         if width <= 0 or height <= 0:
             return
 
@@ -431,43 +486,43 @@ class SpectrumVisualizer(Gtk.DrawingArea):
         bar_w = max(1.0, (width - (n - 1) * spacing) / n)
         gradient = self._make_gradient(height, theme)
 
-        effect = self.effect_name
-        if effect == "Bars":
+        effect = self._effect_code
+        if effect == 0:
             self._draw_bars(cr, width, height, gain, gradient, bar_w, spacing)
-        elif effect == "Wave":
+        elif effect == 1:
             self._draw_wave_line(cr, width, height, gain, gradient, filled=False)
-        elif effect == "Fill":
+        elif effect == 2:
             self._draw_wave_line(cr, width, height, gain, gradient, filled=True)
-        elif effect == "Mirror":
+        elif effect == 3:
             self._draw_mirror_bars(cr, width, height, gain, gradient, bar_w, spacing)
-        elif effect == "Dots":
+        elif effect == 4:
             self._draw_dot_matrix(cr, width, height, gain, bar_w, spacing, theme["gradient"])
-        elif effect == "Neon":
+        elif effect == 5:
             self._draw_neon_tunnel(cr, width, height, gain, theme["gradient"])
-        elif effect == "Peak":
+        elif effect == 6:
             self._draw_bars(cr, width, height, gain, gradient, bar_w, spacing)
             self._draw_peak_caps(cr, width, height, gain, bar_w, spacing)
-        elif effect == "Trail":
+        elif effect == 7:
             self._draw_trail_glow(cr, width, height, gain, bar_w, spacing)
             self._draw_bars(cr, width, height, gain, gradient, bar_w, spacing)
-        elif effect == "Pulse":
+        elif effect == 8:
             self._draw_beat_pulse_bg(cr, width, height, theme, float(profile["beat_mul"]))
             self._draw_bars(cr, width, height, gain, gradient, bar_w, spacing)
-        elif effect == "Stereo":
+        elif effect == 9:
             self._draw_split_stereo(cr, width, height, gain, theme["gradient"])
-        elif effect == "Burst":
+        elif effect == 10:
             self._draw_particle_burst(cr, width, height, gain, theme["gradient"])
-        elif effect == "Stars":
+        elif effect == 11:
             self._draw_starscape(cr, width, height, gain, theme["gradient"])
-        elif effect == "Ribbon":
+        elif effect == 12:
             self._draw_ribbon(cr, width, height, gain, theme["gradient"])
-        elif effect == "Spiral":
+        elif effect == 13:
             self._draw_spiral(cr, width, height, gain, theme["gradient"])
-        elif effect == "Pro Bars":
+        elif effect == 14:
             self._draw_pro_analyzer(cr, width, height, gain, theme["gradient"])
-        elif effect == "Pro Line":
+        elif effect == 15:
             self._draw_pro_analyzer_line(cr, width, height, gain, theme["gradient"])
-        elif effect == "Pro Fall":
+        elif effect == 16:
             self._draw_pro_analyzer_waterfall(cr, width, height, gain, theme["gradient"])
         else:
             self._draw_bars(cr, width, height, gain, gradient, bar_w, spacing)
@@ -502,6 +557,101 @@ class SpectrumVisualizer(Gtk.DrawingArea):
         cr.close_path()
 
     def _draw_bars(self, cr, width, height, gain, gradient, bar_w, spacing):
+        # Rust fast path: generate full RGBA frame, then single Cairo paint.
+        if self._rust_core.available and self._rust_bars_rgba_enabled:
+            n = self.num_bars
+            # Cache per-theme/per-bar-count colors to avoid heavy per-frame gradient sampling.
+            bars_key = (self.theme_name, n)
+            if self._bars_color_cache_key != bars_key or self._bars_color_cache is None:
+                grad_src = self._theme_cfg["gradient"]
+                self._bars_color_cache = [
+                    self._color_from_gradient(grad_src, i / float(max(1, n - 1)))
+                    for i in range(n)
+                ]
+                self._bars_color_cache_key = bars_key
+            bar_colors = self._bars_color_cache
+            # Render in device pixels to avoid extra compositor scaling on HiDPI/fractional setups.
+            scale_factor = int(max(1, getattr(self, "get_scale_factor", lambda: 1)() or 1))
+            img_w = int(max(1, width * scale_factor))
+            img_h = int(max(1, height * scale_factor))
+            bars_img_key = (int(img_w), int(img_h), int(n), int(scale_factor))
+            if self._bars_img_cache_key != bars_img_key or self._rust_bars_renderer is None:
+                try:
+                    if self._rust_bars_renderer is not None:
+                        self._rust_bars_renderer.close()
+                except Exception:
+                    pass
+                self._rust_bars_renderer = self._rust_core.create_bars_renderer(int(img_w), int(img_h), int(n))
+                self._bars_img_cache_key = bars_img_key
+                self._bars_color_cache = None
+            if self._rust_bars_renderer is not None:
+                try:
+                    self._rust_bars_renderer.set_colors(bar_colors)
+                    self._rust_bars_renderer.render(
+                        self.current_heights,
+                        float(gain),
+                        int(max(1, round(bar_w * scale_factor))),
+                        int(max(0, round(spacing * scale_factor))),
+                    )
+                    frame = self._rust_bars_renderer.get_frame()
+                except Exception:
+                    frame = None
+            else:
+                frame = None
+            if frame is not None:
+                if not self._logged_rust_bars_img:
+                    logger.info("Bars image-generation path: Rust")
+                    self._logged_rust_bars_img = True
+                rgba_buf, img_w, img_h, stride, _seq = frame
+                try:
+                    surf = cairo.ImageSurface.create_for_data(
+                        rgba_buf,
+                        cairo.FORMAT_ARGB32,
+                        img_w,
+                        img_h,
+                        stride,
+                    )
+                    if img_h == int(max(1, height * scale_factor)):
+                        # Zero-scale path: avoids pixman resampling entirely.
+                        try:
+                            surf.set_device_scale(float(scale_factor), float(scale_factor))
+                        except Exception:
+                            pass
+                        cr.set_source_surface(surf, 0.0, 0.0)
+                        src = cr.get_source()
+                        try:
+                            src.set_filter(cairo.FILTER_NEAREST)
+                        except Exception:
+                            pass
+                        cr.paint()
+                    else:
+                        cr.save()
+                        scale_y = height / float(max(1, img_h))
+                        cr.scale(1.0, scale_y)
+                        try:
+                            surf.set_device_scale(float(scale_factor), float(scale_factor))
+                        except Exception:
+                            pass
+                        cr.set_source_surface(surf, 0.0, 0.0)
+                        src = cr.get_source()
+                        try:
+                            # Prefer cheaper filters than bilinear in this hot path.
+                            if scale_y > 1.08:
+                                src.set_filter(cairo.FILTER_NEAREST)
+                            elif scale_y < 0.95:
+                                src.set_filter(cairo.FILTER_FAST)
+                            else:
+                                src.set_filter(cairo.FILTER_NEAREST)
+                        except Exception:
+                            pass
+                        cr.paint()
+                        cr.restore()
+                    return
+                except Exception:
+                    pass
+        if not self._logged_python_bars_img:
+            logger.info("Bars image-generation path: Python fallback")
+            self._logged_python_bars_img = True
         cr.set_source(gradient)
         for i in range(self.num_bars):
             h_ratio = self.current_heights[i]

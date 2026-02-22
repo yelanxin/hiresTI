@@ -593,14 +593,9 @@ def on_search_changed(app, entry):
         render_search_history(app)
         return
 
+    # Enter-only search mode:
+    # typing updates UI state only; no remote/local search is started here.
     app.search_history_section.set_visible(False)
-
-    def _debounced():
-        app._search_debounce_source = 0
-        _run_search(app, q)
-        return False
-
-    app._search_debounce_source = GLib.timeout_add(300, _debounced)
 
 
 def on_search(app, entry):
@@ -1252,6 +1247,47 @@ def batch_load_home(app, sections):
             return
         app.show_album_details(obj)
 
+    def _build_home_item_button(item_data):
+        v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, css_classes=["card", "home-card"])
+        img_size = 130
+        img_cls = "album-cover-img"
+        if item_data["type"] == "Track":
+            img_size = 88
+            v.add_css_class("home-track-card")
+        elif item_data["type"] == "Artist" or "Radio" in item_data["name"]:
+            img_size = 120
+            img_cls = "circular-avatar"
+        img = Gtk.Image(pixel_size=img_size, css_classes=[img_cls])
+        if item_data["image_url"]:
+            utils.load_img(img, item_data["image_url"], app.cache_dir, img_size)
+        else:
+            img.set_from_icon_name("audio-x-generic-symbolic")
+        v.append(img)
+        v.append(
+            Gtk.Label(
+                label=item_data["name"],
+                ellipsize=2,
+                halign=Gtk.Align.CENTER,
+                wrap=True,
+                max_width_chars=16,
+                css_classes=["heading", "home-card-title"],
+            )
+        )
+        if item_data["sub_title"]:
+            v.append(
+                Gtk.Label(
+                    label=item_data["sub_title"],
+                    ellipsize=1,
+                    halign=Gtk.Align.CENTER,
+                    css_classes=["caption", "dim-label", "home-card-subtitle"],
+                )
+            )
+        btn = Gtk.Button(css_classes=["flat", "history-card-btn"])
+        btn.set_child(v)
+        btn.connect("clicked", lambda _b, d=item_data: _open_item(d))
+        return btn
+
+    render_queue = []
     for sec in sections:
         section_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, css_classes=["home-section"])
         section_head = Gtk.Box(spacing=8, css_classes=["home-section-head"])
@@ -1274,46 +1310,29 @@ def batch_load_home(app, sections):
         _bind_horizontal_scroll_buttons(scroller, left_btn, right_btn)
         section_box.append(scroller)
         app.collection_content_box.append(section_box)
+        render_queue.append({"grid": grid, "items": list(sec["items"]), "index": 0})
 
-        for i, item_data in enumerate(sec["items"]):
-            v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, css_classes=["card", "home-card"])
-            img_size = 130
-            img_cls = "album-cover-img"
-            if item_data["type"] == "Track":
-                img_size = 88
-                v.add_css_class("home-track-card")
-            elif item_data["type"] == "Artist" or "Radio" in item_data["name"]:
-                img_size = 120
-                img_cls = "circular-avatar"
-            img = Gtk.Image(pixel_size=img_size, css_classes=[img_cls])
-            if item_data["image_url"]:
-                utils.load_img(img, item_data["image_url"], app.cache_dir, img_size)
-            else:
-                img.set_from_icon_name("audio-x-generic-symbolic")
-            v.append(img)
-            v.append(
-                Gtk.Label(
-                    label=item_data["name"],
-                    ellipsize=2,
-                    halign=Gtk.Align.CENTER,
-                    wrap=True,
-                    max_width_chars=16,
-                    css_classes=["heading", "home-card-title"],
-                )
-            )
-            if item_data["sub_title"]:
-                v.append(
-                    Gtk.Label(
-                        label=item_data["sub_title"],
-                        ellipsize=1,
-                        halign=Gtk.Align.CENTER,
-                        css_classes=["caption", "dim-label", "home-card-subtitle"],
-                    )
-                )
-            btn = Gtk.Button(css_classes=["flat", "history-card-btn"])
-            btn.set_child(v)
-            btn.connect("clicked", lambda _b, d=item_data: _open_item(d))
-            grid.attach(btn, i // 2, i % 2, 1, 1)
+    # Render cards progressively to avoid one long UI stall on Home.
+    def _render_home_chunk():
+        budget = 10  # number of cards per tick
+        while budget > 0 and render_queue:
+            ctx = render_queue[0]
+            i = int(ctx["index"])
+            items = ctx["items"]
+            if i >= len(items):
+                render_queue.pop(0)
+                continue
+            item_data = items[i]
+            btn = _build_home_item_button(item_data)
+            ctx["grid"].attach(btn, i // 2, i % 2, 1, 1)
+            ctx["index"] = i + 1
+            budget -= 1
+
+        if render_queue:
+            GLib.timeout_add(12, _render_home_chunk)
+        return False
+
+    GLib.idle_add(_render_home_chunk)
 
 
 def render_history_dashboard(app):
@@ -1780,7 +1799,9 @@ def render_liked_songs_dashboard(app, tracks=None):
         if artist_obj is not None:
             utils.load_img(
                 img,
-                lambda a=artist_obj: app.backend.get_artist_artwork_url(a, 320, local_only=True),
+                # Keep behavior aligned with Artists page: allow full fallback chain,
+                # including album-art fallback when artist artwork is unavailable.
+                lambda a=artist_obj: app.backend.get_artist_artwork_url(a, 320),
                 app.cache_dir,
                 54,
             )
@@ -1791,7 +1812,7 @@ def render_liked_songs_dashboard(app, tracks=None):
         badge.set_valign(Gtk.Align.END)
         overlay.add_overlay(badge)
         card.append(overlay)
-        card.append(Gtk.Label(label=name, css_classes=["dim-label"], max_width_chars=12, ellipsize=3))
+        card.append(Gtk.Label(label=name, css_classes=["dim-label"], max_width_chars=16, ellipsize=3))
 
         btn = Gtk.Button(css_classes=["flat", "liked-artist-filter-btn"])
         btn.set_tooltip_text(f"Show {name} tracks")
@@ -2182,7 +2203,7 @@ def render_playlists_home(app):
     else:
         title_txt = "Your Playlists"
     head.append(Gtk.Label(label=title_txt, xalign=0, hexpand=True, css_classes=["home-section-title"]))
-    count_lbl = Gtk.Label(label="Loading...", css_classes=["home-section-count"])
+    count_lbl = Gtk.Label(label="", css_classes=["home-section-count"])
     head.append(count_lbl)
     up_btn = Gtk.Button(icon_name="go-up-symbolic", css_classes=["flat", "playlist-add-top-btn"])
     up_btn.set_tooltip_text("Up Folder")
@@ -2238,9 +2259,6 @@ def render_playlists_home(app):
     section_box.append(flow)
     app.collection_content_box.append(section_box)
 
-    loading = Gtk.Label(label="Loading playlists...", xalign=0, css_classes=["dim-label"], margin_start=8, margin_top=8)
-    section_box.append(loading)
-
     def task():
         parent_folder = getattr(app, "current_playlist_folder", None)
         payload = dict(app.backend.get_playlists_and_folders(parent_folder=parent_folder, limit=1000) or {})
@@ -2249,8 +2267,6 @@ def render_playlists_home(app):
 
         def apply():
             count_lbl.set_text(f"{len(folders)} folders • {len(playlists)} playlists")
-            if loading.get_parent() is section_box:
-                section_box.remove(loading)
 
             for f in folders:
                 card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, css_classes=["card", "home-card"])

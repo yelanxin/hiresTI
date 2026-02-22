@@ -214,6 +214,13 @@ class AudioPlayer:
             logger.warning("Rate discovery failed (continuing): %s", e)
 
     def _set_pipewire_clock(self, rate):
+        custom_setter = getattr(self, "pipewire_clock_setter", None)
+        if callable(custom_setter):
+            try:
+                if bool(custom_setter(rate)):
+                    return
+            except Exception as e:
+                logger.debug("Custom PipeWire clock setter failed (%s): %s", rate, e)
         try:
             cmd = ["pw-metadata", "-n", "settings", "0", "clock.force-rate", str(rate)]
             subprocess.run(cmd, check=False, stderr=subprocess.DEVNULL)
@@ -328,14 +335,14 @@ class AudioPlayer:
         return devices
 
     def get_drivers(self):
-        return ["Auto (Default)", "PipeWire", "PulseAudio", "ALSA"]
+        return ["Auto (Default)", "PipeWire", "ALSA"]
 
     def get_devices_for_driver(self, driver):
         devices = []
         if driver == "Auto (Default)":
             devices.append({"name": "Default Output", "device_id": None})
             return devices
-        if driver == "PulseAudio" or driver == "PipeWire":
+        if driver == "PipeWire":
             label = "Default System Output"
             devices.append({"name": label, "device_id": None})
             pa_devs = self._get_pulseaudio_devices()
@@ -397,6 +404,9 @@ class AudioPlayer:
         """
         设置音频输出驱动和设备 (整合 ALSA/PipeWire/PulseAudio 终极优化版)
         """
+        if driver == "PulseAudio":
+            # Backward compatibility for old saved settings.
+            driver = "PipeWire"
         logger.info("Setting output: driver=%s device=%s", driver, device_id)
         self.output_state = "switching"
         self.output_error = None
@@ -501,7 +511,7 @@ class AudioPlayer:
                 logger.info("PipeWire latency map: buffer %sus -> quantum %s/48000", target_buffer_us, quantum)
 
                 props.set_value("node.latency", f"{quantum}/48000")
-                props.set_value("node.autoconnect", "true")
+                props.set_value("node.autoconnect", "false" if device_id else "true")
                 props.set_value("media.role", "Music")       # 标记为音乐流，提高优先级
                 props.set_value("resample.quality", 12)      # 高质量重采样 (0-14)
 
@@ -511,8 +521,8 @@ class AudioPlayer:
                 sink.set_property("stream-properties", props)
                 self.pipeline.set_property("audio-sink", sink)
             else:
-                # 如果系统没装 pipewiresink，回退到 Pulse
-                self.set_output("PulseAudio", device_id)
+                # 如果系统没装 pipewiresink，回退到 Auto
+                self._set_auto_sink()
                 return
 
         # ==========================================

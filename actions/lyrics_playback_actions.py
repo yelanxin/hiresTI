@@ -3,6 +3,7 @@ import logging
 
 from gi.repository import Gtk, GLib
 from app_errors import classify_exception, user_message
+from actions import audio_settings_actions
 
 logger = logging.getLogger(__name__)
 MAX_PREFETCH_CACHE = 6
@@ -299,8 +300,28 @@ def play_track(app, index):
                 def apply_playback():
                     if request_id != getattr(app, "_play_request_id", 0):
                         return False
+                    prev_state = str(getattr(app.player, "output_state", "idle") or "idle")
                     app.player.load(url)
                     app.player.play()
+                    audio_settings_actions.update_output_status_ui(app)
+                    cur_state = str(getattr(app.player, "output_state", "idle") or "idle")
+                    cur_err = str(getattr(app.player, "output_error", "") or "").strip()
+                    blocked = bool(getattr(app.player, "_pipewire_rate_blocked", False))
+                    if blocked or cur_state == "error":
+                        if app.play_btn is not None:
+                            app.play_btn.set_icon_name("media-playback-start-symbolic")
+                        msg = cur_err or "Audio output error."
+                        if hasattr(app, "show_output_notice"):
+                            app.show_output_notice(f"Output error: {msg}", "error", 4200)
+                        if blocked and hasattr(app, "_show_simple_dialog"):
+                            app._show_simple_dialog("Playback blocked", msg)
+                        logger.warning(
+                            "Playback blocked after load/play: prev_state=%s state=%s err=%s",
+                            prev_state,
+                            cur_state,
+                            msg,
+                        )
+                        return False
                     app.play_btn.set_icon_name("media-playback-pause-symbolic")
                     return False
 
@@ -420,21 +441,52 @@ def scroll_to_lyric(app, widget):
 
 
 def update_ui_loop(app):
-    p, d = app.player.get_position()
+    now = GLib.get_monotonic_time() / 1_000_000.0
+    try:
+        playing_now = bool(app.player.is_playing())
+        last_playing = getattr(app, "_last_playing_ui_state", None)
+        if playing_now != last_playing:
+            app._last_playing_ui_state = playing_now
+            if getattr(app, "play_btn", None) is not None:
+                app.play_btn.set_icon_name(
+                    "media-playback-pause-symbolic" if playing_now else "media-playback-start-symbolic"
+                )
+    except Exception:
+        playing_now = False
+
+    p = 0.0
+    d = 0.0
+    cached_pd = getattr(app, "_ui_cached_pd", None)
+    if (not playing_now) and cached_pd is not None:
+        last_poll = float(getattr(app, "_ui_last_pos_poll_ts", 0.0) or 0.0)
+        if (now - last_poll) < 0.25:
+            p, d = cached_pd
+        else:
+            p, d = app.player.get_position()
+            app._ui_cached_pd = (p, d)
+            app._ui_last_pos_poll_ts = now
+    else:
+        p, d = app.player.get_position()
+        app._ui_cached_pd = (p, d)
+        app._ui_last_pos_poll_ts = now
 
     if d > 0:
-        app.is_programmatic_update = True
-        app.scale.set_range(0, d)
-        app.scale.set_value(p)
-        app.is_programmatic_update = False
-        if hasattr(app, "_update_progress_thumb_position"):
-            app._update_progress_thumb_position()
+        user_interacting_seek = bool(getattr(app, "_seek_user_interacting", False))
+        if not user_interacting_seek:
+            app.is_programmatic_update = True
+            app.scale.set_range(0, d)
+            app.scale.set_value(p)
+            app.is_programmatic_update = False
+            if hasattr(app, "_update_progress_thumb_position"):
+                app._update_progress_thumb_position()
 
         current_int_sec = int(p)
-        if not hasattr(app, "_last_sec") or app._last_sec != current_int_sec:
+        if (not user_interacting_seek) and (not hasattr(app, "_last_sec") or app._last_sec != current_int_sec):
             app.lbl_current_time.set_text(f"{int(p//60)}:{int(p%60):02d}")
             app.lbl_total_time.set_text(f"{int(d//60)}:{int(d%60):02d}")
             app._last_sec = current_int_sec
+        elif user_interacting_seek:
+            app.lbl_total_time.set_text(f"{int(d//60)}:{int(d%60):02d}")
 
     if hasattr(app, "lyrics_mgr") and app.lyrics_mgr.has_synced and hasattr(app, "lyric_widgets") and app.lyric_widgets:
         offset_ms = int(getattr(app, "lyrics_user_offset_ms", 0) or 0)

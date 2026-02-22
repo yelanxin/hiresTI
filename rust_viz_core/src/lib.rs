@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::os::raw::c_int;
 use std::slice;
 
 pub struct VizProcessor {
@@ -9,6 +10,79 @@ pub struct VizProcessor {
     min_interval_ms: f64,
     last_emit_ms: f64,
     current: Vec<f32>,
+}
+
+pub struct VizStateEngine {
+    num_bars: usize,
+    target: Vec<f32>,
+    current: Vec<f32>,
+    trail: Vec<f32>,
+    peak: Vec<f32>,
+    peak_ttl: Vec<u16>,
+    bass_level: f32,
+    smooth: f32,
+    trail_decay: f32,
+    peak_hold_frames: u16,
+    peak_fall: f32,
+    bass_smooth: f32,
+}
+
+pub struct BarsRenderer {
+    width: usize,
+    height: usize,
+    num_bars: usize,
+    colors: Vec<f32>, // RGBA per bar, len=num_bars*4
+    rgba: Vec<u8>,    // premultiplied BGRA (Cairo ARGB32 little-endian)
+    seq: u64,
+}
+
+impl BarsRenderer {
+    fn new(width: usize, height: usize, num_bars: usize) -> Self {
+        let w = width.max(1);
+        let h = height.max(1);
+        let n = num_bars.max(1);
+        let mut colors = vec![0.0_f32; n * 4];
+        for i in 0..n {
+            let p = i * 4;
+            colors[p] = 0.0;
+            colors[p + 1] = 0.72;
+            colors[p + 2] = 1.0;
+            colors[p + 3] = 1.0;
+        }
+        let rgba = vec![0_u8; w.saturating_mul(h).saturating_mul(4)];
+        Self {
+            width: w,
+            height: h,
+            num_bars: n,
+            colors,
+            rgba,
+            seq: 0,
+        }
+    }
+
+    fn ensure_shape(&mut self, width: usize, height: usize, num_bars: usize) {
+        let w = width.max(1);
+        let h = height.max(1);
+        let n = num_bars.max(1);
+        if self.width != w || self.height != h {
+            self.width = w;
+            self.height = h;
+            self.rgba.resize(self.width.saturating_mul(self.height).saturating_mul(4), 0);
+        }
+        if self.num_bars != n {
+            self.num_bars = n;
+            self.colors.resize(self.num_bars * 4, 0.0);
+            for i in 0..self.num_bars {
+                let p = i * 4;
+                if self.colors[p + 3] <= 0.0 {
+                    self.colors[p] = 0.0;
+                    self.colors[p + 1] = 0.72;
+                    self.colors[p + 2] = 1.0;
+                    self.colors[p + 3] = 1.0;
+                }
+            }
+        }
+    }
 }
 
 impl VizProcessor {
@@ -27,6 +101,96 @@ impl VizProcessor {
             last_emit_ms: -1.0,
             current: vec![0.0; bars],
         }
+    }
+}
+
+impl VizStateEngine {
+    fn new(
+        num_bars: usize,
+        smooth: f32,
+        trail_decay: f32,
+        peak_hold_frames: u16,
+        peak_fall: f32,
+        bass_smooth: f32,
+    ) -> Self {
+        let n = num_bars.max(1);
+        Self {
+            num_bars: n,
+            target: vec![0.0; n],
+            current: vec![0.0; n],
+            trail: vec![0.0; n],
+            peak: vec![0.0; n],
+            peak_ttl: vec![0; n],
+            bass_level: 0.0,
+            smooth: smooth.clamp(0.0, 1.0),
+            trail_decay: trail_decay.clamp(0.0, 1.0),
+            peak_hold_frames,
+            peak_fall: peak_fall.max(0.0),
+            bass_smooth: bass_smooth.clamp(0.0, 1.0),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.target.fill(0.0);
+        self.current.fill(0.0);
+        self.trail.fill(0.0);
+        self.peak.fill(0.0);
+        self.peak_ttl.fill(0);
+        self.bass_level = 0.0;
+    }
+
+    fn set_params(
+        &mut self,
+        smooth: f32,
+        trail_decay: f32,
+        peak_hold_frames: u16,
+        peak_fall: f32,
+        bass_smooth: f32,
+    ) {
+        self.smooth = smooth.clamp(0.0, 1.0);
+        self.trail_decay = trail_decay.clamp(0.0, 1.0);
+        self.peak_hold_frames = peak_hold_frames;
+        self.peak_fall = peak_fall.max(0.0);
+        self.bass_smooth = bass_smooth.clamp(0.0, 1.0);
+    }
+
+    fn set_target_from_slice(&mut self, input: &[f32]) -> usize {
+        let n = self.num_bars.min(input.len());
+        self.target[..n].copy_from_slice(&input[..n]);
+        if n < self.num_bars {
+            self.target[n..self.num_bars].fill(0.0);
+        }
+        n
+    }
+
+    fn tick(&mut self) {
+        let n = self.num_bars;
+        let bass_n = (n / 10).max(1);
+        let mut bass_acc = 0.0_f32;
+        for i in 0..n {
+            let cur = self.current[i];
+            let tgt = self.target[i];
+            let next = cur + ((tgt - cur) * self.smooth);
+            self.current[i] = next;
+
+            let tr = self.trail[i] * self.trail_decay;
+            self.trail[i] = if next > tr { next } else { tr };
+
+            if next >= self.peak[i] {
+                self.peak[i] = next;
+                self.peak_ttl[i] = self.peak_hold_frames;
+            } else if self.peak_ttl[i] > 0 {
+                self.peak_ttl[i] -= 1;
+            } else {
+                self.peak[i] = (self.peak[i] - self.peak_fall).max(0.0);
+            }
+
+            if i < bass_n {
+                bass_acc += next;
+            }
+        }
+        let bass_tgt = bass_acc / (bass_n as f32);
+        self.bass_level += (bass_tgt - self.bass_level) * self.bass_smooth;
     }
 }
 
@@ -143,6 +307,104 @@ pub extern "C" fn viz_processor_process(
     let out = unsafe { slice::from_raw_parts_mut(output_ptr, n) };
     out.copy_from_slice(&p.current[..n]);
     p.last_emit_ms = now_ms;
+    n
+}
+
+#[no_mangle]
+pub extern "C" fn viz_state_new(
+    num_bars: usize,
+    smooth: f32,
+    trail_decay: f32,
+    peak_hold_frames: usize,
+    peak_fall: f32,
+    bass_smooth: f32,
+) -> *mut VizStateEngine {
+    let hold = peak_hold_frames.min(u16::MAX as usize) as u16;
+    let st = VizStateEngine::new(num_bars, smooth, trail_decay, hold, peak_fall, bass_smooth);
+    Box::into_raw(Box::new(st))
+}
+
+#[no_mangle]
+pub extern "C" fn viz_state_free(ptr: *mut VizStateEngine) {
+    if ptr.is_null() {
+        return;
+    }
+    unsafe {
+        drop(Box::from_raw(ptr));
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn viz_state_reset(ptr: *mut VizStateEngine) {
+    if ptr.is_null() {
+        return;
+    }
+    let st = unsafe { &mut *ptr };
+    st.reset();
+}
+
+#[no_mangle]
+pub extern "C" fn viz_state_set_params(
+    ptr: *mut VizStateEngine,
+    smooth: f32,
+    trail_decay: f32,
+    peak_hold_frames: usize,
+    peak_fall: f32,
+    bass_smooth: f32,
+) -> c_int {
+    if ptr.is_null() {
+        return -1;
+    }
+    let st = unsafe { &mut *ptr };
+    let hold = peak_hold_frames.min(u16::MAX as usize) as u16;
+    st.set_params(smooth, trail_decay, hold, peak_fall, bass_smooth);
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn viz_state_set_target(
+    ptr: *mut VizStateEngine,
+    input_ptr: *const f32,
+    input_len: usize,
+) -> usize {
+    if ptr.is_null() || input_ptr.is_null() || input_len == 0 {
+        return 0;
+    }
+    let st = unsafe { &mut *ptr };
+    let input = unsafe { slice::from_raw_parts(input_ptr, input_len) };
+    st.set_target_from_slice(input)
+}
+
+#[no_mangle]
+pub extern "C" fn viz_state_tick_copy(
+    ptr: *mut VizStateEngine,
+    cur_out_ptr: *mut f32,
+    trail_out_ptr: *mut f32,
+    peak_out_ptr: *mut f32,
+    out_len: usize,
+    bass_out_ptr: *mut f32,
+) -> usize {
+    if ptr.is_null() || cur_out_ptr.is_null() || trail_out_ptr.is_null() || peak_out_ptr.is_null() || out_len == 0 {
+        return 0;
+    }
+    let st = unsafe { &mut *ptr };
+    let n = st.num_bars.min(out_len);
+    if n == 0 {
+        return 0;
+    }
+    st.tick();
+
+    let cur_out = unsafe { slice::from_raw_parts_mut(cur_out_ptr, n) };
+    let trail_out = unsafe { slice::from_raw_parts_mut(trail_out_ptr, n) };
+    let peak_out = unsafe { slice::from_raw_parts_mut(peak_out_ptr, n) };
+    cur_out.copy_from_slice(&st.current[..n]);
+    trail_out.copy_from_slice(&st.trail[..n]);
+    peak_out.copy_from_slice(&st.peak[..n]);
+    if !bass_out_ptr.is_null() {
+        unsafe {
+            *bass_out_ptr = st.bass_level;
+        }
+    }
     n
 }
 
@@ -687,6 +949,231 @@ pub extern "C" fn build_dots_rgba(
         }
     }
     need
+}
+
+#[no_mangle]
+pub extern "C" fn build_bars_rgba(
+    levels_ptr: *const f32,
+    levels_len: usize,
+    gain: f32,
+    canvas_width_px: usize,
+    height_px: usize,
+    bar_w_px: usize,
+    spacing_px: usize,
+    bar_colors_ptr: *const f32,
+    bar_colors_len: usize,
+    out_ptr: *mut u8,
+    out_len: usize,
+) -> usize {
+    if levels_ptr.is_null()
+        || bar_colors_ptr.is_null()
+        || out_ptr.is_null()
+        || levels_len == 0
+        || canvas_width_px == 0
+        || height_px == 0
+        || bar_w_px == 0
+        || bar_colors_len < levels_len.saturating_mul(4)
+    {
+        return 0;
+    }
+    let width_px = canvas_width_px;
+    let need = width_px.saturating_mul(height_px).saturating_mul(4);
+    if out_len < need {
+        return 0;
+    }
+    let levels = unsafe { slice::from_raw_parts(levels_ptr, levels_len) };
+    let bar_colors = unsafe { slice::from_raw_parts(bar_colors_ptr, bar_colors_len) };
+    let out = unsafe { slice::from_raw_parts_mut(out_ptr, need) };
+    out.fill(0);
+
+    for i in 0..levels_len {
+        let lvl = (levels[i] * gain).clamp(0.0, 1.0);
+        if lvl < 0.001 {
+            continue;
+        }
+        let x0 = i.saturating_mul(bar_w_px.saturating_add(spacing_px));
+        if x0 >= width_px {
+            continue;
+        }
+        let x1 = (x0 + bar_w_px).min(width_px);
+        if x1 <= x0 {
+            continue;
+        }
+
+        let h = (lvl * (height_px as f32)).max(1.0) as usize;
+        let y0 = height_px.saturating_sub(h);
+        let p = i * 4;
+        let r = bar_colors[p].clamp(0.0, 1.0);
+        let g = bar_colors[p + 1].clamp(0.0, 1.0);
+        let b = bar_colors[p + 2].clamp(0.0, 1.0);
+        let a = bar_colors[p + 3].clamp(0.0, 1.0);
+        let pr = r * a;
+        let pg = g * a;
+        let pb = b * a;
+
+        for yy in y0..height_px {
+            let row = yy * width_px;
+            for xx in x0..x1 {
+                let off = (row + xx) * 4;
+                // Cairo FORMAT_ARGB32 on little-endian memory is BGRA premultiplied.
+                out[off] = (pb * 255.0) as u8;
+                out[off + 1] = (pg * 255.0) as u8;
+                out[off + 2] = (pr * 255.0) as u8;
+                out[off + 3] = (a * 255.0) as u8;
+            }
+        }
+    }
+    need
+}
+
+#[no_mangle]
+pub extern "C" fn viz_bars_renderer_new(
+    width: usize,
+    height: usize,
+    num_bars: usize,
+) -> *mut BarsRenderer {
+    let r = BarsRenderer::new(width, height, num_bars);
+    Box::into_raw(Box::new(r))
+}
+
+#[no_mangle]
+pub extern "C" fn viz_bars_renderer_free(ptr: *mut BarsRenderer) {
+    if ptr.is_null() {
+        return;
+    }
+    unsafe {
+        drop(Box::from_raw(ptr));
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn viz_bars_renderer_set_colors(
+    ptr: *mut BarsRenderer,
+    colors_ptr: *const f32,
+    colors_len: usize,
+) -> c_int {
+    if ptr.is_null() || colors_ptr.is_null() || colors_len == 0 {
+        return -1;
+    }
+    let r = unsafe { &mut *ptr };
+    let need = r.num_bars.saturating_mul(4);
+    let src = unsafe { slice::from_raw_parts(colors_ptr, colors_len) };
+    let n = need.min(src.len());
+    if n == 0 {
+        return -2;
+    }
+    r.colors[..n].copy_from_slice(&src[..n]);
+    if n < need {
+        for i in (n / 4)..r.num_bars {
+            let p = i * 4;
+            r.colors[p] = 0.0;
+            r.colors[p + 1] = 0.72;
+            r.colors[p + 2] = 1.0;
+            r.colors[p + 3] = 1.0;
+        }
+    }
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn viz_bars_renderer_render(
+    ptr: *mut BarsRenderer,
+    levels_ptr: *const f32,
+    levels_len: usize,
+    gain: f32,
+    bar_w_px: usize,
+    spacing_px: usize,
+) -> c_int {
+    if ptr.is_null() || levels_ptr.is_null() || levels_len == 0 {
+        return -1;
+    }
+    let r = unsafe { &mut *ptr };
+    r.ensure_shape(r.width, r.height, levels_len);
+    let width_px = r.width;
+    let height_px = r.height;
+    let bw = bar_w_px.max(1);
+    let sp = spacing_px;
+    let need = width_px.saturating_mul(height_px).saturating_mul(4);
+    if r.rgba.len() < need {
+        r.rgba.resize(need, 0);
+    }
+    r.rgba[..need].fill(0);
+    let levels = unsafe { slice::from_raw_parts(levels_ptr, levels_len) };
+    let n = levels_len.min(r.num_bars);
+
+    for i in 0..n {
+        let lvl = (levels[i] * gain).clamp(0.0, 1.0);
+        if lvl < 0.001 {
+            continue;
+        }
+        let x0 = i.saturating_mul(bw.saturating_add(sp));
+        if x0 >= width_px {
+            continue;
+        }
+        let x1 = (x0 + bw).min(width_px);
+        if x1 <= x0 {
+            continue;
+        }
+        let h = (lvl * (height_px as f32)).max(1.0) as usize;
+        let y0 = height_px.saturating_sub(h);
+        let p = i * 4;
+        let rr = r.colors[p].clamp(0.0, 1.0);
+        let gg = r.colors[p + 1].clamp(0.0, 1.0);
+        let bb = r.colors[p + 2].clamp(0.0, 1.0);
+        let aa = r.colors[p + 3].clamp(0.0, 1.0);
+        let pr = rr * aa;
+        let pg = gg * aa;
+        let pb = bb * aa;
+        let rb = (pr * 255.0) as u8;
+        let gb = (pg * 255.0) as u8;
+        let bb8 = (pb * 255.0) as u8;
+        let ab = (aa * 255.0) as u8;
+
+        for yy in y0..height_px {
+            let row = yy * width_px;
+            for xx in x0..x1 {
+                let off = (row + xx) * 4;
+                r.rgba[off] = bb8;
+                r.rgba[off + 1] = gb;
+                r.rgba[off + 2] = rb;
+                r.rgba[off + 3] = ab;
+            }
+        }
+    }
+    r.seq = r.seq.wrapping_add(1);
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn viz_bars_renderer_get_frame(
+    ptr: *mut BarsRenderer,
+    out_ptr: *mut *const u8,
+    out_len: *mut usize,
+    out_w: *mut usize,
+    out_h: *mut usize,
+    out_stride: *mut usize,
+    out_seq: *mut u64,
+) -> c_int {
+    if ptr.is_null()
+        || out_ptr.is_null()
+        || out_len.is_null()
+        || out_w.is_null()
+        || out_h.is_null()
+        || out_stride.is_null()
+        || out_seq.is_null()
+    {
+        return -1;
+    }
+    let r = unsafe { &mut *ptr };
+    unsafe {
+        *out_ptr = r.rgba.as_ptr();
+        *out_len = r.rgba.len();
+        *out_w = r.width;
+        *out_h = r.height;
+        *out_stride = r.width.saturating_mul(4);
+        *out_seq = r.seq;
+    }
+    0
 }
 
 #[no_mangle]

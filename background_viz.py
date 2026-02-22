@@ -67,8 +67,9 @@ void main() {
 
         vec2 dv = vec2((uv.x - c.x) * uAspect, (uv.y - c.y));
         float d = length(dv);
-        float r = 0.62 + (0.40 * ee);
-        float a = smoothstep(r, 0.0, d) * (0.18 + (0.48 * ee));
+        // Larger halo footprint: target ~80% horizontal coverage.
+        float r = 0.90 + (0.50 * ee);
+        float a = smoothstep(r, 0.0, d) * (0.20 + (0.50 * ee));
 
         vec3 halo = mix(uColorA, uColorB, 0.45);
         col += halo * a;
@@ -127,8 +128,9 @@ void main() {
 
         vec2 dv = vec2((uv.x - c.x) * uAspect, (uv.y - c.y));
         float d = length(dv);
-        float r = 0.62 + (0.40 * ee);
-        float a = smoothstep(r, 0.0, d) * (0.18 + (0.48 * ee));
+        // Larger halo footprint: target ~80% horizontal coverage.
+        float r = 0.90 + (0.50 * ee);
+        float a = smoothstep(r, 0.0, d) * (0.20 + (0.50 * ee));
 
         vec3 halo = mix(uColorA, uColorB, 0.45);
         col += halo * a;
@@ -147,6 +149,7 @@ class _BackgroundCommon:
         self.current_energy = 0.0
         self.target_energy = 0.0
         self.phase = 0.0
+        self._active = True
         self.base_bg_rgb = (0.04, 0.04, 0.06)
         self._last_cover_key = None
         self.motion_mode = "Soft"
@@ -177,6 +180,13 @@ class _BackgroundCommon:
                 self.target_energy = 0.0
                 self.current_energy = 0.0
             self._request_redraw()
+
+    def set_active(self, active):
+        self._active = bool(active)
+        if not self._active:
+            self.target_energy = 0.0
+            self.current_energy = 0.0
+        self._request_redraw()
 
     def set_theme_mode(self, is_dark):
         self.base_bg_rgb = (0.04, 0.04, 0.06) if is_dark else (0.90, 0.91, 0.93)
@@ -269,6 +279,9 @@ class _BackgroundCommon:
         Thread(target=task, daemon=True).start()
 
     def update_energy(self, magnitudes):
+        if not self._active:
+            self.target_energy = 0.0
+            return
         profile = self.motion_profiles.get(self.motion_mode, self.motion_profiles["Soft"])
         if profile["energy_gain"] <= 0.0:
             self.target_energy = 0.0
@@ -283,6 +296,8 @@ class _BackgroundCommon:
         self.target_energy = max(0.08, min(1.0, self.target_energy))
 
     def _tick(self):
+        if not self._active:
+            return True
         profile = self.motion_profiles.get(self.motion_mode, self.motion_profiles["Soft"])
         is_visible = bool(self.get_visible() and self.get_mapped() and self.get_opacity() > 0.01)
         if not is_visible:

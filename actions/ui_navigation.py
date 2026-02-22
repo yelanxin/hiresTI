@@ -88,14 +88,9 @@ def on_nav_selected(app, box, row):
         app.grid_title_label.set_text("Liked Songs")
         if hasattr(app, "grid_subtitle_label") and app.grid_subtitle_label is not None:
             app.grid_subtitle_label.set_text("Your TIDAL favorite tracks")
-        loading = Gtk.Label(
-            label="Loading liked songs...",
-            xalign=0,
-            css_classes=["dim-label"],
-            margin_start=8,
-            margin_top=8,
-        )
-        app.collection_content_box.append(loading)
+        # Instant first paint: render cached/skeleton UI immediately, then refresh async.
+        cached_tracks = list(getattr(app, "liked_tracks_data", []) or [])
+        app.render_liked_songs_dashboard(cached_tracks)
         app.refresh_liked_songs_dashboard()
         return
 

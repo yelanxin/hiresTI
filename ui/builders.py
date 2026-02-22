@@ -499,7 +499,12 @@ def build_player_bar(app, container):
     center_panel.set_hexpand(True)
     center_panel.set_halign(Gtk.Align.FILL)
 
-    center_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER, halign=Gtk.Align.CENTER)
+    center_box = Gtk.Box(
+        orientation=Gtk.Orientation.VERTICAL,
+        valign=Gtk.Align.CENTER,
+        halign=Gtk.Align.CENTER,
+        spacing=8,
+    )
     ctrls = Gtk.Box(spacing=12, halign=Gtk.Align.CENTER)
     ctrls.add_css_class("player-ctrls-box")
 
