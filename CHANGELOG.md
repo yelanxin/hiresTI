@@ -1,5 +1,41 @@
 # Changelog
 
+## 1.2.0 - 2026-02-22
+Coverage: major audio architecture refactor after 1.1.1, centered on Rust audio runtime.
+
+### Added
+- Added Rust launcher binary entrypoint (`hiresti`) via new `rust_launcher` crate.
+- Added optional Python binary bundling path (PyInstaller onedir):
+  - helper script: `tools/build_py_binary.sh`,
+  - packaging switch: `HIRESTI_PY_BINARY=1`.
+
+### Changed
+- Audio runtime is now Rust-first:
+  - playback transport, device routing, and output state transitions run through Rust core pipeline,
+  - Python-side fallback paths were reduced/removed in core playback flow.
+- PipeWire/ALSA path handling was refactored around Rust transport control:
+  - output route application and rebind/recovery flow unified,
+  - clearer behavior when target device is unavailable or route switch fails.
+- Signal Path/Tech Info data sources were moved toward Rust-driven runtime values:
+  - playback/session/output fields now align with live Rust pipeline state,
+  - less dependence on ad-hoc Python-side estimations.
+- Visualizer and audio timing integration was reworked around Rust spectrum pipeline:
+  - better lifecycle control when drawers/tabs are shown or hidden,
+  - reduced unnecessary background spectrum processing in inactive states.
+- Packaging flow updated to build/install Rust launcher to `/usr/bin/hiresti` instead of generating a shell wrapper.
+- Launcher flow updated:
+  - Rust launcher prefers bundled binary (`/usr/share/hiresti/hiresti_app/hiresti_app`) when present,
+  - otherwise falls back to `python3 main.py`.
+
+### Fixed
+- Improved output-device reliability in Rust playback path during route changes/hotplug scenarios.
+- Improved observability of audio/login failures with clearer runtime diagnostics in logs/UI.
+
+### Notes
+- In source mode, seeing a `python` process is expected (Rust launcher starts Python app).
+- To run with a bundled app binary entry, build with:
+  - `HIRESTI_PY_BINARY=1 ./package.sh <type> <version>`
+
 ## 1.1.1 - 2026-02-21
 Coverage: incremental fixes and performance refinements after 1.1.0.
 

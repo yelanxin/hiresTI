@@ -8,6 +8,7 @@
 
 ## Highlights
 
+- From `v1.2.0`, hiresTI uses a Rust audio engine core by default
 - Native Linux UI with GTK4 + Libadwaita
 - TIDAL OAuth login and account-scoped library access
 - Bit-perfect playback flow with optional exclusive output controls
@@ -33,8 +34,14 @@
 
 - Python 3.10+
 - GTK4 + Libadwaita (PyGObject)
-- GStreamer (playback pipeline)
+- Rust audio engine core (`rust_audio_core`)
+- GStreamer (audio pipeline runtime via Rust core)
 - `tidalapi` (TIDAL integration)
+
+## Audio Engine Note
+
+Starting from `v1.2.0`, playback is driven by the Rust audio engine core by default.
+Python remains the UI/application layer, while transport/output routing and core playback runtime run through Rust.
 
 ## Runtime Requirements
 
