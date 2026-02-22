@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.hiresti.player</id>
+  <name>HiresTI</name>
+  <summary>High-Res TIDAL player for Linux</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <developer id="com.hiresti">
+    <name>HiresTI Developers</name>
+  </developer>
+  <launchable type="desktop-id">com.hiresti.player.desktop</launchable>
+  <url type="homepage">https://github.com/yelanxin/hiresTI</url>
+  <url type="bugtracker">https://github.com/yelanxin/hiresTI/issues</url>
+  <description>
+    <p>
+      HiresTI is a native Linux desktop client for TIDAL focused on stable playback,
+      high-quality output paths, and a responsive GTK4/Libadwaita UI.
+    </p>
+  </description>
+  <categories>
+    <category>AudioVideo</category>
+    <category>Audio</category>
+    <category>Player</category>
+  </categories>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="1.2.1" date="2026-02-22"/>
+  </releases>
+</component>
