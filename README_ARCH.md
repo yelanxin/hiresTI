@@ -79,7 +79,7 @@ Keep `main.py` as an orchestrator, and move new feature logic into:
 - `HIRESTI_LOG_ROTATE_BYTES` rotate threshold in bytes (default `5242880`)
 - `HIRESTI_LOG_BACKUP_COUNT` rotated file count (default `3`)
 - `HIRESTI_LOG_MODULE_LEVELS` per-module override, for example:
-  `audio_player=DEBUG,tidal_backend=INFO`
+  `rust_audio_engine=DEBUG,tidal_backend=INFO`
 
 ## Testing
 

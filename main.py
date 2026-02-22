@@ -4967,4 +4967,16 @@ class TidalApp(Adw.Application):
 
 if __name__ == "__main__":
     setup_logging()
+    try:
+        git_rev = (
+            subprocess.check_output(
+                ["git", "rev-parse", "--short", "HEAD"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=1.5,
+            ).strip()
+        )
+    except Exception:
+        git_rev = "unknown"
+    logger.info("Starting HiresTI build: git_rev=%s", git_rev)
     TidalApp().run(None)
