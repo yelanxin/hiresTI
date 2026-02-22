@@ -334,15 +334,25 @@ class SpectrumVisualizer(Gtk.DrawingArea):
         self._refresh_theme_cache()
         self._refresh_profile_cache()
         self._refresh_effect_cache()
-        self._active = True
-        
-        # 启动动画循环 (约 60fps)
-        GLib.timeout_add(16, self._on_animation_tick)
+        self._active = False
+        self._anim_source = None
 
     def set_active(self, active):
-        self._active = bool(active)
+        new_active = bool(active)
+        if self._active == new_active:
+            return
+        self._active = new_active
         if self._active:
+            if self._anim_source is None:
+                self._anim_source = GLib.timeout_add(16, self._on_animation_tick)
             self.queue_draw()
+        else:
+            if self._anim_source:
+                try:
+                    GLib.source_remove(self._anim_source)
+                except Exception:
+                    pass
+                self._anim_source = None
 
     def get_theme_names(self):
         return list(self.themes.keys())
@@ -438,7 +448,8 @@ class SpectrumVisualizer(Gtk.DrawingArea):
 
     def _on_animation_tick(self):
         if not self._active:
-            return True
+            self._anim_source = None
+            return False
         profile = self._profile_cfg
         changed = False
         self.phase += 0.045
