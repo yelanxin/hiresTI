@@ -9,11 +9,11 @@ import time
 from pathlib import Path
 from collections import deque
 
-from audio_player import AudioPlayer
 from gi.repository import GLib
 import gi
 gi.require_version("Gst", "1.0")
-from gi.repository import Gst
+gi.require_version("GstPbutils", "1.0")
+from gi.repository import Gst, GstPbutils
 
 logger = logging.getLogger(__name__)
 
@@ -33,10 +33,6 @@ class _RustAudioCore:
         self._event_cb_fn = None
         self._event_py_cb = None
         self._spectrum_batch_cache = {}
-
-        if os.getenv("HIRESTI_RUST_AUDIO_CORE", "1") == "0":
-            logger.info("Rust audio core disabled by env HIRESTI_RUST_AUDIO_CORE=0")
-            return
 
         so_paths = [
             Path(__file__).resolve().parent / "rust_audio_core" / "target" / "release" / "librust_audio_core.so",
@@ -875,10 +871,10 @@ class RustAudioPlayerAdapter:
         Release global PipeWire force-rate so other apps can negotiate freely.
         """
         try:
-            driver = str(getattr(self, "current_driver", "") or getattr(self._py, "current_driver", "") or "")
+            driver = str(getattr(self, "current_driver", "") or "")
             if driver != "PipeWire":
                 return
-            if bool(getattr(self._py, "exclusive_lock_mode", False)):
+            if bool(getattr(self, "exclusive_lock_mode", False)):
                 return
             # Keep allowed-rates but release force-rate lock.
             rc = self._rust.set_pipewire_clock_rate(0)
@@ -947,26 +943,15 @@ class RustAudioPlayerAdapter:
             logger.debug("PipeWire target resolve after profile switch failed", exc_info=True)
             return device_id
 
-    def _rust_pipewire_clock_setter(self, rate):
+    def _should_manage_pipewire_rate(self):
         if not self._rust.available:
             return False
-        rc = self._rust.set_pipewire_clock_rate(rate)
-        if rc == 0:
-            logger.info("Rust PipeWire C API clock set: %s", int(rate or 0))
-        else:
-            logger.warning("Rust PipeWire C API clock set failed rc=%s rate=%s", rc, int(rate or 0))
-        # In Rust mode, do not fall back to shell pw-metadata.
-        return True
-
-    def _should_manage_pipewire_rate(self):
-        if not self._is_rust_transport_active():
-            return False
-        driver = str(getattr(self, "current_driver", "") or getattr(self._py, "current_driver", "") or "")
+        driver = str(getattr(self, "current_driver", "") or "")
         if driver != "PipeWire":
             return False
-        if not bool(getattr(self._py, "active_rate_switch", False)):
+        if not bool(getattr(self, "active_rate_switch", False)):
             return False
-        if bool(getattr(self._py, "exclusive_lock_mode", False)):
+        if bool(getattr(self, "exclusive_lock_mode", False)):
             return False
         return True
 
@@ -1009,14 +994,10 @@ class RustAudioPlayerAdapter:
         driver = (
             getattr(self, "current_driver", None)
             or getattr(self, "requested_driver", None)
-            or getattr(self._py, "current_driver", None)
-            or getattr(self._py, "requested_driver", None)
         )
         device_id = (
             getattr(self, "current_device_id", None)
             or getattr(self, "requested_device_id", None)
-            or getattr(self._py, "current_device_id", None)
-            or getattr(self._py, "requested_device_id", None)
         )
         return driver, device_id
 
@@ -1046,30 +1027,37 @@ class RustAudioPlayerAdapter:
         self._on_eos_callback = on_eos_callback
         self._on_tag_callback = on_tag_callback
         self._on_spectrum_callback = on_spectrum_callback
-        self._py = AudioPlayer(
-            on_eos_callback=on_eos_callback,
-            on_tag_callback=on_tag_callback,
-            on_spectrum_callback=on_spectrum_callback,
-            on_viz_sync_offset_update=on_viz_sync_offset_update,
-        )
         self._rust = _RustAudioCore()
-        if self._rust.available:
-            self._py.pipewire_clock_setter = self._rust_pipewire_clock_setter
-        # Default to Rust transport/single path. Allow explicit env override to
-        # disable for troubleshooting.
-        self._use_rust_transport = (
-            str(os.getenv("HIRESTI_RUST_AUDIO_TRANSPORT", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
-        )
-        self._rust_single_transport = (
-            str(os.getenv("HIRESTI_RUST_AUDIO_SINGLE", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
-        )
-        self._shadow_analyzer_enabled = False
-        self.output_state = getattr(self._py, "output_state", "idle")
-        self.output_error = getattr(self._py, "output_error", None)
-        self.requested_driver = getattr(self._py, "requested_driver", None)
-        self.requested_device_id = getattr(self._py, "requested_device_id", None)
-        self.current_driver = getattr(self._py, "current_driver", "Auto")
-        self.current_device_id = getattr(self._py, "current_device_id", None)
+        # Rust-only transport policy.
+        self.stream_info = {
+            "codec": "-",
+            "bitrate": 0,
+            "rate": 0,
+            "depth": 0,
+            "fmt_str": "",
+            "source_rate": 0,
+            "source_depth": 0,
+            "source_fmt_str": "",
+            "output_rate": 0,
+            "output_depth": 0,
+            "output_fmt_str": "",
+        }
+        self.event_log = []
+        self.bit_perfect_mode = False
+        self.visual_sync_offset_ms = 0
+        self.visual_sync_base_ms = 0
+        self.visual_sync_lead_ms = 0
+        self.visual_sync_auto_offset_ms = 0.0
+        self.active_rate_switch = False
+        self.exclusive_lock_mode = False
+        self.alsa_buffer_time = 100000
+        self.alsa_latency_time = 10000
+        self.output_state = "idle"
+        self.output_error = None
+        self.requested_driver = None
+        self.requested_device_id = None
+        self.current_driver = "Auto (Default)"
+        self.current_device_id = None
         self._seek_hold_until = 0.0
         self._seek_target_s = None
         self._last_seek_issue_ts = 0.0
@@ -1112,12 +1100,13 @@ class RustAudioPlayerAdapter:
         self._viz_spectrum_queue = deque(maxlen=1024)
         self._viz_last_render_frame = None
         self._rust_last_pump_ts = 0.0
-        self._rust_pump_idle_interval_playing_s = 0.04
-        self._rust_pump_idle_interval_paused_s = 0.12
+        # When spectrum is disabled, keep Rust event polling lower to reduce CPU.
+        # UI progress remains smooth due cached position refresh gate.
+        self._rust_pump_idle_interval_playing_s = 0.08
+        self._rust_pump_idle_interval_paused_s = 0.25
         # Extra lookback to ensure interpolation has both neighbors even when
         # spectrum frames arrive in coarse bursts.
         self._viz_interp_lookback_s = 0.12
-        self._shadow_sink_ready = False
         self._output_switch_lock = threading.RLock()
         self._output_switch_inflight = False
         self._output_switch_pending = None
@@ -1129,6 +1118,12 @@ class RustAudioPlayerAdapter:
         self._pw_last_probe_ts = 0.0
         self._pw_retry_backoff_s = 0.0
         self._pipewire_rate_blocked = False
+        self._discoverer = None
+        try:
+            self._discoverer = GstPbutils.Discoverer.new(1 * Gst.SECOND)
+        except Exception:
+            self._discoverer = None
+            logger.warning("Rust discoverer init failed; source pre-detect disabled")
         if self._rust.available:
             self._rust.set_event_callback(self._on_rust_event)
             try:
@@ -1136,19 +1131,49 @@ class RustAudioPlayerAdapter:
                 self._rust.set_spectrum_enabled(False)
             except Exception:
                 pass
-            # Balanced cadence: keeps spectrum responsive without excessive CPU.
-            self._rust_pump_source = GLib.timeout_add(16, self._pump_rust_events_tick)
-            # Clock-driven visual rendering (decoupled from spectrum callback jitter).
-            self._viz_render_source = GLib.timeout_add(16, self._viz_render_tick)
-        self._configure_shadow_analyzer()
+            # Start with low-frequency pump while spectrum is disabled.
+            self._restart_rust_pump_timer(120)
+            # Render timer is enabled only when spectrum is on.
+            self._viz_render_source = 0
+        else:
+            raise RuntimeError("Rust audio core is required but unavailable.")
         logger.info(
-            "Audio engine path: RustAdapter (rust_core=%s, rust_transport=%s, rust_single=%s)",
+            "Audio engine path: RustAdapter (rust_core=%s, rust_transport=on, rust_single=on)",
             "on" if self._rust.available else "off",
-            "on" if self._use_rust_transport else "off",
-            "on" if self._rust_single_transport else "off",
         )
-        if self._rust_single_transport:
-            logger.info("Rust single transport is enabled")
+        logger.info("Rust single transport is enabled")
+
+    def _restart_rust_pump_timer(self, interval_ms):
+        try:
+            target = max(8, int(interval_ms or 16))
+        except Exception:
+            target = 16
+        if int(getattr(self, "_rust_pump_interval_ms", 0) or 0) == target and int(getattr(self, "_rust_pump_source", 0) or 0) != 0:
+            return
+        if int(getattr(self, "_rust_pump_source", 0) or 0):
+            try:
+                GLib.source_remove(self._rust_pump_source)
+            except Exception:
+                pass
+            self._rust_pump_source = 0
+        self._rust_pump_interval_ms = target
+        self._rust_pump_source = GLib.timeout_add(target, self._pump_rust_events_tick)
+
+    def _retune_idle_timers(self):
+        if bool(getattr(self, "_rust_spectrum_enabled", False)):
+            self._restart_rust_pump_timer(16)
+            if int(getattr(self, "_viz_render_source", 0) or 0) == 0:
+                self._viz_render_source = GLib.timeout_add(16, self._viz_render_tick)
+            return
+        # No spectrum: keep pump low-frequency and stop render loop completely.
+        is_playing_cached = bool(getattr(self, "_cached_is_playing", False))
+        self._restart_rust_pump_timer(200 if is_playing_cached else 400)
+        if int(getattr(self, "_viz_render_source", 0) or 0):
+            try:
+                GLib.source_remove(self._viz_render_source)
+            except Exception:
+                pass
+            self._viz_render_source = 0
 
     def _parse_rust_tag_event(self, msg):
         text = str(msg or "").strip()
@@ -1237,56 +1262,6 @@ class RustAudioPlayerAdapter:
             except Exception:
                 pass
 
-    def _configure_shadow_analyzer(self):
-        want_shadow = bool(
-            self._is_rust_single_active()
-            and str(os.getenv("HIRESTI_RUST_SHADOW_ANALYZER", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
-        )
-        if not want_shadow:
-            self._shadow_analyzer_enabled = False
-            try:
-                self._py.on_eos_callback = self._on_eos_callback
-            except Exception:
-                pass
-            return
-        try:
-            if not self._shadow_sink_ready:
-                sink = Gst.ElementFactory.make("fakesink", "shadow-audio-sink")
-                if sink is not None:
-                    try:
-                        sink.set_property("sync", False)
-                    except Exception:
-                        pass
-                    self._py.pipeline.set_state(Gst.State.NULL)
-                    self._py.pipeline.set_property("audio-sink", sink)
-                    self._shadow_sink_ready = True
-            # Rust core handles EOS; avoid duplicate queue advance from shadow pipeline.
-            self._py.on_eos_callback = None
-            # Keep visual analysis available.
-            try:
-                self._py.set_spectrum_enabled(True)
-            except Exception:
-                pass
-            try:
-                self._py.set_volume(0.0)
-            except Exception:
-                pass
-            self._shadow_analyzer_enabled = True
-            logger.info("Rust shadow analyzer: enabled (tech/spectrum via Python fakesink)")
-        except Exception:
-            self._shadow_analyzer_enabled = False
-            logger.exception("Failed to enable Rust shadow analyzer")
-
-    def _disable_shadow_analyzer(self):
-        if not self._shadow_analyzer_enabled:
-            return
-        self._shadow_analyzer_enabled = False
-        try:
-            self._py.on_eos_callback = self._on_eos_callback
-        except Exception:
-            pass
-        logger.info("Rust shadow analyzer: disabled")
-
     def _maybe_pre_adjust_pipewire_rate(self, uri):
         """
         Keep parity with Python engine behavior:
@@ -1295,20 +1270,20 @@ class RustAudioPlayerAdapter:
         """
         self._pipewire_rate_blocked = False
         try:
-            driver = str(getattr(self, "current_driver", "") or getattr(self._py, "current_driver", "") or "")
+            driver = str(getattr(self, "current_driver", "") or "")
             if driver != "PipeWire":
                 logger.info("Rust transport: pre-adjust skipped (driver=%s)", driver or "unknown")
                 return True
-            if not bool(getattr(self._py, "active_rate_switch", False)):
+            if not bool(getattr(self, "active_rate_switch", False)):
                 logger.info("Rust transport: pre-adjust skipped (active_rate_switch=off)")
                 return True
-            if bool(getattr(self._py, "exclusive_lock_mode", False)):
+            if bool(getattr(self, "exclusive_lock_mode", False)):
                 logger.info("Rust transport: pre-adjust skipped (exclusive_lock=on)")
                 return True
-            if not hasattr(self._py, "discoverer") or self._py.discoverer is None:
+            if self._discoverer is None:
                 return True
             target_rate = 0
-            info = self._py.discoverer.discover_uri(uri)
+            info = self._discoverer.discover_uri(uri)
             audio_streams = info.get_audio_streams() if info else []
             if audio_streams:
                 a0 = audio_streams[0]
@@ -1469,9 +1444,9 @@ class RustAudioPlayerAdapter:
                         cur_driver, cur_device = self._effective_output_selection()
                         cur_driver = str(cur_driver or "")
                         if cur_driver == "PipeWire":
-                            target_buffer = int(getattr(self._py, "alsa_buffer_time", 100000) or 100000)
-                            target_latency = int(getattr(self._py, "alsa_latency_time", 10000) or 10000)
-                            exclusive = bool(getattr(self._py, "exclusive_lock_mode", False))
+                            target_buffer = int(getattr(self, "alsa_buffer_time", 100000) or 100000)
+                            target_latency = int(getattr(self, "alsa_latency_time", 10000) or 10000)
+                            exclusive = bool(getattr(self, "exclusive_lock_mode", False))
                             rc_rebind = self._rust.set_output(
                                 cur_driver,
                                 cur_device,
@@ -1513,27 +1488,19 @@ class RustAudioPlayerAdapter:
                 pass
         if prev_enabled != self._rust_spectrum_enabled:
             logger.info("Rust spectrum processing: %s", "ON" if self._rust_spectrum_enabled else "OFF")
+            self._retune_idle_timers()
         if not self._rust_spectrum_enabled:
             self._viz_spectrum_queue.clear()
             self._viz_last_render_frame = None
         if self._viz_trace_enabled:
             self._viz_trace_enable_ts = time.monotonic()
             logger.info("VIZ TRACE rust-set-spectrum-enabled: %s", bool(self._rust_spectrum_enabled))
-        # In Rust single-transport mode, spectrum is produced by Rust path.
-        # Avoid toggling Python spectrum chain on first open; that cold-start
-        # can stall drawer animation and is unnecessary unless shadow analyzer is enabled.
-        if self._is_rust_single_active() and (not self._shadow_analyzer_enabled):
-            logger.info(
-                "Spectrum path: rust=%s python=%s (rust-single fast-path)",
-                bool(self._rust_spectrum_enabled),
-                False,
-            )
-            return True
-        fn = getattr(self._py, "set_spectrum_enabled", None)
-        if callable(fn):
-            logger.info("Spectrum path: rust=%s python=%s", bool(self._rust_spectrum_enabled), bool(enabled))
-            return fn(enabled)
-        return False
+        logger.info(
+            "Spectrum path: rust=%s python=%s (rust-only)",
+            bool(self._rust_spectrum_enabled),
+            False,
+        )
+        return True
 
     def _classify_rust_error(self, text):
         t = str(text or "").lower()
@@ -1580,38 +1547,27 @@ class RustAudioPlayerAdapter:
             pass
         logger.warning("Rust transport failure: op=%s rc=%s", op, rc)
 
-    def __getattr__(self, name):
-        return getattr(self._py, name)
+    def set_alsa_latency(self, buffer_ms, latency_ms):
+        self.alsa_buffer_time = int(float(buffer_ms or 0.0) * 1000.0)
+        self.alsa_latency_time = int(float(latency_ms or 0.0) * 1000.0)
+        return True
 
-    @property
-    def stream_info(self):
-        return self._py.stream_info
+    def toggle_bit_perfect(self, enabled, exclusive_lock=False):
+        self.bit_perfect_mode = bool(enabled)
+        self.exclusive_lock_mode = bool(exclusive_lock)
+        self.active_rate_switch = bool(enabled) and (not bool(exclusive_lock))
+        return True
 
-    @stream_info.setter
-    def stream_info(self, value):
-        self._py.stream_info = value
+    def set_eq_band(self, band_index, gain):
+        # Rust engine path has no Python equalizer chain.
+        return False
 
-    @property
-    def event_log(self):
-        return self._py.event_log
+    def reset_eq(self):
+        # Rust engine path has no Python equalizer chain.
+        return False
 
-    @event_log.setter
-    def event_log(self, value):
-        self._py.event_log = value
-
-    @property
-    def visual_sync_offset_ms(self):
-        return self._py.visual_sync_offset_ms
-
-    @visual_sync_offset_ms.setter
-    def visual_sync_offset_ms(self, value):
-        self._py.visual_sync_offset_ms = value
-
-    def _is_rust_transport_active(self):
-        return bool(self._rust.available and self._use_rust_transport)
-
-    def _is_rust_single_active(self):
-        return bool(self._rust.available and self._use_rust_transport and self._rust_single_transport)
+    def get_drivers(self):
+        return ["Auto (Default)", "PipeWire", "ALSA"]
 
     def _on_rust_event(self, evt, msg):
         if evt == _RustAudioCore.EVENT_EOS:
@@ -1665,6 +1621,10 @@ class RustAudioPlayerAdapter:
                     logger.info("Rust audio event state: %s", msg or "(empty)")
                 else:
                     logger.debug("Rust audio event state: %s", msg or "(empty)")
+                try:
+                    self._retune_idle_timers()
+                except Exception:
+                    pass
             else:
                 logger.debug("Rust audio event state: %s", msg or "(empty)")
         elif evt == _RustAudioCore.EVENT_TAG:
@@ -1890,7 +1850,7 @@ class RustAudioPlayerAdapter:
         # This avoids "visual ahead of audio" when runtime offset state is stale.
         cfg_buffer_ms = 0.0
         try:
-            cfg_buffer_ms = max(0.0, float(getattr(self._py, "alsa_buffer_time", 0) or 0.0) / 1000.0)
+            cfg_buffer_ms = max(0.0, float(getattr(self, "alsa_buffer_time", 0) or 0.0) / 1000.0)
         except Exception:
             cfg_buffer_ms = 0.0
         effective_offset_ms = max(learned_offset_ms, cfg_buffer_ms)
@@ -2031,7 +1991,6 @@ class RustAudioPlayerAdapter:
             self._seek_flush_source = 0
         try:
             self._release_pipewire_clock_override(reason="cleanup")
-            self._py.cleanup()
         finally:
             self._rust.close()
 
@@ -2042,59 +2001,44 @@ class RustAudioPlayerAdapter:
             self._last_loaded_uri = ""
         logger.info(
             "RustAdapter.load: transport_active=%s driver=%s device=%s uri=%s",
-            self._is_rust_transport_active(),
+            bool(self._rust.available),
             self._effective_output_selection()[0],
             self._effective_output_selection()[1],
             (str(uri or "")[:120] + "...") if len(str(uri or "")) > 120 else str(uri or ""),
         )
-        if self._is_rust_transport_active():
-            self._reset_rust_visual_sync_state()
-            ok = self._maybe_pre_adjust_pipewire_rate(uri)
-            if ok is False:
-                logger.warning("RustAdapter.load blocked: PipeWire rate pre-adjust failed")
-                return
-        if self._is_rust_transport_active():
-            prev = dict(getattr(self, "stream_info", {}) or {})
-            self.stream_info = {
-                "codec": "Loading...",
-                "bitrate": 0,
-                "rate": int(prev.get("rate", 0) or 0),
-                "depth": int(prev.get("depth", 0) or 0),
-                "fmt_str": prev.get("fmt_str", ""),
-                "source_rate": int(prev.get("source_rate", 0) or 0),
-                "source_depth": int(prev.get("source_depth", 0) or 0),
-                "source_fmt_str": prev.get("source_fmt_str", ""),
-                "output_rate": 0,
-                "output_depth": 0,
-                "output_fmt_str": "",
-            }
-            if callable(getattr(self, "_on_tag_callback", None)):
-                try:
-                    GLib.idle_add(self._on_tag_callback, self.stream_info)
-                except Exception:
-                    pass
-            rc = self._rust.set_uri(uri)
-            logger.info("RustAdapter.load: rust set_uri rc=%s", rc)
-            if rc != 0:
-                self._mark_transport_error("set_uri", rc)
-            else:
-                self.output_error = None
-                self._cached_pos_s = 0.0
-                self._cached_dur_s = 0.0
-                self._cached_is_playing = False
-        if self._shadow_analyzer_enabled and self._is_rust_single_active():
-            self._py.load(uri)
+        self._reset_rust_visual_sync_state()
+        ok = self._maybe_pre_adjust_pipewire_rate(uri)
+        if ok is False:
+            logger.warning("RustAdapter.load blocked: PipeWire rate pre-adjust failed")
+            return
+        prev = dict(getattr(self, "stream_info", {}) or {})
+        self.stream_info = {
+            "codec": "Loading...",
+            "bitrate": 0,
+            "rate": int(prev.get("rate", 0) or 0),
+            "depth": int(prev.get("depth", 0) or 0),
+            "fmt_str": prev.get("fmt_str", ""),
+            "source_rate": int(prev.get("source_rate", 0) or 0),
+            "source_depth": int(prev.get("source_depth", 0) or 0),
+            "source_fmt_str": prev.get("source_fmt_str", ""),
+            "output_rate": 0,
+            "output_depth": 0,
+            "output_fmt_str": "",
+        }
+        if callable(getattr(self, "_on_tag_callback", None)):
             try:
-                self._py.set_spectrum_enabled(True)
+                GLib.idle_add(self._on_tag_callback, self.stream_info)
             except Exception:
                 pass
-            try:
-                GLib.timeout_add(200, self._py._install_pad_probe)
-            except Exception:
-                pass
-        if not self._is_rust_single_active():
-            self._py.load(uri)
-
+        rc = self._rust.set_uri(uri)
+        logger.info("RustAdapter.load: rust set_uri rc=%s", rc)
+        if rc != 0:
+            self._mark_transport_error("set_uri", rc)
+        else:
+            self.output_error = None
+            self._cached_pos_s = 0.0
+            self._cached_dur_s = 0.0
+            self._cached_is_playing = False
     def set_uri(self, uri):
         try:
             self._last_loaded_uri = str(uri or "")
@@ -2102,63 +2046,47 @@ class RustAudioPlayerAdapter:
             self._last_loaded_uri = ""
         logger.info(
             "RustAdapter.set_uri: transport_active=%s driver=%s device=%s uri=%s",
-            self._is_rust_transport_active(),
+            bool(self._rust.available),
             self._effective_output_selection()[0],
             self._effective_output_selection()[1],
             (str(uri or "")[:120] + "...") if len(str(uri or "")) > 120 else str(uri or ""),
         )
-        if self._is_rust_transport_active():
-            self._reset_rust_visual_sync_state()
-            ok = self._maybe_pre_adjust_pipewire_rate(uri)
-            if ok is False:
-                logger.warning("RustAdapter.set_uri blocked: PipeWire rate pre-adjust failed")
-                return
-        if self._is_rust_transport_active():
-            prev = dict(getattr(self, "stream_info", {}) or {})
-            self.stream_info = {
-                "codec": "Loading...",
-                "bitrate": 0,
-                "rate": int(prev.get("rate", 0) or 0),
-                "depth": int(prev.get("depth", 0) or 0),
-                "fmt_str": prev.get("fmt_str", ""),
-                "source_rate": int(prev.get("source_rate", 0) or 0),
-                "source_depth": int(prev.get("source_depth", 0) or 0),
-                "source_fmt_str": prev.get("source_fmt_str", ""),
-                "output_rate": 0,
-                "output_depth": 0,
-                "output_fmt_str": "",
-            }
-            if callable(getattr(self, "_on_tag_callback", None)):
-                try:
-                    GLib.idle_add(self._on_tag_callback, self.stream_info)
-                except Exception:
-                    pass
-            rc = self._rust.set_uri(uri)
-            logger.info("RustAdapter.set_uri: rust set_uri rc=%s", rc)
-            if rc != 0:
-                self._mark_transport_error("set_uri", rc)
-            else:
-                self.output_error = None
-                self._cached_pos_s = 0.0
-                self._cached_dur_s = 0.0
-                self._cached_is_playing = False
-        if self._shadow_analyzer_enabled and self._is_rust_single_active():
-            self._py.set_uri(uri)
+        self._reset_rust_visual_sync_state()
+        ok = self._maybe_pre_adjust_pipewire_rate(uri)
+        if ok is False:
+            logger.warning("RustAdapter.set_uri blocked: PipeWire rate pre-adjust failed")
+            return
+        prev = dict(getattr(self, "stream_info", {}) or {})
+        self.stream_info = {
+            "codec": "Loading...",
+            "bitrate": 0,
+            "rate": int(prev.get("rate", 0) or 0),
+            "depth": int(prev.get("depth", 0) or 0),
+            "fmt_str": prev.get("fmt_str", ""),
+            "source_rate": int(prev.get("source_rate", 0) or 0),
+            "source_depth": int(prev.get("source_depth", 0) or 0),
+            "source_fmt_str": prev.get("source_fmt_str", ""),
+            "output_rate": 0,
+            "output_depth": 0,
+            "output_fmt_str": "",
+        }
+        if callable(getattr(self, "_on_tag_callback", None)):
             try:
-                self._py.set_spectrum_enabled(True)
+                GLib.idle_add(self._on_tag_callback, self.stream_info)
             except Exception:
                 pass
-            try:
-                GLib.timeout_add(200, self._py._install_pad_probe)
-            except Exception:
-                pass
-        if not self._is_rust_single_active():
-            self._py.set_uri(uri)
-
+        rc = self._rust.set_uri(uri)
+        logger.info("RustAdapter.set_uri: rust set_uri rc=%s", rc)
+        if rc != 0:
+            self._mark_transport_error("set_uri", rc)
+        else:
+            self.output_error = None
+            self._cached_pos_s = 0.0
+            self._cached_dur_s = 0.0
+            self._cached_is_playing = False
     def play(self):
-        if self._is_rust_transport_active():
-            self._reset_rust_visual_sync_state()
-        if self._is_rust_transport_active() and bool(getattr(self, "_pipewire_rate_blocked", False)):
+        self._reset_rust_visual_sync_state()
+        if bool(getattr(self, "_pipewire_rate_blocked", False)):
             try:
                 logger.warning("RustAdapter.play: retrying PipeWire rate recovery from blocked state")
                 self._release_pipewire_clock_override(reason="play-retry")
@@ -2173,69 +2101,46 @@ class RustAudioPlayerAdapter:
             except Exception:
                 logger.debug("RustAdapter.play: PipeWire retry path failed", exc_info=True)
                 return
-        if self._is_rust_transport_active():
-            rc = self._rust.play()
-            logger.info(
-                "RustAdapter.play: rust play rc=%s driver=%s device=%s",
-                rc,
-                self._effective_output_selection()[0],
-                self._effective_output_selection()[1],
-            )
-            if rc != 0:
-                self._mark_transport_error("play", rc)
-            else:
-                self.output_state = "active"
-                self.output_error = None
-                self._cached_is_playing = True
-                self._rust_last_play_ts = time.monotonic()
-                self._refresh_rust_cache(force=True)
-        if self._shadow_analyzer_enabled and self._is_rust_single_active():
-            self._py.play()
-            try:
-                self._py.set_spectrum_enabled(True)
-            except Exception:
-                pass
-            try:
-                GLib.timeout_add(200, self._py._install_pad_probe)
-            except Exception:
-                pass
-        if not self._is_rust_single_active():
-            self._py.play()
-
+        rc = self._rust.play()
+        logger.info(
+            "RustAdapter.play: rust play rc=%s driver=%s device=%s",
+            rc,
+            self._effective_output_selection()[0],
+            self._effective_output_selection()[1],
+        )
+        if rc != 0:
+            self._mark_transport_error("play", rc)
+        else:
+            self.output_state = "active"
+            self.output_error = None
+            self._cached_is_playing = True
+            self._rust_last_play_ts = time.monotonic()
+            self._refresh_rust_cache(force=True)
+            self._retune_idle_timers()
     def pause(self):
-        if self._is_rust_transport_active():
-            rc = self._rust.pause()
-            logger.info("RustAdapter.pause: rust pause rc=%s", rc)
-            if rc != 0:
-                self._mark_transport_error("pause", rc)
-            else:
-                self.output_error = None
-                self._cached_is_playing = False
-                self._release_pipewire_clock_override(reason="pause")
-                self._refresh_rust_cache(force=True)
-        if self._shadow_analyzer_enabled and self._is_rust_single_active():
-            self._py.pause()
-        if not self._is_rust_single_active():
-            self._py.pause()
-
+        rc = self._rust.pause()
+        logger.info("RustAdapter.pause: rust pause rc=%s", rc)
+        if rc != 0:
+            self._mark_transport_error("pause", rc)
+        else:
+            self.output_error = None
+            self._cached_is_playing = False
+            self._release_pipewire_clock_override(reason="pause")
+            self._refresh_rust_cache(force=True)
+            self._retune_idle_timers()
     def stop(self):
-        if self._is_rust_transport_active():
-            self._reset_rust_visual_sync_state()
-            rc = self._rust.stop()
-            logger.info("RustAdapter.stop: rust stop rc=%s", rc)
-            if rc != 0:
-                self._mark_transport_error("stop", rc)
-            else:
-                self.output_error = None
-                self._cached_is_playing = False
-                self._cached_pos_s = 0.0
-                self._release_pipewire_clock_override(reason="stop")
-                self._refresh_rust_cache(force=True)
-        if self._shadow_analyzer_enabled and self._is_rust_single_active():
-            self._py.stop()
-        if not self._is_rust_single_active():
-            self._py.stop()
-
+        self._reset_rust_visual_sync_state()
+        rc = self._rust.stop()
+        logger.info("RustAdapter.stop: rust stop rc=%s", rc)
+        if rc != 0:
+            self._mark_transport_error("stop", rc)
+        else:
+            self.output_error = None
+            self._cached_is_playing = False
+            self._cached_pos_s = 0.0
+            self._release_pipewire_clock_override(reason="stop")
+            self._refresh_rust_cache(force=True)
+            self._retune_idle_timers()
     def seek(self, position_seconds):
         try:
             target_s = float(position_seconds or 0.0)
@@ -2246,7 +2151,7 @@ class RustAudioPlayerAdapter:
         # Rust single path can be too sensitive to tiny cursor jitter near target.
         # Ignore rapid micro-seeks to avoid audible "tick" jumps while preserving
         # normal large scrubs.
-        if self._is_rust_single_active() and self._last_seek_issue_target is not None:
+        if self._last_seek_issue_target is not None:
             if (now - self._last_seek_issue_ts) < 1.0 and abs(self._seek_target_s - self._last_seek_issue_target) < 0.20:
                 return
         self._last_seek_issue_ts = now
@@ -2290,27 +2195,18 @@ class RustAudioPlayerAdapter:
             self._last_seek_dispatched_target = target
             self._last_seek_dispatch_ts = now
 
-        if self._is_rust_transport_active():
-            rc = self._rust.seek(target)
-            if rc != 0:
-                self._mark_transport_error("seek", rc)
-            else:
-                self.output_error = None
-                self._refresh_rust_cache(force=True)
-        if self._shadow_analyzer_enabled and self._is_rust_single_active():
-            self._py.seek(target)
-        if not self._is_rust_single_active():
-            self._py.seek(target)
-
+        rc = self._rust.seek(target)
+        if rc != 0:
+            self._mark_transport_error("seek", rc)
+        else:
+            self.output_error = None
+            self._refresh_rust_cache(force=True)
     def set_volume(self, vol):
-        if self._is_rust_transport_active():
-            rc = self._rust.set_volume(vol)
-            if rc != 0:
-                self._mark_transport_error("set_volume", rc)
-            else:
-                self.output_error = None
-        if not self._is_rust_single_active():
-            self._py.set_volume(vol)
+        rc = self._rust.set_volume(vol)
+        if rc != 0:
+            self._mark_transport_error("set_volume", rc)
+        else:
+            self.output_error = None
 
     def set_output(self, driver, device_id=None):
         req_driver = driver
@@ -2355,16 +2251,12 @@ class RustAudioPlayerAdapter:
             if same_driver:
                 resolved_device_id = (
                     getattr(self, "current_device_id", None)
-                    or getattr(self._py, "current_device_id", None)
                     or getattr(self, "requested_device_id", None)
-                    or getattr(self._py, "requested_device_id", None)
                 )
         self.requested_driver = driver
         self.requested_device_id = resolved_device_id
         self.current_driver = driver
         self.current_device_id = resolved_device_id
-        self._py.current_driver = driver
-        self._py.current_device_id = resolved_device_id
         self.output_state = "switching"
         self.output_error = None
         if str(driver or "") == "PipeWire":
@@ -2378,7 +2270,7 @@ class RustAudioPlayerAdapter:
                 )
             except Exception:
                 logger.debug("PipeWire switch pre-check failed", exc_info=True)
-        if str(driver or "") == "PipeWire" and bool(getattr(self._py, "active_rate_switch", False)):
+        if str(driver or "") == "PipeWire" and bool(getattr(self, "active_rate_switch", False)):
             if self._ensure_pipewire_pro_audio_profile(resolved_device_id):
                 new_target = self._resolve_pipewire_target_after_profile_switch(resolved_device_id)
                 if str(new_target or "") != str(resolved_device_id or ""):
@@ -2390,149 +2282,101 @@ class RustAudioPlayerAdapter:
                     resolved_device_id = new_target
                     self.requested_device_id = resolved_device_id
                     self.current_device_id = resolved_device_id
-                    self._py.current_device_id = resolved_device_id
-        if self._is_rust_transport_active():
-            target_buffer = int(getattr(self._py, "alsa_buffer_time", 100000) or 100000)
-            target_latency = int(getattr(self._py, "alsa_latency_time", 10000) or 10000)
-            exclusive = bool(getattr(self._py, "exclusive_lock_mode", False))
-            rc = self._rust.set_output(
-                driver,
-                resolved_device_id,
-                buffer_us=target_buffer,
-                latency_us=target_latency,
-                exclusive=exclusive,
-            )
-            if rc == 0:
-                if str(driver or "") == "PipeWire":
-                    logger.info("PipeWire switch applied by Rust: target=%s", str(resolved_device_id or "default"))
-                self.output_state = "active"
-                self.output_error = None
-                if self._is_rust_single_active():
-                    return True
-            else:
-                self.output_state = "error"
-                self.output_error = f"Output switch failed (rc={rc}) for {driver}/{resolved_device_id or 'default'}"
-                logger.error(
-                    "Rust output switch failed: driver=%s device=%s rc=%s (no auto-fallback)",
-                    driver,
-                    resolved_device_id,
-                    rc,
-                )
-                return False
-        return self._py.set_output(driver, resolved_device_id)
+        target_buffer = int(getattr(self, "alsa_buffer_time", 100000) or 100000)
+        target_latency = int(getattr(self, "alsa_latency_time", 10000) or 10000)
+        exclusive = bool(getattr(self, "exclusive_lock_mode", False))
+        rc = self._rust.set_output(
+            driver,
+            resolved_device_id,
+            buffer_us=target_buffer,
+            latency_us=target_latency,
+            exclusive=exclusive,
+        )
+        if rc == 0:
+            if str(driver or "") == "PipeWire":
+                logger.info("PipeWire switch applied by Rust: target=%s", str(resolved_device_id or "default"))
+            self.output_state = "active"
+            self.output_error = None
+            return True
+
+        self.output_state = "error"
+        self.output_error = f"Output switch failed (rc={rc}) for {driver}/{resolved_device_id or 'default'}"
+        logger.error(
+            "Rust output switch failed: driver=%s device=%s rc=%s",
+            driver,
+            resolved_device_id,
+            rc,
+        )
+        return False
 
     def is_playing(self):
-        if self._is_rust_single_active():
-            self._refresh_rust_cache(force=False)
-            return bool(self._cached_is_playing)
-        return self._py.is_playing()
+        self._refresh_rust_cache(force=False)
+        return bool(self._cached_is_playing)
 
     def get_latency(self):
-        if self._is_rust_transport_active():
-            lat = float(self._rust.get_latency() or 0.0)
-            try:
-                now = time.monotonic()
-                last = float(getattr(self, "_lat_probe_log_ts", 0.0) or 0.0)
-                if (now - last) >= 3.0:
-                    setattr(self, "_lat_probe_log_ts", now)
-                    probe = self._rust.get_latency_probe() or {}
-                    log_fn = logger.info if self._viz_trace_enabled else logger.debug
-                    log_fn(
-                        "Rust latency probe: source=%s latency_ms=%.3f",
-                        str(probe.get("source", "unknown")),
-                        float(probe.get("latency_s", 0.0) or 0.0) * 1000.0,
-                    )
-            except Exception:
-                pass
-            if lat > 0.0:
-                return lat
-        return self._py.get_latency()
+        lat = float(self._rust.get_latency() or 0.0)
+        try:
+            now = time.monotonic()
+            last = float(getattr(self, "_lat_probe_log_ts", 0.0) or 0.0)
+            if (now - last) >= 3.0:
+                setattr(self, "_lat_probe_log_ts", now)
+                probe = self._rust.get_latency_probe() or {}
+                log_fn = logger.info if self._viz_trace_enabled else logger.debug
+                log_fn(
+                    "Rust latency probe: source=%s latency_ms=%.3f",
+                    str(probe.get("source", "unknown")),
+                    float(probe.get("latency_s", 0.0) or 0.0) * 1000.0,
+                )
+        except Exception:
+            pass
+        return max(0.0, lat)
 
     def get_position(self):
-        if self._is_rust_single_active():
-            self._refresh_rust_cache(force=False)
-            p = float(self._cached_pos_s or 0.0)
-            d = float(self._cached_dur_s or 0.0)
-            if self._seek_target_s is not None and time.monotonic() < self._seek_hold_until:
-                target = float(self._seek_target_s)
-                # Mask transient 0/rebound frame right after flush seek.
-                if p < max(0.2, target * 0.5):
-                    return target, d
-            else:
-                self._seek_target_s = None
-            return p, d
-        p, d = self._py.get_position()
-        if self._rust.available:
-            rp = self._rust.get_position()
-            if rp > 0 and abs(rp - float(p or 0.0)) > 5.0:
-                logger.debug("Rust/Python position delta: rust=%.3f py=%.3f", rp, float(p or 0.0))
+        self._refresh_rust_cache(force=False)
+        p = float(self._cached_pos_s or 0.0)
+        d = float(self._cached_dur_s or 0.0)
+        if self._seek_target_s is not None and time.monotonic() < self._seek_hold_until:
+            target = float(self._seek_target_s)
+            # Mask transient 0/rebound frame right after flush seek.
+            if p < max(0.2, target * 0.5):
+                return target, d
+        else:
+            self._seek_target_s = None
         return p, d
 
     def set_speed(self, speed):
-        rust_ok = None
-        if self._is_rust_transport_active():
-            rust_ok = (self._rust.set_speed(speed) == 0)
-        py_fn = getattr(self._py, "set_speed", None)
-        if (not self._is_rust_single_active()) and callable(py_fn):
-            return py_fn(speed)
-        return True if rust_ok is None else rust_ok
+        return self._rust.set_speed(speed) == 0
 
     def set_pitch(self, semitones):
-        rust_ok = None
-        if self._is_rust_transport_active():
-            rust_ok = (self._rust.set_pitch(semitones) == 0)
-        py_fn = getattr(self._py, "set_pitch", None)
-        if (not self._is_rust_single_active()) and callable(py_fn):
-            return py_fn(semitones)
-        return True if rust_ok is None else rust_ok
+        return self._rust.set_pitch(semitones) == 0
 
     def get_devices_for_driver(self, driver):
         driver_name = str(driver or "")
-        if self._rust.available:
-            devices = self._rust.list_devices(driver)
-            if devices is not None:
-                try:
-                    key = driver_name
-                    sig = tuple((str(d.get("name") or ""), str(d.get("device_id") or "")) for d in devices)
-                    prev = self._last_enum_signature_by_driver.get(key)
-                    if prev != sig:
-                        self._last_enum_signature_by_driver[key] = sig
-                        logger.info("Output devices via Rust enum: driver=%s count=%d", driver, len(devices))
-                        if driver_name == "PipeWire":
-                            mapped = ", ".join(
-                                f"{str(d.get('name') or '').strip()} -> {str(d.get('device_id') or '').strip() or 'default'}"
-                                for d in devices
-                            )
-                            logger.info("PipeWire enum map: %s", mapped)
-                except Exception:
+        devices = self._rust.list_devices(driver)
+        if devices is not None:
+            try:
+                key = driver_name
+                sig = tuple((str(d.get("name") or ""), str(d.get("device_id") or "")) for d in devices)
+                prev = self._last_enum_signature_by_driver.get(key)
+                if prev != sig:
+                    self._last_enum_signature_by_driver[key] = sig
                     logger.info("Output devices via Rust enum: driver=%s count=%d", driver, len(devices))
-                return devices
-            logger.warning("Rust device enum unavailable; fallback to Python enum for driver=%s", driver)
-        return self._py.get_devices_for_driver(driver)
+                    if driver_name == "PipeWire":
+                        mapped = ", ".join(
+                            f"{str(d.get('name') or '').strip()} -> {str(d.get('device_id') or '').strip() or 'default'}"
+                            for d in devices
+                        )
+                        logger.info("PipeWire enum map: %s", mapped)
+            except Exception:
+                logger.info("Output devices via Rust enum: driver=%s count=%d", driver, len(devices))
+            return devices
+        logger.error("Rust device enumeration unavailable for driver=%s", driver)
+        return []
 
 
 def create_audio_engine(on_eos_callback=None, on_tag_callback=None, on_spectrum_callback=None, on_viz_sync_offset_update=None):
-    mode_raw = os.getenv("HIRESTI_AUDIO_ENGINE")
-    mode = str(mode_raw or "rust").strip().lower()
-    rust_hint = any(
-        str(os.getenv(k, "0") or "0").strip().lower() in ("1", "true", "yes", "on")
-        for k in ("HIRESTI_RUST_AUDIO_TRANSPORT", "HIRESTI_RUST_AUDIO_SINGLE")
-    )
-    if mode_raw is None:
-        if rust_hint:
-            logger.info("Audio engine default: Rust (env rust hints detected)")
-        else:
-            logger.info("Audio engine default: Rust")
-    if mode == "rust":
-        return RustAudioPlayerAdapter(
-            on_eos_callback=on_eos_callback,
-            on_tag_callback=on_tag_callback,
-            on_spectrum_callback=on_spectrum_callback,
-            on_viz_sync_offset_update=on_viz_sync_offset_update,
-        )
-
-    logger.info("Audio engine path: Python")
-    return AudioPlayer(
+    logger.info("Audio engine policy: Rust-only")
+    return RustAudioPlayerAdapter(
         on_eos_callback=on_eos_callback,
         on_tag_callback=on_tag_callback,
         on_spectrum_callback=on_spectrum_callback,

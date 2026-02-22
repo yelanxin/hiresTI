@@ -896,19 +896,31 @@ class SpectrumVisualizerGLArea(Gtk.GLArea):
         self._theme_c0 = (0.0, 1.0, 1.0)
         self._theme_c1 = (0.2, 0.0, 0.5)
         self._effect_mode = 0
-        self._active = True
+        self._active = False
+        self._anim_source = None
         self._refresh_theme_cache()
         self._refresh_profile_cache()
         self._refresh_effect_cache()
         self._rust_core = RustVizCore()
         self._rust_processor = self._build_rust_processor()
         self._rust_state = self._build_rust_state()
-        GLib.timeout_add(self._frame_interval_ms, self._on_animation_tick)
 
     def set_active(self, active):
-        self._active = bool(active)
+        new_active = bool(active)
+        if self._active == new_active:
+            return
+        self._active = new_active
         if self._active:
+            if self._anim_source is None:
+                self._anim_source = GLib.timeout_add(self._frame_interval_ms, self._on_animation_tick)
             self.queue_render()
+        else:
+            if self._anim_source:
+                try:
+                    GLib.source_remove(self._anim_source)
+                except Exception:
+                    pass
+                self._anim_source = None
 
     def _refresh_profile_cache(self):
         p = self.profiles[self.profile_name] if self.profile_name in self.profiles else self.profiles["Dynamic"]
@@ -1114,7 +1126,8 @@ class SpectrumVisualizerGLArea(Gtk.GLArea):
 
     def _on_animation_tick(self):
         if not self._active:
-            return True
+            self._anim_source = None
+            return False
         self.phase += 0.045
         if self._rust_state is not None:
             if not self._logged_rust_anim:
