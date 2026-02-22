@@ -12,6 +12,7 @@ logger = logging.getLogger(__name__)
 
 class TidalBackend:
     def __init__(self):
+        self._normalize_tls_ca_env()
         self.session = tidalapi.Session()
         self._tune_http_pool()
         self.token_file = os.path.expanduser("~/.cache/hiresti_token.json")
@@ -37,6 +38,67 @@ class TidalBackend:
         self._last_login_error = ""
         # Circuit breaker for unstable mix endpoint.
         self._mix_fail_until = {}
+
+    def _default_ca_bundle_candidates(self):
+        candidates = [
+            "/etc/ssl/certs/ca-certificates.crt",                # Debian/Ubuntu
+            "/etc/pki/tls/certs/ca-bundle.crt",                  # RHEL/Fedora
+            "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem", # RHEL legacy path
+            "/etc/ssl/cert.pem",                                 # Alpine/macOS-style
+        ]
+        try:
+            import certifi
+            certifi_path = str(certifi.where() or "").strip()
+            if certifi_path:
+                candidates.insert(0, certifi_path)
+        except Exception:
+            pass
+        return candidates
+
+    def _resolve_existing_ca_bundle(self):
+        for p in self._default_ca_bundle_candidates():
+            if p and os.path.isfile(p):
+                return p
+        return ""
+
+    def _normalize_tls_ca_env(self):
+        """
+        Fix invalid CA bundle env values inherited from host shells (for example
+        an RHEL-only path on Ubuntu). requests will fail with:
+        'Could not find a suitable TLS CA certificate bundle, invalid path: ...'
+        """
+        vars_to_check = ("REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "SSL_CERT_FILE")
+        invalid_vars = []
+        for k in vars_to_check:
+            raw = str(os.getenv(k, "") or "").strip()
+            if not raw:
+                continue
+            if not os.path.isfile(raw):
+                invalid_vars.append((k, raw))
+
+        if not invalid_vars:
+            return
+
+        fallback = self._resolve_existing_ca_bundle()
+        if fallback:
+            for k, bad in invalid_vars:
+                os.environ[k] = fallback
+                logger.warning(
+                    "Invalid %s path '%s'; using '%s' instead.",
+                    k,
+                    bad,
+                    fallback,
+                )
+            return
+
+        # Last resort: unset invalid overrides and let requests/certifi defaults work.
+        for k, bad in invalid_vars:
+            os.environ.pop(k, None)
+            logger.warning(
+                "Invalid %s path '%s'; cleared override to use default CA bundle discovery.",
+                k,
+                bad,
+            )
 
     def get_last_login_error(self):
         return str(self._last_login_error or "").strip()
@@ -164,6 +226,7 @@ class TidalBackend:
         return result
 
     def start_oauth(self):
+        self._normalize_tls_ca_env()
         self._set_last_login_error("")
         self.session = tidalapi.Session()
         self._apply_global_config()
