@@ -1,6 +1,8 @@
 import os
 import logging
 import time
+import math
+import random
 import shutil
 import subprocess
 import platform
@@ -15,7 +17,7 @@ from gi.repository import Gtk, Adw, GLib, Gdk, Pango
 import webbrowser
 from threading import Thread, current_thread, main_thread
 from tidal_backend import TidalBackend
-from audio_player import AudioPlayer
+from rust_audio_engine import create_audio_engine
 from models import HistoryManager, PlaylistManager
 from signal_path import AudioSignalPathWindow
 import utils
@@ -148,11 +150,24 @@ class TidalApp(Adw.Application):
         self._viz_handle_settle_source = 0
         self._viz_handle_resize_source = 0
         self._viz_handle_resize_retries = 0
+        self._viz_open_layout_source = 0
         self._viz_fade_source = 0
+        self._viz_open_stream_source = 0
+        self._viz_stream_prewarm_source = 0
+        self._viz_opened_once = False
+        self._viz_gl_prewarm_done = False
         self._last_spectrum_frame = None
+        self._last_spectrum_ts = 0.0
         self._viz_seed_frame = None
         self._viz_warmup_until = 0.0
         self._viz_warmup_duration_s = 2.0
+        self._viz_placeholder_source = 0
+        self._viz_placeholder_phase = 0.0
+        self._viz_placeholder_frame = []
+        self._viz_real_frame_streak = 0
+        self._viz_trace_open_ts = 0.0
+        self._viz_trace_last_cb_ts = 0.0
+        self._viz_trace_first_real_logged = False
         self._ui_loop_source = 0
         self._last_output_state = None
         self._last_output_error = None
@@ -192,6 +207,10 @@ class TidalApp(Adw.Application):
         self._tray_ready = False
         self._allow_window_close = False
         self._thumb_smooth_x = None
+        self._seek_pending_value = None
+        self._seek_commit_source = 0
+        self._seek_user_interacting = False
+        self._viz_current_page = "spectrum"
 
     def _apply_overlay_scroll_padding(self, expanded):
         extra = 0
@@ -308,15 +327,58 @@ class TidalApp(Adw.Application):
 
     def on_output_state_transition(self, prev_state, state, detail=None):
         if state == "switching":
+            try:
+                audio_settings_actions._touch_output_probe_burst(self, seconds=30)
+            except Exception:
+                pass
             self.show_output_notice("Audio device changed, reconnecting...", "switching", 2400)
             return
         if state == "active" and prev_state in ("switching", "fallback", "error"):
             self.show_output_notice("Audio output reconnected", "ok", 2200)
             return
         if state == "fallback":
-            self.show_output_notice("Primary output unavailable, switched to fallback", "warn", 3200)
+            try:
+                audio_settings_actions._touch_output_probe_burst(self, seconds=60)
+            except Exception:
+                pass
+            if self.play_btn is not None:
+                self.play_btn.set_icon_name("media-playback-start-symbolic")
+            detail_text = str(detail or "")
+            if "disconnected" in detail_text.lower():
+                # Remember the device that was active when disconnect happened, so
+                # hotplug logic can detect "same device came back" and optionally
+                # auto-rebind once.
+                try:
+                    drv_item = self.driver_dd.get_selected_item() if self.driver_dd is not None else None
+                    dev_item = self.device_dd.get_selected_item() if self.device_dd is not None else None
+                    if drv_item is not None:
+                        self._last_disconnected_driver = drv_item.get_string()
+                    if dev_item is not None:
+                        self._last_disconnected_device_name = dev_item.get_string()
+                except Exception:
+                    pass
+                self.show_output_notice("USB audio device disconnected, rebinding to first available output", "warn", 3600)
+                # Keep selected driver unchanged; refresh devices and bind to first available.
+                try:
+                    audio_settings_actions.refresh_devices_keep_driver_select_first(self, reason="usb-disconnect")
+                    audio_settings_actions.start_output_hotplug_watch(
+                        self,
+                        seconds=60,
+                        interval_ms=1000,
+                        slow_interval_ms=5000,
+                    )
+                except Exception:
+                    pass
+            else:
+                self.show_output_notice("Primary output unavailable, switched to fallback", "warn", 3200)
             return
         if state == "error":
+            try:
+                audio_settings_actions._touch_output_probe_burst(self, seconds=45)
+            except Exception:
+                pass
+            if self.play_btn is not None:
+                self.play_btn.set_icon_name("media-playback-start-symbolic")
             msg = str(detail or "Unknown output error")
             self.show_output_notice(f"Output error: {msg}", "error", 3600)
 
@@ -408,7 +470,7 @@ class TidalApp(Adw.Application):
             self.play_mode = self.MODE_LOOP
         self.shuffle_indices = [] # 用来存随机播放的顺序列表
 
-        self.player = AudioPlayer(
+        self.player = create_audio_engine(
             on_eos_callback=self.on_next_track,
             on_tag_callback=self.update_tech_label,
             on_spectrum_callback=self.on_spectrum_data,
@@ -543,6 +605,10 @@ class TidalApp(Adw.Application):
         if ui_loop:
             GLib.source_remove(ui_loop)
             self._ui_loop_source = 0
+        seek_commit = getattr(self, "_seek_commit_source", 0)
+        if seek_commit:
+            GLib.source_remove(seek_commit)
+            self._seek_commit_source = 0
         self.save_settings()
         if self.player is not None:
             self.player.cleanup()
@@ -698,6 +764,10 @@ class TidalApp(Adw.Application):
     def _resolve_viz_backend_key(self, effect_name=None):
         if not effect_name:
             effect_name = self._selected_name_from_dropdown(self.viz_effect_dd)
+        # Force Bars to GL shader path to avoid Cairo/pixman composition overhead.
+        # If GL is unavailable, backend rebuild will gracefully fall back.
+        if effect_name == "Bars":
+            return "gl"
         try:
             idx = int(self.settings.get("viz_backend_policy", 0))
         except Exception:
@@ -973,6 +1043,7 @@ class TidalApp(Adw.Application):
     def on_lyrics_motion_changed(self, dd, _param):
         idx = dd.get_selected()
         self._apply_lyrics_motion_by_index(idx, update_dropdown=False)
+        self._sync_spectrum_stream_state()
         self.schedule_save_settings()
 
     def _apply_lyrics_offset_ms(self, offset_ms):
@@ -995,6 +1066,7 @@ class TidalApp(Adw.Application):
         if self.viz_theme_dd is None:
             return
         page = stack.get_visible_child_name() if stack is not None else ""
+        self._viz_current_page = page or "spectrum"
         is_spectrum = page == "spectrum"
         is_lyrics = page == "lyrics"
         self.viz_theme_dd.set_visible(is_spectrum)
@@ -1016,6 +1088,45 @@ class TidalApp(Adw.Application):
             self.lyrics_ctrl_box.set_visible(is_lyrics)
         if hasattr(self, "lyrics_offset_box") and self.lyrics_offset_box is not None:
             self.lyrics_offset_box.set_visible(is_lyrics)
+        self._sync_viz_tab_runtime_state()
+        self._sync_spectrum_stream_state()
+
+    def _sync_viz_tab_runtime_state(self):
+        revealer = getattr(self, "viz_revealer", None)
+        is_open = bool(revealer is not None and revealer.get_reveal_child())
+        page = str(getattr(self, "_viz_current_page", "spectrum") or "spectrum")
+        spectrum_active = bool(is_open and page == "spectrum")
+        lyrics_active = bool(is_open and page == "lyrics")
+        if getattr(self, "viz", None) is not None and hasattr(self.viz, "set_active"):
+            try:
+                self.viz.set_active(spectrum_active)
+            except Exception:
+                pass
+        if getattr(self, "bg_viz", None) is not None and hasattr(self.bg_viz, "set_active"):
+            try:
+                self.bg_viz.set_active(lyrics_active)
+            except Exception:
+                pass
+
+    def _should_enable_spectrum_stream(self):
+        revealer = getattr(self, "viz_revealer", None)
+        if revealer is None or (not revealer.get_reveal_child()):
+            return False
+        page = str(getattr(self, "_viz_current_page", "spectrum") or "spectrum")
+        if page == "spectrum":
+            return True
+        # Lyrics tab: Static background does not need live spectrum data.
+        if page == "lyrics":
+            motion_idx = int(self.settings.get("lyrics_bg_motion", 1) or 0)
+            if motion_idx == 0:
+                return False
+            return True
+        return False
+
+    def _sync_spectrum_stream_state(self):
+        self._sync_viz_tab_runtime_state()
+        if self.player is not None and hasattr(self.player, "set_spectrum_enabled"):
+            self.player.set_spectrum_enabled(self._should_enable_spectrum_stream())
 
     def _restore_last_view(self):
         nav_id = self.settings.get("last_nav", "home")
@@ -1145,7 +1256,90 @@ class TidalApp(Adw.Application):
 
         self._schedule_update_ui_loop(40)
         GLib.timeout_add(1000, self._refresh_output_status_loop)
+        GLib.timeout_add(260, self._prewarm_gl_visualizer_once)
+        GLib.timeout_add(80, self._start_spectrum_stream_prewarm)
         self._init_tray_icon()
+
+    def _prewarm_gl_visualizer_once(self):
+        # Warm up GLArea realize/shader path once without visible drawer motion.
+        if bool(getattr(self, "_viz_gl_prewarm_done", False)):
+            return False
+        if str(getattr(self, "_viz_backend_key", "")) != "gl":
+            return False
+        revealer = getattr(self, "viz_revealer", None)
+        root = getattr(self, "viz_root", None)
+        handle = getattr(self, "viz_handle_box", None)
+        if revealer is None or root is None:
+            return False
+        if bool(revealer.get_reveal_child()):
+            return False
+
+        self._viz_gl_prewarm_done = True
+        try:
+            old_dur = int(revealer.get_transition_duration() or 0)
+        except Exception:
+            old_dur = 0
+        try:
+            old_opacity = float(root.get_opacity() or 1.0)
+        except Exception:
+            old_opacity = 1.0
+        old_handle_visible = bool(handle.get_visible()) if handle is not None else True
+
+        try:
+            revealer.set_transition_duration(0)
+            root.set_opacity(0.0)
+            if handle is not None:
+                handle.set_visible(False)
+            revealer.set_reveal_child(True)
+        except Exception:
+            # Best-effort only; never block startup.
+            try:
+                revealer.set_transition_duration(old_dur)
+            except Exception:
+                pass
+            if handle is not None:
+                handle.set_visible(old_handle_visible)
+            root.set_opacity(old_opacity)
+            return False
+
+        def _finish():
+            try:
+                revealer.set_reveal_child(False)
+                root.set_opacity(old_opacity)
+                revealer.set_transition_duration(old_dur)
+                if handle is not None:
+                    handle.set_visible(old_handle_visible)
+            except Exception:
+                pass
+            return False
+
+        GLib.timeout_add(70, _finish)
+        return False
+
+    def _start_spectrum_stream_prewarm(self):
+        # Warm up spectrum pipeline once in background to avoid first-open hitch.
+        if self.player is None or (not hasattr(self.player, "set_spectrum_enabled")):
+            return False
+        revealer = getattr(self, "viz_revealer", None)
+        if revealer is not None and bool(revealer.get_reveal_child()):
+            return False
+        try:
+            self.player.set_spectrum_enabled(True)
+        except Exception:
+            return False
+
+        if self._viz_stream_prewarm_source:
+            GLib.source_remove(self._viz_stream_prewarm_source)
+            self._viz_stream_prewarm_source = 0
+
+        def _finish():
+            self._viz_stream_prewarm_source = 0
+            self._sync_spectrum_stream_state()
+            return False
+
+        # Keep warm briefly, then restore to intended state.
+        self._viz_stream_prewarm_source = GLib.timeout_add(900, _finish)
+        return False
 
     def _get_tray_icon_path(self):
         candidates = [
@@ -1483,13 +1677,18 @@ class TidalApp(Adw.Application):
         paned = getattr(self, "paned", None)
         if paned is not None:
             paned.set_visible(True)
-        # Login state should not hide the player bar itself.
+        mini_btn = getattr(self, "mini_btn", None)
+        if mini_btn is not None:
+            mini_btn.set_visible(bool(logged_in))
+        tools_btn = getattr(self, "tools_btn", None)
+        if tools_btn is not None:
+            tools_btn.set_visible(bool(logged_in))
         player_overlay = getattr(self, "player_overlay", None)
         if player_overlay is not None:
-            player_overlay.set_visible(True)
+            player_overlay.set_visible(bool(logged_in))
         bottom_bar = getattr(self, "bottom_bar", None)
         if bottom_bar is not None:
-            bottom_bar.set_visible(True)
+            bottom_bar.set_visible(bool(logged_in))
         self._set_overlay_handles_visible(bool(logged_in))
 
     def _set_login_view_pending(self):
@@ -1506,6 +1705,12 @@ class TidalApp(Adw.Application):
             self.sidebar_box.set_visible(False)
         if hasattr(self, "search_entry") and self.search_entry is not None:
             self.search_entry.set_visible(False)
+        mini_btn = getattr(self, "mini_btn", None)
+        if mini_btn is not None:
+            mini_btn.set_visible(False)
+        tools_btn = getattr(self, "tools_btn", None)
+        if tools_btn is not None:
+            tools_btn.set_visible(False)
         player_overlay = getattr(self, "player_overlay", None)
         if player_overlay is not None:
             player_overlay.set_visible(False)
@@ -1560,9 +1765,38 @@ class TidalApp(Adw.Application):
     def on_spectrum_data(self, magnitudes, position_s=None):
         if not magnitudes:
             return
-        frame = list(magnitudes)
+        trace = str(os.getenv("HIRESTI_VIZ_TRACE", "0")).strip().lower() in ("1", "true", "yes", "on")
+        now_cb = time.monotonic()
+        frame = magnitudes if isinstance(magnitudes, list) else list(magnitudes)
         self._last_spectrum_frame = frame
-        if not self.viz_revealer.get_reveal_child():
+        self._last_spectrum_ts = now_cb
+        if trace:
+            if self._viz_trace_open_ts > 0.0 and (not self._viz_trace_first_real_logged):
+                self._viz_trace_first_real_logged = True
+                logger.info(
+                    "VIZ TRACE first-real: delta_open=%.1fms len=%d page=%s",
+                    (now_cb - self._viz_trace_open_ts) * 1000.0,
+                    len(frame),
+                    str(getattr(self, "_viz_current_page", "spectrum")),
+                )
+            if self._viz_trace_last_cb_ts > 0.0:
+                gap_ms = (now_cb - self._viz_trace_last_cb_ts) * 1000.0
+                if gap_ms >= 80.0:
+                    logger.info("VIZ TRACE callback-gap: %.1fms", gap_ms)
+            self._viz_trace_last_cb_ts = now_cb
+        # Soft handoff: don't cut placeholder on first real frame.
+        # Wait for a short real-frame streak and blend from current placeholder frame.
+        if int(getattr(self, "_viz_placeholder_source", 0) or 0):
+            self._viz_real_frame_streak = int(getattr(self, "_viz_real_frame_streak", 0) or 0) + 1
+            if self._viz_real_frame_streak == 1 and self._viz_placeholder_frame:
+                self._viz_seed_frame = list(self._viz_placeholder_frame)
+                self._viz_warmup_until = time.monotonic() + 0.32
+            if self._viz_real_frame_streak >= 4:
+                self._stop_viz_placeholder()
+        else:
+            self._viz_real_frame_streak = 0
+        revealer = self.viz_revealer
+        if revealer is None or (not revealer.get_reveal_child()):
             return
         now = time.monotonic()
         if self._viz_warmup_until > now and self._viz_seed_frame:
@@ -1572,11 +1806,107 @@ class TidalApp(Adw.Application):
         elif self._viz_warmup_until <= now:
             self._viz_seed_frame = None
             self._viz_warmup_until = 0.0
-        current_page = self.viz_stack.get_visible_child_name()
+        self._apply_viz_frame(frame)
+
+    def _apply_viz_frame(self, frame):
+        if not frame:
+            return
+        current_page = self._viz_current_page
         if current_page == "lyrics" and self.bg_viz is not None:
             self.bg_viz.update_energy(frame)
         if current_page == "spectrum" and self.viz is not None:
             self.viz.update_data(frame)
+
+    def _stop_viz_placeholder(self):
+        src = int(getattr(self, "_viz_placeholder_source", 0) or 0)
+        if src:
+            GLib.source_remove(src)
+            self._viz_placeholder_source = 0
+        self._viz_real_frame_streak = 0
+
+    def _start_viz_placeholder_if_needed(self):
+        self._stop_viz_placeholder()
+        revealer = getattr(self, "viz_revealer", None)
+        if revealer is None or (not revealer.get_reveal_child()):
+            return
+        # If we already have a recent real frame, no need for synthetic bootstrap.
+        # But when opening quickly after close, spectrum stream may still be in
+        # deferred re-enable window (_viz_open_stream_source active), and
+        # _last_spectrum_ts can look "fresh" while no new frames are actually
+        # flowing yet. In that case we should still start placeholder to avoid
+        # a visible 0.5~1s freeze.
+        now = time.monotonic()
+        stream_reenable_pending = bool(int(getattr(self, "_viz_open_stream_source", 0) or 0))
+        if (not stream_reenable_pending) and ((now - float(getattr(self, "_last_spectrum_ts", 0.0) or 0.0)) < 0.35):
+            return
+
+        try:
+            n = int(self.settings.get("viz_bar_count", 32) or 32)
+        except Exception:
+            n = 32
+        n = max(8, min(128, n))
+        if not self._viz_placeholder_frame or len(self._viz_placeholder_frame) != n:
+            self._viz_placeholder_frame = [-60.0] * n
+        self._viz_placeholder_phase = 0.0
+        self._viz_real_frame_streak = 0
+        start_ts = now
+        duration_s = 2.0
+        end_ts = start_ts + duration_s
+
+        def _tick():
+            rev = getattr(self, "viz_revealer", None)
+            if rev is None or (not rev.get_reveal_child()):
+                self._viz_placeholder_source = 0
+                return False
+            # Real data arrived steadily -> handoff in on_spectrum_data.
+            if int(getattr(self, "_viz_real_frame_streak", 0) or 0) >= 4:
+                self._viz_placeholder_source = 0
+                return False
+            if time.monotonic() > end_ts:
+                self._viz_placeholder_source = 0
+                return False
+
+            now_tick = time.monotonic()
+            life = max(0.0, min(1.0, (end_ts - now_tick) / max(1e-6, duration_s)))
+            # Keep lively at beginning, then fade toward floor.
+            energy_gate = pow(life, 0.80)
+
+            self._viz_placeholder_phase += 0.24
+            ph = self._viz_placeholder_phase
+            frame = self._viz_placeholder_frame
+            nn = len(frame)
+            center1 = 0.14 + (0.06 * math.sin(ph * 0.23))
+            center2 = 0.38 + (0.10 * math.sin((ph * 0.15) + 1.2))
+            sigma1 = 0.10
+            sigma2 = 0.16
+            for i in range(nn):
+                x = i / float(max(1, nn - 1))
+                # Low-end dominant envelope + moving "energy hills".
+                low_tilt = 0.36 * pow(max(0.0, 1.0 - x), 1.22)
+                g1 = math.exp(-((x - center1) ** 2) / (2.0 * sigma1 * sigma1))
+                g2 = math.exp(-((x - center2) ** 2) / (2.0 * sigma2 * sigma2))
+                ripple = 0.042 * math.sin((x * 17.0) + (ph * 0.8))
+                # Add jagged per-bin variation so neighbouring bars are less "too smooth".
+                jagged = (0.030 * math.sin((i * 3.5) + (ph * 2.8))) + ((random.random() - 0.5) * 0.11)
+                noise = (random.random() - 0.5) * 0.060
+
+                target = 0.022 + low_tilt + (0.28 * g1) + (0.18 * g2) + ripple + jagged + noise
+                # Rare transient peaks so placeholder feels alive, not static.
+                if random.random() < 0.040:
+                    target += 0.28 * random.random()
+                target = max(0.0, min(0.82, target * energy_gate))
+                # Convert to dB-like spectrum values expected by visualizer path.
+                # Keep in realistic range to avoid full-screen "max level" look.
+                target_db = -60.0 + (target * 48.0)  # ~[-60 dB, -12 dB]
+                # Slightly faster response, and progressively pull to floor near the end.
+                blend = 0.34 if life > 0.45 else 0.24
+                floor_pull = (1.0 - life) * 0.22
+                frame[i] = (frame[i] * (1.0 - blend)) + (target_db * blend)
+                frame[i] = (frame[i] * (1.0 - floor_pull)) + (-60.0 * floor_pull)
+            self._apply_viz_frame(frame)
+            return True
+
+        self._viz_placeholder_source = GLib.timeout_add(33, _tick)
 
     def _blend_spectrum_frames(self, seed, live, t):
         if not seed:
@@ -1809,32 +2139,42 @@ class TidalApp(Adw.Application):
         if not url:
             logger.error("QR generation aborted: empty login url (id=%s).", attempt_id)
             return None
-        if qrcode is None:
+        path = os.path.join(GLib.get_tmp_dir(), f"hiresti-login-qr-{attempt_id}.png")
+
+        def _try_qrencode_fallback():
             tool = shutil.which("qrencode")
             if not tool:
-                logger.error(
-                    "QR generation unavailable (id=%s): python 'qrcode' and system 'qrencode' are both missing.",
-                    attempt_id,
-                )
                 return None
             try:
-                path = os.path.join(GLib.get_tmp_dir(), f"hiresti-login-qr-{attempt_id}.png")
                 subprocess.run([tool, "-m", "1", "-s", "6", "-o", path, url], check=True)
                 if os.path.exists(path):
+                    logger.info("QR generated via qrencode fallback (id=%s).", attempt_id)
                     return path
             except Exception as e:
                 logger.warning("qrencode generation failed (id=%s): %s", attempt_id, e)
+            return None
+
+        if qrcode is None:
+            out = _try_qrencode_fallback()
+            if out:
+                return out
+            logger.error(
+                "QR generation unavailable (id=%s): python 'qrcode' and system 'qrencode' are both missing.",
+                attempt_id,
+            )
             return None
         try:
             qr = qrcode.QRCode(border=1, box_size=6)
             qr.add_data(url)
             qr.make(fit=True)
             img = qr.make_image(fill_color="black", back_color="white")
-            path = os.path.join(GLib.get_tmp_dir(), f"hiresti-login-qr-{attempt_id}.png")
             img.save(path)
             return path
         except Exception as e:
             logger.warning("QR generation failed (id=%s): %s", attempt_id, e)
+            out = _try_qrencode_fallback()
+            if out:
+                return out
             return None
 
     def _show_login_qr_dialog(self, oauth, attempt_id):
@@ -1970,6 +2310,36 @@ class TidalApp(Adw.Application):
             self._force_driver_selection("ALSA"); self.driver_dd.set_sensitive(False); self.on_driver_changed(self.driver_dd, None)
         else:
             self.driver_dd.set_sensitive(True)
+            drv_item = self.driver_dd.get_selected_item() if self.driver_dd is not None else None
+            drv_name = drv_item.get_string() if drv_item is not None else ""
+            if state and drv_name == "PipeWire" and hasattr(self.player, "ensure_pipewire_pro_audio"):
+                def _switch_to_pro_audio():
+                    ok = False
+                    try:
+                        ok = bool(self.player.ensure_pipewire_pro_audio())
+                    except Exception:
+                        ok = False
+
+                    def _apply_ui():
+                        try:
+                            audio_settings_actions._refresh_devices_for_current_driver_ui_only(
+                                self, reason="bit-perfect-pro-audio"
+                            )
+                        except Exception:
+                            pass
+                        if ok:
+                            self.show_output_notice("Bit-perfect enabled: switched card profile to pro-audio.", "ok", 2800)
+                        else:
+                            self.show_output_notice(
+                                "Bit-perfect enabled, but pro-audio switch failed. You can still choose device manually.",
+                                "warn",
+                                3800,
+                            )
+                        return False
+
+                    GLib.idle_add(_apply_ui)
+
+                Thread(target=_switch_to_pro_audio, daemon=True).start()
 
     def on_exclusive_toggled(self, switch, state):
         self.settings["exclusive_lock"] = state
@@ -1989,6 +2359,10 @@ class TidalApp(Adw.Application):
             self.driver_dd.set_sensitive(True)
             # 刷新一下非独占状态下的设备列表
             self.on_device_changed(self.device_dd, None)
+
+    def on_auto_rebind_once_toggled(self, switch, state):
+        self.settings["output_auto_rebind_once"] = bool(state)
+        self.save_settings()
 
     def on_toggle_mode(self, btn):
         """切换播放模式：循环 -> 单曲 -> 随机 -> 算法 -> 循环"""
@@ -2063,9 +2437,10 @@ class TidalApp(Adw.Application):
             if keyword in model.get_item(i).get_string(): self.driver_dd.set_selected(i); break
 
     def update_tech_label(self, info):
-        fmt = info.get('fmt_str', '')
+        fmt = str(info.get('fmt_str', '') or '')
+        fmt_norm = " ".join(fmt.replace("\\", " ").split())
         codec = info.get('codec', '-')
-        if not fmt and (not codec or codec in ["-", "Loading..."]):
+        if (not fmt_norm) and (not codec or codec in ["-", "Loading..."]):
             self.lbl_tech.set_text("")
             self.lbl_tech.set_tooltip_text(None)
             self.lbl_tech.remove_css_class("tech-label")
@@ -2075,17 +2450,50 @@ class TidalApp(Adw.Application):
             return
 
         display_codec = codec if codec and codec not in ["-", "Loading..."] else "PCM"
+        if isinstance(display_codec, str):
+            codec_low = display_codec.lower()
+            if "flac" in codec_low:
+                display_codec = "FLAC"
+            elif "aac" in codec_low:
+                display_codec = "AAC"
+            elif "alac" in codec_low:
+                display_codec = "ALAC"
+            else:
+                display_codec = display_codec.replace("\\", " ").strip()
 
-        rate_depth = fmt
-        if "|" in fmt:
-            parts = [p.strip() for p in fmt.split("|")]
-            if len(parts) >= 2:
-                rate = parts[0]
-                depth = parts[1].replace("bit", "-bit")
-                rate_depth = f"{depth}/{rate}"
+        # Prefer explicit numeric fields; fmt_str can be missing or escaped.
+        def _pick_int(*keys):
+            for k in keys:
+                try:
+                    v = int(info.get(k, 0) or 0)
+                except Exception:
+                    v = 0
+                if v > 0:
+                    return v
+            return 0
+
+        src_rate = _pick_int("source_rate", "rate", "output_rate")
+        src_depth = _pick_int("source_depth", "depth", "output_depth")
+
+        if src_rate > 0 and src_depth > 0:
+            rate_depth = f"{src_depth}-bit/{(src_rate / 1000.0):g}kHz"
+        else:
+            rate_depth = fmt_norm
+            if "|" in fmt_norm:
+                parts = [p.strip() for p in fmt_norm.split("|")]
+                if len(parts) >= 2:
+                    rate = parts[0]
+                    depth = parts[1].replace("bit", "-bit")
+                    rate_depth = f"{depth}/{rate}"
+            if not rate_depth:
+                rate_depth = "-"
 
         bitrate = int(info.get("bitrate", 0) or 0)
-        bitrate_text = f" • {bitrate//1000}k" if bitrate > 0 else ""
+        if bitrate > 0:
+            kbps = max(1, int(round(bitrate / 1000.0)))
+            bitrate_text = f" • {kbps}k"
+        else:
+            bitrate_text = ""
 
         is_bp = bool(getattr(self.player, "bit_perfect_mode", False))
         is_ex = bool(getattr(self.player, "exclusive_lock_mode", False))
@@ -2099,7 +2507,7 @@ class TidalApp(Adw.Application):
         # Full detail remains available on hover.
         dev_name = getattr(self, "current_device_name", "Default")
         self.lbl_tech.set_tooltip_text(
-            f"{display_codec} | {fmt} | {bitrate//1000}kbps | {dev_name} | output={output_state}"
+            f"{display_codec} | {rate_depth} | {bitrate//1000}kbps | {dev_name} | output={output_state}"
         )
 
         for cls in ("tech-state-ok", "tech-state-mixed", "tech-state-warn"):
@@ -2260,6 +2668,8 @@ class TidalApp(Adw.Application):
         else:
             if self.track_list is not None:
                 targets.append(self.track_list)
+            if getattr(self, "liked_track_list", None) is not None:
+                targets.append(self.liked_track_list)
             if getattr(self, "playlist_track_list", None) is not None:
                 targets.append(self.playlist_track_list)
             if getattr(self, "queue_track_list", None) is not None:
@@ -3797,7 +4207,34 @@ class TidalApp(Adw.Application):
 
     def on_seek(self, s): 
         self._update_progress_thumb_position()
-        if not self.is_programmatic_update: self.player.seek(s.get_value())
+        if self.is_programmatic_update:
+            return
+        self._seek_user_interacting = True
+        value = float(s.get_value())
+        self._seek_pending_value = value
+        try:
+            self.lbl_current_time.set_text(f"{int(value//60)}:{int(value%60):02d}")
+        except Exception:
+            pass
+        if self._seek_commit_source:
+            GLib.source_remove(self._seek_commit_source)
+            self._seek_commit_source = 0
+
+        def _commit_seek():
+            self._seek_commit_source = 0
+            target = self._seek_pending_value
+            self._seek_pending_value = None
+            try:
+                if target is not None:
+                    self.player.seek(float(target))
+            finally:
+                # Never keep seek-interacting state latched on errors, otherwise
+                # progress UI can appear frozen.
+                self._seek_user_interacting = False
+            return False
+
+        # Commit only after dragging value settles.
+        self._seek_commit_source = GLib.timeout_add(120, _commit_seek)
 
     def _update_progress_thumb_position(self):
         if self.scale is None or self.scale_thumb is None:
@@ -3860,13 +4297,25 @@ class TidalApp(Adw.Application):
         return lyrics_playback_actions.update_ui_loop(self)
 
     def _get_ui_loop_interval_ms(self):
+        is_playing = False
+        try:
+            is_playing = bool(self.player.is_playing())
+        except Exception:
+            is_playing = False
+
         if not self.playing_track_id:
+            return 280
+        if not is_playing:
+            revealer = self.viz_revealer
+            if revealer is not None and revealer.get_reveal_child():
+                return 120
             return 220
-        if self.viz_revealer is not None and self.viz_revealer.get_reveal_child():
-            if self.viz_stack is not None and self.viz_stack.get_visible_child_name() == "lyrics":
+        revealer = self.viz_revealer
+        if revealer is not None and revealer.get_reveal_child():
+            if self._viz_current_page == "lyrics":
                 return 25
             return 40
-        return 120
+        return 100
 
     def _schedule_update_ui_loop(self, delay_ms=None):
         source = getattr(self, "_ui_loop_source", 0)
@@ -3877,7 +4326,11 @@ class TidalApp(Adw.Application):
 
         def _tick():
             self._ui_loop_source = 0
-            keep_running = bool(self.update_ui_loop())
+            try:
+                keep_running = bool(self.update_ui_loop())
+            except Exception:
+                logger.exception("UI loop tick failed")
+                keep_running = True
             if keep_running:
                 self._schedule_update_ui_loop()
             return False
@@ -4209,42 +4662,78 @@ class TidalApp(Adw.Application):
         self.schedule_save_settings()
 
     def _set_visualizer_expanded(self, expanded):
+        trace = str(os.getenv("HIRESTI_VIZ_TRACE", "0")).strip().lower() in ("1", "true", "yes", "on")
         if expanded:
+            self._viz_trace_open_ts = time.monotonic()
+            self._viz_trace_last_cb_ts = 0.0
+            self._viz_trace_first_real_logged = False
             self._viz_seed_frame = list(self._last_spectrum_frame) if self._last_spectrum_frame else None
             self._viz_warmup_until = time.monotonic() + float(self._viz_warmup_duration_s)
-        if self.player is not None and hasattr(self.player, "set_spectrum_enabled"):
-            self.player.set_spectrum_enabled(expanded)
-        # 触发 Revealer 动画 (上下滑动)
-        self.viz_revealer.set_reveal_child(expanded)
-        self._apply_overlay_scroll_padding(expanded)
-        self._position_viz_handle(expanded)
+            if trace:
+                logger.info(
+                    "VIZ TRACE drawer-open: seed=%s warmup=%.2fs page=%s",
+                    bool(self._viz_seed_frame),
+                    float(self._viz_warmup_duration_s),
+                    str(getattr(self, "_viz_current_page", "spectrum")),
+                )
+        if self._viz_open_layout_source:
+            GLib.source_remove(self._viz_open_layout_source)
+            self._viz_open_layout_source = 0
+        if self._viz_open_stream_source:
+            GLib.source_remove(self._viz_open_stream_source)
+            self._viz_open_stream_source = 0
         if self._viz_handle_settle_source:
             GLib.source_remove(self._viz_handle_settle_source)
             self._viz_handle_settle_source = 0
+        # 触发 Revealer 动画 (上下滑动)
+        self.viz_revealer.set_reveal_child(expanded)
+        if expanded:
+            self._start_viz_handle_follow_transition()
+        if expanded:
+            # Enable stream immediately to avoid "never started" corner cases,
+            # then keep deferred sync for layout-friendly startup.
+            self._sync_spectrum_stream_state()
+            # First-open smoothness: let reveal animation run first, then do heavier work.
+            def _defer_open_layout():
+                self._viz_open_layout_source = 0
+                self._apply_overlay_scroll_padding(True)
+                self._position_viz_handle(True, animate=False)
+                return False
+
+            def _defer_open_stream():
+                self._viz_open_stream_source = 0
+                self._sync_spectrum_stream_state()
+                if self._viz_seed_frame:
+                    page = str(getattr(self, "_viz_current_page", "spectrum") or "spectrum")
+                    if page == "spectrum" and getattr(self, "viz", None) is not None:
+                        self.viz.update_data(self._viz_seed_frame)
+                    if page == "lyrics" and getattr(self, "bg_viz", None) is not None:
+                        self.bg_viz.update_energy(self._viz_seed_frame)
+                return False
+
+            self._viz_open_layout_source = GLib.timeout_add(220, _defer_open_layout)
+            self._viz_open_stream_source = GLib.timeout_add(260, _defer_open_stream)
+            self._start_viz_placeholder_if_needed()
+        else:
+            # Closing should stop spectrum stream and restore layout immediately.
+            self._sync_spectrum_stream_state()
+            self._apply_overlay_scroll_padding(False)
+            self._position_viz_handle(False)
+            self._stop_viz_placeholder()
+            if trace:
+                logger.info("VIZ TRACE drawer-close")
         if expanded:
             # Temporarily disable visualizer content fade-in for latency A/B test.
             if self._viz_fade_source:
                 GLib.source_remove(self._viz_fade_source)
                 self._viz_fade_source = 0
             self._set_viz_content_opacity(1.0)
-            if self._viz_seed_frame:
-                if getattr(self, "viz", None) is not None:
-                    self.viz.update_data(self._viz_seed_frame)
-                if getattr(self, "bg_viz", None) is not None:
-                    self.bg_viz.update_energy(self._viz_seed_frame)
-            def _settle_handle():
-                self._viz_handle_settle_source = 0
-                self._position_viz_handle(True)
-                return False
-            # Reposition once after layout settles; avoids first-open mismatch.
-            self._viz_handle_settle_source = GLib.timeout_add(220, _settle_handle)
+            self._viz_opened_once = True
 
         # 图标切换
         if expanded:
             self.viz_btn.set_icon_name("hiresti-pan-down-symbolic")
             self.viz_btn.add_css_class("active")
-            if self.viz is not None:
-                self.viz.queue_draw()
         else:
             if self._last_spectrum_frame:
                 self._viz_seed_frame = list(self._last_spectrum_frame)
@@ -4286,7 +4775,7 @@ class TidalApp(Adw.Application):
 
         self._viz_fade_source = GLib.timeout_add(16, _tick)
 
-    def _position_viz_handle(self, expanded):
+    def _position_viz_handle(self, expanded, animate=True):
         box = getattr(self, "viz_handle_box", None)
         if box is None:
             return
@@ -4294,11 +4783,18 @@ class TidalApp(Adw.Application):
         base_bottom = 0
         target = 0
         if not expanded:
-            self._animate_viz_handle_to(base_bottom, duration_ms=180)
+            if animate:
+                self._animate_viz_handle_to(base_bottom, duration_ms=180)
+            else:
+                box.set_margin_bottom(base_bottom)
             return
         panel_h = 0
+        revealer = getattr(self, "viz_revealer", None)
+        if revealer is not None:
+            # During reveal animation this is the live visible height.
+            panel_h = int(revealer.get_height() or 0)
         if getattr(self, "viz_root", None) is not None:
-            panel_h = int(self.viz_root.get_height() or 0)
+            panel_h = max(panel_h, int(self.viz_root.get_height() or 0))
         if panel_h <= 1 and getattr(self, "viz_stack", None) is not None:
             stack_h = int(self.viz_stack.get_height() or 0)
             if stack_h > 1:
@@ -4306,7 +4802,50 @@ class TidalApp(Adw.Application):
         if panel_h <= 1:
             panel_h = 286
         target = max(base_bottom, panel_h - 24 + base_bottom - 12 - 7)
-        self._animate_viz_handle_to(target, duration_ms=180)
+        if animate:
+            self._animate_viz_handle_to(target, duration_ms=180)
+        else:
+            box.set_margin_bottom(target)
+
+    def _start_viz_handle_follow_transition(self):
+        if self._viz_handle_settle_source:
+            GLib.source_remove(self._viz_handle_settle_source)
+            self._viz_handle_settle_source = 0
+        if self._viz_handle_anim_source:
+            GLib.source_remove(self._viz_handle_anim_source)
+            self._viz_handle_anim_source = 0
+        revealer = getattr(self, "viz_revealer", None)
+        box = getattr(self, "viz_handle_box", None)
+        if revealer is None:
+            return
+        if box is None:
+            return
+        duration_ms = int(revealer.get_transition_duration() or 220)
+        start_us = GLib.get_monotonic_time()
+        # Keep watcher alive a bit beyond revealer transition; position is
+        # computed from live revealer height every frame, so no lag drift.
+        span_us = max(120_000, (duration_ms + 120) * 1000)
+
+        def _tick():
+            rev = getattr(self, "viz_revealer", None)
+            if rev is None or (not rev.get_reveal_child()):
+                self._viz_handle_settle_source = 0
+                return False
+            live_h = int(rev.get_height() or 0)
+            if live_h <= 1:
+                live_h = int(getattr(self, "viz_root", None).get_height() or 0) if getattr(self, "viz_root", None) is not None else 0
+            cur = max(0, live_h - 24 - 12 - 7)
+            self._align_viz_handle_to_play_button()
+            box.set_margin_bottom(max(0, cur))
+            elapsed = GLib.get_monotonic_time() - start_us
+            if elapsed >= span_us:
+                self._viz_handle_settle_source = 0
+                # Final settle to exact layout target.
+                self._position_viz_handle(True, animate=False)
+                return False
+            return True
+
+        self._viz_handle_settle_source = GLib.timeout_add(16, _tick)
 
     def _align_viz_handle_to_play_button(self):
         box = getattr(self, "viz_handle_box", None)

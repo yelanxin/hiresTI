@@ -1,5 +1,7 @@
 import random
 
+from actions import audio_settings_actions
+
 
 def on_play_pause(app, btn):
     if app.player.is_playing():
@@ -7,6 +9,18 @@ def on_play_pause(app, btn):
         btn.set_icon_name("media-playback-start-symbolic")
     else:
         app.player.play()
+        audio_settings_actions.update_output_status_ui(app)
+        state = str(getattr(app.player, "output_state", "idle") or "idle")
+        err = str(getattr(app.player, "output_error", "") or "").strip()
+        blocked = bool(getattr(app.player, "_pipewire_rate_blocked", False))
+        if blocked or state == "error":
+            btn.set_icon_name("media-playback-start-symbolic")
+            msg = err or "Audio output error."
+            if hasattr(app, "show_output_notice"):
+                app.show_output_notice(f"Output error: {msg}", "error", 4200)
+            if blocked and hasattr(app, "_show_simple_dialog"):
+                app._show_simple_dialog("Playback blocked", msg)
+            return
         btn.set_icon_name("media-playback-pause-symbolic")
 
 

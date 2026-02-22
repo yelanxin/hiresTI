@@ -385,6 +385,24 @@ def build_settings_page(app):
     row_state.append(app.output_recover_btn)
     group_out.append(row_state)
 
+    row_rebind = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
+    rebind_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
+    rebind_info.append(Gtk.Label(label="Auto Rebind Once", xalign=0, css_classes=["settings-label"]))
+    rebind_info.append(
+        Gtk.Label(
+            label="When a disconnected device returns, auto switch back one time",
+            xalign=0,
+            css_classes=["dim-label"],
+        )
+    )
+    row_rebind.append(rebind_info)
+    row_rebind.append(Gtk.Box(hexpand=True))
+    app.auto_rebind_once_switch = Gtk.Switch(valign=Gtk.Align.CENTER)
+    app.auto_rebind_once_switch.set_active(bool(app.settings.get("output_auto_rebind_once", False)))
+    app.auto_rebind_once_switch.connect("state-set", app.on_auto_rebind_once_toggled)
+    row_rebind.append(app.auto_rebind_once_switch)
+    group_out.append(row_rebind)
+
     settings_vbox.append(group_out)
 
     settings_vbox.append(Gtk.Label(label="Diagnostics", xalign=0, css_classes=["section-title"], margin_top=10))

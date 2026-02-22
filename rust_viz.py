@@ -10,6 +10,8 @@ logger = logging.getLogger(__name__)
 class RustVizCore:
     def __init__(self):
         self._lib = self._load_library()
+        self._bars_rgba_buffers = {}
+        self._bars_rgba_colors_cache = {}
         if self._lib is None:
             logger.info("Rust viz core unavailable; falling back to Python spectrum path.")
             return
@@ -205,6 +207,70 @@ class RustVizCore:
         except Exception:
             logger.info("Rust viz core lacks build_dots_rgba symbol; using Python fallback for dots image.")
 
+        self._build_bars_rgba = None
+        try:
+            bars_rgba = self._lib.build_bars_rgba
+            bars_rgba.argtypes = [
+                ctypes.POINTER(ctypes.c_float),  # levels ptr
+                ctypes.c_size_t,                 # levels len
+                ctypes.c_float,                  # gain
+                ctypes.c_size_t,                 # canvas width px
+                ctypes.c_size_t,                 # height px
+                ctypes.c_size_t,                 # bar width px
+                ctypes.c_size_t,                 # spacing px
+                ctypes.POINTER(ctypes.c_float),  # bar colors ptr
+                ctypes.c_size_t,                 # bar colors len
+                ctypes.POINTER(ctypes.c_ubyte),  # output rgba ptr
+                ctypes.c_size_t,                 # output len bytes
+            ]
+            bars_rgba.restype = ctypes.c_size_t
+            self._build_bars_rgba = bars_rgba
+        except Exception:
+            logger.info("Rust viz core lacks build_bars_rgba symbol; using Python fallback for bars image.")
+        self._bars_renderer_new = None
+        self._bars_renderer_free = None
+        self._bars_renderer_set_colors = None
+        self._bars_renderer_render = None
+        self._bars_renderer_get_frame = None
+        try:
+            br_new = self._lib.viz_bars_renderer_new
+            br_new.argtypes = [ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t]
+            br_new.restype = ctypes.c_void_p
+            br_free = self._lib.viz_bars_renderer_free
+            br_free.argtypes = [ctypes.c_void_p]
+            br_free.restype = None
+            br_set = self._lib.viz_bars_renderer_set_colors
+            br_set.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_size_t]
+            br_set.restype = ctypes.c_int
+            br_render = self._lib.viz_bars_renderer_render
+            br_render.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.c_size_t,
+                ctypes.c_float,
+                ctypes.c_size_t,
+                ctypes.c_size_t,
+            ]
+            br_render.restype = ctypes.c_int
+            br_get = self._lib.viz_bars_renderer_get_frame
+            br_get.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.POINTER(ctypes.c_size_t),
+                ctypes.POINTER(ctypes.c_size_t),
+                ctypes.POINTER(ctypes.c_size_t),
+                ctypes.POINTER(ctypes.c_size_t),
+                ctypes.POINTER(ctypes.c_uint64),
+            ]
+            br_get.restype = ctypes.c_int
+            self._bars_renderer_new = br_new
+            self._bars_renderer_free = br_free
+            self._bars_renderer_set_colors = br_set
+            self._bars_renderer_render = br_render
+            self._bars_renderer_get_frame = br_get
+        except Exception:
+            logger.info("Rust viz core lacks bars renderer object API; using bars_rgba fallback.")
+
         self._count_artist_keys = None
         try:
             count_keys = self._lib.count_artist_keys
@@ -301,6 +367,61 @@ class RustVizCore:
         proc.restype = ctypes.c_size_t
         self._viz_processor_process = proc
 
+        self._viz_state_new = None
+        self._viz_state_free = None
+        self._viz_state_reset = None
+        self._viz_state_set_params = None
+        self._viz_state_set_target = None
+        self._viz_state_tick_copy = None
+        try:
+            st_new = self._lib.viz_state_new
+            st_new.argtypes = [
+                ctypes.c_size_t,  # num bars
+                ctypes.c_float,   # smooth
+                ctypes.c_float,   # trail decay
+                ctypes.c_size_t,  # peak hold frames
+                ctypes.c_float,   # peak fall
+                ctypes.c_float,   # bass smooth
+            ]
+            st_new.restype = ctypes.c_void_p
+            st_free = self._lib.viz_state_free
+            st_free.argtypes = [ctypes.c_void_p]
+            st_free.restype = None
+            st_reset = self._lib.viz_state_reset
+            st_reset.argtypes = [ctypes.c_void_p]
+            st_reset.restype = None
+            st_setp = self._lib.viz_state_set_params
+            st_setp.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_float,
+                ctypes.c_float,
+                ctypes.c_size_t,
+                ctypes.c_float,
+                ctypes.c_float,
+            ]
+            st_setp.restype = ctypes.c_int
+            st_sett = self._lib.viz_state_set_target
+            st_sett.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_size_t]
+            st_sett.restype = ctypes.c_size_t
+            st_tick = self._lib.viz_state_tick_copy
+            st_tick.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.c_size_t,
+                ctypes.POINTER(ctypes.c_float),
+            ]
+            st_tick.restype = ctypes.c_size_t
+            self._viz_state_new = st_new
+            self._viz_state_free = st_free
+            self._viz_state_reset = st_reset
+            self._viz_state_set_params = st_setp
+            self._viz_state_set_target = st_sett
+            self._viz_state_tick_copy = st_tick
+        except Exception:
+            logger.info("Rust viz core lacks viz_state_* symbols; using Python animation fallback.")
+
     @property
     def available(self) -> bool:
         return self._lib is not None
@@ -360,6 +481,29 @@ class RustVizCore:
         if not ptr:
             return None
         return RustVizProcessor(self, ptr, int(num_bars))
+
+    def create_state_engine(
+        self,
+        num_bars: int,
+        smooth: float = 0.45,
+        trail_decay: float = 0.90,
+        peak_hold_frames: int = 8,
+        peak_fall: float = 0.02,
+        bass_smooth: float = 0.22,
+    ) -> Optional["RustVizStateEngine"]:
+        if self._lib is None or self._viz_state_new is None:
+            return None
+        ptr = self._viz_state_new(
+            int(num_bars),
+            ctypes.c_float(float(smooth)),
+            ctypes.c_float(float(trail_decay)),
+            ctypes.c_size_t(max(0, int(peak_hold_frames))),
+            ctypes.c_float(float(peak_fall)),
+            ctypes.c_float(float(bass_smooth)),
+        )
+        if not ptr:
+            return None
+        return RustVizStateEngine(self, ptr, int(num_bars))
 
     def build_log_bins(self, values: Iterable[float], out_count: int) -> Optional[List[float]]:
         if self._lib is None:
@@ -793,6 +937,80 @@ class RustVizCore:
             return None
         return (bytearray(out_arr[:written]), width_px, hpx)
 
+    def build_bars_rgba(
+        self,
+        levels: Iterable[float],
+        gain: float,
+        canvas_width_px: int,
+        height_px: int,
+        bar_w_px: int,
+        spacing_px: int,
+        bar_colors_rgba: Iterable[Iterable[float]],
+    ) -> Optional[tuple]:
+        if self._lib is None or self._build_bars_rgba is None:
+            return None
+        vals = [float(v) for v in levels]
+        if not vals:
+            return None
+        width_px = max(1, int(canvas_width_px))
+        hpx = max(1, int(height_px))
+        bw = max(1, int(bar_w_px))
+        sp = max(0, int(spacing_px))
+
+        colors = [tuple(c) for c in bar_colors_rgba]
+        needed = len(vals)
+        if len(colors) < needed:
+            last = colors[-1] if colors else (0.0, 0.7, 1.0, 1.0)
+            colors.extend([last] * (needed - len(colors)))
+        elif len(colors) > needed:
+            colors = colors[:needed]
+        color_len = needed * 4
+        out_len = width_px * hpx * 4
+        buf_key = (needed, width_px, hpx)
+        bufs = self._bars_rgba_buffers.get(buf_key)
+        if bufs is None:
+            bufs = {
+                "levels_buf": (ctypes.c_float * needed)(),
+                "colors_buf": (ctypes.c_float * color_len)(),
+                "out_arr": (ctypes.c_ubyte * out_len)(),
+            }
+            self._bars_rgba_buffers[buf_key] = bufs
+        levels_buf = bufs["levels_buf"]
+        colors_buf = bufs["colors_buf"]
+        out_arr = bufs["out_arr"]
+
+        for i, v in enumerate(vals):
+            levels_buf[i] = float(v)
+
+        colors_sig = (buf_key, id(bar_colors_rgba))
+        cached_sig = self._bars_rgba_colors_cache.get(buf_key)
+        if cached_sig != colors_sig:
+            j = 0
+            for c in colors:
+                colors_buf[j] = float(c[0]); j += 1
+                colors_buf[j] = float(c[1]); j += 1
+                colors_buf[j] = float(c[2]); j += 1
+                colors_buf[j] = float(c[3]); j += 1
+            self._bars_rgba_colors_cache[buf_key] = colors_sig
+        written = int(
+            self._build_bars_rgba(
+                levels_buf,
+                ctypes.c_size_t(needed),
+                ctypes.c_float(float(gain)),
+                ctypes.c_size_t(width_px),
+                ctypes.c_size_t(hpx),
+                ctypes.c_size_t(bw),
+                ctypes.c_size_t(sp),
+                colors_buf,
+                ctypes.c_size_t(color_len),
+                out_arr,
+                ctypes.c_size_t(out_len),
+            )
+        )
+        if written <= 0:
+            return None
+        return (memoryview(out_arr)[:written], width_px, hpx)
+
     def count_artist_keys(self, keys: Iterable[int]) -> Optional[List[tuple]]:
         if self._lib is None or self._count_artist_keys is None:
             return None
@@ -954,6 +1172,121 @@ class RustVizCore:
                 continue
         return None
 
+    def create_bars_renderer(self, width: int, height: int, num_bars: int):
+        if self._lib is None or self._bars_renderer_new is None:
+            return None
+        ptr = self._bars_renderer_new(
+            ctypes.c_size_t(max(1, int(width))),
+            ctypes.c_size_t(max(1, int(height))),
+            ctypes.c_size_t(max(1, int(num_bars))),
+        )
+        if not ptr:
+            return None
+        return RustBarsRenderer(self, ctypes.c_void_p(ptr), int(num_bars))
+
+
+class RustBarsRenderer:
+    def __init__(self, core: RustVizCore, ptr: ctypes.c_void_p, num_bars: int):
+        self._core = core
+        self._ptr = ptr
+        self._num_bars = max(1, int(num_bars))
+        self._levels_buf = (ctypes.c_float * self._num_bars)()
+        self._colors_buf = (ctypes.c_float * (self._num_bars * 4))()
+        self._frame_ptr = ctypes.c_void_p()
+        self._frame_len = ctypes.c_size_t(0)
+        self._frame_w = ctypes.c_size_t(0)
+        self._frame_h = ctypes.c_size_t(0)
+        self._frame_stride = ctypes.c_size_t(0)
+        self._frame_seq = ctypes.c_uint64(0)
+        self._frame_buf_obj = None
+        self._last_seq = -1
+
+    def close(self):
+        if self._ptr:
+            self._core._bars_renderer_free(self._ptr)
+            self._ptr = None
+            self._frame_buf_obj = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def set_colors(self, bar_colors_rgba: Iterable[Iterable[float]]) -> bool:
+        if not self._ptr:
+            return False
+        colors = [tuple(c) for c in bar_colors_rgba]
+        if len(colors) < self._num_bars:
+            last = colors[-1] if colors else (0.0, 0.72, 1.0, 1.0)
+            colors.extend([last] * (self._num_bars - len(colors)))
+        elif len(colors) > self._num_bars:
+            colors = colors[:self._num_bars]
+        j = 0
+        for c in colors:
+            self._colors_buf[j] = float(c[0]); j += 1
+            self._colors_buf[j] = float(c[1]); j += 1
+            self._colors_buf[j] = float(c[2]); j += 1
+            self._colors_buf[j] = float(c[3]); j += 1
+        rc = int(
+            self._core._bars_renderer_set_colors(
+                self._ptr,
+                self._colors_buf,
+                ctypes.c_size_t(self._num_bars * 4),
+            )
+        )
+        return rc == 0
+
+    def render(self, levels: Iterable[float], gain: float, bar_w_px: int, spacing_px: int) -> bool:
+        if not self._ptr:
+            return False
+        vals = [float(v) for v in levels]
+        if len(vals) < self._num_bars:
+            vals.extend([0.0] * (self._num_bars - len(vals)))
+        elif len(vals) > self._num_bars:
+            vals = vals[:self._num_bars]
+        for i, v in enumerate(vals):
+            self._levels_buf[i] = v
+        rc = int(
+            self._core._bars_renderer_render(
+                self._ptr,
+                self._levels_buf,
+                ctypes.c_size_t(self._num_bars),
+                ctypes.c_float(float(gain)),
+                ctypes.c_size_t(max(1, int(bar_w_px))),
+                ctypes.c_size_t(max(0, int(spacing_px))),
+            )
+        )
+        return rc == 0
+
+    def get_frame(self):
+        if not self._ptr:
+            return None
+        rc = int(
+            self._core._bars_renderer_get_frame(
+                self._ptr,
+                ctypes.byref(self._frame_ptr),
+                ctypes.byref(self._frame_len),
+                ctypes.byref(self._frame_w),
+                ctypes.byref(self._frame_h),
+                ctypes.byref(self._frame_stride),
+                ctypes.byref(self._frame_seq),
+            )
+        )
+        if rc != 0 or not self._frame_ptr.value or self._frame_len.value <= 0:
+            return None
+        if int(self._frame_seq.value) != self._last_seq:
+            self._last_seq = int(self._frame_seq.value)
+            arr_t = ctypes.c_ubyte * int(self._frame_len.value)
+            self._frame_buf_obj = arr_t.from_address(int(self._frame_ptr.value))
+        return (
+            self._frame_buf_obj,
+            int(self._frame_w.value),
+            int(self._frame_h.value),
+            int(self._frame_stride.value),
+            int(self._frame_seq.value),
+        )
+
 
 class RustVizProcessor:
     def __init__(self, core: RustVizCore, ptr: ctypes.c_void_p, num_bars: int):
@@ -1003,3 +1336,85 @@ class RustVizProcessor:
         if len(out) < self._num_bars:
             out.extend([0.0] * (self._num_bars - len(out)))
         return out
+
+
+class RustVizStateEngine:
+    def __init__(self, core: RustVizCore, ptr: ctypes.c_void_p, num_bars: int):
+        self._core = core
+        self._ptr = ptr
+        self._num_bars = max(1, int(num_bars))
+        self._target_buf = (ctypes.c_float * self._num_bars)()
+        self._bass_buf = ctypes.c_float(0.0)
+
+    def close(self):
+        if self._ptr:
+            self._core._viz_state_free(self._ptr)
+            self._ptr = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def reset(self):
+        if self._ptr:
+            self._core._viz_state_reset(self._ptr)
+
+    def set_params(
+        self,
+        smooth: float,
+        trail_decay: float,
+        peak_hold_frames: int,
+        peak_fall: float,
+        bass_smooth: float = 0.22,
+    ) -> bool:
+        if not self._ptr:
+            return False
+        rc = int(
+            self._core._viz_state_set_params(
+                self._ptr,
+                ctypes.c_float(float(smooth)),
+                ctypes.c_float(float(trail_decay)),
+                ctypes.c_size_t(max(0, int(peak_hold_frames))),
+                ctypes.c_float(float(peak_fall)),
+                ctypes.c_float(float(bass_smooth)),
+            )
+        )
+        return rc == 0
+
+    def set_target(self, levels: Iterable[float]) -> int:
+        if not self._ptr:
+            return 0
+        vals = [float(v) for v in levels]
+        if len(vals) < self._num_bars:
+            vals.extend([0.0] * (self._num_bars - len(vals)))
+        elif len(vals) > self._num_bars:
+            vals = vals[:self._num_bars]
+        for i, v in enumerate(vals):
+            self._target_buf[i] = v
+        return int(self._core._viz_state_set_target(self._ptr, self._target_buf, self._num_bars))
+
+
+    def tick_copy(
+        self,
+        cur_out,
+        trail_out,
+        peak_out,
+    ):
+        if not self._ptr:
+            return 0, 0.0
+        out_len = min(self._num_bars, len(cur_out), len(trail_out), len(peak_out))
+        if out_len <= 0:
+            return 0, 0.0
+        written = int(
+            self._core._viz_state_tick_copy(
+                self._ptr,
+                cur_out,
+                trail_out,
+                peak_out,
+                ctypes.c_size_t(out_len),
+                ctypes.byref(self._bass_buf),
+            )
+        )
+        return written, float(self._bass_buf.value)

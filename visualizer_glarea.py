@@ -3,7 +3,9 @@ gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk, GLib
 import math
 import time
+import os
 import logging
+import ctypes
 from collections import deque
 from rust_viz import RustVizCore
 
@@ -34,9 +36,7 @@ out vec4 FragColor;
 
 uniform int uMode;          // 0: bars, 1: wave, 2: dots, 3: mirror, 4: pro fall, 5: peak, 6: pulse, 7: trail, 8+: extended
 uniform int uNumBars;
-uniform float uHeights[128];
-uniform float uTrail[128];
-uniform float uPeak[128];
+uniform sampler2D uBandsTex; // x: bar index, y=0, rgb=(height,trail,peak)
 uniform vec3 uColorA;
 uniform vec3 uColorB;
 uniform float uDotPeriod;   // normalized period in Y
@@ -53,7 +53,7 @@ float sample_height(float x) {
     float fx = clamp(x, 0.0, 0.999999) * float(uNumBars);
     int idx = int(floor(fx));
     idx = clamp(idx, 0, uNumBars - 1);
-    return uHeights[idx];
+    return texelFetch(uBandsTex, ivec2(idx, 0), 0).r;
 }
 
 float sample_height_smooth(float x) {
@@ -62,7 +62,9 @@ float sample_height_smooth(float x) {
     i0 = clamp(i0, 0, uNumBars - 1);
     int i1 = min(uNumBars - 1, i0 + 1);
     float t = fract(fx);
-    return mix(uHeights[i0], uHeights[i1], t);
+    float h0 = texelFetch(uBandsTex, ivec2(i0, 0), 0).r;
+    float h1 = texelFetch(uBandsTex, ivec2(i1, 0), 0).r;
+    return mix(h0, h1, t);
 }
 
 float sample_height_soft(float x) {
@@ -121,8 +123,8 @@ void main() {
         int idx = int(floor(fx));
         idx = clamp(idx, 0, uNumBars - 1);
         float local = fract(fx);
-        float h = uHeights[idx];
-        float p = uPeak[idx];
+        float h = texelFetch(uBandsTex, ivec2(idx, 0), 0).r;
+        float p = texelFetch(uBandsTex, ivec2(idx, 0), 0).b;
         float barFill = 1.0 - step(uBarFill, local);
         float bar = rounded_bar_mask_bottom(local, y, h, uBarFill);
         float cap = smoothstep(0.012, 0.0, abs(y - p));
@@ -136,7 +138,7 @@ void main() {
         int idx = int(floor(fx));
         idx = clamp(idx, 0, uNumBars - 1);
         float local = fract(fx);
-        float h = uHeights[idx];
+        float h = texelFetch(uBandsTex, ivec2(idx, 0), 0).r;
         float barFill = 1.0 - step(uBarFill, local);
         float bar = rounded_bar_mask_bottom(local, y, h, uBarFill);
         vec2 p2 = vec2(x - 0.5, y - 0.58);
@@ -151,8 +153,8 @@ void main() {
         int idx = int(floor(fx));
         idx = clamp(idx, 0, uNumBars - 1);
         float local = fract(fx);
-        float h = uHeights[idx];
-        float t = uTrail[idx];
+        float h = texelFetch(uBandsTex, ivec2(idx, 0), 0).r;
+        float t = texelFetch(uBandsTex, ivec2(idx, 0), 0).g;
         float barFill = 1.0 - step(uBarFill, local);
         float bar = rounded_bar_mask_bottom(local, y, h, uBarFill);
         float trail = rounded_bar_mask_bottom(local, y, t, uBarFill);
@@ -171,7 +173,7 @@ void main() {
         i = clamp(i, 0, halfN - 1);
         int src = (x < 0.5) ? i : min(uNumBars - 1, i + halfN);
         float local = fract(fx);
-        float h = uHeights[src];
+        float h = texelFetch(uBandsTex, ivec2(src, 0), 0).r;
         float barFill = 1.0 - step(uBarFill, local);
         float bar = rounded_bar_mask_bottom(local, y, h, uBarFill);
         float notch = step(0.496, x) * (1.0 - step(0.504, x)); // thin center split only
@@ -185,8 +187,8 @@ void main() {
         int idx = int(floor(fx));
         idx = clamp(idx, 0, uNumBars - 1);
         float local = fract(fx);
-        float h = uHeights[idx];
-        float p = uPeak[idx];
+        float h = texelFetch(uBandsTex, ivec2(idx, 0), 0).r;
+        float p = texelFetch(uBandsTex, ivec2(idx, 0), 0).b;
         float barFill = 1.0 - step(uBarFill, local);
         float bar = rounded_bar_mask_bottom(local, y, h, uBarFill);
         float core = bar;
@@ -334,7 +336,7 @@ void main() {
         int idx = int(floor(fx));
         idx = clamp(idx, 0, uNumBars - 1);
         float local = fract(fx);
-        float h = uHeights[idx] * 0.48;
+        float h = texelFetch(uBandsTex, ivec2(idx, 0), 0).r * 0.48;
         float mid = 0.5;
         float top = step(mid - h, y) * (1.0 - step(mid, y));
         float bot = step(mid, y) * (1.0 - step(mid + h, y));
@@ -346,7 +348,7 @@ void main() {
         int idx = int(floor(fx));
         idx = clamp(idx, 0, uNumBars - 1);
         float local = fract(fx);
-        float h = uHeights[idx];
+        float h = texelFetch(uBandsTex, ivec2(idx, 0), 0).r;
         float barFill = 1.0 - step(uBarFill, local); // left-aligned bar, right gap
         float bar = (uMode == 2) ? step(y, h) : rounded_bar_mask_bottom(local, y, h, uBarFill);
         if (uMode == 2) {
@@ -392,9 +394,7 @@ out vec4 FragColor;
 
 uniform int uMode;          // 0: bars, 1: wave, 2: dots, 3: mirror, 4: pro fall, 5: peak, 6: pulse, 7: trail, 8+: extended
 uniform int uNumBars;
-uniform float uHeights[128];
-uniform float uTrail[128];
-uniform float uPeak[128];
+uniform sampler2D uBandsTex; // x: bar index, y=0, rgb=(height,trail,peak)
 uniform vec3 uColorA;
 uniform vec3 uColorB;
 uniform float uDotPeriod;
@@ -411,7 +411,7 @@ float sample_height(float x) {
     float fx = clamp(x, 0.0, 0.999999) * float(uNumBars);
     int idx = int(floor(fx));
     idx = clamp(idx, 0, uNumBars - 1);
-    return uHeights[idx];
+    return texelFetch(uBandsTex, ivec2(idx, 0), 0).r;
 }
 
 float sample_height_smooth(float x) {
@@ -420,7 +420,9 @@ float sample_height_smooth(float x) {
     i0 = clamp(i0, 0, uNumBars - 1);
     int i1 = min(uNumBars - 1, i0 + 1);
     float t = fract(fx);
-    return mix(uHeights[i0], uHeights[i1], t);
+    float h0 = texelFetch(uBandsTex, ivec2(i0, 0), 0).r;
+    float h1 = texelFetch(uBandsTex, ivec2(i1, 0), 0).r;
+    return mix(h0, h1, t);
 }
 
 float sample_height_soft(float x) {
@@ -479,8 +481,8 @@ void main() {
         int idx = int(floor(fx));
         idx = clamp(idx, 0, uNumBars - 1);
         float local = fract(fx);
-        float h = uHeights[idx];
-        float p = uPeak[idx];
+        float h = texelFetch(uBandsTex, ivec2(idx, 0), 0).r;
+        float p = texelFetch(uBandsTex, ivec2(idx, 0), 0).b;
         float barFill = 1.0 - step(uBarFill, local);
         float bar = rounded_bar_mask_bottom(local, y, h, uBarFill);
         float cap = smoothstep(0.012, 0.0, abs(y - p));
@@ -494,7 +496,7 @@ void main() {
         int idx = int(floor(fx));
         idx = clamp(idx, 0, uNumBars - 1);
         float local = fract(fx);
-        float h = uHeights[idx];
+        float h = texelFetch(uBandsTex, ivec2(idx, 0), 0).r;
         float barFill = 1.0 - step(uBarFill, local);
         float bar = rounded_bar_mask_bottom(local, y, h, uBarFill);
         vec2 p2 = vec2(x - 0.5, y - 0.58);
@@ -509,8 +511,8 @@ void main() {
         int idx = int(floor(fx));
         idx = clamp(idx, 0, uNumBars - 1);
         float local = fract(fx);
-        float h = uHeights[idx];
-        float t = uTrail[idx];
+        float h = texelFetch(uBandsTex, ivec2(idx, 0), 0).r;
+        float t = texelFetch(uBandsTex, ivec2(idx, 0), 0).g;
         float barFill = 1.0 - step(uBarFill, local);
         float bar = rounded_bar_mask_bottom(local, y, h, uBarFill);
         float trail = rounded_bar_mask_bottom(local, y, t, uBarFill);
@@ -529,7 +531,7 @@ void main() {
         i = clamp(i, 0, halfN - 1);
         int src = (x < 0.5) ? i : min(uNumBars - 1, i + halfN);
         float local = fract(fx);
-        float h = uHeights[src];
+        float h = texelFetch(uBandsTex, ivec2(src, 0), 0).r;
         float barFill = 1.0 - step(uBarFill, local);
         float bar = rounded_bar_mask_bottom(local, y, h, uBarFill);
         float notch = step(0.496, x) * (1.0 - step(0.504, x));
@@ -543,8 +545,8 @@ void main() {
         int idx = int(floor(fx));
         idx = clamp(idx, 0, uNumBars - 1);
         float local = fract(fx);
-        float h = uHeights[idx];
-        float p = uPeak[idx];
+        float h = texelFetch(uBandsTex, ivec2(idx, 0), 0).r;
+        float p = texelFetch(uBandsTex, ivec2(idx, 0), 0).b;
         float barFill = 1.0 - step(uBarFill, local);
         float bar = rounded_bar_mask_bottom(local, y, h, uBarFill);
         float core = bar;
@@ -687,7 +689,7 @@ void main() {
         int idx = int(floor(fx));
         idx = clamp(idx, 0, uNumBars - 1);
         float local = fract(fx);
-        float h = uHeights[idx] * 0.48;
+        float h = texelFetch(uBandsTex, ivec2(idx, 0), 0).r * 0.48;
         float mid = 0.5;
         float top = step(mid - h, y) * (1.0 - step(mid, y));
         float bot = step(mid, y) * (1.0 - step(mid + h, y));
@@ -699,7 +701,7 @@ void main() {
         int idx = int(floor(fx));
         idx = clamp(idx, 0, uNumBars - 1);
         float local = fract(fx);
-        float h = uHeights[idx];
+        float h = texelFetch(uBandsTex, ivec2(idx, 0), 0).r;
         float barFill = 1.0 - step(uBarFill, local);
         float bar = (uMode == 2) ? step(y, h) : rounded_bar_mask_bottom(local, y, h, uBarFill);
         if (uMode == 2) {
@@ -727,6 +729,26 @@ void main() {
 
 
 class SpectrumVisualizerGLArea(Gtk.GLArea):
+    EFFECT_MODE_MAP = {
+        "Bars": 0,
+        "Wave": 1,
+        "Dots": 2,
+        "Mirror": 3,
+        "Pro Fall": 4,
+        "Peak": 5,
+        "Pulse": 6,
+        "Trail": 7,
+        "Fill": 8,
+        "Stereo": 9,
+        "Burst": 12,
+        "Ribbon": 14,
+        "Spiral": 15,
+        "Pro Bars": 16,
+        "Pro Line": 17,
+        "Stars": 18,
+        "Neon": 11,
+    }
+
     def __init__(self):
         if GL is None or gl_shaders is None:
             raise RuntimeError("PyOpenGL is required for GLArea visualizer")
@@ -825,9 +847,7 @@ class SpectrumVisualizerGLArea(Gtk.GLArea):
         self._vbo = None
         self._u_mode = -1
         self._u_num = -1
-        self._u_heights = -1
-        self._u_trail = -1
-        self._u_peak = -1
+        self._u_bands_tex = -1
         self._u_c0 = -1
         self._u_c1 = -1
         self._u_dot_period = -1
@@ -840,6 +860,7 @@ class SpectrumVisualizerGLArea(Gtk.GLArea):
         self._u_time = -1
         self._u_aspect = -1
         self._water_tex = None
+        self._bands_tex = None
         self._water_w = 512
         self._water_h = 64
         self._water_head_idx = 0
@@ -851,16 +872,65 @@ class SpectrumVisualizerGLArea(Gtk.GLArea):
         self._frame_queue = deque()
         self._frame_interval_ms = 16  # ~60fps render interpolation
         self._last_logged_mode = None
+        self._logged_rust_anim = False
+        self._logged_python_anim = False
         self.phase = 0.0
+        # Reused GL uniform buffers to avoid per-frame Python allocations.
+        self._u_heights_buf = (ctypes.c_float * 128)()
+        self._u_trail_buf = (ctypes.c_float * 128)()
+        self._u_peak_buf = (ctypes.c_float * 128)()
+        self._bands_tex_buf = (ctypes.c_float * (128 * 4))()
+        self._state_cur_buf = (ctypes.c_float * 128)()
+        self._state_trail_buf = (ctypes.c_float * 128)()
+        self._state_peak_buf = (ctypes.c_float * 128)()
+        self._uploaded_count = 0
+        self._viz_trace_enabled = str(os.getenv("HIRESTI_VIZ_TRACE", "0")).strip().lower() in ("1", "true", "yes", "on")
+        self._viz_trace_last_render_ts = 0.0
+        # Cached profile fields used in hot paths.
+        self._prof_smooth = 0.45
+        self._prof_trail_decay = 0.90
+        self._prof_peak_hold = 8
+        self._prof_peak_fall = 0.02
+        self._prof_gain_mul = 1.0
+        self._theme_height_gain = 1.6
+        self._theme_c0 = (0.0, 1.0, 1.0)
+        self._theme_c1 = (0.2, 0.0, 0.5)
+        self._effect_mode = 0
+        self._active = True
+        self._refresh_theme_cache()
+        self._refresh_profile_cache()
+        self._refresh_effect_cache()
         self._rust_core = RustVizCore()
         self._rust_processor = self._build_rust_processor()
+        self._rust_state = self._build_rust_state()
         GLib.timeout_add(self._frame_interval_ms, self._on_animation_tick)
+
+    def set_active(self, active):
+        self._active = bool(active)
+        if self._active:
+            self.queue_render()
+
+    def _refresh_profile_cache(self):
+        p = self.profiles[self.profile_name] if self.profile_name in self.profiles else self.profiles["Dynamic"]
+        self._prof_smooth = float(p.get("smooth", 0.45))
+        self._prof_trail_decay = float(p.get("trail_decay", 0.90))
+        self._prof_peak_hold = int(p.get("peak_hold_frames", 8))
+        self._prof_peak_fall = float(p.get("peak_fall", 0.02))
+        self._prof_gain_mul = float(p.get("gain_mul", 1.0))
+
+    def _refresh_theme_cache(self):
+        t = self.themes[self.theme_name] if self.theme_name in self.themes else self.themes["Aurora (Default)"]
+        self._theme_height_gain = float(t.get("height_gain", 1.6))
+        self._theme_c0 = t.get("c0", (0.0, 1.0, 1.0))
+        self._theme_c1 = t.get("c1", (0.2, 0.0, 0.5))
+
+    def _refresh_effect_cache(self):
+        self._effect_mode = int(self.EFFECT_MODE_MAP.get(self.effect_name, 0))
 
     def _build_rust_processor(self):
         if not self._rust_core.available:
             return None
-        p = self.profiles.get(self.profile_name, self.profiles["Dynamic"])
-        smooth = float(p.get("smooth", 0.45))
+        smooth = self._prof_smooth
         return self._rust_core.create_processor(
             num_bars=self.num_bars,
             max_hz=24.0,
@@ -869,11 +939,27 @@ class SpectrumVisualizerGLArea(Gtk.GLArea):
             db_range=60.0,
         )
 
+    def _build_rust_state(self):
+        if not self._rust_core.available:
+            return None
+        return self._rust_core.create_state_engine(
+            num_bars=self.num_bars,
+            smooth=self._prof_smooth,
+            trail_decay=self._prof_trail_decay,
+            peak_hold_frames=self._prof_peak_hold,
+            peak_fall=self._prof_peak_fall,
+            bass_smooth=0.22,
+        )
+
     def _rebuild_rust_processor(self):
         if self._rust_processor is not None:
             self._rust_processor.close()
             self._rust_processor = None
         self._rust_processor = self._build_rust_processor()
+        if self._rust_state is not None:
+            self._rust_state.close()
+            self._rust_state = None
+        self._rust_state = self._build_rust_state()
 
     def do_measure(self, orientation, for_size):
         if orientation == Gtk.Orientation.HORIZONTAL:
@@ -892,11 +978,13 @@ class SpectrumVisualizerGLArea(Gtk.GLArea):
     def set_theme(self, theme_name):
         if theme_name in self.themes:
             self.theme_name = theme_name
+            self._refresh_theme_cache()
             self.queue_render()
 
     def set_effect(self, effect_name):
         if effect_name in self.effects:
             self.effect_name = effect_name
+            self._refresh_effect_cache()
             if effect_name == "Pro Fall" and self._water_data:
                 self._water_data[:] = b"\x00" * len(self._water_data)
                 self._water_head_idx = 0
@@ -906,7 +994,16 @@ class SpectrumVisualizerGLArea(Gtk.GLArea):
     def set_profile(self, profile_name):
         if profile_name in self.profiles:
             self.profile_name = profile_name
+            self._refresh_profile_cache()
             self._rebuild_rust_processor()
+            if self._rust_state is not None:
+                self._rust_state.set_params(
+                    smooth=self._prof_smooth,
+                    trail_decay=self._prof_trail_decay,
+                    peak_hold_frames=self._prof_peak_hold,
+                    peak_fall=self._prof_peak_fall,
+                    bass_smooth=0.22,
+                )
             self.queue_render()
 
     def set_num_bars(self, count):
@@ -931,11 +1028,11 @@ class SpectrumVisualizerGLArea(Gtk.GLArea):
     def update_data(self, magnitudes):
         if not magnitudes:
             return
-        vals = list(magnitudes)
         out = None
         if self._rust_processor is not None:
-            out = self._rust_processor.process(vals)
+            out = self._rust_processor.process(magnitudes)
         if out is None:
+            vals = list(magnitudes)
             actual = min(len(vals), self.num_bars)
             db_min = -60.0
             db_range = 60.0
@@ -950,22 +1047,25 @@ class SpectrumVisualizerGLArea(Gtk.GLArea):
             while len(out) < self.num_bars:
                 out.append(0.0)
 
-        now_ms = time.monotonic() * 1000.0
-        self._frame_queue.append((now_ms, out))
-
-        # Keep queue bounded in case rendering stalls.
-        while len(self._frame_queue) > 64:
-            self._frame_queue.popleft()
-
-        target_ts = now_ms - self._render_lag_ms
-        chosen = None
-        while self._frame_queue and self._frame_queue[0][0] <= target_ts:
-            _ts, chosen = self._frame_queue.popleft()
-        if chosen is None:
-            return
+        # Fast path: no lag compensation requested, avoid queue churn.
+        if self._render_lag_ms <= 0.01:
+            chosen = out
+        else:
+            now_ms = time.monotonic() * 1000.0
+            self._frame_queue.append((now_ms, out))
+            while len(self._frame_queue) > 64:
+                self._frame_queue.popleft()
+            target_ts = now_ms - self._render_lag_ms
+            chosen = None
+            while self._frame_queue and self._frame_queue[0][0] <= target_ts:
+                _ts, chosen = self._frame_queue.popleft()
+            if chosen is None:
+                return
 
         self.target_heights = chosen
         self._display_target_heights = chosen
+        if self._rust_state is not None:
+            self._rust_state.set_target(chosen)
         self._push_waterfall_column(chosen)
 
     def _build_log_bins_py(self, values, out_count):
@@ -1013,14 +1113,33 @@ class SpectrumVisualizerGLArea(Gtk.GLArea):
         self._water_dirty = True
 
     def _on_animation_tick(self):
-        changed = False
+        if not self._active:
+            return True
         self.phase += 0.045
+        if self._rust_state is not None:
+            if not self._logged_rust_anim:
+                logger.info("GLArea animation state path: Rust")
+                self._logged_rust_anim = True
+            n = min(self.num_bars, 128)
+            written, bass = self._rust_state.tick_copy(
+                self._state_cur_buf,
+                self._state_trail_buf,
+                self._state_peak_buf,
+            )
+            if written > 0:
+                self.bass_level = bass
+                self.queue_render()
+            return True
+
+        if not self._logged_python_anim:
+            logger.info("GLArea animation state path: Python fallback")
+            self._logged_python_anim = True
+        changed = False
         n = self.num_bars
-        p = self.profiles.get(self.profile_name, self.profiles["Dynamic"])
-        smooth = float(p.get("smooth", 0.30))
-        trail_decay = float(p.get("trail_decay", 0.90))
-        peak_hold_frames = int(p.get("peak_hold_frames", 8))
-        peak_fall = float(p.get("peak_fall", 0.02))
+        smooth = self._prof_smooth
+        trail_decay = self._prof_trail_decay
+        peak_hold_frames = self._prof_peak_hold
+        peak_fall = self._prof_peak_fall
         bass_acc = 0.0
         bass_n = max(1, n // 10)
         for i in range(n):
@@ -1028,7 +1147,6 @@ class SpectrumVisualizerGLArea(Gtk.GLArea):
             cur = self.current_heights[i]
             d = tgt - cur
             if abs(d) > 0.0008:
-                # Match Cairo-like symmetric smoothing response.
                 self.current_heights[i] = cur + (d * smooth)
                 changed = True
             h = self.current_heights[i]
@@ -1069,6 +1187,9 @@ class SpectrumVisualizerGLArea(Gtk.GLArea):
         if self._program is not None:
             GL.glDeleteProgram(self._program)
             self._program = None
+        if self._bands_tex is not None:
+            GL.glDeleteTextures([self._bands_tex])
+            self._bands_tex = None
         if self._water_tex is not None:
             GL.glDeleteTextures([self._water_tex])
             self._water_tex = None
@@ -1096,9 +1217,7 @@ class SpectrumVisualizerGLArea(Gtk.GLArea):
             raise RuntimeError(f"Failed to compile GL shaders: {last_err}")
         self._u_mode = GL.glGetUniformLocation(self._program, "uMode")
         self._u_num = GL.glGetUniformLocation(self._program, "uNumBars")
-        self._u_heights = GL.glGetUniformLocation(self._program, "uHeights")
-        self._u_trail = GL.glGetUniformLocation(self._program, "uTrail")
-        self._u_peak = GL.glGetUniformLocation(self._program, "uPeak")
+        self._u_bands_tex = GL.glGetUniformLocation(self._program, "uBandsTex")
         self._u_c0 = GL.glGetUniformLocation(self._program, "uColorA")
         self._u_c1 = GL.glGetUniformLocation(self._program, "uColorB")
         self._u_dot_period = GL.glGetUniformLocation(self._program, "uDotPeriod")
@@ -1130,6 +1249,27 @@ class SpectrumVisualizerGLArea(Gtk.GLArea):
         GL.glBindBuffer(GL.GL_ARRAY_BUFFER, 0)
         GL.glBindVertexArray(0)
 
+        # Bands texture (x=bar index, rgb=(height,trail,peak)).
+        self._bands_tex = GL.glGenTextures(1)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, self._bands_tex)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_NEAREST)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_NEAREST)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_S, GL.GL_CLAMP_TO_EDGE)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_CLAMP_TO_EDGE)
+        GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)
+        GL.glTexImage2D(
+            GL.GL_TEXTURE_2D,
+            0,
+            GL.GL_RGBA32F,
+            128,
+            1,
+            0,
+            GL.GL_RGBA,
+            GL.GL_FLOAT,
+            self._bands_tex_buf,
+        )
+        GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
+
         # Waterfall texture (single-channel intensity packed into RGBA bytes).
         self._water_tex = GL.glGenTextures(1)
         GL.glBindTexture(GL.GL_TEXTURE_2D, self._water_tex)
@@ -1158,6 +1298,13 @@ class SpectrumVisualizerGLArea(Gtk.GLArea):
             return True
         if self._program is None:
             return True
+        if self._viz_trace_enabled:
+            now = time.monotonic()
+            if self._viz_trace_last_render_ts > 0.0:
+                gap_ms = (now - self._viz_trace_last_render_ts) * 1000.0
+                if gap_ms >= 70.0:
+                    logger.info("VIZ TRACE gl-render-gap: %.1fms", gap_ms)
+            self._viz_trace_last_render_ts = now
         w = int(self.get_width() or 0)
         h = int(self.get_height() or 0)
         if w <= 1 or h <= 1:
@@ -1169,62 +1316,60 @@ class SpectrumVisualizerGLArea(Gtk.GLArea):
         GL.glClear(GL.GL_COLOR_BUFFER_BIT)
 
         GL.glUseProgram(self._program)
-        if self.effect_name == "Wave":
-            mode = 1
-        elif self.effect_name == "Fill":
-            mode = 8
-        elif self.effect_name == "Dots":
-            mode = 2
-        elif self.effect_name == "Mirror":
-            mode = 3
-        elif self.effect_name == "Neon":
-            mode = 11
-        elif self.effect_name == "Peak":
-            mode = 5
-        elif self.effect_name == "Pulse":
-            mode = 6
-        elif self.effect_name == "Trail":
-            mode = 7
-        elif self.effect_name == "Stereo":
-            mode = 9
-        elif self.effect_name == "Burst":
-            mode = 12
-        elif self.effect_name == "Stars":
-            mode = 18
-        elif self.effect_name == "Ribbon":
-            mode = 14
-        elif self.effect_name == "Spiral":
-            mode = 15
-        elif self.effect_name == "Pro Bars":
-            mode = 16
-        elif self.effect_name == "Pro Line":
-            mode = 17
-        elif self.effect_name == "Pro Fall":
-            mode = 4
-        else:
-            mode = 0
+        mode = self._effect_mode
         if self._last_logged_mode != mode:
             logger.info("GLArea effect mode: %s (%s)", mode, self.effect_name)
             self._last_logged_mode = mode
         GL.glUniform1i(self._u_mode, mode)
         GL.glUniform1i(self._u_num, int(self.num_bars))
 
-        theme = self.themes.get(self.theme_name, self.themes["Aurora (Default)"])
-        profile = self.profiles.get(self.profile_name, self.profiles["Dynamic"])
-        gain = float(theme["height_gain"]) * float(profile["gain_mul"])
-        heights = [0.0] * 128
-        for i in range(min(self.num_bars, 128)):
-            heights[i] = max(0.0, min(1.0, self.current_heights[i] * gain * self._sensitivity))
+        gain = self._theme_height_gain * self._prof_gain_mul
 
-        import ctypes
-        h_arr = (ctypes.c_float * 128)(*heights)
-        GL.glUniform1fv(self._u_heights, 128, h_arr)
-        t_arr = (ctypes.c_float * 128)(*([max(0.0, min(1.0, self.trail_heights[i] * gain * self._sensitivity)) if i < self.num_bars else 0.0 for i in range(128)]))
-        p_arr = (ctypes.c_float * 128)(*([max(0.0, min(1.0, self.peak_holds[i] * gain * self._sensitivity)) if i < self.num_bars else 0.0 for i in range(128)]))
-        GL.glUniform1fv(self._u_trail, 128, t_arr)
-        GL.glUniform1fv(self._u_peak, 128, p_arr)
-        c0 = theme["c0"]
-        c1 = theme["c1"]
+        h_buf = self._u_heights_buf
+        t_buf = self._u_trail_buf
+        p_buf = self._u_peak_buf
+        n_local = min(self.num_bars, 128)
+        sens = self._sensitivity
+        cur = self._state_cur_buf if self._rust_state is not None else self.current_heights
+        tr = self._state_trail_buf if self._rust_state is not None else self.trail_heights
+        pk = self._state_peak_buf if self._rust_state is not None else self.peak_holds
+        for i in range(n_local):
+            h_buf[i] = max(0.0, min(1.0, cur[i] * gain * sens))
+            t_buf[i] = max(0.0, min(1.0, tr[i] * gain * sens))
+            p_buf[i] = max(0.0, min(1.0, pk[i] * gain * sens))
+        # Clear tail only when needed (bar-count dropped).
+        if self._uploaded_count > n_local:
+            for i in range(n_local, self._uploaded_count):
+                h_buf[i] = 0.0
+                t_buf[i] = 0.0
+                p_buf[i] = 0.0
+        self._uploaded_count = n_local
+        # Upload bands as texture (rgb = height/trail/peak), reducing uniform call overhead.
+        btex = self._bands_tex_buf
+        for i in range(128):
+            base = i * 4
+            btex[base] = h_buf[i]
+            btex[base + 1] = t_buf[i]
+            btex[base + 2] = p_buf[i]
+            btex[base + 3] = 0.0
+        if self._bands_tex is not None and self._u_bands_tex >= 0:
+            GL.glActiveTexture(GL.GL_TEXTURE1)
+            GL.glBindTexture(GL.GL_TEXTURE_2D, self._bands_tex)
+            GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)
+            GL.glTexSubImage2D(
+                GL.GL_TEXTURE_2D,
+                0,
+                0,
+                0,
+                128,
+                1,
+                GL.GL_RGBA,
+                GL.GL_FLOAT,
+                btex,
+            )
+            GL.glUniform1i(self._u_bands_tex, 1)
+        c0 = self._theme_c0
+        c1 = self._theme_c1
         GL.glUniform3f(self._u_c0, float(c0[0]), float(c0[1]), float(c0[2]))
         GL.glUniform3f(self._u_c1, float(c1[0]), float(c1[1]), float(c1[2]))
         GL.glUniform1f(self._u_bass, float(max(0.0, min(1.0, self.bass_level))))
@@ -1273,6 +1418,9 @@ class SpectrumVisualizerGLArea(Gtk.GLArea):
         GL.glBindVertexArray(self._vao)
         GL.glDrawArrays(GL.GL_TRIANGLE_STRIP, 0, 4)
         GL.glBindVertexArray(0)
+        GL.glActiveTexture(GL.GL_TEXTURE1)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
+        GL.glActiveTexture(GL.GL_TEXTURE0)
         GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
         GL.glUseProgram(0)
         return True

@@ -621,6 +621,7 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
 .signal-connector { color: alpha(currentColor, 0.2); font-size: 24px; font-weight: 800; margin: -4px 0; }
 .stat-value { font-family: "Monospace"; font-weight: bold; font-size: 13px; }
 .success-text { color: #26a269; }
+.warning-text { color: #f6d32d; }
 
 /* Shortcut content style (keep system popover shell) */
 .shortcuts-popover { min-width: 380px; }
