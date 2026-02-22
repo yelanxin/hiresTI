@@ -3,6 +3,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
 fn resolve_app_dir() -> PathBuf {
+    let flatpak_packaged = PathBuf::from("/app/share/hiresti");
+    if flatpak_packaged.join("main.py").is_file() {
+        return flatpak_packaged;
+    }
+
     let packaged = PathBuf::from("/usr/share/hiresti");
     if packaged.join("main.py").is_file() {
         return packaged;
