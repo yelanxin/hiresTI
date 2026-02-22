@@ -4,6 +4,7 @@ runtime-version: "48"
 sdk: org.gnome.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
+  - org.freedesktop.Sdk.Extension.llvm19
 command: hiresti
 
 build-options:
@@ -11,6 +12,8 @@ build-options:
   env:
     CCACHE_DISABLE: "1"
     RUSTC_WRAPPER: ""
+    LIBCLANG_PATH: /usr/lib/sdk/llvm19/lib
+    BINDGEN_EXTRA_CLANG_ARGS: "-resource-dir=/usr/lib/sdk/llvm19/lib/clang/19 -isystem /usr/lib/sdk/llvm19/lib/clang/19/include -isystem /usr/include"
 
 finish-args:
   - --share=network
