@@ -146,6 +146,7 @@ class TidalApp(Adw.Application):
         self.output_notice_icon = None
         self.output_notice_label = None
         self._output_notice_source = 0
+        self._output_status_source = 0
         self._viz_handle_anim_source = 0
         self._viz_handle_settle_source = 0
         self._viz_handle_resize_source = 0
@@ -605,6 +606,10 @@ class TidalApp(Adw.Application):
         if ui_loop:
             GLib.source_remove(ui_loop)
             self._ui_loop_source = 0
+        output_status = getattr(self, "_output_status_source", 0)
+        if output_status:
+            GLib.source_remove(output_status)
+            self._output_status_source = 0
         seek_commit = getattr(self, "_seek_commit_source", 0)
         if seek_commit:
             GLib.source_remove(seek_commit)
@@ -834,6 +839,7 @@ class TidalApp(Adw.Application):
         self.viz_stack.add_titled(self.viz, "spectrum", "Spectrum")
         if vis_name:
             self.viz_stack.set_visible_child_name(vis_name)
+        self._sync_viz_tab_runtime_state()
         self._sync_viz_dropdown_models(theme_name=theme_name, effect_name=effect_name, profile_name=profile_name)
         logger.info("Visualizer backend switched: %s (requested=%s effect=%s)", actual_key, backend_key, effect_name)
 
@@ -1255,7 +1261,7 @@ class TidalApp(Adw.Application):
         GLib.idle_add(lambda: (self._schedule_viz_handle_realign(), False)[1])
 
         self._schedule_update_ui_loop(40)
-        GLib.timeout_add(1000, self._refresh_output_status_loop)
+        self._schedule_output_status_loop(1000)
         GLib.timeout_add(260, self._prewarm_gl_visualizer_once)
         GLib.timeout_add(80, self._start_spectrum_stream_prewarm)
         self._init_tray_icon()
@@ -2082,7 +2088,13 @@ class TidalApp(Adw.Application):
             if ok:
                 GLib.idle_add(self._on_login_success_for_attempt, attempt_id)
             else:
-                GLib.idle_add(self._on_login_failed_for_attempt, attempt_id, "Authentication failed or timed out.")
+                detail = ""
+                try:
+                    detail = str(getattr(self.backend, "get_last_login_error", lambda: "")() or "").strip()
+                except Exception:
+                    detail = ""
+                msg = detail or "Authentication failed or timed out."
+                GLib.idle_add(self._on_login_failed_for_attempt, attempt_id, msg)
 
         Thread(target=login_thread, daemon=True).start()
 
@@ -2429,7 +2441,46 @@ class TidalApp(Adw.Application):
 
     def _refresh_output_status_loop(self):
         audio_settings_actions.update_output_status_ui(self)
-        return True
+
+    def _get_output_status_interval_ms(self):
+        try:
+            is_settings = bool(
+                getattr(self, "right_stack", None) is not None
+                and self.right_stack.get_visible_child_name() == "settings"
+            )
+        except Exception:
+            is_settings = False
+        if is_settings:
+            return 1000
+        state = str(getattr(self.player, "output_state", "idle") or "idle")
+        if state in ("fallback", "error", "switching"):
+            return 1200
+        try:
+            is_playing = bool(self.player.is_playing())
+        except Exception:
+            is_playing = False
+        return 2500 if is_playing else 6000
+
+    def _schedule_output_status_loop(self, delay_ms=None):
+        source = getattr(self, "_output_status_source", 0)
+        if source:
+            try:
+                GLib.source_remove(source)
+            except Exception:
+                pass
+            self._output_status_source = 0
+        next_delay = int(delay_ms if delay_ms is not None else self._get_output_status_interval_ms())
+
+        def _tick():
+            self._output_status_source = 0
+            try:
+                self._refresh_output_status_loop()
+            except Exception:
+                logger.exception("Output status loop tick failed")
+            self._schedule_output_status_loop()
+            return False
+
+        self._output_status_source = GLib.timeout_add(max(250, next_delay), _tick)
 
     def _force_driver_selection(self, keyword):
         model = self.driver_dd.get_model()
@@ -2788,6 +2839,10 @@ class TidalApp(Adw.Application):
         def _is_stale():
             return req_id != int(getattr(self, "_liked_tracks_request_id", 0) or 0)
 
+        def _liked_view_active():
+            current = self.nav_list.get_selected_row() if self.nav_list is not None else None
+            return bool(current and getattr(current, "nav_id", None) == "liked_songs")
+
         def _apply_if_active(tracks):
             current = self.nav_list.get_selected_row() if self.nav_list is not None else None
             if not current or getattr(current, "nav_id", None) != "liked_songs":
@@ -2798,6 +2853,8 @@ class TidalApp(Adw.Application):
             return False
 
         def task():
+            if _is_stale() or (not _liked_view_active()):
+                return
             # Stage 1: get a small slice for fast first paint.
             head_tracks = list(self.backend.get_favorite_tracks(limit=100))
             if head_tracks and not _is_stale():
@@ -2805,6 +2862,9 @@ class TidalApp(Adw.Application):
                     GLib.idle_add(lambda: _apply_if_active(head_tracks))
 
             # Stage 2: fetch full library in background.
+            # Skip full fetch if user already left Liked Songs to avoid pointless heavy work.
+            if _is_stale() or (not _liked_view_active()):
+                return
             tracks = list(self.backend.get_favorite_tracks(limit=20000))
             if _is_stale():
                 return
@@ -4315,7 +4375,8 @@ class TidalApp(Adw.Application):
             if self._viz_current_page == "lyrics":
                 return 25
             return 40
-        return 100
+        # No visualizer/lyrics drawer visible: keep UI updates responsive but reduce idle wakeups.
+        return 160
 
     def _schedule_update_ui_loop(self, delay_ms=None):
         source = getattr(self, "_ui_loop_source", 0)

@@ -1167,7 +1167,7 @@ class RustAudioPlayerAdapter:
             return
         # No spectrum: keep pump low-frequency and stop render loop completely.
         is_playing_cached = bool(getattr(self, "_cached_is_playing", False))
-        self._restart_rust_pump_timer(80 if is_playing_cached else 250)
+        self._restart_rust_pump_timer(200 if is_playing_cached else 400)
         if int(getattr(self, "_viz_render_source", 0) or 0):
             try:
                 GLib.source_remove(self._viz_render_source)

@@ -1219,6 +1219,8 @@ def batch_load_artists(app, artists, batch=10):
 def batch_load_home(app, sections):
     if not sections:
         return
+    render_token = int(getattr(app, "_home_render_token", 0) or 0) + 1
+    app._home_render_token = render_token
 
     def _scroll_h(scroller, direction=1):
         adj = scroller.get_hadjustment()
@@ -1314,6 +1316,13 @@ def batch_load_home(app, sections):
 
     # Render cards progressively to avoid one long UI stall on Home.
     def _render_home_chunk():
+        # Stop rendering immediately when Home is no longer active or this render got superseded.
+        current_token = int(getattr(app, "_home_render_token", 0) or 0)
+        if current_token != render_token:
+            return False
+        row = app.nav_list.get_selected_row() if getattr(app, "nav_list", None) is not None else None
+        if not row or getattr(row, "nav_id", None) != "home":
+            return False
         budget = 10  # number of cards per tick
         while budget > 0 and render_queue:
             ctx = render_queue[0]

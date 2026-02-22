@@ -473,11 +473,29 @@ def update_ui_loop(app):
     if d > 0:
         user_interacting_seek = bool(getattr(app, "_seek_user_interacting", False))
         if not user_interacting_seek:
-            app.is_programmatic_update = True
-            app.scale.set_range(0, d)
-            app.scale.set_value(p)
-            app.is_programmatic_update = False
-            if hasattr(app, "_update_progress_thumb_position"):
+            scale_changed = False
+            try:
+                last_max = float(getattr(app, "_ui_last_scale_max", 0.0) or 0.0)
+            except Exception:
+                last_max = 0.0
+            # Range rarely changes during one track; avoid re-applying every tick.
+            if abs(last_max - float(d)) >= 0.25:
+                app.is_programmatic_update = True
+                app.scale.set_range(0, d)
+                app.is_programmatic_update = False
+                app._ui_last_scale_max = float(d)
+
+            # Avoid noisy tiny value pushes that still trigger redraw/layout work.
+            try:
+                cur_scale_v = float(app.scale.get_value() or 0.0)
+            except Exception:
+                cur_scale_v = 0.0
+            if abs(cur_scale_v - float(p)) >= 0.025:
+                app.is_programmatic_update = True
+                app.scale.set_value(p)
+                app.is_programmatic_update = False
+                scale_changed = True
+            if scale_changed and hasattr(app, "_update_progress_thumb_position"):
                 app._update_progress_thumb_position()
 
         current_int_sec = int(p)
@@ -488,7 +506,18 @@ def update_ui_loop(app):
         elif user_interacting_seek:
             app.lbl_total_time.set_text(f"{int(d//60)}:{int(d%60):02d}")
 
-    if hasattr(app, "lyrics_mgr") and app.lyrics_mgr.has_synced and hasattr(app, "lyric_widgets") and app.lyric_widgets:
+    lyrics_live = False
+    try:
+        revealer = getattr(app, "viz_revealer", None)
+        lyrics_live = bool(
+            revealer is not None
+            and revealer.get_reveal_child()
+            and str(getattr(app, "_viz_current_page", "spectrum") or "spectrum") == "lyrics"
+        )
+    except Exception:
+        lyrics_live = False
+
+    if lyrics_live and hasattr(app, "lyrics_mgr") and app.lyrics_mgr.has_synced and hasattr(app, "lyric_widgets") and app.lyric_widgets:
         offset_ms = int(getattr(app, "lyrics_user_offset_ms", 0) or 0)
         current_time = p + 0.3 + (offset_ms / 1000.0)
         active_idx = -1
@@ -535,7 +564,7 @@ def update_ui_loop(app):
                     cur["main"].set_markup(_karaoke_markup(cur["karaoke_words"], k_idx))
                     cur["karaoke_last_idx"] = k_idx
 
-    if hasattr(app, "target_scroll_y") and hasattr(app, "lyrics_scroller"):
+    if lyrics_live and hasattr(app, "target_scroll_y") and hasattr(app, "lyrics_scroller"):
         adj = app.lyrics_scroller.get_vadjustment()
         current_y = adj.get_value()
         target_y = app.target_scroll_y
