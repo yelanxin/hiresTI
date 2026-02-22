@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.2.1 - 2026-02-22
+Coverage: login reliability hotfix for Linux distro TLS CA path differences.
+
+### Fixed
+- Fixed TIDAL OAuth/login failures on Ubuntu when inherited TLS env vars pointed to non-existent RHEL CA bundle paths (for example `/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem`).
+- Added runtime CA bundle normalization in `TidalBackend`:
+  - validate `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `SSL_CERT_FILE`,
+  - auto-fallback to available bundle (`certifi` first, then common system paths),
+  - clear invalid overrides if no valid bundle file is found.
+- Added regression test coverage for invalid CA bundle env handling during OAuth startup.
+
 ## 1.2.0 - 2026-02-22
 Coverage: major audio architecture refactor after 1.1.1, centered on Rust audio runtime.
 
