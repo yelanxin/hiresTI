@@ -159,10 +159,29 @@ class _BackgroundCommon:
             "Dynamic": {"energy_gain": 1.15, "phase_speed": 0.034, "smoothing": 0.36},
         }
         self._frame_interval_active_ms = 33
+        self._frame_interval_inactive_ms = 240
+        self._tick_source = 0
+        self._tick_interval_ms = 0
         self._last_draw_energy = 0.0
         self._last_draw_phase = 0.0
         self.randomize_colors()
-        GLib.timeout_add(self._frame_interval_active_ms, self._tick)
+        self._schedule_tick(self._frame_interval_inactive_ms)
+
+    def _schedule_tick(self, interval_ms):
+        try:
+            target = max(16, int(interval_ms or self._frame_interval_active_ms))
+        except Exception:
+            target = self._frame_interval_active_ms
+        if self._tick_source and self._tick_interval_ms == target:
+            return
+        if self._tick_source:
+            try:
+                GLib.source_remove(self._tick_source)
+            except Exception:
+                pass
+            self._tick_source = 0
+        self._tick_interval_ms = target
+        self._tick_source = GLib.timeout_add(target, self._tick)
 
     def _request_redraw(self):
         if hasattr(self, "queue_render"):
@@ -186,6 +205,15 @@ class _BackgroundCommon:
         if not self._active:
             self.target_energy = 0.0
             self.current_energy = 0.0
+            if self._tick_source:
+                try:
+                    GLib.source_remove(self._tick_source)
+                except Exception:
+                    pass
+                self._tick_source = 0
+                self._tick_interval_ms = 0
+        else:
+            self._schedule_tick(self._frame_interval_active_ms)
         self._request_redraw()
 
     def set_theme_mode(self, is_dark):
@@ -296,14 +324,16 @@ class _BackgroundCommon:
         self.target_energy = max(0.08, min(1.0, self.target_energy))
 
     def _tick(self):
+        self._tick_source = 0
         if not self._active:
-            return True
+            return False
         profile = self.motion_profiles.get(self.motion_mode, self.motion_profiles["Soft"])
         is_visible = bool(self.get_visible() and self.get_mapped() and self.get_opacity() > 0.01)
         if not is_visible:
             if self.current_energy > 0.001:
                 self.current_energy *= 0.96
-            return True
+            self._schedule_tick(self._frame_interval_inactive_ms)
+            return False
 
         diff = self.target_energy - self.current_energy
         if abs(diff) > 0.001:
@@ -320,7 +350,8 @@ class _BackgroundCommon:
             self._last_draw_energy = self.current_energy
             self._last_draw_phase = self.phase
             self._request_redraw()
-        return True
+        self._schedule_tick(self._frame_interval_active_ms)
+        return False
 
 
 class _BackgroundVisualizerCairo(Gtk.DrawingArea, _BackgroundCommon):

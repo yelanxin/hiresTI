@@ -34,8 +34,21 @@ class TidalBackend:
                     self._artist_placeholder_uuids.add(val)
         self.lyrics_cache = {}
         self.max_lyrics_cache = 300
+        self._last_login_error = ""
         # Circuit breaker for unstable mix endpoint.
         self._mix_fail_until = {}
+
+    def get_last_login_error(self):
+        return str(self._last_login_error or "").strip()
+
+    def _set_last_login_error(self, message):
+        self._last_login_error = str(message or "").strip()
+
+    def _format_login_error(self, exc):
+        kind = classify_exception(exc)
+        etype = type(exc).__name__
+        msg = str(exc or "").strip() or "(no message)"
+        return f"[{kind}/{etype}] {msg}"
 
     def _tune_http_pool(self):
         """
@@ -151,6 +164,7 @@ class TidalBackend:
         return result
 
     def start_oauth(self):
+        self._set_last_login_error("")
         self.session = tidalapi.Session()
         self._apply_global_config()
         login_url_obj, future = self.session.login_oauth()
@@ -199,10 +213,14 @@ class TidalBackend:
                 self.save_session()
                 self.refresh_favorite_ids()
                 self._apply_global_config()
+                self._set_last_login_error("")
                 return True
+            self._set_last_login_error("OAuth completed but session is not logged in.")
+            logger.warning("Login failed: %s", self.get_last_login_error())
         except Exception as e:
-            kind = classify_exception(e)
-            logger.error("Login failed [%s]: %s", kind, e)
+            detail = self._format_login_error(e)
+            self._set_last_login_error(detail)
+            logger.error("Login failed: %s", detail)
         return False
 
     def check_login(self):

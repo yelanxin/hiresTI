@@ -77,7 +77,8 @@ class SpectrumVisualizerGPU(Gtk.Widget):
         self._logged_rust_bins = False
         self._logged_python_bins = False
         self._cairo_renderer.set_num_bars(self.num_bars)
-        GLib.timeout_add(16, self._on_animation_tick)
+        self._active = False
+        self._anim_source = None
 
     def do_measure(self, orientation, for_size):
         if orientation == Gtk.Orientation.HORIZONTAL:
@@ -92,6 +93,23 @@ class SpectrumVisualizerGPU(Gtk.Widget):
 
     def get_profile_names(self):
         return list(self.profiles.keys())
+
+    def set_active(self, active):
+        new_active = bool(active)
+        if self._active == new_active:
+            return
+        self._active = new_active
+        if self._active:
+            if self._anim_source is None:
+                self._anim_source = GLib.timeout_add(16, self._on_animation_tick)
+            self.queue_draw()
+        else:
+            if self._anim_source:
+                try:
+                    GLib.source_remove(self._anim_source)
+                except Exception:
+                    pass
+                self._anim_source = None
 
     def set_theme(self, theme_name):
         if theme_name in self.themes:
@@ -158,6 +176,9 @@ class SpectrumVisualizerGPU(Gtk.Widget):
         self.target_heights = out
 
     def _on_animation_tick(self):
+        if not self._active:
+            self._anim_source = None
+            return False
         profile = self.profiles.get(self.profile_name, self.profiles["Dynamic"])
         changed = False
         self.phase += 0.045
