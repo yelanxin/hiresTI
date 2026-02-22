@@ -17,9 +17,18 @@ Not requested:
 - broad D-Bus talk names
 - `--device=all`
 
+## Python dependency lock file
+
+`python3-requirements.json` is generated from `flatpak/requirements-flatpak.txt` using:
+
+```bash
+python3 -m flatpak_pip_generator -r flatpak/requirements-flatpak.txt -o flatpak/python3-requirements
+```
+
+Re-run the command when Python dependency versions change.
+
 ## Submission checklist before opening a Flathub PR
 
-1. Replace the `python-deps` module with pinned, auditable Python sources (no network-time pip install in build).
-2. Run `flatpak-builder --user --install --force-clean build-dir flatpak/com.hiresti.player.yml` locally.
-3. Validate AppStream metadata and screenshots.
-4. Verify runtime behavior in sandbox (login, playback, device switch, rate switching).
+1. Run `flatpak-builder --user --install --force-clean build-dir flatpak/com.hiresti.player.yml` locally.
+2. Validate AppStream metadata and screenshots.
+3. Verify runtime behavior in sandbox (login, playback, device switch, rate switching).
