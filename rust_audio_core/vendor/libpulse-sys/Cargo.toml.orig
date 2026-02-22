@@ -1,0 +1,43 @@
+[package]
+edition = "2021"
+name = "libpulse-sys"
+version = "1.23.0"
+authors = ["Lyndon Brown <jnqnfe@gmail.com>"]
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+description = "FFI bindings for the PulseAudio libpulse system library."
+keywords = ["ffi", "pulseaudio", "audio"]
+homepage = "https://github.com/jnqnfe/pulse-binding-rust"
+repository = "https://github.com/jnqnfe/pulse-binding-rust"
+exclude = ["README.md"]
+links = "pulse"
+build = "build.rs"
+rust-version = "1.63"
+
+[dependencies]
+libc = "0.2"
+num-traits = "0.2"
+num-derive = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["winsock2"], default-features = false }
+
+[build-dependencies]
+pkg-config = "0.3.23"
+
+[features]
+default = ["pa_v8"]
+
+# PA version compatibility selection
+# See the overall project `COMPATIBILITY.md` file for explanation.
+pa_v15 = ["pa_v14"]
+pa_v14 = ["pa_v13"]
+pa_v13 = ["pa_v12"]
+pa_v12 = ["pa_v8"]
+pa_v8  = ["pa_v6"]
+pa_v6  = []
+
+[package.metadata.docs.rs]
+all-features = false
+no-default-features = true
+rustdoc-args = ["--cfg", "docsrs"]

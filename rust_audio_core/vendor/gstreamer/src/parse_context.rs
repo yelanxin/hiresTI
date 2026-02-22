@@ -1,0 +1,42 @@
+// Take a look at the license at the top of the repository in the LICENSE file.
+
+use crate::ffi;
+use glib::translate::*;
+
+glib::wrapper! {
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    #[doc(alias = "GstParseContext")]
+    pub struct ParseContext(Boxed<ffi::GstParseContext>);
+
+    match fn {
+        copy => |ptr| ffi::gst_parse_context_copy(ptr),
+        free => |ptr| ffi::gst_parse_context_free(ptr),
+        type_ => || ffi::gst_parse_context_get_type(),
+    }
+}
+
+unsafe impl Send for ParseContext {}
+unsafe impl Sync for ParseContext {}
+
+impl ParseContext {
+    #[doc(alias = "gst_parse_context_new")]
+    pub fn new() -> Self {
+        unsafe { from_glib_full(ffi::gst_parse_context_new()) }
+    }
+
+    #[doc(alias = "get_missing_elements")]
+    #[doc(alias = "gst_parse_context_get_missing_elements")]
+    pub fn missing_elements(&self) -> Vec<String> {
+        unsafe {
+            FromGlibPtrContainer::from_glib_full(ffi::gst_parse_context_get_missing_elements(
+                mut_override(self.to_glib_none().0),
+            ))
+        }
+    }
+}
+
+impl Default for ParseContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}

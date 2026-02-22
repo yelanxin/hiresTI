@@ -3,7 +3,6 @@ import json
 import logging
 import os
 import re
-import subprocess
 import threading
 import time
 from pathlib import Path
@@ -601,106 +600,31 @@ class RustAudioPlayerAdapter:
     _ERR_NETWORK_KEYS = ("timeout", "timed out", "network", "connection", "dns", "tls", "ssl")
     _ERR_CODEC_KEYS = ("decode", "decoder", "codec", "not-negotiated", "caps", "demux", "parser")
 
-    @staticmethod
-    def _pipewire_card_from_device_id(device_id):
-        dev = str(device_id or "").strip()
-        if not dev.startswith("alsa_output."):
-            return ""
-        # Example:
-        # alsa_output.usb-FIIO_FIIO_KA13-01.analog-stereo -> alsa_card.usb-FIIO_FIIO_KA13-01
-        core = dev[len("alsa_output."):]
-        suffixes = [
-            ".analog-stereo",
-            ".pro-output-0",
-            ".pro-output-1",
-            ".pro-output-2",
-            ".pro-output-3",
-            ".multichannel-output",
-            ".iec958-stereo",
-        ]
-        for sx in suffixes:
-            if core.endswith(sx):
-                core = core[: -len(sx)]
-                break
-        if not core:
-            return ""
-        return f"alsa_card.{core}"
-
-    @staticmethod
-    def _read_card_active_profile(card_name):
-        try:
-            res = subprocess.run(
-                ["pactl", "list", "cards"],
-                capture_output=True,
-                text=True,
-                timeout=2.0,
-            )
-            if res.returncode != 0:
-                return ""
-            lines = str(res.stdout or "").splitlines()
-            current_card = ""
-            active = ""
-            for raw in lines:
-                line = raw.rstrip()
-                s = line.strip()
-                if s.startswith("Name:"):
-                    current_card = s.split(":", 1)[1].strip()
-                elif s.startswith("Active Profile:") and current_card == card_name:
-                    active = s.split(":", 1)[1].strip()
-                    break
-            return active
-        except Exception:
-            return ""
-
-    @staticmethod
-    def _set_card_profile(card_name, profile_name):
-        try:
-            res = subprocess.run(
-                ["pactl", "set-card-profile", str(card_name), str(profile_name)],
-                capture_output=True,
-                text=True,
-                timeout=2.0,
-            )
-            return int(res.returncode), str(res.stderr or "").strip()
-        except Exception as e:
-            return -1, str(e)
-
     def _ensure_pipewire_pro_audio_profile(self, device_id):
         """
-        Dedicated profile switch flow:
-        1) Resolve card from selected output node
-        2) Skip if already in pro-audio
-        3) Apply profile and verify Active Profile
+        Ask Rust core to switch matching card profile to pro-audio.
+        Keep retries to absorb transient session-manager delays.
         """
         try:
-            card = self._pipewire_card_from_device_id(device_id)
-            if not card:
+            dev = str(device_id or "").strip()
+            if not dev:
                 return False
-            active = self._read_card_active_profile(card)
-            if active == "pro-audio":
-                logger.info("PipeWire card already in pro-audio: %s", card)
-                return True
-            rc_rust = self._rust.set_pipewire_pro_audio(device_id)
-            if rc_rust == 0:
-                active = self._read_card_active_profile(card)
-                if active == "pro-audio":
-                    logger.info("PipeWire card profile set to pro-audio via Rust: %s", card)
+            last_rc = -1
+            for attempt in range(1, 4):
+                rc_rust = int(self._rust.set_pipewire_pro_audio(dev))
+                last_rc = rc_rust
+                if rc_rust == 0:
+                    logger.info(
+                        "PipeWire pro-audio profile set via Rust API: device=%s attempt=%d",
+                        dev,
+                        attempt,
+                    )
                     return True
-            last_err = f"rust_rc={rc_rust}"
-            for attempt in range(1, 3):
-                rc, err = self._set_card_profile(card, "pro-audio")
-                if rc != 0:
-                    last_err = err or last_err
                 time.sleep(0.12)
-                active = self._read_card_active_profile(card)
-                if active == "pro-audio":
-                    logger.info("PipeWire card profile set to pro-audio via fallback: %s (attempt=%d)", card, attempt)
-                    return True
             logger.warning(
-                "Failed to set pro-audio profile for %s: active=%s err=%s",
-                card,
-                active or "unknown",
-                last_err or "unknown",
+                "Failed to set PipeWire pro-audio profile via Rust API: device=%s rc=%s",
+                dev,
+                last_rc,
             )
             return False
         except Exception:
@@ -746,7 +670,7 @@ class RustAudioPlayerAdapter:
         return {}
 
     def _read_pipewire_clock_metadata(self):
-        # Prefer Rust C API snapshot (no command-line dependency).
+        # Use Rust C API snapshot only (no command-line dependency).
         snap = self._read_runtime_snapshot()
         try:
             pw = snap.get("pipewire", {}) if isinstance(snap, dict) else {}
@@ -757,35 +681,7 @@ class RustAudioPlayerAdapter:
                 }
         except Exception:
             pass
-        # Legacy fallback path for environments where Rust snapshot is unavailable.
-        try:
-            res = subprocess.run(
-                ["pw-metadata", "-n", "settings", "0"],
-                capture_output=True,
-                text=True,
-                timeout=1.5,
-            )
-            if res.returncode != 0:
-                return {}
-            out = str(res.stdout or "")
-            vals = {}
-            for line in out.splitlines():
-                s = line.strip()
-                if "key:'clock.force-rate'" in s:
-                    try:
-                        raw = s.split("value:'", 1)[1].split("'", 1)[0].strip()
-                        vals["force_rate"] = int(raw)
-                    except Exception:
-                        pass
-                elif "key:'clock.allowed-rates'" in s:
-                    try:
-                        raw = s.split("value:'", 1)[1].split("'", 1)[0].strip()
-                        vals["allowed_rates_raw"] = raw
-                    except Exception:
-                        pass
-            return vals
-        except Exception:
-            return {}
+        return {}
 
     @staticmethod
     def _parse_allowed_rates(raw):
@@ -815,57 +711,6 @@ class RustAudioPlayerAdapter:
                 return meta, False
             time.sleep(max(0.01, float(interval_s or 0.05)))
 
-    def _fallback_set_pipewire_clock_metadata(self, target_rate, allow_csv):
-        try:
-            rc_clear = subprocess.run(
-                [
-                    "pw-metadata",
-                    "-n",
-                    "settings",
-                    "0",
-                    "clock.force-rate",
-                    "0",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=1.5,
-            ).returncode
-            rc_allow = subprocess.run(
-                [
-                    "pw-metadata",
-                    "-n",
-                    "settings",
-                    "0",
-                    "clock.allowed-rates",
-                    f"[ {str(allow_csv or '').replace(',', ' ')} ]",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=1.5,
-            ).returncode
-            rc_force = subprocess.run(
-                [
-                    "pw-metadata",
-                    "-n",
-                    "settings",
-                    "0",
-                    "clock.force-rate",
-                    str(int(target_rate or 0)),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=1.5,
-            ).returncode
-            logger.info(
-                "PipeWire metadata CLI fallback applied: rc_clear=%s rc_allowed=%s rc_force=%s target=%s",
-                rc_clear,
-                rc_allow,
-                rc_force,
-                int(target_rate or 0),
-            )
-        except Exception:
-            logger.debug("PipeWire metadata CLI fallback failed", exc_info=True)
-
     def _release_pipewire_clock_override(self, reason="idle"):
         """
         Release global PipeWire force-rate so other apps can negotiate freely.
@@ -880,36 +725,20 @@ class RustAudioPlayerAdapter:
             rc = self._rust.set_pipewire_clock_rate(0)
             if rc != 0:
                 logger.warning("PipeWire force-rate release failed rc=%s (reason=%s)", rc, reason)
-            meta = self._read_pipewire_clock_metadata()
-            effective = int(meta.get("force_rate", 0) or 0)
-            if effective != 0:
-                rc_cli = subprocess.run(
-                    [
-                        "pw-metadata",
-                        "-n",
-                        "settings",
-                        "0",
-                        "clock.force-rate",
-                        "0",
-                    ],
-                    capture_output=True,
-                    text=True,
-                    timeout=1.5,
-                ).returncode
-                meta2 = self._read_pipewire_clock_metadata()
-                effective2 = int(meta2.get("force_rate", 0) or 0)
-                if rc_cli == 0 and effective2 == 0:
-                    logger.info("PipeWire force-rate released via CLI fallback (reason=%s)", reason)
-                else:
-                    logger.warning(
-                        "PipeWire force-rate release verify failed (reason=%s): c_api_rc=%s cli_rc=%s before=%s after=%s",
-                        reason,
-                        rc,
-                        rc_cli,
-                        effective,
-                        effective2,
-                    )
-                    return
+            meta, released_ok = self._wait_pipewire_metadata(
+                lambda m: int(m.get("force_rate", 0) or 0) == 0,
+                timeout_s=1.4,
+                interval_s=0.06,
+            )
+            if not released_ok:
+                effective = int(meta.get("force_rate", 0) or 0)
+                logger.warning(
+                    "PipeWire force-rate release verify failed (reason=%s): c_api_rc=%s observed=%s",
+                    reason,
+                    rc,
+                    effective,
+                )
+                return
             self._pw_target_rate_hz = 0
             logger.info("PipeWire force-rate released (reason=%s)", reason)
         except Exception:
@@ -1333,7 +1162,6 @@ class RustAudioPlayerAdapter:
                     pass
             if target_rate > 0:
                 allow_csv = "44100,48000,88200,96000,176400,192000"
-                allow_space = "44100 48000 88200 96000 176400 192000"
                 allow_required = {44100, 48000, 88200, 96000, 176400, 192000}
                 rc_clear = self._rust.set_pipewire_clock_rate(0)
                 logger.info("Rust transport: PipeWire clock.force-rate clear via C API rc=%s", rc_clear)
@@ -1342,27 +1170,19 @@ class RustAudioPlayerAdapter:
                 rc_allow = self._rust.set_pipewire_allowed_rates(allow_csv)
                 if rc_allow != 0:
                     logger.warning("Rust transport: PipeWire clock.allowed-rates set failed rc=%s", rc_allow)
-                    self._fallback_set_pipewire_clock_metadata(target_rate, allow_csv)
                 else:
                     logger.info("Rust transport: PipeWire clock.allowed-rates set via C API: %s", allow_csv)
                 meta_allow, allow_ok = self._wait_pipewire_metadata(
                     lambda m: allow_required.issubset(self._parse_allowed_rates(m.get("allowed_rates_raw"))),
-                    timeout_s=0.55,
-                    interval_s=0.05,
+                    timeout_s=1.2,
+                    interval_s=0.06,
                 )
                 allowed_now = self._parse_allowed_rates(meta_allow.get("allowed_rates_raw"))
                 if not allow_required.issubset(allowed_now):
                     logger.warning(
-                        "PipeWire allowed-rates mismatch after C API write: got=%s; trying CLI fallback",
+                        "PipeWire allowed-rates mismatch after C API write: got=%s",
                         meta_allow.get("allowed_rates_raw", "unknown"),
                     )
-                    self._fallback_set_pipewire_clock_metadata(target_rate, allow_space)
-                    meta_allow, _allow_ok2 = self._wait_pipewire_metadata(
-                        lambda m: allow_required.issubset(self._parse_allowed_rates(m.get("allowed_rates_raw"))),
-                        timeout_s=0.55,
-                        interval_s=0.05,
-                    )
-                    allowed_now = self._parse_allowed_rates(meta_allow.get("allowed_rates_raw"))
                 self._pw_allowed_rates_applied = allow_required.issubset(allowed_now)
                 logger.info(
                     "PipeWire allowed-rates verify: ok=%s values=%s waited=%s",
@@ -1376,61 +1196,43 @@ class RustAudioPlayerAdapter:
                     self._pw_last_enforce_ts = time.monotonic()
                     self._pw_retry_backoff_s = 0.0
                     logger.info("Rust transport: PipeWire clock.force-rate set via C API: %s", target_rate)
-                    # Verify effective settings via pw-metadata.
+                    # Verify effective settings via Rust C API runtime snapshot.
                     # Metadata updates can lag slightly under load, so retry C API
-                    # a few times before falling back to CLI.
+                    # writes/reads for a short window before declaring mismatch.
                     meta = {}
                     effective = 0
                     force_ok = False
-                    for attempt in range(1, 4):
+                    for attempt in range(1, 6):
                         meta, force_ok = self._wait_pipewire_metadata(
                             lambda m: int(m.get("force_rate", 0) or 0) == int(target_rate),
-                            timeout_s=0.65 if attempt == 1 else 0.45,
-                            interval_s=0.05,
+                            timeout_s=1.0 if attempt == 1 else 0.6,
+                            interval_s=0.06,
                         )
                         effective = int(meta.get("force_rate", 0) or 0)
                         if effective == int(target_rate):
                             break
                         rc_retry = self._rust.set_pipewire_clock_rate(target_rate)
                         logger.warning(
-                            "PipeWire force-rate not visible yet (attempt=%s/3 want=%s got=%s), retry C API rc=%s",
+                            "PipeWire force-rate not visible yet (attempt=%s/5 want=%s got=%s), retry C API rc=%s",
                             attempt,
                             int(target_rate),
                             effective,
                             rc_retry,
                         )
-                        time.sleep(0.06)
+                        time.sleep(0.08)
                     if effective != int(target_rate):
-                        logger.warning(
-                            "PipeWire metadata mismatch after C API write: want=%s got=%s; trying CLI fallback",
-                            int(target_rate),
+                        self._pipewire_rate_blocked = True
+                        self.output_state = "error"
+                        self.output_error = (
+                            f"PipeWire sample-rate is locked at {effective} Hz, requested {int(target_rate)} Hz. "
+                            "Stop other audio apps and retry."
+                        )
+                        logger.error(
+                            "Rust transport: blocking playback due to PipeWire rate mismatch (effective=%s target=%s)",
                             effective,
+                            int(target_rate),
                         )
-                        self._fallback_set_pipewire_clock_metadata(target_rate, allow_space)
-                        meta2, _force_ok2 = self._wait_pipewire_metadata(
-                            lambda m: int(m.get("force_rate", 0) or 0) == int(target_rate),
-                            timeout_s=0.45,
-                            interval_s=0.05,
-                        )
-                        eff2 = int(meta2.get("force_rate", 0) or 0)
-                        logger.info(
-                            "PipeWire metadata after CLI fallback: force_rate=%s allowed=%s",
-                            meta2.get("force_rate", "unknown"),
-                            meta2.get("allowed_rates_raw", "unknown"),
-                        )
-                        if eff2 and eff2 != int(target_rate):
-                            self._pipewire_rate_blocked = True
-                            self.output_state = "error"
-                            self.output_error = (
-                                f"PipeWire sample-rate is locked at {eff2} Hz, requested {int(target_rate)} Hz. "
-                                "Stop other audio apps and retry."
-                            )
-                            logger.error(
-                                "Rust transport: blocking playback due to PipeWire rate mismatch (effective=%s target=%s)",
-                                eff2,
-                                int(target_rate),
-                            )
-                            return False
+                        return False
                     else:
                         logger.info(
                             "PipeWire metadata verified: force_rate=%s allowed=%s waited=%s",

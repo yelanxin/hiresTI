@@ -1,13 +1,17 @@
 use gstreamer as gst;
+use libpulse_binding as pulse;
 use pipewire as pw;
 use gst::prelude::*;
+use pulse::callbacks::ListResult;
+use pulse::context::{Context as PaContext, FlagSet as PaContextFlagSet, State as PaContextState};
+use pulse::mainloop::standard::Mainloop as PaMainloop;
+use pulse::operation::State as PaOperationState;
 use pw::{context::Context as PwContext, keys, main_loop::MainLoop as PwMainLoop, metadata::Metadata as PwMetadata, registry::GlobalObject, types::ObjectType};
 use std::cell::{Cell, RefCell};
 use std::env;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_double, c_int, c_void};
 use std::ptr;
-use std::process::Command;
 use std::rc::Rc;
 use std::sync::Once;
 use std::thread;
@@ -141,6 +145,24 @@ impl Engine {
             };
             let metadata: PwMetadata = registry.bind(&obj).map_err(|e| format!("pw bind metadata: {e}"))?;
             metadata.set_property(0, key, value_type, Some(value));
+            // set_property is asynchronous. Wait for a core sync round-trip so
+            // subsequent readers are less likely to observe stale metadata.
+            let done3 = Rc::new(Cell::new(false));
+            let done3_clone = done3.clone();
+            let ml_quit3 = mainloop.clone();
+            let pending3 = core.sync(0).map_err(|e| format!("pw sync3: {e}"))?;
+            let _listener_core3 = core
+                .add_listener_local()
+                .done(move |id, seq| {
+                    if id == pw::core::PW_ID_CORE && seq == pending3 {
+                        done3_clone.set(true);
+                        ml_quit3.quit();
+                    }
+                })
+                .register();
+            while !done3.get() {
+                mainloop.run();
+            }
             Ok(())
         })();
         result
@@ -173,7 +195,7 @@ impl Engine {
             "[ {} ]",
             vals.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" ")
         );
-        // Keep type empty like `pw-metadata` for array-like values.
+        // Keep type empty for array-like values.
         Self::pipewire_set_settings_metadata("clock.allowed-rates", &arr, None)
     }
 
@@ -1276,41 +1298,76 @@ pub extern "C" fn rac_set_spectrum_enabled(ptr: *mut Engine, enabled: c_int) -> 
 }
 
 fn list_pulseaudio_sinks() -> Vec<(String, Option<String>)> {
-    let mut out: Vec<(String, Option<String>)> = Vec::new();
-    let cmd = Command::new("pactl").args(["list", "sinks"]).output();
-    let Ok(res) = cmd else {
-        return out;
+    fn str_opt_to_string(v: Option<std::borrow::Cow<'_, str>>) -> String {
+        v.map(|x| x.into_owned()).unwrap_or_default()
+    }
+
+    let Ok((mut mainloop, context)) = pa_connect() else {
+        return Vec::new();
     };
-    if !res.status.success() {
-        return out;
-    }
-    let text = String::from_utf8_lossy(&res.stdout);
-    for block in text.split("Sink #") {
-        let mut dev_id: Option<String> = None;
-        let mut desc: Option<String> = None;
-        for raw in block.lines() {
-            let line = raw.trim();
-            if let Some(rest) = line.strip_prefix("Name:") {
-                let n = rest.trim().to_string();
-                if !n.is_empty() {
-                    dev_id = Some(n);
-                }
-            } else if let Some(rest) = line.strip_prefix("Description:") {
-                let d = rest.trim().to_string();
-                if !d.is_empty() {
-                    desc = Some(d);
-                }
+
+    let mut out: Vec<(String, Option<String>)> = Vec::new();
+    let shared: Rc<RefCell<Vec<(String, Option<String>)>>> = Rc::new(RefCell::new(Vec::new()));
+    let done = Rc::new(Cell::new(false));
+
+    let shared_cb = Rc::clone(&shared);
+    let done_cb = Rc::clone(&done);
+    let mut op = context.introspect().get_sink_info_list(move |res| match res {
+        ListResult::Item(info) => {
+            let dev = str_opt_to_string(info.name.as_ref().cloned());
+            if dev.is_empty() || dev.ends_with(".monitor") {
+                return;
             }
+            let desc = str_opt_to_string(info.description.as_ref().cloned());
+            let name = if desc.is_empty() { dev.clone() } else { desc };
+            shared_cb.borrow_mut().push((name, Some(dev)));
         }
-        if let Some(id) = dev_id {
-            if id.ends_with(".monitor") {
-                continue;
-            }
-            let name = desc.unwrap_or_else(|| id.clone());
-            out.push((name, Some(id)));
+        ListResult::End | ListResult::Error => {
+            done_cb.set(true);
         }
-    }
+    });
+
+    pa_wait_for_list(&mut mainloop, &context, &done, &mut op);
+    out.extend(shared.borrow().iter().cloned());
     out
+}
+
+fn pa_connect() -> Result<(PaMainloop, PaContext), String> {
+    let mut mainloop = PaMainloop::new().ok_or_else(|| "pulseaudio mainloop init failed".to_string())?;
+    let mut context = PaContext::new(&mainloop, "hiresTI")
+        .ok_or_else(|| "pulseaudio context init failed".to_string())?;
+    context
+        .connect(None, PaContextFlagSet::NOFLAGS, None)
+        .map_err(|e| format!("pulseaudio connect failed: {e}"))?;
+    loop {
+        match context.get_state() {
+            PaContextState::Ready => return Ok((mainloop, context)),
+            PaContextState::Failed | PaContextState::Terminated => {
+                return Err(format!("pulseaudio context state: {:?}", context.get_state()));
+            }
+            _ => {
+                let _ = mainloop.iterate(false);
+            }
+        }
+    }
+}
+
+fn pa_wait_for_list<T: ?Sized>(
+    mainloop: &mut PaMainloop,
+    context: &PaContext,
+    done: &Rc<Cell<bool>>,
+    op: &mut pulse::operation::Operation<T>,
+) {
+    while !done.get() {
+        match context.get_state() {
+            PaContextState::Failed | PaContextState::Terminated => break,
+            _ => {}
+        }
+        if op.get_state() != PaOperationState::Running {
+            break;
+        }
+        let _ = mainloop.iterate(false);
+    }
 }
 
 fn list_pipewire_sinks() -> Vec<(String, Option<String>)> {
@@ -1475,54 +1532,100 @@ fn card_from_pipewire_output_node(device_id: &str) -> Option<String> {
     Some(format!("alsa_card.{core}"))
 }
 
-fn pactl_card_active_profile(card: &str) -> Option<String> {
-    let out = Command::new("pactl").args(["list", "cards"]).output().ok()?;
-    if !out.status.success() {
+fn pulseaudio_card_active_profile(card: &str) -> Option<String> {
+    fn str_opt_to_string(v: Option<std::borrow::Cow<'_, str>>) -> String {
+        v.map(|x| x.into_owned()).unwrap_or_default()
+    }
+
+    let Ok((mut mainloop, context)) = pa_connect() else {
+        return None;
+    };
+
+    let target = card.trim().to_string();
+    if target.is_empty() {
         return None;
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut current_card = String::new();
-    for line in text.lines() {
-        let s = line.trim();
-        if let Some(rest) = s.strip_prefix("Name:") {
-            current_card = rest.trim().to_string();
-            continue;
-        }
-        if current_card == card {
-            if let Some(rest) = s.strip_prefix("Active Profile:") {
-                return Some(rest.trim().to_string());
+
+    let found = Rc::new(RefCell::new(None::<String>));
+    let done = Rc::new(Cell::new(false));
+
+    let found_cb = Rc::clone(&found);
+    let done_cb = Rc::clone(&done);
+    let mut op = context.introspect().get_card_info_list(move |res| match res {
+        ListResult::Item(info) => {
+            let name = str_opt_to_string(info.name.as_ref().cloned());
+            if name != target {
+                return;
+            }
+            let profile = info
+                .active_profile
+                .as_ref()
+                .map(|p| str_opt_to_string(p.name.as_ref().cloned()))
+                .unwrap_or_default();
+            if !profile.is_empty() {
+                *found_cb.borrow_mut() = Some(profile);
             }
         }
-    }
-    None
+        ListResult::End | ListResult::Error => {
+            done_cb.set(true);
+        }
+    });
+    pa_wait_for_list(&mut mainloop, &context, &done, &mut op);
+    let result = found.borrow().clone();
+    result
 }
 
-fn pactl_set_card_profile(card: &str, profile: &str) -> Result<(), String> {
-    let out = Command::new("pactl")
-        .args(["set-card-profile", card, profile])
-        .output()
-        .map_err(|e| format!("pactl exec failed: {e}"))?;
-    if out.status.success() {
+fn pulseaudio_set_card_profile(card: &str, profile: &str) -> Result<(), String> {
+    let (mut mainloop, context) = pa_connect()?;
+    let done = Rc::new(Cell::new(false));
+    let ok = Rc::new(Cell::new(false));
+
+    let done_cb = Rc::clone(&done);
+    let ok_cb = Rc::clone(&ok);
+    let op = context.introspect().set_card_profile_by_name(
+        card,
+        profile,
+        Some(Box::new(move |success| {
+            ok_cb.set(success);
+            done_cb.set(true);
+        })),
+    );
+
+    while !done.get() {
+        match context.get_state() {
+            PaContextState::Failed | PaContextState::Terminated => break,
+            _ => {}
+        }
+        if op.get_state() != PaOperationState::Running {
+            break;
+        }
+        let _ = mainloop.iterate(false);
+    }
+
+    if ok.get() {
         return Ok(());
     }
-    Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    Err(format!(
+        "set card profile failed for card={} profile={}",
+        card, profile
+    ))
 }
 
 fn ensure_pipewire_pro_audio_for_device(device_id: &str) -> Result<String, String> {
     let card = card_from_pipewire_output_node(device_id)
         .ok_or_else(|| "unsupported or empty device id".to_string())?;
-    if let Some(active) = pactl_card_active_profile(&card) {
+    if let Some(active) = pulseaudio_card_active_profile(&card) {
         if active == "pro-audio" {
             return Ok(card);
         }
     }
     let mut last_err = String::new();
     for _ in 0..3 {
-        if let Err(e) = pactl_set_card_profile(&card, "pro-audio") {
+        if let Err(e) = pulseaudio_set_card_profile(&card, "pro-audio") {
             last_err = e;
         }
         thread::sleep(Duration::from_millis(120));
-        if let Some(active) = pactl_card_active_profile(&card) {
+        if let Some(active) = pulseaudio_card_active_profile(&card) {
             if active == "pro-audio" {
                 return Ok(card);
             }

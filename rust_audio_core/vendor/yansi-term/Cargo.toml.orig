@@ -1,0 +1,37 @@
+[package]
+name = "yansi-term"
+description = "Library for ANSI terminal colours and styles (bold, underline)"
+authors = [
+    "ogham@bsago.me",
+    "Ryan Scheel (Havvy) <ryan.havvy@gmail.com>",
+    "Josh Triplett <josh@joshtriplett.org>",
+    "Juan Aguilar Santillana <mhpoin@gmail.com>"
+]
+documentation = "https://docs.rs/yansi-term"
+homepage = "https://github.com/botika/yansi-term"
+license = "MIT"
+readme = "README.md"
+version = "0.1.2"
+repository = "https://github.com/botika/yansi-term"
+edition = "2018"
+
+[badges]
+travis-ci = { repository = "botika/yansi-term", branch = "master" }
+maintenance = { status = "actively-developed" }
+
+[features]
+derive_serde_style = ["serde"]
+
+[dependencies.serde]
+version = "1.0"
+features = ["derive"]
+optional = true
+
+[target.'cfg(target_os="windows")'.dependencies.winapi]
+version = "0.3.4"
+features = ["consoleapi", "errhandlingapi", "fileapi", "handleapi", "processenv"]
+
+[dev-dependencies]
+doc-comment = "0.3"
+regex = "1.1"
+serde_json = "1.0"

@@ -1,0 +1,129 @@
+// Take a look at the license at the top of the repository in the LICENSE file.
+
+use std::{marker::PhantomData, mem};
+
+use glib::translate::*;
+
+use crate::{ffi, MemoryFlags};
+
+#[derive(Debug, Clone, Copy)]
+#[doc(alias = "GstAllocationParams")]
+#[repr(transparent)]
+pub struct AllocationParams(ffi::GstAllocationParams);
+
+unsafe impl Send for AllocationParams {}
+unsafe impl Sync for AllocationParams {}
+
+impl Default for AllocationParams {
+    fn default() -> Self {
+        unsafe {
+            let mut params = mem::MaybeUninit::uninit();
+            ffi::gst_allocation_params_init(params.as_mut_ptr());
+            AllocationParams(params.assume_init())
+        }
+    }
+}
+
+impl AllocationParams {
+    #[doc(alias = "get_flags")]
+    #[inline]
+    pub fn flags(&self) -> MemoryFlags {
+        unsafe { from_glib(self.0.flags) }
+    }
+
+    #[doc(alias = "get_align")]
+    #[inline]
+    pub fn align(&self) -> usize {
+        self.0.align
+    }
+
+    #[doc(alias = "get_prefix")]
+    #[inline]
+    pub fn prefix(&self) -> usize {
+        self.0.prefix
+    }
+
+    #[doc(alias = "get_padding")]
+    #[inline]
+    pub fn padding(&self) -> usize {
+        self.0.padding
+    }
+
+    #[inline]
+    pub fn set_flags(&mut self, flags: MemoryFlags) {
+        self.0.flags = flags.into_glib();
+    }
+
+    #[inline]
+    pub fn set_align(&mut self, align: usize) {
+        self.0.align = align;
+    }
+
+    #[inline]
+    pub fn set_prefix(&mut self, prefix: usize) {
+        self.0.prefix = prefix;
+    }
+
+    #[inline]
+    pub fn set_padding(&mut self, padding: usize) {
+        self.0.padding = padding;
+    }
+
+    pub fn new(flags: MemoryFlags, align: usize, prefix: usize, padding: usize) -> Self {
+        assert_initialized_main_thread!();
+        let params = unsafe {
+            ffi::GstAllocationParams {
+                flags: flags.into_glib(),
+                align,
+                prefix,
+                padding,
+                ..mem::zeroed()
+            }
+        };
+
+        params.into()
+    }
+
+    #[inline]
+    pub fn as_ptr(&self) -> *const ffi::GstAllocationParams {
+        &self.0
+    }
+}
+
+impl From<ffi::GstAllocationParams> for AllocationParams {
+    #[inline]
+    fn from(params: ffi::GstAllocationParams) -> Self {
+        skip_assert_initialized!();
+        AllocationParams(params)
+    }
+}
+
+impl PartialEq for AllocationParams {
+    fn eq(&self, other: &Self) -> bool {
+        self.flags() == other.flags()
+            && self.align() == other.align()
+            && self.prefix() == other.prefix()
+            && self.padding() == other.padding()
+    }
+}
+
+impl Eq for AllocationParams {}
+
+#[doc(hidden)]
+impl<'a> ToGlibPtr<'a, *const ffi::GstAllocationParams> for AllocationParams {
+    type Storage = PhantomData<&'a Self>;
+
+    #[inline]
+    fn to_glib_none(&'a self) -> Stash<'a, *const ffi::GstAllocationParams, Self> {
+        Stash(&self.0, PhantomData)
+    }
+}
+
+impl FromGlib<ffi::GstAllocationParams> for AllocationParams {
+    #[allow(unused_unsafe)]
+    #[inline]
+    unsafe fn from_glib(value: ffi::GstAllocationParams) -> Self {
+        skip_assert_initialized!();
+        Self::from(value)
+    }
+}

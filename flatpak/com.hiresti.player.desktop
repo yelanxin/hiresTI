@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=HiresTI
+Comment=High-Res TIDAL player for Linux
+Exec=hiresti
+Icon=com.hiresti.player
+Terminal=false
+Type=Application
+Categories=AudioVideo;Audio;Player;Music;
+StartupWMClass=HiresTI

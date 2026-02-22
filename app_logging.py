@@ -24,7 +24,7 @@ def _parse_level(level_name: str, default: int) -> int:
 def _apply_module_levels(root_logger: logging.Logger, default_level: int) -> None:
     """
     Apply per-module log levels from env var:
-    HIRESTI_LOG_MODULE_LEVELS="audio_player=DEBUG,tidal_backend=INFO"
+    HIRESTI_LOG_MODULE_LEVELS="rust_audio_engine=DEBUG,tidal_backend=INFO"
     """
     raw = os.getenv("HIRESTI_LOG_MODULE_LEVELS", "").strip()
     if not raw:
@@ -58,7 +58,7 @@ def setup_logging() -> None:
     - HIRESTI_LOG_ROTATE_BYTES: max file size before rotation (default: 5242880)
     - HIRESTI_LOG_BACKUP_COUNT: number of rotated files to keep (default: 3)
     - HIRESTI_LOG_MODULE_LEVELS: comma-separated module overrides
-      e.g. "audio_player=DEBUG,tidal_backend=INFO"
+      e.g. "rust_audio_engine=DEBUG,tidal_backend=INFO"
     """
     level_name = os.getenv("HIRESTI_LOG_LEVEL", "INFO").upper()
     level = _parse_level(level_name, logging.INFO)

@@ -1,0 +1,39 @@
+[package]
+name = "libspa"
+version = "0.8.0"
+authors = ["Guillaume Desmottes <guillaume.desmottes@collabora.com>"]
+rust-version = "1.65"
+edition = "2021"
+categories = ["api-bindings", "multimedia"]
+description = "Rust bindings for libspa"
+repository = "https://gitlab.freedesktop.org/pipewire/pipewire-rs"
+license = "MIT"
+readme = "README.md"
+homepage = "https://pipewire.org"
+documentation = "https://pipewire.pages.freedesktop.org/pipewire-rs/libspa/"
+keywords = ["pipewire", "multimedia", "audio", "video"]
+
+[dependencies]
+spa_sys = { package = "libspa-sys", version = "0.8", path = "../libspa-sys" }
+bitflags = "2"
+libc = "0.2"
+nix = "0.27"
+cookie-factory = "0.3.2"
+nom = "7"
+convert_case = "0.6"
+
+[dev-dependencies]
+pipewire-sys = { version = "0.8", path = "../pipewire-sys" }
+pipewire = { version = "0.8", path = "../pipewire" }
+
+[build-dependencies]
+system-deps = "6"
+cc = "1.0.66"
+
+[package.metadata.system-deps]
+libspa = { name = "libspa-0.2", version = "0.2" }
+
+[features]
+v0_3_33 = []
+v0_3_65 = ["v0_3_33", "spa_sys/v0_3_65"]
+v0_3_75 = ["v0_3_65"]

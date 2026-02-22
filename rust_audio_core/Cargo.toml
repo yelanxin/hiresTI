@@ -15,3 +15,4 @@ codegen-units = 1
 [dependencies]
 gstreamer = "0.23"
 pipewire = "0.8"
+libpulse-binding = "2"
