@@ -1,0 +1,27 @@
+[package]
+name = "pipewire-sys"
+version = "0.8.0"
+authors = ["Tom Wagner <tom.a.wagner@protonmail.com", "Guillaume Desmottes <guillaume.desmottes@collabora.com>"]
+edition = "2021"
+links = "pipewire-0.3"
+categories = ["api-bindings", "multimedia"]
+description = "Rust FFI bindings for PipeWire"
+repository = "https://gitlab.freedesktop.org/pipewire/pipewire-rs"
+license = "MIT"
+readme = "README.md"
+homepage = "https://pipewire.org"
+documentation = "https://pipewire.pages.freedesktop.org/pipewire-rs/pipewire_sys/"
+keywords = ["ffi", "pipewire", "multimedia", "audio", "video"]
+
+[dependencies]
+spa_sys = { package = "libspa-sys", version = "0.8", path = "../libspa-sys" }
+
+[build-dependencies]
+bindgen = { version = "0.69", default-features = false, features = ["runtime"] }
+system-deps = "6"
+
+[package.metadata.system-deps]
+libpipewire = { name = "libpipewire-0.3", version = "0.3" }
+
+[lib]
+doctest = false # https://github.com/rust-lang/rust-bindgen/issues/1313
