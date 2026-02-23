@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import requests
 import hashlib
@@ -6,6 +8,7 @@ import time
 import cairo
 from pathlib import Path
 from threading import Thread
+from typing import Optional, Callable, Any
 from gi.repository import GLib, GdkPixbuf, Gdk
 
 logger = logging.getLogger(__name__)
@@ -16,7 +19,7 @@ _TIDAL_IMAGE_HEADERS = {
 }
 
 
-def prune_image_cache(cache_dir, max_bytes=300 * 1024 * 1024, max_age_days=30):
+def prune_image_cache(cache_dir: str, max_bytes: int = 300 * 1024 * 1024, max_age_days: int = 30) -> None:
     """
     Prune cover cache by age and total size.
     - Remove files older than max_age_days.
@@ -109,7 +112,7 @@ def _get_rounded_radius(classes: set, size: int) -> int:
     return 0
 
 
-def load_img(widget, url_provider, cache_dir, size=84):
+def load_img(widget: Any, url_provider: Callable[[], str] | str, cache_dir: str, size: int = 84) -> None:
     widget.set_size_request(size, size)
     if hasattr(widget, 'set_paintable'):
         widget.set_paintable(None)
@@ -247,13 +250,13 @@ def _paint_cover_fill(cr, pb, x, y, w, h):
 
 
 def generate_auto_collage_cover(
-    image_refs,
-    image_cache_dir,
-    collage_cache_dir,
-    key_prefix="playlist",
-    size=512,
-    overlay_alpha=0.0,
-    overlay_style="flat",
+    image_refs: list,
+    image_cache_dir: str,
+    collage_cache_dir: str,
+    key_prefix: str = "playlist",
+    size: int = 512,
+    overlay_alpha: float = 0.0,
+    overlay_style: str = "flat",
 ):
     """
     Generate a cached playlist cover:
