@@ -47,8 +47,10 @@ modules:
     buildsystem: simple
     build-commands:
       - install -d /app/share/hiresti
-      - cp -a main.py tidal_backend.py rust_audio_engine.py app_logging.py app_settings.py app_errors.py lyrics_manager.py models.py signal_path.py utils.py ui_config.py visualizer.py visualizer_glarea.py visualizer_gpu.py background_viz.py rust_viz.py /app/share/hiresti/
-      - cp -a actions ui icons /app/share/hiresti/
+      - cp -a src/main.py src/tidal_backend.py src/rust_audio_engine.py src/app_logging.py src/app_settings.py src/app_errors.py src/lyrics_manager.py src/models.py src/signal_path.py src/utils.py src/ui_config.py src/viz/visualizer.py src/viz/visualizer_glarea.py src/viz/visualizer_gpu.py src/background_viz.py src/rust_viz.py /app/share/hiresti/
+      - cp -a src/actions src/icons /app/share/hiresti/
+      - cp -a src/app /app/share/hiresti/
+      - cp -a src/ui /app/share/hiresti/
       - cp -a version.txt /app/share/hiresti/version.txt
       - install -Dm644 flatpak/com.hiresti.player.desktop /app/share/applications/com.hiresti.player.desktop
       - install -Dm644 flatpak/com.hiresti.player.metainfo.xml /app/share/metainfo/com.hiresti.player.metainfo.xml
