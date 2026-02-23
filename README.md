@@ -69,7 +69,7 @@ python3 main.py
 ```
 
 ## Install Prebuilt Packages
-Please download prebuild package from release page.
+Please download prebuilt package from release page.
 
 ### Debian / Ubuntu (DEB)
 
