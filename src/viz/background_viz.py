@@ -11,7 +11,7 @@ import os
 import random
 from threading import Thread
 
-import requests
+import utils.helpers as helpers
 
 logger = logging.getLogger(__name__)
 
@@ -270,13 +270,10 @@ class _BackgroundCommon:
 
         def task():
             try:
-                os.makedirs(cache_dir, exist_ok=True)
-                f_path = os.path.join(cache_dir, cover_key)
-                if not os.path.exists(f_path):
-                    r = requests.get(cover_url, timeout=8)
-                    r.raise_for_status()
-                    with open(f_path, "wb") as f:
-                        f.write(r.content)
+                f_path = helpers.download_to_cache(cover_url, cache_dir, cover_key, timeout=8)
+                if not f_path:
+                    GLib.idle_add(self.randomize_colors)
+                    return
 
                 pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(f_path, 48, 48, True)
                 rgb = self._dominant_rgb_from_pixbuf(pb)

@@ -21,12 +21,12 @@ gi.require_version('Adw', '1')
 from gi.repository import Gtk, Adw, GLib, Gdk, Pango
 import webbrowser
 from threading import Thread, current_thread, main_thread
-from tidal_backend import TidalBackend
-from rust_audio_engine import create_audio_engine
+from backend import TidalBackend
+from _rust.audio import create_audio_engine
 from models import HistoryManager, PlaylistManager
-from signal_path import AudioSignalPathWindow
-import utils
-import ui_config
+from services.signal_path import AudioSignalPathWindow
+import utils.helpers as utils
+from ui import config as ui_config
 from ui import builders as ui_builders
 from ui import views_builders as ui_views_builders
 from viz.visualizer import SpectrumVisualizer
@@ -38,15 +38,16 @@ from actions import playback_actions
 from actions import audio_settings_actions
 from actions import lyrics_playback_actions
 from actions import playback_stream_actions
-from lyrics_manager import LyricsManager
-from app_logging import setup_logging
-from app_settings import load_settings, save_settings as persist_settings
-from app_errors import classify_exception
-from app.constants import (
+from services.lyrics import LyricsManager
+from core.logging import setup_logging
+from core.settings import load_settings, save_settings as persist_settings
+from core.errors import classify_exception
+from core.constants import (
     PlayMode, LyricsSettings, AudioLatency, VisualizerSettings,
     CacheSettings, LikedTracksCache, VizWarmup, DiagEvents,
 )
-from app.executor import submit_daemon
+from core.executor import submit_daemon
+from utils.paths import get_cache_dir
 
 logger = logging.getLogger(__name__)
 
@@ -438,7 +439,7 @@ class TidalApp(Adw.Application):
         GLib.set_prgname("HiresTI")
         self.app_version = self._detect_app_version()
         self.backend = TidalBackend()
-        self._cache_root = os.path.expanduser("~/.cache/hiresti")
+        self._cache_root = get_cache_dir()
         self._account_scope = "guest"
         self.settings_file = os.path.join(self._cache_root, "settings.json")
         self.settings = load_settings(self.settings_file)
@@ -563,25 +564,6 @@ class TidalApp(Adw.Application):
         except Exception:
             pass
         return "dev"
-
-    def on_about_clicked(self, _btn=None):
-        info_lines = [
-            "A desktop TIDAL client focused on audio quality and visual experience.",
-            f"Python: {platform.python_version()}",
-        ]
-        about = Adw.AboutWindow(
-            transient_for=getattr(self, "win", None),
-            modal=True,
-            application_name="HiresTI",
-            application_icon="hiresti",
-            version=str(getattr(self, "app_version", "dev")),
-            developers=["Yelanxin"],
-            website="https://github.com/yelanxin/hiresTI",
-            issue_url="https://github.com/yelanxin/hiresTI/issues",
-            license_type=Gtk.License.GPL_3_0,
-            comments="\n".join(info_lines),
-        )
-        about.present()
 
     def do_shutdown(self):
         logger.info("Shutting down application...")
@@ -1167,12 +1149,13 @@ class TidalApp(Adw.Application):
             return
 
         icon_theme = Gtk.IconTheme.get_for_display(display)
-        icons_path = os.path.join(os.path.dirname(__file__), "..", "icons")
+        # icons directory is in project root, not in src/
+        icons_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "icons")
         if os.path.exists(icons_path):
             icon_theme.add_search_path(icons_path)
 
         provider = Gtk.CssProvider()
-        logo_svg = os.path.join(os.path.dirname(__file__), "..", "icons", "hicolor", "scalable", "apps", "hiresti.svg")
+        logo_svg = os.path.join(os.path.dirname(__file__), "icons", "hicolor", "scalable", "apps", "hiresti.svg")
         css_data = ui_config.CSS_DATA.replace("__HIRESTI_LOGO_SVG__", logo_svg.replace("\\", "/"))
         provider.load_from_data(css_data.encode())
         Gtk.StyleContext.add_provider_for_display(display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
@@ -1342,9 +1325,9 @@ class TidalApp(Adw.Application):
 
     def _get_tray_icon_path(self):
         candidates = [
-            os.path.join(os.path.dirname(__file__), "..", "icons", "hicolor", "64x64", "apps", "hiresti.png"),
-            os.path.join(os.path.dirname(__file__), "..", "icons", "hicolor", "128x128", "apps", "hiresti.png"),
-            os.path.join(os.path.dirname(__file__), "..", "icons", "hicolor", "32x32", "apps", "hiresti.png"),
+            os.path.join(os.path.dirname(__file__), "icons", "hicolor", "64x64", "apps", "hiresti.png"),
+            os.path.join(os.path.dirname(__file__), "icons", "hicolor", "128x128", "apps", "hiresti.png"),
+            os.path.join(os.path.dirname(__file__), "icons", "hicolor", "32x32", "apps", "hiresti.png"),
         ]
         for p in candidates:
             if os.path.exists(p):
@@ -1492,9 +1475,6 @@ class TidalApp(Adw.Application):
                 pass
         return False
 
-    def _build_header(self, container):
-        ui_builders.build_header(self, container)
-
     def _build_volume_popover(self):
         pop = Gtk.Popover()
         # 创建垂直布局容器
@@ -1555,22 +1535,6 @@ class TidalApp(Adw.Application):
             return True
 
         return False
-    
-    def on_volume_changed_ui(self, scale):
-        val = scale.get_value()
-        self.player.set_volume(val / 100.0)
-        self.settings["volume"] = int(round(val))
-        self.schedule_save_settings()
-
-        # 根据音量大小切换图标
-        icon = "hiresti-volume-high-symbolic"
-        if val == 0: icon = "hiresti-volume-muted-symbolic"
-        elif val < 30: icon = "hiresti-volume-low-symbolic"
-        elif val < 70: icon = "hiresti-volume-medium-symbolic"
-
-        if self.vol_btn is not None:
-            self.vol_btn.set_icon_name(icon)
-
 
     def toggle_mini_mode(self, btn):
         if not hasattr(self, "is_mini_mode"):
@@ -1659,16 +1623,6 @@ class TidalApp(Adw.Application):
         vbox.append(btn)
         pop.set_child(vbox)
         return pop
-    
-    def on_tech_info_clicked(self, btn):
-        win = AudioSignalPathWindow(self)
-        win.present()
-
-    def _build_body(self, container):
-        ui_builders.build_body(self, container)
-
-    def _build_grid_view(self):
-        ui_views_builders.build_grid_view(self)
 
     def _toggle_login_view(self, logged_in):
         self._session_restore_pending = False
@@ -1735,12 +1689,6 @@ class TidalApp(Adw.Application):
         revealer = getattr(self, "viz_revealer", None)
         if revealer is not None:
             self._set_visualizer_expanded(False)
-
-    def _build_tracks_view(self):
-        ui_views_builders.build_tracks_view(self)
-
-    def _build_settings_page(self):
-        ui_views_builders.build_settings_page(self)
 
     def _build_eq_popover(self):
         pop = Gtk.Popover()
@@ -2294,6 +2242,7 @@ class TidalApp(Adw.Application):
     def on_login_success(self):
         logger.info("Login successful.")
         self.show_output_notice("Login successful.", "ok", 2000)
+        self.backend._tune_http_pool()  # Ensure HTTP pool is tuned after login
         self._apply_account_scope(force=True)
         self._home_sections_cache = None
         self._toggle_login_view(True)
@@ -2369,32 +2318,6 @@ class TidalApp(Adw.Application):
         self.settings["output_auto_rebind_once"] = bool(state)
         self.save_settings()
 
-    def on_toggle_mode(self, btn):
-        """切换播放模式：循环 -> 单曲 -> 随机 -> 算法 -> 循环"""
-        # 循环切换 0 -> 1 -> 2 -> 3 -> 0
-        self.play_mode = (self.play_mode + 1) % 4
-        
-        # 获取图标和提示文字
-        icon = self.MODE_ICONS.get(self.play_mode, "hiresti-mode-loop-symbolic")
-        tooltip = self.MODE_TOOLTIPS.get(self.play_mode, "Loop")
-        
-        # 更新 UI
-        if self.mode_btn is not None:
-            self.mode_btn.set_icon_name(icon)
-            self.mode_btn.set_tooltip_text(tooltip)
-        
-        # 状态处理
-        if self.play_mode == self.MODE_SHUFFLE or self.play_mode == self.MODE_SMART:
-            # 立即生成随机池，防止切歌时 shuffle_indices 为空
-            self._generate_shuffle_list()
-            # print(f"[Mode] Switched to {tooltip}")
-        else:
-            # 切回顺序模式，清空随机池以节省内存
-            self.shuffle_indices = []
-            # print(f"[Mode] Switched to {tooltip}")
-        self.settings["play_mode"] = self.play_mode
-        self.schedule_save_settings()
-
     def _generate_shuffle_list(self):
         """生成随机播放索引列表"""
         # 1. 安全检查：列表是否存在
@@ -2425,15 +2348,6 @@ class TidalApp(Adw.Application):
         random.shuffle(indices)
         
         self.shuffle_indices = indices
-
-    def get_next_index(self, direction=1):
-        return playback_actions.get_next_index(self, direction)
-
-    def on_latency_changed(self, dd, p):
-        audio_settings_actions.on_latency_changed(self, dd, p)
-
-    def _refresh_output_status_loop(self):
-        audio_settings_actions.update_output_status_ui(self)
 
     def _get_output_status_interval_ms(self):
         try:
@@ -2565,22 +2479,6 @@ class TidalApp(Adw.Application):
 
         self.lbl_tech.set_visible(True)
 
-    def on_settings_clicked(self, btn):
-        self._remember_last_view("settings")
-        self.right_stack.set_visible_child_name("settings"); self.grid_title_label.set_text("Settings"); self.back_btn.set_sensitive(True); self.nav_list.select_row(None)
-
-    def on_quality_changed(self, dd, p):
-        playback_stream_actions.on_quality_changed(self, dd, p)
-
-    def _restart_player_with_url(self, url, pos):
-        playback_stream_actions.restart_player_with_url(self, url, pos)
-
-    def on_driver_changed(self, dd, p):
-        audio_settings_actions.on_driver_changed(self, dd, p)
-
-    def on_device_changed(self, dd, p):
-        audio_settings_actions.on_device_changed(self, dd, p)
-
     def on_recover_output_clicked(self, btn):
         audio_settings_actions.on_recover_output_clicked(self, btn)
 
@@ -2603,10 +2501,6 @@ class TidalApp(Adw.Application):
         self.current_track_list = [track]
         self._set_play_queue([track])
         self.play_track(0)
-
-    def show_album_details(self, alb):
-        self.current_remote_playlist = None
-        ui_actions.show_album_details(self, alb)
 
     def _sort_tracks(self, tracks, field, asc=True):
         items = list(tracks or [])
@@ -2685,15 +2579,6 @@ class TidalApp(Adw.Application):
             self.playlist_sort_asc = True
         if self.current_playlist_id:
             self.render_playlist_detail(self.current_playlist_id)
-
-    def get_sorted_playlist_tracks(self, playlist_id):
-        tracks = self.playlist_mgr.get_tracks(playlist_id) if hasattr(self, "playlist_mgr") else []
-        if getattr(self, "playlist_edit_mode", False):
-            return tracks
-        return self._sort_tracks(tracks, self.playlist_sort_field, self.playlist_sort_asc)
-
-    def populate_tracks(self, tracks):
-        ui_actions.populate_tracks(self, tracks)
 
     def _update_track_list_icon(self, target_list=None):
         """
@@ -2781,31 +2666,10 @@ class TidalApp(Adw.Application):
 
             submit_daemon(resolve_artist)
 
-    def on_artist_clicked(self, artist):
-        ui_navigation.on_artist_clicked(self, artist)
-
-    def batch_load_albums(self, albs, batch=6):
-        return ui_actions.batch_load_albums(self, albs, batch)
-
-    def batch_load_artists(self, artists, batch=10):
-        return ui_actions.batch_load_artists(self, artists, batch)
-
-    def batch_load_home(self, sections):
-        ui_actions.batch_load_home(self, sections)
-
     def render_daily_mixes(self, mixes=None):
         if mixes is None:
             mixes = self.build_daily_mixes()
         ui_actions.render_daily_mixes(self, mixes)
-
-    def render_history_dashboard(self):
-        ui_actions.render_history_dashboard(self)
-
-    def render_collection_dashboard(self, favorite_tracks=None, favorite_albums=None):
-        ui_actions.render_collection_dashboard(self, favorite_tracks, favorite_albums)
-
-    def render_liked_songs_dashboard(self, tracks=None):
-        ui_actions.render_liked_songs_dashboard(self, tracks)
 
     def refresh_liked_songs_dashboard(self):
         row = self.nav_list.get_selected_row() if self.nav_list is not None else None
@@ -2873,72 +2737,6 @@ class TidalApp(Adw.Application):
             GLib.idle_add(lambda: _apply_if_active(tracks))
 
         submit_daemon(task)
-        return False
-
-    def render_queue_dashboard(self):
-        ui_actions.render_queue_dashboard(self)
-
-    def render_queue_drawer(self):
-        ui_actions.render_queue_drawer(self)
-
-    def _sync_queue_handle_state(self, expanded):
-        btn = getattr(self, "queue_btn", None)
-        if btn is not None:
-            btn.set_icon_name(
-                "hiresti-queue-handle-right-symbolic" if expanded else "hiresti-queue-handle-left-symbolic"
-            )
-            btn.set_tooltip_text("Close Queue" if expanded else "Open Queue")
-            if expanded:
-                btn.add_css_class("active")
-            else:
-                btn.remove_css_class("active")
-        anchor = getattr(self, "queue_anchor", None)
-        if anchor is not None:
-            if expanded:
-                anchor.add_css_class("open")
-            else:
-                anchor.remove_css_class("open")
-
-    def toggle_queue_drawer(self, _btn=None):
-        revealer = getattr(self, "queue_revealer", None)
-        if revealer is None:
-            return
-        show = not revealer.get_reveal_child()
-        revealer.set_reveal_child(show)
-        if getattr(self, "queue_backdrop", None) is not None:
-            self.queue_backdrop.set_visible(show)
-        self._sync_queue_handle_state(show)
-        if show:
-            # Let reveal animation start first; defer queue row rendering so
-            # first-frame animation is not blocked by list build work.
-            GLib.timeout_add(120, lambda: (self.render_queue_drawer(), False)[1])
-
-    def close_queue_drawer(self):
-        revealer = getattr(self, "queue_revealer", None)
-        if revealer is not None:
-            revealer.set_reveal_child(False)
-        if getattr(self, "queue_backdrop", None) is not None:
-            self.queue_backdrop.set_visible(False)
-        self._sync_queue_handle_state(False)
-
-    def _is_queue_nav_selected(self):
-        row = self.nav_list.get_selected_row() if self.nav_list is not None else None
-        return bool(row and getattr(row, "nav_id", None) == "queue")
-
-    def _get_active_queue(self):
-        q = list(getattr(self, "play_queue", []) or [])
-        if q:
-            return q
-        return list(getattr(self, "current_track_list", []) or [])
-
-    def _set_play_queue(self, tracks):
-        self.play_queue = list(tracks or [])
-        self.shuffle_indices = []
-
-    def _refresh_queue_views(self):
-        self.render_queue_drawer()
-        if self._is_queue_nav_selected():
-            self.render_queue_dashboard()
         return False
 
     def render_playlists_home(self):
@@ -4213,19 +4011,6 @@ class TidalApp(Adw.Application):
         section_box.append(self.main_flow)
         self.collection_content_box.append(section_box)
 
-    def on_play_pause(self, btn):
-        playback_actions.on_play_pause(self, btn)
-
-
-    def on_next_track(self, btn=None):
-        playback_actions.on_next_track(self, btn)
-
-    def on_prev_track(self, btn=None):
-        playback_actions.on_prev_track(self, btn)
-
-    def _load_cover_art(self, cover_id_or_url):
-        playback_stream_actions.load_cover_art(self, cover_id_or_url)
-
     def _update_list_ui(self, index):
         """更新列表选中状态。"""
         if self.list_box is None: return
@@ -4237,13 +4022,6 @@ class TidalApp(Adw.Application):
         except Exception as e:
             logger.warning("List update failed: %s", e)
 
-
-    def render_lyrics_list(self, lyrics_obj=None, status_msg=None):
-        lyrics_playback_actions.render_lyrics_list(self, lyrics_obj, status_msg)
-
-
-    def play_track(self, index):
-        lyrics_playback_actions.play_track(self, index)
 
     def _get_tidal_image_url(self, uuid, width=320, height=320):
         """将 TIDAL UUID 转换为可访问的图片 URL。"""
@@ -4332,9 +4110,6 @@ class TidalApp(Adw.Application):
         except Exception:
             pass
 
-    def _scroll_to_lyric(self, widget):
-        lyrics_playback_actions.scroll_to_lyric(self, widget)
-
     def _restore_paned_position_after_layout(self):
         if self.paned is None:
             return False
@@ -4345,9 +4120,6 @@ class TidalApp(Adw.Application):
         if saved_paned > 0 and self.paned.get_position() != saved_paned:
             self.paned.set_position(saved_paned)
         return False
-
-    def update_ui_loop(self):
-        return lyrics_playback_actions.update_ui_loop(self)
 
     def _get_ui_loop_interval_ms(self):
         is_playing = False
@@ -4588,38 +4360,9 @@ class TidalApp(Adw.Application):
 
         submit_daemon(do)
 
-    def on_fav_clicked(self, btn):
-        if not self.current_album: return
-        is_currently_active = "active" in btn.get_css_classes()
-        is_add = not is_currently_active
-        def do():
-            if self.backend.toggle_album_favorite(self.current_album.id, is_add): GLib.idle_add(lambda: self._update_fav_icon(btn, is_add))
-        submit_daemon(do)
-
-    def on_artist_fav_clicked(self, btn):
-        if not self.current_selected_artist: return
-        art = self.current_selected_artist
-        is_currently_active = "active" in btn.get_css_classes()
-        is_add = not is_currently_active
-        def do():
-            if self.backend.toggle_artist_favorite(art.id, is_add): GLib.idle_add(lambda: self._update_fav_icon(btn, is_add))
-        submit_daemon(do)
-
     def _build_search_view(self):
         ui_views_builders.build_search_view(self)
         ui_actions.render_search_history(self)
-
-    def on_search(self, entry):
-        ui_actions.on_search(self, entry)
-
-    def on_search_changed(self, entry):
-        ui_actions.on_search_changed(self, entry)
-
-    def clear_search_history(self, btn):
-        ui_actions.clear_search_history(self, btn)
-
-    def render_search_results(self, res):
-        ui_actions.render_search_results(self, res)
 
     def on_search_track_selected(self, box, row):
         if not row: return
@@ -4957,6 +4700,100 @@ class TidalApp(Adw.Application):
             return True
 
         self._viz_handle_anim_source = GLib.timeout_add(16, _tick)
+
+# Import handlers from app module and bind to TidalApp class
+from app.app_handlers import (
+    on_about_clicked,
+    on_login_clicked,
+    on_logout_clicked,
+    on_settings_clicked,
+    on_volume_changed_ui,
+    on_tech_info_clicked,
+    on_toggle_mode,
+    on_fav_clicked,
+    on_artist_fav_clicked,
+    _get_active_queue,
+    _set_play_queue,
+    _is_queue_nav_selected,
+    _sync_queue_handle_state,
+    toggle_queue_drawer,
+    close_queue_drawer,
+    get_sorted_playlist_tracks,
+)
+
+# Import delegation targets from actions modules
+from actions import playback_actions
+from actions import ui_actions
+from actions import ui_navigation
+from actions import playback_stream_actions
+from actions import lyrics_playback_actions
+
+# Bind module functions to TidalApp class
+TidalApp.on_about_clicked = on_about_clicked
+TidalApp.on_login_clicked = on_login_clicked
+TidalApp.on_logout_clicked = on_logout_clicked
+TidalApp.on_settings_clicked = on_settings_clicked
+TidalApp.on_volume_changed_ui = on_volume_changed_ui
+TidalApp.on_tech_info_clicked = on_tech_info_clicked
+TidalApp.on_toggle_mode = on_toggle_mode
+TidalApp.on_fav_clicked = on_fav_clicked
+TidalApp.on_artist_fav_clicked = on_artist_fav_clicked
+
+# Queue methods from app_handlers
+TidalApp._get_active_queue = _get_active_queue
+TidalApp._set_play_queue = _set_play_queue
+TidalApp._is_queue_nav_selected = _is_queue_nav_selected
+TidalApp._sync_queue_handle_state = _sync_queue_handle_state
+TidalApp.toggle_queue_drawer = toggle_queue_drawer
+TidalApp.close_queue_drawer = close_queue_drawer
+
+# Playlist methods
+TidalApp.get_sorted_playlist_tracks = get_sorted_playlist_tracks
+
+# Bind delegated methods to actions modules
+TidalApp.on_play_pause = lambda self, btn: playback_actions.on_play_pause(self, btn)
+TidalApp.on_next_track = lambda self, btn=None: playback_actions.on_next_track(self, btn)
+TidalApp.on_prev_track = lambda self, btn=None: playback_actions.on_prev_track(self, btn)
+TidalApp.get_next_index = lambda self, direction=1: playback_actions.get_next_index(self, direction)
+TidalApp.on_quality_changed = lambda self, dd, p: playback_stream_actions.on_quality_changed(self, dd, p)
+TidalApp._restart_player_with_url = lambda self, url, pos: playback_stream_actions.restart_player_with_url(self, url, pos)
+TidalApp.show_album_details = lambda self, alb: ui_actions.show_album_details(self, alb)
+TidalApp.populate_tracks = lambda self, tracks: ui_actions.populate_tracks(self, tracks)
+TidalApp.on_artist_clicked = lambda self, artist: ui_navigation.on_artist_clicked(self, artist)
+TidalApp.batch_load_albums = lambda self, albs, batch=6: ui_actions.batch_load_albums(self, albs, batch)
+TidalApp.batch_load_artists = lambda self, artists, batch=10: ui_actions.batch_load_artists(self, artists, batch)
+TidalApp.batch_load_home = lambda self, sections: ui_actions.batch_load_home(self, sections)
+TidalApp.render_daily_mixes = lambda self, mixes=None: ui_actions.render_daily_mixes(self, mixes)
+TidalApp.render_history_dashboard = lambda self: ui_actions.render_history_dashboard(self)
+TidalApp.render_collection_dashboard = lambda self, favorite_tracks=None, favorite_albums=None: ui_actions.render_collection_dashboard(self, favorite_tracks, favorite_albums)
+TidalApp.render_liked_songs_dashboard = lambda self, tracks=None: ui_actions.render_liked_songs_dashboard(self, tracks)
+TidalApp.render_queue_dashboard = lambda self: ui_actions.render_queue_dashboard(self)
+TidalApp.render_queue_drawer = lambda self: ui_actions.render_queue_drawer(self)
+TidalApp.render_playlists_home = lambda self: ui_actions.render_playlists_home(self)
+TidalApp.render_playlist_detail = lambda self, playlist_id: ui_actions.render_playlist_detail(self, playlist_id)
+TidalApp.render_search_tracks_page = lambda self: ui_actions.render_search_tracks_page(self)
+TidalApp.on_nav_selected = lambda self, box, row: ui_navigation.on_nav_selected(self, box, row)
+TidalApp.on_back_clicked = lambda self, btn: ui_navigation.on_back_clicked(self, btn)
+TidalApp._load_cover_art = lambda self, cover_id_or_url: playback_stream_actions.load_cover_art(self, cover_id_or_url)
+TidalApp.get_next_index = lambda self, direction=1: playback_actions.get_next_index(self, direction)
+TidalApp.on_latency_changed = lambda self, dd, p: audio_settings_actions.on_latency_changed(self, dd, p)
+TidalApp.on_driver_changed = lambda self, dd, p: audio_settings_actions.on_driver_changed(self, dd, p)
+TidalApp.on_device_changed = lambda self, dd, p: audio_settings_actions.on_device_changed(self, dd, p)
+TidalApp._refresh_output_status_loop = lambda self: audio_settings_actions.update_output_status_ui(self)
+TidalApp._build_header = lambda self, container: ui_builders.build_header(self, container)
+TidalApp._build_tracks_view = lambda self: ui_views_builders.build_tracks_view(self)
+TidalApp._build_settings_page = lambda self: ui_views_builders.build_settings_page(self)
+TidalApp._build_body = lambda self, container: ui_builders.build_body(self, container)
+TidalApp._build_grid_view = lambda self: ui_views_builders.build_grid_view(self)
+TidalApp.render_lyrics_list = lambda self, lyrics_obj=None, status_msg=None: lyrics_playback_actions.render_lyrics_list(self, lyrics_obj, status_msg)
+TidalApp.play_track = lambda self, index: lyrics_playback_actions.play_track(self, index)
+TidalApp._scroll_to_lyric = lambda self, widget: lyrics_playback_actions.scroll_to_lyric(self, widget)
+TidalApp.update_ui_loop = lambda self: lyrics_playback_actions.update_ui_loop(self)
+TidalApp.render_search_history = lambda self: ui_actions.render_search_history(self)
+TidalApp.on_search = lambda self, entry: ui_actions.on_search(self, entry)
+TidalApp.on_search_changed = lambda self, entry: ui_actions.on_search_changed(self, entry)
+TidalApp.clear_search_history = lambda self, btn: ui_actions.clear_search_history(self, btn)
+TidalApp.render_search_results = lambda self, res: ui_actions.render_search_results(self, res)
 
 if __name__ == "__main__":
     setup_logging()

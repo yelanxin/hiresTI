@@ -21,37 +21,61 @@ finish-args:
   - --socket=fallback-x11
   - --socket=pulseaudio
   - --device=dri
+  - --talk-name=org.freedesktop.secrets
 
 modules:
   - python3-requirements.json
 
-  - name: rust-launcher
+  - name: hiresti-launcher
     buildsystem: simple
     build-commands:
-      - cd rust_launcher && cargo build --release --offline
-      - install -Dm755 rust_launcher/target/release/hiresti /app/bin/hiresti
-    sources:
-      - type: dir
-        path: ..
+      # Create launcher wrapper - Flatpak auto-sets XDG_* variables to ~/.var/app/$APPID/
+      - |
+        cat > /app/bin/hiresti << 'WRAPPER_EOF'
+        #!/bin/bash
+        # Flatpak wrapper for hiresti
+        # Note: Flatpak automatically maps XDG_CACHE_HOME, XDG_CONFIG_HOME, XDG_DATA_HOME
+        # to persistent directories under ~/.var/app/com.hiresti.player/
+
+        # App directory
+        APP_DIR="/app/share/hiresti"
+
+        # Run the app
+        cd "$APP_DIR"
+        PYTHONPATH="$APP_DIR:$APP_DIR/libs" python3 main.py "$@"
+        WRAPPER_EOF
+      - chmod +x /app/bin/hiresti
+    sources: []
 
   - name: rust-audio-core
     buildsystem: simple
     build-commands:
-      - cd rust_audio_core && cargo build --release --offline
-      - install -Dm755 rust_audio_core/target/release/librust_audio_core.so /app/share/hiresti/rust_audio_core/target/release/librust_audio_core.so
+      - cd hiresTI/src_rust/rust_audio_core && cargo build --release --offline
+      - install -Dm755 hiresTI/src_rust/rust_audio_core/target/release/librust_audio_core.so /app/share/hiresti/src_rust/rust_audio_core/target/release/librust_audio_core.so
     sources:
       - type: dir
-        path: ..
+        path: ../..
+
+  - name: rust-viz-core
+    buildsystem: simple
+    build-commands:
+      - cd hiresTI/src_rust/rust_viz_core && cargo build --release --offline
+      - install -Dm755 hiresTI/src_rust/rust_viz_core/target/release/libviz_core.so /app/share/hiresti/src_rust/rust_viz_core/target/release/libviz_core.so
+    sources:
+      - type: dir
+        path: ../..
 
   - name: hiresTI-app
     buildsystem: simple
     build-commands:
       - install -d /app/share/hiresti
-      - cp -a src/main.py src/tidal_backend.py src/rust_audio_engine.py src/app_logging.py src/app_settings.py src/app_errors.py src/lyrics_manager.py src/models.py src/signal_path.py src/utils.py src/ui_config.py src/viz/visualizer.py src/viz/visualizer_glarea.py src/viz/visualizer_gpu.py src/background_viz.py src/rust_viz.py /app/share/hiresti/
-      - cp -a src/actions src/icons /app/share/hiresti/
-      - cp -a src/app /app/share/hiresti/
-      - cp -a src/ui /app/share/hiresti/
-      - cp -a version.txt /app/share/hiresti/version.txt
+      # Copy all Python source files from src/
+      - cp -a src/* /app/share/hiresti/
+      # Copy icons
+      - cp -a icons /app/share/hiresti/
+      # Copy version
+      - cp version.txt /app/share/hiresti/version.txt
+      # Desktop and metainfo files
       - install -Dm644 flatpak/com.hiresti.player.desktop /app/share/applications/com.hiresti.player.desktop
       - install -Dm644 flatpak/com.hiresti.player.metainfo.xml /app/share/metainfo/com.hiresti.player.metainfo.xml
       - install -Dm644 icons/hicolor/128x128/apps/hiresti.png /app/share/icons/hicolor/128x128/apps/com.hiresti.player.png
