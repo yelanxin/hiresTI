@@ -97,10 +97,6 @@ sudo dnf install ./hiresti-<version>-1.el9.<arch>.rpm
 sudo pacman -U ./hiresti-<version>-1-<arch>.pkg.tar.zst
 ```
 
-### Install from flatpak
-```bash
-flatpak install --user ./hiresti-<version>.flatpak
-```
 
 ## Upgrade Guide
 
