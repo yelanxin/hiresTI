@@ -1,6 +1,6 @@
 from app.constants import (
     PlayMode,
-    LyricsSettings,
+    LyricsSettings, 
     AudioLatency,
     VisualizerSettings,
     CacheSettings,
@@ -8,6 +8,7 @@ from app.constants import (
     VizWarmup,
     DiagEvents,
 )
+from app.executor import TaskExecutor, submit_task, submit_daemon
 
 __all__ = [
     "PlayMode",
@@ -18,4 +19,7 @@ __all__ = [
     "LikedTracksCache",
     "VizWarmup",
     "DiagEvents",
+    "TaskExecutor",
+    "submit_task",
+    "submit_daemon",
 ]

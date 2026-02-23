@@ -41,6 +41,7 @@ from app.constants import (
     PlayMode, LyricsSettings, AudioLatency, VisualizerSettings,
     CacheSettings, LikedTracksCache, VizWarmup, DiagEvents,
 )
+from app.executor import submit_daemon
 
 logger = logging.getLogger(__name__)
 
@@ -398,7 +399,7 @@ class TidalApp(Adw.Application):
                 max_tracks=max(0, int(getattr(self, "audio_cache_tracks", 0) or 0)),
             )
 
-        Thread(target=task, daemon=True).start()
+        submit_daemon(task)
 
     def _account_scope_from_backend_user(self):
         user = getattr(self.backend, "user", None)
@@ -1417,7 +1418,7 @@ class TidalApp(Adw.Application):
             else:
                 GLib.idle_add(self._toggle_login_view, False)
 
-        Thread(target=task, daemon=True).start()
+        submit_daemon(task)
 
     def _setup_theme_watch(self):
         """
@@ -2083,7 +2084,7 @@ class TidalApp(Adw.Application):
                 msg = detail or "Authentication failed or timed out."
                 GLib.idle_add(self._on_login_failed_for_attempt, attempt_id, msg)
 
-        Thread(target=login_thread, daemon=True).start()
+        submit_daemon(login_thread)
 
     def _open_login_url(self, url, attempt_id):
         url = str(url or "").strip()
@@ -2338,7 +2339,7 @@ class TidalApp(Adw.Application):
 
                     GLib.idle_add(_apply_ui)
 
-                Thread(target=_switch_to_pro_audio, daemon=True).start()
+                submit_daemon(_switch_to_pro_audio)
 
     def on_exclusive_toggled(self, switch, state):
         self.settings["exclusive_lock"] = state
@@ -2773,7 +2774,7 @@ class TidalApp(Adw.Application):
                     return
                 GLib.idle_add(self.on_artist_clicked, resolved)
 
-            Thread(target=resolve_artist, daemon=True).start()
+            submit_daemon(resolve_artist)
 
     def on_artist_clicked(self, artist):
         ui_navigation.on_artist_clicked(self, artist)
@@ -2866,7 +2867,7 @@ class TidalApp(Adw.Application):
             self.liked_tracks_last_fetch_ts = time.time()
             GLib.idle_add(lambda: _apply_if_active(tracks))
 
-        Thread(target=task, daemon=True).start()
+        submit_daemon(task)
         return False
 
     def render_queue_dashboard(self):
@@ -3012,7 +3013,7 @@ class TidalApp(Adw.Application):
 
                 GLib.idle_add(apply)
 
-            Thread(target=task, daemon=True).start()
+            submit_daemon(task)
 
         self._prompt_playlist_name(
             "New Folder",
@@ -3054,7 +3055,7 @@ class TidalApp(Adw.Application):
 
                 GLib.idle_add(apply)
 
-            Thread(target=task, daemon=True).start()
+            submit_daemon(task)
 
         self._prompt_playlist_name(
             "Rename Folder",
@@ -3115,7 +3116,7 @@ class TidalApp(Adw.Application):
 
                 GLib.idle_add(apply)
 
-            Thread(target=task, daemon=True).start()
+            submit_daemon(task)
 
         dialog.connect("response", _on_response)
         dialog.present()
@@ -3190,7 +3191,7 @@ class TidalApp(Adw.Application):
 
             GLib.idle_add(apply)
 
-        Thread(target=task, daemon=True).start()
+        submit_daemon(task)
 
     def _refresh_remote_playlist_visibility_button(self, playlist_obj=None):
         btn = getattr(self, "remote_playlist_visibility_btn", None)
@@ -3239,7 +3240,7 @@ class TidalApp(Adw.Application):
 
             GLib.idle_add(apply)
 
-        Thread(target=task, daemon=True).start()
+        submit_daemon(task)
 
     def _open_cloud_playlist_editor(
         self,
@@ -3402,7 +3403,7 @@ class TidalApp(Adw.Application):
 
                 GLib.idle_add(apply)
 
-            Thread(target=task, daemon=True).start()
+            submit_daemon(task)
 
         self._open_cloud_playlist_editor(
             dialog_title="Edit playlist",
@@ -3461,7 +3462,7 @@ class TidalApp(Adw.Application):
 
                 GLib.idle_add(apply)
 
-            Thread(target=task, daemon=True).start()
+            submit_daemon(task)
 
         dialog.connect("response", _on_response)
         dialog.present()
@@ -3524,7 +3525,7 @@ class TidalApp(Adw.Application):
 
                 GLib.idle_add(apply)
 
-            Thread(target=task, daemon=True).start()
+            submit_daemon(task)
 
         dialog.connect("response", _on_response)
         dialog.present()
@@ -3549,7 +3550,7 @@ class TidalApp(Adw.Application):
 
             GLib.idle_add(apply)
 
-        Thread(target=task, daemon=True).start()
+        submit_daemon(task)
 
     def on_playlist_track_selected(self, box, row):
         if not row:
@@ -3617,7 +3618,7 @@ class TidalApp(Adw.Application):
 
                 GLib.idle_add(apply)
 
-            Thread(target=task, daemon=True).start()
+            submit_daemon(task)
 
         self._open_cloud_playlist_editor(
             dialog_title="Create playlist",
@@ -3718,7 +3719,7 @@ class TidalApp(Adw.Application):
 
                 GLib.idle_add(apply)
 
-            Thread(target=task, daemon=True).start()
+            submit_daemon(task)
 
         self._prompt_playlist_pick(_do_add)
 
@@ -3814,7 +3815,7 @@ class TidalApp(Adw.Application):
 
             GLib.idle_add(apply)
 
-        Thread(target=do, daemon=True).start()
+        submit_daemon(do)
 
     def on_search_tracks_prev_page(self, _btn=None):
         self.search_tracks_page = max(0, int(getattr(self, "search_tracks_page", 0) or 0) - 1)
@@ -4468,7 +4469,7 @@ class TidalApp(Adw.Application):
 
             GLib.idle_add(apply)
 
-        Thread(target=do, daemon=True).start()
+        submit_daemon(do)
 
     def create_track_fav_button(self, track, css_classes=None):
         classes = css_classes or ["flat", "circular", "track-heart-btn"]
@@ -4503,7 +4504,7 @@ class TidalApp(Adw.Application):
 
             GLib.idle_add(apply)
 
-        Thread(target=do, daemon=True).start()
+        submit_daemon(do)
 
     def on_track_row_fav_clicked(self, btn):
         track_id = getattr(btn, "_track_fav_id", None)
@@ -4531,7 +4532,7 @@ class TidalApp(Adw.Application):
 
             GLib.idle_add(apply)
 
-        Thread(target=do, daemon=True).start()
+        submit_daemon(do)
 
     def refresh_visible_track_fav_buttons(self):
         roots = [
@@ -4580,7 +4581,7 @@ class TidalApp(Adw.Application):
 
             GLib.idle_add(apply)
 
-        Thread(target=do, daemon=True).start()
+        submit_daemon(do)
 
     def on_fav_clicked(self, btn):
         if not self.current_album: return
@@ -4588,7 +4589,7 @@ class TidalApp(Adw.Application):
         is_add = not is_currently_active
         def do():
             if self.backend.toggle_album_favorite(self.current_album.id, is_add): GLib.idle_add(lambda: self._update_fav_icon(btn, is_add))
-        Thread(target=do, daemon=True).start()
+        submit_daemon(do)
 
     def on_artist_fav_clicked(self, btn):
         if not self.current_selected_artist: return
@@ -4597,7 +4598,7 @@ class TidalApp(Adw.Application):
         is_add = not is_currently_active
         def do():
             if self.backend.toggle_artist_favorite(art.id, is_add): GLib.idle_add(lambda: self._update_fav_icon(btn, is_add))
-        Thread(target=do, daemon=True).start()
+        submit_daemon(do)
 
     def _build_search_view(self):
         ui_views_builders.build_search_view(self)
