@@ -1,8 +1,10 @@
 # hiresTI Music Player
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
+![Rust](https://img.shields.io/badge/Rust-1.70%2B-orange?logo=rust)
 ![GTK4](https://img.shields.io/badge/UI-GTK4%20%2B%20Libadwaita-green)
 ![License](https://img.shields.io/badge/License-GPL--3.0-purple)
+
 
 `hiresTI` is a native Linux desktop client for TIDAL, focused on stable playback, high-quality output paths, and a responsive GTK4/Libadwaita user experience.
 
