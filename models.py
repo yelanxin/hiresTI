@@ -4,64 +4,76 @@ import os
 import time
 import json
 import uuid
-from typing import Any
+from typing import Any, Optional
+from dataclasses import dataclass, field
 from abc import ABC, abstractmethod
 
 
-class ScopeManager(ABC):
-    """Base class for scoped data managers (History, Playlist)"""
-
-    def __init__(self, base_dir=None, scope_key="guest"):
-        self.base_dir = os.path.expanduser(base_dir or "~/.cache/hiresti")
-        self.scope_key = "guest"
-        self.path = ""
-        self.set_scope(scope_key)
-
-    @abstractmethod
-    def set_scope(self, scope_key):
-        pass
+@dataclass
+class LocalArtist:
+    """Simplified artist object"""
+    name: str = "Unknown"
+    id: Optional[Any] = None
 
 
+@dataclass
+class LocalAlbumInfo:
+    """Simplified album info for track objects"""
+    id: Optional[Any] = None
+    name: str = "Unknown Album"
+    cover: Optional[str] = None
+
+
+@dataclass
 class LocalAlbum:
-    def __init__(self, data):
-        self.id = data.get("id")
-        self.name = data.get("name")
-        # 伪装成 Tidal 的 Artist 对象，防止 main.py 报错
-        self.artist = type(
-            "obj",
-            (object,),
-            {
-                "name": data.get("artist", "Unknown"),
-                "id": data.get("artist_id"),
-            },
+    """Local album representation"""
+    id: Optional[Any] = None
+    name: Optional[str] = None
+    artist: LocalArtist = field(default_factory=LocalArtist)
+    cover_url: Optional[str] = None
+    release_date: Optional[str] = None
+    num_tracks: str = "?"
+
+    @classmethod
+    def from_dict(cls, data: dict) -> LocalAlbum:
+        return cls(
+            id=data.get("id"),
+            name=data.get("name"),
+            artist=LocalArtist(
+                name=data.get("artist", "Unknown"),
+                id=data.get("artist_id"),
+            ),
+            cover_url=data.get("cover_url"),
         )
-        self.cover_url = data.get("cover_url")
-        self.release_date = None
-        self.num_tracks = "?"
 
 
+@dataclass
 class LocalTrack:
-    def __init__(self, data):
-        self.id = data.get("id")
-        self.name = data.get("name", "Unknown Track")
-        self.duration = data.get("duration", 0) or 0
-        self.cover = data.get("cover")
-        self.artist = type(
-            "obj",
-            (object,),
-            {
-                "name": data.get("artist", "Unknown"),
-                "id": data.get("artist_id"),
-            },
-        )
-        self.album = type(
-            "obj",
-            (object,),
-            {
-                "id": data.get("album_id"),
-                "name": data.get("album_name", "Unknown Album"),
-                "cover": data.get("cover"),
-            },
+    """Local track representation"""
+    id: Optional[Any] = None
+    name: str = "Unknown Track"
+    duration: int = 0
+    cover: Optional[str] = None
+    artist: LocalArtist = field(default_factory=LocalArtist)
+    album: LocalAlbumInfo = field(default_factory=LocalAlbumInfo)
+    play_count: Optional[int] = None
+
+    @classmethod
+    def from_dict(cls, data: dict) -> LocalTrack:
+        return cls(
+            id=data.get("id"),
+            name=data.get("name", "Unknown Track"),
+            duration=data.get("duration", 0) or 0,
+            cover=data.get("cover"),
+            artist=LocalArtist(
+                name=data.get("artist", "Unknown"),
+                id=data.get("artist_id"),
+            ),
+            album=LocalAlbumInfo(
+                id=data.get("album_id"),
+                name=data.get("album_name", "Unknown Album"),
+                cover=data.get("cover"),
+            ),
         )
 
 
@@ -123,7 +135,7 @@ class HistoryManager:
         track_id = entry.get("track_id")
         if not track_id:
             return None
-        return LocalTrack(
+        return LocalTrack.from_dict(
             {
                 "id": track_id,
                 "name": entry.get("track_name") or entry.get("name") or "Unknown Track",
@@ -199,7 +211,7 @@ class HistoryManager:
                 continue
             seen.add(alb_id)
             albums.append(
-                LocalAlbum(
+                LocalAlbum.from_dict(
                     {
                         "id": alb_id,
                         "name": item.get("album_name") or item.get("name") or "Unknown Album",
@@ -409,7 +421,7 @@ class PlaylistManager:
             return []
         out = []
         for e in p.get("tracks", []):
-            tr = LocalTrack(
+            tr = LocalTrack.from_dict(
                 {
                     "id": e.get("track_id"),
                     "name": e.get("track_name", "Unknown Track"),
