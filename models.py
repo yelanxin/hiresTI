@@ -5,6 +5,21 @@ import time
 import json
 import uuid
 from typing import Any
+from abc import ABC, abstractmethod
+
+
+class ScopeManager(ABC):
+    """Base class for scoped data managers (History, Playlist)"""
+
+    def __init__(self, base_dir=None, scope_key="guest"):
+        self.base_dir = os.path.expanduser(base_dir or "~/.cache/hiresti")
+        self.scope_key = "guest"
+        self.path = ""
+        self.set_scope(scope_key)
+
+    @abstractmethod
+    def set_scope(self, scope_key):
+        pass
 
 
 class LocalAlbum:
