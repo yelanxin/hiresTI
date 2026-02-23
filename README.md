@@ -69,6 +69,7 @@ python3 main.py
 ```
 
 ## Install Prebuilt Packages
+Please download prebuild package from release page.
 
 ### Debian / Ubuntu (DEB)
 
@@ -92,6 +93,11 @@ sudo dnf install ./hiresti-<version>-1.el9.<arch>.rpm
 
 ```bash
 sudo pacman -U ./hiresti-<version>-1-<arch>.pkg.tar.zst
+```
+
+### Install from flatpak
+```bash
+flatpak install --user ./hiresti-<version>.flatpak
 ```
 
 ## Upgrade Guide
