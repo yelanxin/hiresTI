@@ -1,2 +1,27 @@
-package.sh
-package.sh
+# Build artifacts
+build*/
+dist/
+*.flatpak
+flatpak-builddir/
+.flatpak-builder*
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Rust build
+target/
+Cargo.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment
+.env.local
+.env
+
+# Logs
+*.log
