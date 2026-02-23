@@ -1167,12 +1167,12 @@ class TidalApp(Adw.Application):
             return
 
         icon_theme = Gtk.IconTheme.get_for_display(display)
-        icons_path = os.path.join(os.path.dirname(__file__), "icons")
+        icons_path = os.path.join(os.path.dirname(__file__), "..", "icons")
         if os.path.exists(icons_path):
             icon_theme.add_search_path(icons_path)
 
         provider = Gtk.CssProvider()
-        logo_svg = os.path.join(os.path.dirname(__file__), "icons", "hicolor", "scalable", "apps", "hiresti.svg")
+        logo_svg = os.path.join(os.path.dirname(__file__), "..", "icons", "hicolor", "scalable", "apps", "hiresti.svg")
         css_data = ui_config.CSS_DATA.replace("__HIRESTI_LOGO_SVG__", logo_svg.replace("\\", "/"))
         provider.load_from_data(css_data.encode())
         Gtk.StyleContext.add_provider_for_display(display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
@@ -1342,9 +1342,9 @@ class TidalApp(Adw.Application):
 
     def _get_tray_icon_path(self):
         candidates = [
-            os.path.join(os.path.dirname(__file__), "icons", "hicolor", "64x64", "apps", "hiresti.png"),
-            os.path.join(os.path.dirname(__file__), "icons", "hicolor", "128x128", "apps", "hiresti.png"),
-            os.path.join(os.path.dirname(__file__), "icons", "hicolor", "32x32", "apps", "hiresti.png"),
+            os.path.join(os.path.dirname(__file__), "..", "icons", "hicolor", "64x64", "apps", "hiresti.png"),
+            os.path.join(os.path.dirname(__file__), "..", "icons", "hicolor", "128x128", "apps", "hiresti.png"),
+            os.path.join(os.path.dirname(__file__), "..", "icons", "hicolor", "32x32", "apps", "hiresti.png"),
         ]
         for p in candidates:
             if os.path.exists(p):
