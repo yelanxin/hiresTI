@@ -37,6 +37,10 @@ from lyrics_manager import LyricsManager
 from app_logging import setup_logging
 from app_settings import load_settings, save_settings as persist_settings
 from app_errors import classify_exception
+from app.constants import (
+    PlayMode, LyricsSettings, AudioLatency, VisualizerSettings,
+    CacheSettings, LikedTracksCache, VizWarmup, DiagEvents,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,36 +57,19 @@ except Exception:
     qrcode = None
 
 class TidalApp(Adw.Application):
-    MODE_LOOP = 0     # 列表循环 (默认)
-    MODE_ONE = 1      # 单曲循环
-    MODE_SHUFFLE = 2  # 专辑/列表随机 (本地乱序)
-    MODE_SMART = 3    # 算法随机 (模拟 AI 推荐/无限流)
+    MODE_LOOP = PlayMode.LOOP
+    MODE_ONE = PlayMode.ONE
+    MODE_SHUFFLE = PlayMode.SHUFFLE
+    MODE_SMART = PlayMode.SMART
 
-    # 对应的图标
-    MODE_ICONS = {
-        0: "hiresti-mode-loop-symbolic",
-        1: "hiresti-mode-one-symbolic",
-        2: "hiresti-mode-shuffle-symbolic",
-        3: "hiresti-mode-smart-symbolic"
-    }
+    MODE_ICONS = PlayMode.ICONS
+    MODE_TOOLTIPS = PlayMode.TOOLTIPS
 
-    # 对应的提示文字
-    MODE_TOOLTIPS = {
-        0: "Loop All (Album/Playlist)",
-        1: "Loop Single Track",
-        2: "Shuffle (Randomize Order)",
-        3: "Smart Shuffle (Algorithm)"
-    }
-    LYRICS_FONT_PRESETS = ["Live", "Studio", "Compact"]
-    LATENCY_OPTIONS = ["Safe (400ms)", "Standard (100ms)", "Low Latency (40ms)", "Aggressive (20ms)"]
-    VIZ_BAR_OPTIONS = [4, 8, 16, 32, 48, 64, 96, 128]
-    VIZ_BACKEND_POLICIES = ["Perf", "Quality"]
-    LATENCY_MAP = {
-        "Safe (400ms)":      (400, 40),  # Buffer, Latency
-        "Standard (100ms)":  (100, 10),
-        "Low Latency (40ms)":(40, 4),
-        "Aggressive (20ms)": (20, 2)
-    }
+    LYRICS_FONT_PRESETS = LyricsSettings.FONT_PRESETS
+    LATENCY_OPTIONS = AudioLatency.OPTIONS
+    LATENCY_MAP = AudioLatency.MAP
+    VIZ_BAR_OPTIONS = VisualizerSettings.BAR_OPTIONS
+    VIZ_BACKEND_POLICIES = VisualizerSettings.BACKEND_POLICIES
 
     def _init_ui_refs(self):
         # Widgets created during do_activate/build steps.
@@ -124,7 +111,7 @@ class TidalApp(Adw.Application):
         self.liked_track_list = None
         self.liked_tracks_data = []
         self.liked_tracks_last_fetch_ts = 0.0
-        self.liked_tracks_cache_ttl_sec = 30.0
+        self.liked_tracks_cache_ttl_sec = LikedTracksCache.TTL_SEC
         self.queue_track_list = None
         self.queue_drawer_list = None
         self.queue_count_label = None
@@ -161,7 +148,7 @@ class TidalApp(Adw.Application):
         self._last_spectrum_ts = 0.0
         self._viz_seed_frame = None
         self._viz_warmup_until = 0.0
-        self._viz_warmup_duration_s = 2.0
+        self._viz_warmup_duration_s = VizWarmup.DURATION_S
         self._viz_placeholder_source = 0
         self._viz_placeholder_phase = 0.0
         self._viz_placeholder_frame = []
@@ -238,12 +225,12 @@ class TidalApp(Adw.Application):
             return
         ts = time.strftime("%H:%M:%S")
         self._diag_events.append(f"{ts} | {message}")
-        if len(self._diag_events) > 120:
-            self._diag_events = self._diag_events[-120:]
+        if len(self._diag_events) > DiagEvents.MAX_ENTRIES:
+            self._diag_events = self._diag_events[-DiagEvents.MAX_ENTRIES:]
         if self._diag_text is not None:
             combined = list(getattr(self.player, "event_log", [])) + self._diag_events
             buf = self._diag_text.get_buffer()
-            buf.set_text("\n".join(combined[-120:]))
+            buf.set_text("\n".join(combined[-DiagEvents.MAX_ENTRIES:]))
 
     def _apply_status_class(self, label, state):
         if label is None:
@@ -284,7 +271,7 @@ class TidalApp(Adw.Application):
             return
         combined = list(getattr(self.player, "event_log", [])) + self._diag_events
         buf = self._diag_text.get_buffer()
-        buf.set_text("\n".join(combined[-120:]) if combined else "No events yet.")
+        buf.set_text("\n".join(combined[-DiagEvents.MAX_ENTRIES:]) if combined else "No events yet.")
         self._diag_pop.popup()
 
     def show_output_notice(self, text, state="idle", timeout_ms=2600):
@@ -394,8 +381,8 @@ class TidalApp(Adw.Application):
             except ValueError:
                 return default
 
-        max_mb = _parse_int_env("HIRESTI_COVER_CACHE_MAX_MB", 300)
-        max_days = _parse_int_env("HIRESTI_COVER_CACHE_MAX_DAYS", 30)
+        max_mb = _parse_int_env("HIRESTI_COVER_CACHE_MAX_MB", CacheSettings.DEFAULT_MAX_MB)
+        max_days = _parse_int_env("HIRESTI_COVER_CACHE_MAX_DAYS", CacheSettings.DEFAULT_MAX_DAYS)
         max_bytes = max_mb * 1024 * 1024
 
         def task():
@@ -504,7 +491,7 @@ class TidalApp(Adw.Application):
         os.makedirs(self.cache_dir, exist_ok=True)
         self.audio_cache_dir = os.path.join(self._cache_root, "audio")
         os.makedirs(self.audio_cache_dir, exist_ok=True)
-        self.audio_cache_tracks = int(self.settings.get("audio_cache_tracks", 20) or 0)
+        self.audio_cache_tracks = int(self.settings.get("audio_cache_tracks", CacheSettings.DEFAULT_AUDIO_TRACKS) or 0)
         self._schedule_cache_maintenance()
         
         self.current_track_list = []
