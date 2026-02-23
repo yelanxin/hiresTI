@@ -1,0 +1,80 @@
+[package]
+name = "cookie-factory"
+version = "0.3.3"
+authors = ["Geoffroy Couprie <geo.couprie@gmail.com>", "Pierre Chifflier <chifflier@wzdftpd.net>"]
+license = "MIT"
+repository = "https://github.com/rust-bakery/cookie-factory"
+readme = "README.md"
+documentation = "http://docs.rs/cookie-factory"
+description = "nom inspired serialization library"
+categories = ["encoding"]
+keywords = ["encoding", "serialization", "nom"]
+edition = "2018"
+
+include = [
+  "Cargo.toml",
+  "LICENSE",
+  "README.md",
+  ".gitignore",
+  "src/*.rs",
+  "src/combinator/*.rs",
+  "example/*.rs"
+]
+
+[features]
+default = ["std", "async"]
+std = []
+async = ["futures"]
+
+[dev-dependencies]
+async-std = { version = "1.9.0", features = ["attributes"] }
+maplit = "^1.0"
+
+[profile.bench]
+debug = true
+lto = true
+codegen-units = 1
+
+#[[example]]
+#name = "cursor"
+#required-features = ["std"]
+#path = "cursor.rs"
+
+#[[example]]
+#name = "json"
+#path = "json.rs"
+
+[[example]]
+name = "http"
+required-features = ["std"]
+path = "examples/http.rs"
+
+[[example]]
+name = "async_http"
+required-features = ["std", "async"]
+path = "examples/async_http.rs"
+
+[[example]]
+name = "cursor"
+required-features = ["std"]
+path = "examples/cursor.rs"
+
+[[test]]
+name = "http"
+required-features = ["std"]
+path = "tests/http.rs"
+
+#[[test]]
+#name = "pouet"
+#path = "pouet.rs"
+
+#[[test]]
+#name = "combinators-json"
+#path = "combinators-json.rs"
+
+[badges]
+travis-ci = { repository = "Geal/cookie-factory" }
+maintenance = { status = "actively-developed" }
+
+[dependencies]
+futures = { version = "0.3.16", optional = true }
