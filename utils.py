@@ -96,121 +96,87 @@ def _rounded_pixbuf(pb, radius):
         return pb
 
 
+def _get_rounded_radius(classes: set, size: int) -> int:
+    """根据 CSS 类返回圆角半径"""
+    if "circular-avatar" in classes:
+        return size // 2
+    if "playback-art" in classes:
+        return 12
+    if "header-art" in classes:
+        return 14
+    if "album-cover-img" in classes:
+        return 10
+    return 0
+
+
 def load_img(widget, url_provider, cache_dir, size=84):
-    """
-    [混合修复版]
-    - Gtk.Picture: 使用 Texture，自适应 (适合大图)。
-    - Gtk.Image: 使用 set_pixel_size 强力锁死尺寸 (适合图标/封面)。
-    """
-    # 预设尺寸请求 (作为保底)
     widget.set_size_request(size, size)
-    
-    # 清空内容
-    if hasattr(widget, 'set_paintable'): widget.set_paintable(None)
-    elif hasattr(widget, 'set_from_pixbuf'): widget.set_from_pixbuf(None)
-    
+    if hasattr(widget, 'set_paintable'):
+        widget.set_paintable(None)
+    elif hasattr(widget, 'set_from_pixbuf'):
+        widget.set_from_pixbuf(None)
+
     def fetch():
         try:
             u = url_provider() if callable(url_provider) else url_provider
             if not u:
-                logger.debug("load_img: empty image source (widget=%s, size=%s)", type(widget).__name__, size)
                 return
-            logger.debug("load_img: start (widget=%s, size=%s, source=%s)", type(widget).__name__, size, u)
-            
+
             widget._target_url = u
-            f_path = None
-            if isinstance(u, str) and os.path.exists(u):
-                # Local file path (e.g. generated playlist collage cover)
-                f_path = u
-            else:
+            f_path = u if (isinstance(u, str) and os.path.exists(u)) else None
+            if f_path is None:
                 f_name = hashlib.md5(str(u).encode()).hexdigest()
                 f_path = os.path.join(cache_dir, f_name)
-            
-            # 下载
+
             if not os.path.exists(f_path):
                 try:
-                    req_kwargs = {"timeout": 10}
-                    if isinstance(u, str) and "resources.tidal.com/" in u:
-                        req_kwargs["headers"] = _TIDAL_IMAGE_HEADERS
-                    r = requests.get(u, **req_kwargs)
+                    headers = _TIDAL_IMAGE_HEADERS if "resources.tidal.com/" in u else {}
+                    r = requests.get(u, timeout=10, headers=headers)
                     r.raise_for_status()
                     with open(f_path, 'wb') as f:
                         f.write(r.content)
-                except requests.RequestException as e:
-                    # Retry once with browser-like headers for CDN/proxy edge cases.
+                except requests.RequestException:
                     try:
-                        retry_kwargs = {"timeout": 10, "headers": _TIDAL_IMAGE_HEADERS}
-                        r = requests.get(u, **retry_kwargs)
+                        r = requests.get(u, timeout=10, headers=_TIDAL_IMAGE_HEADERS)
                         r.raise_for_status()
                         with open(f_path, 'wb') as f:
                             f.write(r.content)
-                    except requests.RequestException:
+                    except requests.RequestException as e:
                         logger.warning("load_img: download failed (url=%s): %s", u, e)
                         return
 
-            # 判断控件类型
             w_type = type(widget).__name__
             classes = set(widget.get_css_classes()) if hasattr(widget, "get_css_classes") else set()
-            is_avatar = "circular-avatar" in classes
-            is_album_cover = "album-cover-img" in classes
-            is_playback_art = "playback-art" in classes
-            is_header_art = "header-art" in classes
-            
-            # --- 情况 A: Gtk.Picture (用于详情页大图) ---
-            if w_type == 'Picture':
-                try:
-                    pb = GdkPixbuf.Pixbuf.new_from_file(f_path)
-                    scaled_pb = pb.scale_simple(size, size, GdkPixbuf.InterpType.BILINEAR) if pb else None
-                    render_pb = scaled_pb or pb
-                    if render_pb:
-                        if is_avatar:
-                            render_pb = _rounded_pixbuf(render_pb, size // 2)
-                        elif is_playback_art:
-                            render_pb = _rounded_pixbuf(render_pb, 12)
-                        elif is_header_art:
-                            render_pb = _rounded_pixbuf(render_pb, 14)
-                        elif is_album_cover:
-                            render_pb = _rounded_pixbuf(render_pb, 10)
-                    texture = Gdk.Texture.new_for_pixbuf(render_pb)
+            radius = _get_rounded_radius(classes, size)
+
+            try:
+                pb = GdkPixbuf.Pixbuf.new_from_file(f_path)
+                if not pb:
+                    return
+
+                scaled = pb.scale_simple(size, size, GdkPixbuf.InterpType.BILINEAR)
+                if scaled and radius > 0:
+                    scaled = _rounded_pixbuf(scaled, radius)
+
+                if w_type == 'Picture':
+                    texture = Gdk.Texture.new_for_pixbuf(scaled or pb)
                     def apply_pic():
                         if hasattr(widget, '_target_url') and widget._target_url == u:
                             widget.set_size_request(size, size)
                             widget.set_paintable(texture)
-                            logger.debug("load_img: applied picture (source=%s)", u)
                     GLib.idle_add(apply_pic)
-                except Exception as e:
-                    logger.warning("load_img: failed to apply picture texture from %s: %s", f_path, e)
-
-            # --- 情况 B: Gtk.Image (用于播放栏/列表) ---
-            else:
-                try:
-                    pb = GdkPixbuf.Pixbuf.new_from_file(f_path)
-                    if pb:
-                        # 直接按目标尺寸缩放，避免大图先闪一下再回落。
-                        scaled = pb.scale_simple(size, size, GdkPixbuf.InterpType.BILINEAR)
-                        if scaled:
-                            if is_avatar:
-                                scaled = _rounded_pixbuf(scaled, size // 2)
-                            elif is_playback_art:
-                                scaled = _rounded_pixbuf(scaled, 12)
-                            elif is_header_art:
-                                scaled = _rounded_pixbuf(scaled, 14)
-                            elif is_album_cover:
-                                scaled = _rounded_pixbuf(scaled, 10)
-                        
-                        def apply_img():
-                            if hasattr(widget, '_target_url') and widget._target_url == u:
-                                # 强制锁定逻辑显示尺寸
-                                widget.set_pixel_size(size) 
-                                widget.set_from_pixbuf(scaled)
-                                logger.debug("load_img: applied image (source=%s)", u)
-                        GLib.idle_add(apply_img)
-                except Exception as e:
-                    logger.warning("load_img: failed to apply image pixbuf from %s: %s", f_path, e)
+                else:
+                    def apply_img():
+                        if hasattr(widget, '_target_url') and widget._target_url == u:
+                            widget.set_pixel_size(size)
+                            widget.set_from_pixbuf(scaled)
+                    GLib.idle_add(apply_img)
+            except Exception as e:
+                logger.warning("load_img: failed to apply image from %s: %s", f_path, e)
 
         except Exception as e:
             logger.warning("load_img: unexpected error: %s", e)
-            
+
     Thread(target=fetch, daemon=True).start()
 
 def set_pointer_cursor(widget, enable):

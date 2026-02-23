@@ -348,6 +348,11 @@ class TidalBackend:
         return False
 
     def refresh_favorite_ids(self):
+        from threading import Thread
+        thread = Thread(target=self._refresh_favorite_ids_sync, daemon=True)
+        thread.start()
+
+    def _refresh_favorite_ids_sync(self):
         try:
             if not self.user: return
             albums = self.get_recent_albums(limit=20000)
@@ -531,70 +536,9 @@ class TidalBackend:
         try:
             if not self.user:
                 return []
-            target = max(0, int(limit))
-            if target <= 0:
-                return []
-
-            tracks_api = getattr(self.user.favorites, "tracks", None)
-            if not callable(tracks_api):
-                return []
-
-            def _normalize(seq):
-                if isinstance(seq, list):
-                    return seq
-                return list(seq or [])
-
-            def _fetch_page(offset, page_size):
-                call_specs = (
-                    {"limit": page_size, "offset": offset},
-                    {"offset": offset, "limit": page_size},
-                    {"limit": page_size},
-                    {},
-                )
-                for kwargs in call_specs:
-                    try:
-                        res = tracks_api(**kwargs) if kwargs else tracks_api()
-                    except TypeError:
-                        continue
-                    page = res() if callable(res) else res
-                    return _normalize(page), kwargs
-                # Fallback: plain call if all signature probes failed.
-                res = tracks_api()
-                page = res() if callable(res) else res
-                return _normalize(page), {}
-
-            page_size = min(100, max(1, target))
-            merged = []
-            seen_ids = set()
-            offset = 0
-            while len(merged) < target:
-                page, used_kwargs = _fetch_page(offset, page_size)
-                if not page:
-                    break
-
-                new_added = 0
-                for tr in page:
-                    tid = getattr(tr, "id", None)
-                    key = f"id:{tid}" if tid is not None else f"obj:{id(tr)}"
-                    if key in seen_ids:
-                        continue
-                    seen_ids.add(key)
-                    merged.append(tr)
-                    new_added += 1
-                    if len(merged) >= target:
-                        break
-
-                # Stop if paging is unsupported or no forward progress.
-                if "offset" not in used_kwargs or new_added == 0:
-                    break
-                if len(page) < page_size:
-                    break
-
-                offset += len(page)
-                if offset > 10000:
-                    break
-
-            return merged[:target]
+            fav = getattr(self.user, "favorites", None)
+            tracks_api = getattr(fav, "tracks", None)
+            return self._paginate_favorites_api(tracks_api, limit=limit, page_size=100)
         except Exception as e:
             logger.warning("Failed to fetch favorite tracks: %s", e)
             return []
