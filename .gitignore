@@ -12,6 +12,7 @@ __pycache__/
 
 # Rust build
 target/
+**/target/
 Cargo.lock
 
 # IDE
