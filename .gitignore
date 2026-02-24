@@ -4,6 +4,7 @@ dist/
 *.flatpak
 flatpak-builddir/
 .flatpak-builder*
+flatpak/repo/
 __pycache__/
 *.pyc
 *.pyo
