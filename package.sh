@@ -401,7 +401,7 @@ build_flatpak_package() {
     flatpak-builder --force-clean --repo="$repo_dir" "$build_dir" "$flatpak_builder_file"
 
     # Export to a single .flatpak file
-    flatpak build-export --bundle-refs "$repo_dir" "dist/${APP_NAME}-${VERSION}.flatpak"
+    flatpak build-bundle --runtime-version=48 "$repo_dir" "dist/${APP_NAME}-${VERSION}.flatpak" "com.hiresti.player"
 
     echo "✅ Flatpak package created: dist/${APP_NAME}-${VERSION}.flatpak"
 }
