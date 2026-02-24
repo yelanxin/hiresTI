@@ -112,8 +112,15 @@ def on_about_clicked(self, _btn=None):
 
 def on_login_clicked(self, btn):
     """Handle login button click."""
-    from actions import ui_actions
-    ui_actions.on_login_clicked(self, btn)
+    if self.backend.user:
+        self.user_popover.popup()
+        return
+    if self._login_in_progress:
+        self.show_output_notice("Login already in progress.", "warn", 2200)
+        if self._login_dialog is not None:
+            self._login_dialog.present()
+        return
+    self._show_login_method_dialog()
 
 
 def on_logout_clicked(self, btn):
