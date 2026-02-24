@@ -142,9 +142,9 @@ if [ -f "src_rust/rust_audio_core/Cargo.toml" ]; then
 fi
 
 # 2.3 构建 Rust 启动器（/usr/bin/hiresti）
-# 注意：EL9 使用 shell 脚本，因为 Rust launcher 编译环境 glibc 版本不兼容
-if [[ "$TYPE" == "rpm-el9" || "$TYPE" == "el9" ]]; then
-    # For EL9, use a shell script wrapper (EL9 has older glibc)
+# 注意：EL9 和 DEB 使用 shell 脚本，因为 Rust launcher 编译环境 glibc 版本可能与目标系统不兼容
+if [[ "$TYPE" == "rpm-el9" || "$TYPE" == "el9" || "$TYPE" == "deb" || "$TYPE" == "all" ]]; then
+    # For EL9 and DEB, use a shell script wrapper for better compatibility
     cat <<'WRAPPER' > "$BIN_DIR/$APP_NAME"
 #!/bin/bash
 # Find the app directory
@@ -158,7 +158,7 @@ else
 fi
 WRAPPER
     chmod +x "$BIN_DIR/$APP_NAME"
-    echo "✅ Installed shell launcher for EL9: /usr/bin/$APP_NAME"
+    echo "✅ Installed shell launcher: /usr/bin/$APP_NAME"
 elif [ -f "src_rust/rust_launcher/Cargo.toml" ]; then
     if command -v cargo &> /dev/null; then
         echo "🦀 Building Rust launcher..."
