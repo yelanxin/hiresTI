@@ -11,7 +11,7 @@ from gi.repository import Gtk, GLib
 import cairo
 import math
 import logging
-from rust_viz import RustVizCore
+from _rust.viz import RustVizCore
 
 logger = logging.getLogger(__name__)
 

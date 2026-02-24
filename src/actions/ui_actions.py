@@ -11,10 +11,10 @@ import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk, GLib, Pango, Gdk, GObject
 
-import utils
-from rust_viz import RustVizCore
+import utils.helpers as utils
+from _rust.viz import RustVizCore
 from ui.track_table import LAYOUT, build_tracks_header, append_header_action_spacers
-from app_errors import classify_exception, user_message
+from core.errors import classify_exception, user_message
 
 logger = logging.getLogger(__name__)
 MAX_SEARCH_HISTORY = 10
@@ -1012,6 +1012,59 @@ def render_search_tracks_page(app):
         app.res_trk_list.append(lb_row)
 
 
+def _on_play_album_tracks(app):
+    """Play album tracks from the beginning."""
+    tracks = list(getattr(app, "current_track_list", []) or [])
+    if not tracks:
+        return
+    app.current_track_list = tracks
+    app._set_play_queue(tracks)
+    app.play_track(0)
+
+
+def _on_shuffle_album_tracks(app):
+    """Shuffle and play album tracks."""
+    tracks = list(getattr(app, "current_track_list", []) or [])
+    if not tracks:
+        return
+    # Shuffle only for playback, don't modify display list
+    import random
+    shuffled = tracks.copy()
+    random.shuffle(shuffled)
+    app._set_play_queue(shuffled)
+    app.play_track(0)
+
+
+def _ensure_play_shuffle_btns(app):
+    """Create play/shuffle buttons if needed and add them to album_action_btns_box."""
+    if not hasattr(app, "_album_play_btn") or app._album_play_btn is None:
+        app._album_play_btn = Gtk.Button(icon_name="media-playback-start-symbolic", css_classes=["flat", "circular", "history-scroll-btn"])
+        app._album_play_btn.set_tooltip_text("Play all tracks")
+        app._album_play_btn.connect("clicked", lambda _b: _on_play_album_tracks(app))
+
+        app._album_shuffle_btn = Gtk.Button(icon_name="media-playlist-shuffle-symbolic", css_classes=["flat", "circular", "history-scroll-btn"])
+        app._album_shuffle_btn.set_tooltip_text("Shuffle and play")
+        app._album_shuffle_btn.connect("clicked", lambda _b: _on_shuffle_album_tracks(app))
+
+    action_box = getattr(app, "album_action_btns_box", None)
+    if action_box:
+        child = action_box.get_first_child()
+        found = False
+        while child:
+            if child == app._album_play_btn or child == app._album_shuffle_btn:
+                found = True
+                break
+            child = child.get_next_sibling()
+        if not found:
+            action_box.append(app._album_play_btn)
+            action_box.append(app._album_shuffle_btn)
+
+    if app._album_play_btn:
+        app._album_play_btn.set_visible(True)
+    if app._album_shuffle_btn:
+        app._album_shuffle_btn.set_visible(True)
+
+
 def show_album_details(app, alb):
     current_view = app.right_stack.get_visible_child_name()
     if current_view and current_view != "tracks":
@@ -1046,6 +1099,8 @@ def show_album_details(app, alb):
         app.fav_btn.set_visible(True)
     if app.add_playlist_btn is not None:
         app.add_playlist_btn.set_visible(True)
+
+    _ensure_play_shuffle_btns(app)
 
     while c := app.track_list.get_first_child():
         app.track_list.remove(c)
@@ -1476,68 +1531,163 @@ def render_collection_dashboard(app, favorite_tracks=None, favorite_albums=None)
     app.playlist_track_list = None
     app.queue_track_list = None
 
-    albums = list(favorite_albums or [])
+    # Store all albums for pagination and search
+    app._all_albums = list(favorite_albums or [])
+    app._filtered_albums = app._all_albums
+    app._albums_page = 0
+    app._albums_page_size = 50
 
-    def _scroll_h(scroller, direction=1):
-        adj = scroller.get_hadjustment()
-        if adj is None:
-            return
-        page = max(120.0, float(adj.get_page_size()) * 0.85)
-        target = adj.get_value() + (page * direction)
-        lower = float(adj.get_lower())
-        upper = float(adj.get_upper()) - float(adj.get_page_size())
-        if target < lower:
-            target = lower
-        if target > upper:
-            target = upper
-        adj.set_value(target)
+    def _get_paginated_albums(page):
+        start = page * app._albums_page_size
+        end = start + app._albums_page_size
+        return app._filtered_albums[start:end]
 
-    def _build_two_row_section(title_text, count_text):
+    def _get_total_pages():
+        return (len(app._filtered_albums) + app._albums_page_size - 1) // app._albums_page_size
+
+    def _build_paged_grid_section():
+        """Build a paged grid section using FlowBox with pagination and search."""
         section = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, css_classes=["home-section", "history-section"])
-        head = Gtk.Box(spacing=8, css_classes=["home-section-head"])
-        head.append(Gtk.Label(label=title_text, xalign=0, hexpand=True, css_classes=["home-section-title"]))
-        head.append(Gtk.Label(label=count_text, css_classes=["home-section-count"]))
-        left_btn = Gtk.Button(icon_name="go-previous-symbolic", css_classes=["flat", "circular", "history-scroll-btn"])
-        right_btn = Gtk.Button(icon_name="go-next-symbolic", css_classes=["flat", "circular", "history-scroll-btn"])
-        head.append(left_btn)
-        head.append(right_btn)
-        section.append(head)
-        scroller = Gtk.ScrolledWindow(hexpand=True, vexpand=False, css_classes=["history-row-scroller"])
-        scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
-        grid = Gtk.Grid(column_spacing=16, row_spacing=16)
-        scroller.set_child(grid)
-        left_btn.connect("clicked", lambda _b: _scroll_h(scroller, -1))
-        right_btn.connect("clicked", lambda _b: _scroll_h(scroller, 1))
-        _bind_horizontal_scroll_buttons(scroller, left_btn, right_btn)
-        section.append(scroller)
-        return section, grid
 
-    sec_albums, grid_albums = _build_two_row_section("Saved Albums", f"{len(albums)} items")
-    for i, alb in enumerate(albums):
-        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, css_classes=["card", "home-card", "history-card"])
-        img = Gtk.Image(pixel_size=120, css_classes=["album-cover-img"])
-        cover = app.backend.get_artwork_url(alb, 320)
-        if cover:
-            utils.load_img(img, cover, app.cache_dir, 120)
-        else:
-            img.set_from_icon_name("audio-x-generic-symbolic")
-        card.append(img)
-        card.append(
-            Gtk.Label(
-                label=getattr(alb, "name", "Unknown Album"),
-                halign=Gtk.Align.CENTER,
-                ellipsize=3,
-                wrap=True,
-                max_width_chars=14,
-                css_classes=["home-card-title"],
-            )
+        # Search bar with sort and pagination
+        search_box = Gtk.Box(spacing=8, margin_start=0, margin_end=0, margin_top=6, margin_bottom=8, css_classes=["search-bar"])
+        search_entry = Gtk.Entry(placeholder_text="Search albums...", css_classes=["search-entry"])
+        search_entry.set_hexpand(True)
+        search_box.append(search_entry)
+
+        # Sort dropdown
+        sort_model = Gtk.StringList()
+        sort_model.append("Recently Added")
+        sort_model.append("Album Name (A-Z)")
+        sort_model.append("Album Name (Z-A)")
+        sort_model.append("Artist Name (A-Z)")
+        sort_model.append("Artist Name (Z-A)")
+        sort_dropdown = Gtk.DropDown(model=sort_model, css_classes=["sort-dropdown"])
+        sort_dropdown.set_tooltip_text("Sort albums")
+        sort_dropdown.set_size_request(150, -1)
+        search_box.append(sort_dropdown)
+
+        # Pagination controls
+        prev_btn = Gtk.Button(label="Prev", css_classes=["flat", "liked-action-btn"])
+        prev_btn.set_tooltip_text("Previous page")
+        search_box.append(prev_btn)
+
+        next_btn = Gtk.Button(label="Next", css_classes=["flat", "liked-action-btn"])
+        next_btn.set_tooltip_text("Next page")
+        search_box.append(next_btn)
+
+        section.append(search_box)
+
+        # FlowBox grid
+        scroller = Gtk.ScrolledWindow(hexpand=True, vexpand=True, css_classes=["history-row-scroller"])
+        scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        flow = Gtk.FlowBox(
+            homogeneous=True,
+            min_children_per_line=4,
+            max_children_per_line=10,
+            column_spacing=16,
+            row_spacing=16,
+            selection_mode=Gtk.SelectionMode.NONE,
         )
-        artist_name = getattr(getattr(alb, "artist", None), "name", "Unknown")
-        card.append(Gtk.Label(label=artist_name, halign=Gtk.Align.CENTER, ellipsize=3, css_classes=["dim-label", "home-card-subtitle"]))
-        btn = Gtk.Button(css_classes=["flat", "history-card-btn"])
-        btn.set_child(card)
-        btn.connect("clicked", lambda _b, a=alb: app.on_history_album_clicked(a))
-        grid_albums.attach(btn, i // 2, i % 2, 1, 1)
+        scroller.set_child(flow)
+        section.append(scroller)
+
+        return section, flow, prev_btn, next_btn, search_entry, sort_dropdown
+
+    def _render_album_page(flow, albums_page):
+        """Render albums for a specific page."""
+        _clear_container(flow)
+        for alb in albums_page:
+            card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, css_classes=["card", "home-card", "history-card"])
+            img = Gtk.Image(pixel_size=120, css_classes=["album-cover-img"])
+            cover = app.backend.get_artwork_url(alb, 320)
+            if cover:
+                utils.load_img(img, cover, app.cache_dir, 120)
+            else:
+                img.set_from_icon_name("audio-x-generic-symbolic")
+            card.append(img)
+            card.append(
+                Gtk.Label(
+                    label=getattr(alb, "name", "Unknown Album"),
+                    halign=Gtk.Align.CENTER,
+                    ellipsize=3,
+                    wrap=True,
+                    max_width_chars=14,
+                    css_classes=["home-card-title"],
+                )
+            )
+            artist_name = getattr(getattr(alb, "artist", None), "name", "Unknown")
+            artist_lbl = Gtk.Label(label=artist_name, halign=Gtk.Align.CENTER, ellipsize=3, max_width_chars=16, css_classes=["dim-label", "home-card-subtitle"])
+            artist_lbl.set_tooltip_text(artist_name)
+            card.append(artist_lbl)
+            btn = Gtk.Button(css_classes=["flat", "history-card-btn"])
+            btn.set_child(card)
+            btn.connect("clicked", lambda _b, a=alb: app.on_history_album_clicked(a))
+            flow.append(btn)
+
+    def _update_pagination():
+        """Update pagination UI and re-render current page."""
+        total = _get_total_pages()
+        prev_btn.set_sensitive(app._albums_page > 0)
+        next_btn.set_sensitive(app._albums_page < total - 1)
+        page_albums = _get_paginated_albums(app._albums_page)
+        _render_album_page(flow_albums, page_albums)
+
+    def _on_prev_clicked(_btn):
+        if app._albums_page > 0:
+            app._albums_page -= 1
+            _update_pagination()
+
+    def _on_next_clicked(_btn):
+        if app._albums_page < _get_total_pages() - 1:
+            app._albums_page += 1
+            _update_pagination()
+
+    def _on_search_changed(entry):
+        """Handle search input."""
+        query = entry.get_text().strip().lower()
+        if not query:
+            app._filtered_albums = app._all_albums
+        else:
+            app._filtered_albums = [
+                alb for alb in app._all_albums
+                if query in getattr(alb, "name", "").lower()
+                or query in getattr(getattr(alb, "artist", None), "name", "").lower()
+            ]
+        app._albums_page = 0
+        _apply_sort()
+        _update_pagination()
+
+    def _on_sort_changed(dropdown, _pspec):
+        """Handle sort option change."""
+        _apply_sort()
+        app._albums_page = 0
+        _update_pagination()
+
+    def _apply_sort():
+        """Apply current sort option to filtered albums."""
+        sort_idx = sort_dropdown.get_selected()
+        if sort_idx == 0:  # Recently Added
+            pass
+        elif sort_idx == 1:  # Album Name (A-Z)
+            app._filtered_albums.sort(key=lambda a: getattr(a, "name", "").lower())
+        elif sort_idx == 2:  # Album Name (Z-A)
+            app._filtered_albums.sort(key=lambda a: getattr(a, "name", "").lower(), reverse=True)
+        elif sort_idx == 3:  # Artist Name (A-Z)
+            app._filtered_albums.sort(key=lambda a: getattr(getattr(a, "artist", None), "name", "").lower())
+        elif sort_idx == 4:  # Artist Name (Z-A)
+            app._filtered_albums.sort(key=lambda a: getattr(getattr(a, "artist", None), "name", "").lower(), reverse=True)
+
+    # Build the section
+    sec_albums, flow_albums, prev_btn, next_btn, search_entry, sort_dropdown = _build_paged_grid_section()
+    prev_btn.connect("clicked", _on_prev_clicked)
+    next_btn.connect("clicked", _on_next_clicked)
+    search_entry.connect("changed", _on_search_changed)
+    sort_dropdown.connect("notify::selected", _on_sort_changed)
+
+    # Initial render
+    _apply_sort()
+    _update_pagination()
     app.collection_content_box.append(sec_albums)
 
 

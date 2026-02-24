@@ -1,10 +1,46 @@
 import json
+import logging
 import os
-from typing import Any, Optional, Union
+from dataclasses import dataclass, field, fields
+from typing import Any, Optional
 
+logger = logging.getLogger(__name__)
 
 CURRENT_SETTINGS_VERSION = 2
 
+
+@dataclass
+class SettingsSchema:
+    """Settings schema using dataclass for declarative validation."""
+
+    settings_version: int = CURRENT_SETTINGS_VERSION
+    driver: str = "Auto (Default)"
+    device: str = "Default Output"
+    bit_perfect: bool = False
+    exclusive_lock: bool = False
+    latency_profile: str = "Standard (100ms)"
+    volume: int = 80
+    play_mode: int = 0
+    last_nav: str = "home"
+    last_view: str = "grid_view"
+    viz_expanded: bool = False
+    spectrum_theme: int = 0
+    viz_backend_policy: int = 0
+    viz_bar_count: int = 32
+    viz_profile: int = 1
+    viz_effect: int = 3
+    lyrics_font_preset: int = 1
+    lyrics_bg_motion: int = 1
+    lyrics_user_offset_ms: int = 0
+    viz_sync_offset_ms: int = 0
+    viz_sync_device_offsets: dict = field(default_factory=dict)
+    paned_position: int = 0
+    search_history: list = field(default_factory=list)
+    audio_cache_tracks: int = 20
+    output_auto_rebind_once: bool = False
+
+
+# Default settings as dict for quick access
 DEFAULT_SETTINGS = {
     "settings_version": CURRENT_SETTINGS_VERSION,
     "driver": "Auto (Default)",
@@ -34,6 +70,36 @@ DEFAULT_SETTINGS = {
 }
 
 
+# Validation rules: (key, type_check, min_val, max_val, default)
+# type_check: 0=int, 1=str, 2=bool, 3=list[str], 4=dict
+_VALIDATION_RULES = {
+    "settings_version": (int, 0, None, CURRENT_SETTINGS_VERSION),
+    "driver": (str, None, None, "Auto (Default)"),
+    "device": (str, None, None, "Default Output"),
+    "bit_perfect": (bool, None, None, False),
+    "exclusive_lock": (bool, None, None, False),
+    "latency_profile": (str, None, None, "Standard (100ms)"),
+    "volume": (int, 0, 100, 80),
+    "play_mode": (int, 0, 3, 0),
+    "last_nav": (str, None, None, "home"),
+    "last_view": (str, None, None, "grid_view"),
+    "viz_expanded": (bool, None, None, False),
+    "spectrum_theme": (int, 0, 64, 0),
+    "viz_backend_policy": (int, 0, 1, 0),
+    "viz_bar_count": (int, 4, 128, 32),
+    "viz_profile": (int, 0, 3, 1),
+    "viz_effect": (int, 0, 16, 3),
+    "lyrics_font_preset": (int, 0, 2, 1),
+    "lyrics_bg_motion": (int, 0, 2, 1),
+    "lyrics_user_offset_ms": (int, -2000, 2000, 0),
+    "viz_sync_offset_ms": (int, -500, 500, 0),
+    "paned_position": (int, 0, None, 0),
+    "search_history": (list, None, None, []),
+    "audio_cache_tracks": (int, 0, 200, 20),
+    "output_auto_rebind_once": (bool, None, None, False),
+}
+
+
 def _as_bool(value: Any, default: bool) -> bool:
     if isinstance(value, bool):
         return value
@@ -42,7 +108,7 @@ def _as_bool(value: Any, default: bool) -> bool:
 
 def _as_str(value: Any, default: str) -> str:
     if isinstance(value, str) and value.strip():
-        return value
+        return value.strip()
     return default
 
 
@@ -56,10 +122,10 @@ def _as_int(value: Any, default: int, minimum: Optional[int] = None, maximum: Op
     return value
 
 
-def _as_str_list(value: Any, default: list[str], max_items: int = 10) -> list[str]:
+def _as_str_list(value: Any, default: list, max_items: int = 10) -> list:
     if not isinstance(value, list):
         return list(default)
-    out: list[str] = []
+    out = []
     for item in value:
         if isinstance(item, str) and item.strip():
             out.append(item.strip())
@@ -70,14 +136,14 @@ def _as_str_list(value: Any, default: list[str], max_items: int = 10) -> list[st
 
 def _as_int_dict(
     value: Any,
-    default: dict[str, int],
+    default: dict,
     minimum: int = -500,
     maximum: int = 500,
     max_items: int = 64,
-) -> dict[str, int]:
+) -> dict:
     if not isinstance(value, dict):
         return dict(default)
-    out: dict[str, int] = {}
+    out = {}
     for k, v in value.items():
         if not isinstance(k, str) or not k:
             continue

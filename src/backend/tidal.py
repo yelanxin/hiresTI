@@ -28,7 +28,7 @@ class TidalBackend:
         self.fav_album_ids = set()
         self.fav_artist_ids = set()
         self.fav_track_ids = set()
-        self._artist_artwork_cache = {}
+        self._artist_artwork_cache = {}  # LRU cache using dict (ordered in Python 3.7+)
         self.max_artist_artwork_cache = 500  # Limit cache size to prevent memory leak
         self._artist_placeholder_uuids = {
             "1e01cdb6-f15d-4d8b-8440-a047976c1cac",
@@ -39,7 +39,7 @@ class TidalBackend:
                 val = raw.strip().lower()
                 if val:
                     self._artist_placeholder_uuids.add(val)
-        self.lyrics_cache = {}
+        self.lyrics_cache = {}  # LRU cache using dict (ordered in Python 3.7+)
         self.max_lyrics_cache = 300
         self._last_login_error = ""
         # Circuit breaker for unstable mix endpoint.
@@ -1543,6 +1543,13 @@ class TidalBackend:
         if cache_key and cache_key in self._artist_artwork_cache:
             cached = self._artist_artwork_cache[cache_key]
             if cached:
+                # LRU: move to end (most recently used)
+                # Use try-except for compatibility with dict subclasses
+                try:
+                    self._artist_artwork_cache.move_to_end(cache_key)
+                except AttributeError:
+                    # Fallback for dict subclasses without move_to_end
+                    self._artist_artwork_cache[cache_key] = self._artist_artwork_cache.pop(cache_key)
                 logger.debug(
                     "Artist artwork cache hit: id=%s name=%r size=%s url=%s",
                     artist_id,
@@ -1658,13 +1665,11 @@ class TidalBackend:
             return None
         finally:
             if cache_key and chosen_url:
-                # Enforce cache size limit to prevent memory leak
-                if len(self._artist_artwork_cache) >= self.max_artist_artwork_cache:
-                    # Remove oldest 10% of entries
-                    keys_to_remove = list(self._artist_artwork_cache.keys())[:max(1, self.max_artist_artwork_cache // 10)]
-                    for k in keys_to_remove:
-                        del self._artist_artwork_cache[k]
+                # LRU: add new entry at end (most recently used position)
                 self._artist_artwork_cache[cache_key] = chosen_url
+                # Enforce cache size limit: remove oldest entries from beginning
+                while len(self._artist_artwork_cache) > self.max_artist_artwork_cache:
+                    self._artist_artwork_cache.popitem(last=False)
 
     def get_stream_url(self, track):
         preferred = self.quality
@@ -1786,6 +1791,13 @@ class TidalBackend:
     def get_lyrics(self, track_id):
         logger.debug("Fetching lyrics for track id: %s", track_id)
         if track_id in self.lyrics_cache:
+            # LRU: move to end (most recently used)
+            # Use try-except for compatibility with dict subclasses
+            try:
+                self.lyrics_cache.move_to_end(track_id)
+            except AttributeError:
+                # Fallback for dict subclasses without move_to_end
+                self.lyrics_cache[track_id] = self.lyrics_cache.pop(track_id)
             logger.debug("Lyrics cache hit for track id: %s", track_id)
             return self.lyrics_cache.get(track_id)
 
@@ -1820,11 +1832,11 @@ class TidalBackend:
             return None
 
     def _cache_lyrics(self, track_id, value):
+        # LRU: add new entry at end (most recently used position)
         self.lyrics_cache[track_id] = value
-        if len(self.lyrics_cache) <= self.max_lyrics_cache:
-            return
-        oldest_key = next(iter(self.lyrics_cache))
-        self.lyrics_cache.pop(oldest_key, None)
+        # Enforce cache size limit: remove oldest entries from beginning
+        while len(self.lyrics_cache) > self.max_lyrics_cache:
+            self.lyrics_cache.popitem(last=False)
 
     def logout(self):
         for token_path in (self.token_file, self.legacy_token_file):

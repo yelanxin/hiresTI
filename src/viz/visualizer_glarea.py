@@ -7,7 +7,7 @@ import os
 import logging
 import ctypes
 from collections import deque
-from rust_viz import RustVizCore
+from _rust.viz import RustVizCore
 
 logger = logging.getLogger(__name__)
 try:

@@ -2,7 +2,7 @@ from threading import Thread
 import logging
 
 from gi.repository import Gtk, GLib
-from app_errors import classify_exception, user_message
+from core.errors import classify_exception, user_message
 from actions import audio_settings_actions
 
 logger = logging.getLogger(__name__)

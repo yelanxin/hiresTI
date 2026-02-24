@@ -13,7 +13,7 @@ import math
 import logging
 from copy import deepcopy
 from visualizer import SpectrumVisualizer
-from rust_viz import RustVizCore
+from _rust.viz import RustVizCore
 
 logger = logging.getLogger(__name__)
 

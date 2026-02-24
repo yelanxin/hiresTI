@@ -10,6 +10,8 @@ gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
 from gi.repository import Gtk, Adw, GLib
 
+from core.executor import submit_daemon
+
 logger = logging.getLogger(__name__)
 
 

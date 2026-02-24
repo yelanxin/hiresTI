@@ -15,7 +15,7 @@ from visualizer import SpectrumVisualizer
 from visualizer_gpu import SpectrumVisualizerGPU
 from visualizer_glarea import SpectrumVisualizerGLArea
 from background_viz import BackgroundVisualizer
-import ui_config
+from ui import config as ui_config
 
 logger = logging.getLogger(__name__)
 

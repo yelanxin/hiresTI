@@ -1090,19 +1090,22 @@ class TidalApp(Adw.Application):
                 pass
 
     def _should_enable_spectrum_stream(self):
-        revealer = getattr(self, "viz_revealer", None)
-        if revealer is None or (not revealer.get_reveal_child()):
+        # Keep the spectrum stream alive regardless of viz visibility so that
+        # _last_spectrum_frame stays fresh and the viz opens instantly without
+        # a 0.5-1 s FFT-restart stutter.  on_spectrum_data() already skips
+        # rendering (early-return) when the revealer is closed, so no extra
+        # draw work is done while the viz is hidden.
+        if getattr(self, "player", None) is None:
             return False
+        # Lyrics static mode genuinely needs no live data.
         page = str(getattr(self, "_viz_current_page", "spectrum") or "spectrum")
-        if page == "spectrum":
-            return True
-        # Lyrics tab: Static background does not need live spectrum data.
         if page == "lyrics":
-            motion_idx = int(self.settings.get("lyrics_bg_motion", 1) or 0)
-            if motion_idx == 0:
-                return False
-            return True
-        return False
+            revealer = getattr(self, "viz_revealer", None)
+            if revealer is not None and revealer.get_reveal_child():
+                motion_idx = int(self.settings.get("lyrics_bg_motion", 1) or 0)
+                if motion_idx == 0:
+                    return False
+        return True
 
     def _sync_spectrum_stream_state(self):
         self._sync_viz_tab_runtime_state()
@@ -1234,13 +1237,27 @@ class TidalApp(Adw.Application):
             self.body_overlay.connect("notify::height", self.update_layout_proportions)
         self.paned.connect("notify::position", self.on_paned_position_changed)
         GLib.idle_add(self._restore_paned_position_after_layout)
-        GLib.idle_add(lambda: (self._schedule_viz_handle_realign(), False)[1])
+        GLib.idle_add(lambda: (self._schedule_viz_handle_realign(animate=False), False)[1])
 
         self._schedule_update_ui_loop(40)
         self._schedule_output_status_loop(1000)
         GLib.timeout_add(260, self._prewarm_gl_visualizer_once)
         GLib.timeout_add(80, self._start_spectrum_stream_prewarm)
         self._init_tray_icon()
+        # Ensure overlay handles are visible after UI is fully built.
+        GLib.timeout_add(0, self._ensure_overlay_handles_visible)
+
+    def _ensure_overlay_handles_visible(self):
+        """Ensure overlay handles are visible after UI is fully built."""
+        viz_handle_box = getattr(self, "viz_handle_box", None)
+        if viz_handle_box is not None:
+            viz_handle_box.set_visible(True)
+            viz_handle_box.queue_resize()
+        queue_anchor = getattr(self, "queue_anchor", None)
+        if queue_anchor is not None:
+            queue_anchor.set_visible(True)
+            queue_anchor.queue_resize()
+        return GLib.SOURCE_REMOVE
 
     def _prewarm_gl_visualizer_once(self):
         # Warm up GLArea realize/shader path once without visible drawer motion.
@@ -1776,15 +1793,11 @@ class TidalApp(Adw.Application):
         revealer = getattr(self, "viz_revealer", None)
         if revealer is None or (not revealer.get_reveal_child()):
             return
-        # If we already have a recent real frame, no need for synthetic bootstrap.
-        # But when opening quickly after close, spectrum stream may still be in
-        # deferred re-enable window (_viz_open_stream_source active), and
-        # _last_spectrum_ts can look "fresh" while no new frames are actually
-        # flowing yet. In that case we should still start placeholder to avoid
-        # a visible 0.5~1s freeze.
+        # With the always-on stream policy, _last_spectrum_ts is kept current
+        # while audio is playing.  If a fresh frame arrived recently, skip the
+        # synthetic placeholder entirely — real callbacks will flow right away.
         now = time.monotonic()
-        stream_reenable_pending = bool(int(getattr(self, "_viz_open_stream_source", 0) or 0))
-        if (not stream_reenable_pending) and ((now - float(getattr(self, "_last_spectrum_ts", 0.0) or 0.0)) < 0.35):
+        if (now - float(getattr(self, "_last_spectrum_ts", 0.0) or 0.0)) < 0.35:
             return
 
         try:
@@ -2971,14 +2984,17 @@ class TidalApp(Adw.Application):
         if self.fav_btn is not None:
             self.fav_btn.set_visible(False)
         if self.add_playlist_btn is not None:
-            self.add_playlist_btn.set_visible(True)
+            self.add_playlist_btn.set_visible(False)
         if self.remote_playlist_edit_btn is not None:
-            self.remote_playlist_edit_btn.set_visible(True)
+            self.remote_playlist_edit_btn.set_visible(False)
         if self.remote_playlist_visibility_btn is not None:
-            self.remote_playlist_visibility_btn.set_visible(True)
+            self.remote_playlist_visibility_btn.set_visible(False)
         if self.remote_playlist_more_btn is not None:
             self.remote_playlist_more_btn.set_visible(True)
         self._refresh_remote_playlist_visibility_button(playlist_obj)
+        # Ensure play/shuffle buttons exist and are visible
+        from actions.ui_actions import _ensure_play_shuffle_btns
+        _ensure_play_shuffle_btns(self)
         utils.load_img(self.header_art, lambda: self.backend.get_artwork_url(playlist_obj, 640), self.cache_dir, 160)
 
         while c := self.track_list.get_first_child():
@@ -2997,23 +3013,17 @@ class TidalApp(Adw.Application):
         submit_daemon(task)
 
     def _refresh_remote_playlist_visibility_button(self, playlist_obj=None):
-        btn = getattr(self, "remote_playlist_visibility_btn", None)
-        if btn is None:
-            return
         pl = playlist_obj or getattr(self, "current_remote_playlist", None)
         if pl is None:
-            btn.set_visible(False)
             return
         is_public = bool(getattr(pl, "public", False))
-        btn.set_icon_name("changes-allow-symbolic" if is_public else "changes-prevent-symbolic")
-        btn.set_tooltip_text("Click to make private" if is_public else "Click to make public")
-        try:
-            if is_public:
-                btn.add_css_class("liked-action-btn-primary")
-            else:
-                btn.remove_css_class("liked-action-btn-primary")
-        except Exception:
-            pass
+        # Update menu item icon and label
+        icon = getattr(self, "_vis_menu_icon", None)
+        label = getattr(self, "_vis_menu_label", None)
+        if icon is not None:
+            icon.set_from_icon_name("changes-allow-symbolic" if is_public else "changes-prevent-symbolic")
+        if label is not None:
+            label.set_text("Make Private" if is_public else "Make Public")
 
     def on_remote_playlist_toggle_public_clicked(self, _btn=None, playlist_obj=None):
         pl = playlist_obj or getattr(self, "current_remote_playlist", None)
@@ -4013,14 +4023,26 @@ class TidalApp(Adw.Application):
 
     def _update_list_ui(self, index):
         """更新列表选中状态。"""
-        if self.list_box is None: return
-
-        try:
-            row = self.list_box.get_row_at_index(index)
-            if row:
-                self.list_box.select_row(row)
-        except Exception as e:
-            logger.warning("List update failed: %s", e)
+        playing_id = getattr(self, "playing_track_id", None)
+        if not playing_id:
+            return
+        candidates = [
+            getattr(self, "track_list", None),
+            getattr(self, "liked_track_list", None),
+            getattr(self, "playlist_track_list", None),
+        ]
+        for track_list in candidates:
+            if track_list is None:
+                continue
+            try:
+                row = track_list.get_first_child()
+                while row:
+                    if getattr(row, "track_id", None) == playing_id:
+                        track_list.select_row(row)
+                        break
+                    row = row.get_next_sibling()
+            except Exception as e:
+                logger.warning("List update failed: %s", e)
 
 
     def _get_tidal_image_url(self, uuid, width=320, height=320):
@@ -4173,12 +4195,12 @@ class TidalApp(Adw.Application):
         else:
             s_px = max(int(self.win.get_width() * ui_config.SIDEBAR_RATIO), 240)
         self.paned.set_position(s_px)
-        GLib.idle_add(lambda: (self._schedule_viz_handle_realign(), False)[1])
+        GLib.idle_add(lambda: (self._schedule_viz_handle_realign(animate=False), False)[1])
 
-    def _schedule_viz_handle_realign(self):
+    def _schedule_viz_handle_realign(self, animate=True):
         # Immediate pass + delayed retries to survive fullscreen/restore re-allocation jitter.
         expanded = bool(getattr(self, "viz_revealer", None) is not None and self.viz_revealer.get_reveal_child())
-        self._position_viz_handle(expanded)
+        self._position_viz_handle(expanded, animate=animate)
 
         if self._viz_handle_resize_source:
             GLib.source_remove(self._viz_handle_resize_source)
@@ -4188,7 +4210,7 @@ class TidalApp(Adw.Application):
 
         def _retry():
             expanded_now = bool(getattr(self, "viz_revealer", None) is not None and self.viz_revealer.get_reveal_child())
-            self._position_viz_handle(expanded_now)
+            self._position_viz_handle(expanded_now, animate=animate)
             self._viz_handle_resize_retries -= 1
             if self._viz_handle_resize_retries <= 0:
                 self._viz_handle_resize_source = 0
@@ -4465,12 +4487,23 @@ class TidalApp(Adw.Application):
             self._viz_trace_last_cb_ts = 0.0
             self._viz_trace_first_real_logged = False
             self._viz_seed_frame = list(self._last_spectrum_frame) if self._last_spectrum_frame else None
-            self._viz_warmup_until = time.monotonic() + float(self._viz_warmup_duration_s)
+            # If the stream was kept alive (always-on policy), _last_spectrum_frame
+            # is fresh (<= 0.5 s old) — no blending warmup is needed.  Only warm up
+            # when opening from a cold state (first ever open, or after a long pause
+            # where no spectrum callbacks arrived).
+            now_open = time.monotonic()
+            last_ts = float(getattr(self, "_last_spectrum_ts", 0.0) or 0.0)
+            frame_is_fresh = self._viz_seed_frame and ((now_open - last_ts) < 0.5)
+            if frame_is_fresh:
+                self._viz_warmup_until = 0.0  # skip warmup; real data is already flowing
+            else:
+                self._viz_warmup_until = now_open + float(self._viz_warmup_duration_s)
             if trace:
                 logger.info(
-                    "VIZ TRACE drawer-open: seed=%s warmup=%.2fs page=%s",
+                    "VIZ TRACE drawer-open: seed=%s fresh=%s warmup=%.2fs page=%s",
                     bool(self._viz_seed_frame),
-                    float(self._viz_warmup_duration_s),
+                    frame_is_fresh,
+                    max(0.0, self._viz_warmup_until - now_open),
                     str(getattr(self, "_viz_current_page", "spectrum")),
                 )
         if self._viz_open_layout_source:
@@ -4487,33 +4520,36 @@ class TidalApp(Adw.Application):
         if expanded:
             self._start_viz_handle_follow_transition()
         if expanded:
-            # Enable stream immediately to avoid "never started" corner cases,
-            # then keep deferred sync for layout-friendly startup.
+            # Stream is kept alive (always-on policy), so _sync here is a no-op
+            # in the normal case.  Call it anyway as a safety net for edge cases
+            # (first open, lyrics-static mode change, etc.).
             self._sync_spectrum_stream_state()
-            # First-open smoothness: let reveal animation run first, then do heavier work.
+            # Layout padding / handle position can be deferred (not latency-critical).
             def _defer_open_layout():
                 self._viz_open_layout_source = 0
                 self._apply_overlay_scroll_padding(True)
                 self._position_viz_handle(True, animate=False)
                 return False
 
-            def _defer_open_stream():
-                self._viz_open_stream_source = 0
-                self._sync_spectrum_stream_state()
-                if self._viz_seed_frame:
-                    page = str(getattr(self, "_viz_current_page", "spectrum") or "spectrum")
-                    if page == "spectrum" and getattr(self, "viz", None) is not None:
-                        self.viz.update_data(self._viz_seed_frame)
-                    if page == "lyrics" and getattr(self, "bg_viz", None) is not None:
-                        self.bg_viz.update_energy(self._viz_seed_frame)
-                return False
-
             self._viz_open_layout_source = GLib.timeout_add(220, _defer_open_layout)
-            self._viz_open_stream_source = GLib.timeout_add(260, _defer_open_stream)
+
+            # Seed the visualizer immediately with the last known frame so the
+            # animation tick has something to draw right away.
+            if self._viz_seed_frame:
+                page = str(getattr(self, "_viz_current_page", "spectrum") or "spectrum")
+                if page == "spectrum" and getattr(self, "viz", None) is not None:
+                    self.viz.update_data(self._viz_seed_frame)
+                if page == "lyrics" and getattr(self, "bg_viz", None) is not None:
+                    self.bg_viz.update_energy(self._viz_seed_frame)
+
+            # Placeholder is only needed when there is no fresh real frame yet
+            # (e.g. app just started, no audio ever played).
             self._start_viz_placeholder_if_needed()
         else:
-            # Closing should stop spectrum stream and restore layout immediately.
-            self._sync_spectrum_stream_state()
+            # Keep the spectrum stream running (always-on) so _last_spectrum_frame
+            # stays fresh for instant re-open.  We only clean up layout and the
+            # placeholder animation — no need to call _sync_spectrum_stream_state()
+            # which would (no longer) disable the stream anyway.
             self._apply_overlay_scroll_padding(False)
             self._position_viz_handle(False)
             self._stop_viz_placeholder()
@@ -4663,6 +4699,7 @@ class TidalApp(Adw.Application):
         target_start = int(round(center_x - (handle_w / 2.0)))
         if overlay_w > 0:
             target_start = max(0, min(max(0, overlay_w - handle_w), target_start))
+        target_start = max(0, target_start)
         box.set_halign(Gtk.Align.START)
         box.set_margin_start(target_start)
         box.set_margin_end(0)

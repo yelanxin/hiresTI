@@ -187,7 +187,7 @@ def build_tracks_view(app):
     info.append(app.header_artist)
     info.append(app.header_meta)
 
-    app.fav_btn = Gtk.Button(css_classes=["heart-btn"], icon_name="hiresti-favorite-outline-symbolic", valign=Gtk.Align.CENTER)
+    app.fav_btn = Gtk.Button(css_classes=["flat", "album-fav-btn"], icon_name="hiresti-favorite-outline-symbolic", valign=Gtk.Align.CENTER)
     app.fav_btn.connect("clicked", app.on_fav_clicked)
     app.add_playlist_btn = Gtk.Button(icon_name="list-add-symbolic", css_classes=["flat", "circular", "history-scroll-btn"], valign=Gtk.Align.CENTER)
     app.add_playlist_btn.set_tooltip_text("Add Album Tracks to Playlist")
@@ -207,12 +207,41 @@ def build_tracks_view(app):
     app.remote_playlist_more_pop.set_parent(app.remote_playlist_more_btn)
     more_box = Gtk.Box(
         orientation=Gtk.Orientation.VERTICAL,
-        spacing=4,
-        margin_top=8,
-        margin_bottom=8,
-        margin_start=8,
-        margin_end=8,
+        spacing=0,
+        margin_top=4,
+        margin_bottom=4,
+        margin_start=4,
+        margin_end=4,
+        css_classes=["playlist-more-menu"],
     )
+    # Edit Playlist
+    edit_menu_btn = Gtk.Button(css_classes=["flat"])
+    edit_menu_row = Gtk.Box(spacing=8)
+    edit_menu_row.append(Gtk.Image.new_from_icon_name("document-edit-symbolic"))
+    edit_menu_row.append(Gtk.Label(label="Edit Playlist", xalign=0))
+    edit_menu_btn.set_child(edit_menu_row)
+    edit_menu_btn.connect("clicked", lambda _b: (app.remote_playlist_more_pop.popdown(), app.on_remote_playlist_rename_clicked()))
+    more_box.append(edit_menu_btn)
+    # Toggle Visibility
+    vis_menu_btn = Gtk.Button(css_classes=["flat"])
+    vis_menu_row = Gtk.Box(spacing=8)
+    app._vis_menu_icon = Gtk.Image.new_from_icon_name("changes-prevent-symbolic")
+    app._vis_menu_label = Gtk.Label(label="Make Public", xalign=0)
+    vis_menu_row.append(app._vis_menu_icon)
+    vis_menu_row.append(app._vis_menu_label)
+    vis_menu_btn.set_child(vis_menu_row)
+    vis_menu_btn.connect("clicked", lambda _b: (app.remote_playlist_more_pop.popdown(), app.on_remote_playlist_toggle_public_clicked()))
+    more_box.append(vis_menu_btn)
+    # Add to Playlist
+    add_menu_btn = Gtk.Button(css_classes=["flat"])
+    add_menu_row = Gtk.Box(spacing=8)
+    add_menu_row.append(Gtk.Image.new_from_icon_name("list-add-symbolic"))
+    add_menu_row.append(Gtk.Label(label="Add to Playlist", xalign=0))
+    add_menu_btn.set_child(add_menu_row)
+    add_menu_btn.connect("clicked", lambda _b: (app.remote_playlist_more_pop.popdown(), app.on_add_current_album_to_playlist()))
+    more_box.append(add_menu_btn)
+    more_box.append(Gtk.Separator())
+    # Move to Folder
     move_btn = Gtk.Button(css_classes=["flat"])
     move_row = Gtk.Box(spacing=8)
     move_row.append(Gtk.Image.new_from_icon_name("folder-open-symbolic"))
@@ -230,13 +259,14 @@ def build_tracks_view(app):
     app.remote_playlist_more_pop.set_child(more_box)
     app.remote_playlist_more_btn.connect("clicked", lambda _b: app.remote_playlist_more_pop.popup())
 
+    app.album_action_btns_box = Gtk.Box(spacing=4, valign=Gtk.Align.CENTER, css_classes=["album-action-btns"])
+    app.album_action_btns_box.append(app.remote_playlist_more_btn)
+    app.album_action_btns_box.append(app.fav_btn)
+    app.album_action_btns_box.append(app.add_playlist_btn)
+
     app.album_header_box.append(app.header_art)
     app.album_header_box.append(info)
-    app.album_header_box.append(app.add_playlist_btn)
-    app.album_header_box.append(app.remote_playlist_edit_btn)
-    app.album_header_box.append(app.remote_playlist_visibility_btn)
-    app.album_header_box.append(app.remote_playlist_more_btn)
-    app.album_header_box.append(app.fav_btn)
+    app.album_header_box.append(app.album_action_btns_box)
     trk_content.append(app.album_header_box)
 
     tracks_head, head_btns = build_tracks_header(

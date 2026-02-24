@@ -64,8 +64,6 @@ def on_nav_selected(app, box, row):
 
     if row.nav_id == "collection":
         app.grid_title_label.set_text("My Albums")
-        if hasattr(app, "grid_subtitle_label") and app.grid_subtitle_label is not None:
-            app.grid_subtitle_label.set_text("Your saved albums")
         loading = Gtk.Label(
             label="Loading albums...",
             xalign=0,
@@ -77,10 +75,17 @@ def on_nav_selected(app, box, row):
         if app.backend.user:
             def task():
                 albums = list(app.backend.get_recent_albums())
-                GLib.idle_add(app.render_collection_dashboard, [], albums)
+                album_count = len(albums)
+                def update():
+                    if hasattr(app, "grid_subtitle_label") and app.grid_subtitle_label is not None:
+                        app.grid_subtitle_label.set_text(f"{album_count} saved albums")
+                    app.render_collection_dashboard([], albums)
+                GLib.idle_add(update)
 
             Thread(target=task, daemon=True).start()
         else:
+            if hasattr(app, "grid_subtitle_label") and app.grid_subtitle_label is not None:
+                app.grid_subtitle_label.set_text("0 saved albums")
             app.render_collection_dashboard([], [])
         return
 
