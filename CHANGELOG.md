@@ -1,25 +1,7 @@
 # Changelog
 
-## 1.2.7 - 2026-02-24
-Packaging: dependency and Flatpak Rust source path fixes across all package formats.
-
-### Fixed
-- DEB `Architecture` changed from `all` to the actual host architecture — packages contain arch-specific Rust `.so` files and must not be marked architecture-independent.
-- DEB output filename now reflects the real architecture (e.g. `hiresti_1.2.7_amd64.deb`).
-- DEB `Depends`: added `gstreamer1.0-plugins-base` (provides `GstPbutils`, required by the audio pipeline).
-- RPM `Requires` (both Fedora and EL9): added `python3-cairo` and `gstreamer1-plugins-base`.
-- Arch `.PKGINFO`: corrected `libpipewire` → `pipewire` (actual Arch package name); removed `python-pillow` and `python-requests` from system dependencies (already bundled via pip install).
-- Flatpak Rust module source paths: `path: ../..` + `cd hiresTI/src_rust/…` changed to `path: ..` + `cd src_rust/…` — the old paths required the repo to be inside a directory named exactly `hiresTI`.
-- Flatpak build now runs `cargo vendor` before invoking `flatpak-builder` so the `vendor/` directory is present for the offline `cargo build --release --offline` step inside the sandbox.
-- Shell launcher: removed dead `if [ -f "$APP_DIR/src/main.py" ]` branch — source files are installed flat to `/usr/share/hiresti/`, the `src/` subdirectory never exists in the installed package.
-
-### Changed
-- `requirements.txt` synced with the pip install list in `package.sh`: added `Pillow`, `python-dateutil`, `typing-extensions`, `isodate`, `mpegdash`, `pyaes`, `ratelimit`, `six`, `certifi`.
-
----
-
 ## 1.2.6 - 2026-02-24
-Performance: Liked Songs and My Albums load speed improvements, config directory fixes.
+Performance: Liked Songs and My Albums load speed improvements, config directory fixes, and packaging corrections.
 
 ### Added
 - My Albums now shows a cached instant first paint on repeated visits — no more "Loading albums..." wait when returning to the page.
@@ -34,12 +16,20 @@ Performance: Liked Songs and My Albums load speed improvements, config directory
 - `get_artwork_url()` in My Albums card rendering moved from the GTK main thread to a background worker thread; placeholder icon shown immediately.
 - Image loading (`load_img`) now uses a bounded `ThreadPoolExecutor` (max 8 workers) instead of spawning one unbounded `Thread` per image, preventing thread explosion on large album/artist pages.
 - `_refresh_track_fav_button` now performs the favorite state lookup synchronously (O(1) local set read) instead of submitting a daemon thread per track row.
+- `requirements.txt` synced with the pip install list in `package.sh`: added `Pillow`, `python-dateutil`, `typing-extensions`, `isodate`, `mpegdash`, `pyaes`, `ratelimit`, `six`, `certifi`.
 
 ### Fixed
 - Token files (`hiresti_token.json`) and `settings.json` are now stored in the XDG config directory (`~/.config/hiresti` / `~/.var/app/.../config/hiresti`) instead of the cache directory, so clearing the cache no longer logs users out or resets settings.
 - One-time silent migration: on first launch after upgrade, existing token and settings files are automatically moved from the old cache path to the new config path — no manual action or re-login required.
 - Removed leftover `[DEBUG] print()` statements from `save_session()` that were leaking to stderr in production builds.
 - `_refresh_favorite_ids_sync` no longer issues a duplicate `get_recent_albums` API call on login when the album cache is already fresh from the UI load.
+- DEB `Architecture` changed from `all` to the actual host architecture — packages contain arch-specific Rust `.so` files and must not be marked architecture-independent. Output filename updated accordingly (e.g. `hiresti_1.2.6_amd64.deb`).
+- DEB `Depends`: added `gstreamer1.0-plugins-base` (provides `GstPbutils`, required by the audio pipeline).
+- RPM `Requires` (both Fedora and EL9): added `python3-cairo` and `gstreamer1-plugins-base`.
+- Arch `.PKGINFO`: corrected `libpipewire` → `pipewire`; removed `python-pillow` and `python-requests` (already bundled via pip install).
+- Flatpak Rust module source paths fixed: `path: ../..` + `cd hiresTI/src_rust/…` → `path: ..` + `cd src_rust/…` — the old paths required the repo to be inside a directory named exactly `hiresTI`.
+- Flatpak build now runs `cargo vendor` before invoking `flatpak-builder` so the `vendor/` directory is available for the offline `cargo build --release --offline` step inside the sandbox.
+- Shell launcher: removed dead `if [ -f "$APP_DIR/src/main.py" ]` branch — source files are installed flat to `/usr/share/hiresti/`.
 
 ---
 
