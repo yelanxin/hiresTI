@@ -15,6 +15,13 @@ TYPE="${1:-}"
 VERSION="${2:-}"
 USE_PY_BINARY="${HIRESTI_PY_BINARY:-0}"
 
+# Compute DEB architecture string (e.g. amd64, arm64)
+if command -v dpkg-deb &>/dev/null; then
+    DEB_ARCH="$(dpkg --print-architecture)"
+else
+    DEB_ARCH="$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"
+fi
+
 if [ -z "$TYPE" ] || [ -z "$VERSION" ]; then
     echo "Usage: ./package.sh [deb|rpm|rpm-fedora|rpm-el9|arch|flatpak|all] [version]"
     echo "Example: ./package.sh all 1.0.0"
@@ -147,15 +154,9 @@ if [[ "$TYPE" == "rpm-el9" || "$TYPE" == "el9" || "$TYPE" == "deb" || "$TYPE" ==
     # For EL9 and DEB, use a shell script wrapper for better compatibility
     cat <<'WRAPPER' > "$BIN_DIR/$APP_NAME"
 #!/bin/bash
-# Find the app directory
 APP_DIR="/usr/share/hiresti"
-if [ -f "$APP_DIR/src/main.py" ]; then
-    cd "$APP_DIR"
-    PYTHONPATH="$APP_DIR/libs:$APP_DIR" python3 src/main.py "$@"
-else
-    cd "$APP_DIR"
-    PYTHONPATH="$APP_DIR/libs:$APP_DIR" python3 main.py "$@"
-fi
+cd "$APP_DIR"
+PYTHONPATH="$APP_DIR/libs:$APP_DIR" python3 main.py "$@"
 WRAPPER
     chmod +x "$BIN_DIR/$APP_NAME"
     echo "✅ Installed shell launcher: /usr/bin/$APP_NAME"
@@ -370,9 +371,7 @@ depend = gst-plugins-ugly
 depend = gst-python
 depend = python-gobject
 depend = python-cairo
-depend = python-pillow
-depend = python-requests
-depend = libpipewire
+depend = pipewire
 depend = libpulse
 EOF
 
@@ -390,6 +389,19 @@ build_flatpak_package() {
     if [ ! -f "$flatpak_builder_file" ]; then
         echo "Error: Flatpak manifest not found: $flatpak_builder_file"
         exit 1
+    fi
+
+    # Vendor Rust dependencies for offline Flatpak build.
+    # flatpak-builder copies the source tree (type: dir) without network access, so the
+    # vendor/ directory must exist before flatpak-builder is invoked.
+    if [ -f "src_rust/rust_audio_core/Cargo.toml" ]; then
+        if command -v cargo &>/dev/null; then
+            echo "📦 Vendoring Rust audio core dependencies for Flatpak..."
+            (cd src_rust/rust_audio_core && cargo vendor vendor)
+        else
+            echo "Error: 'cargo' not found. Cannot vendor Rust dependencies for Flatpak."
+            exit 1
+        fi
     fi
 
     # Clean previous build
@@ -414,26 +426,26 @@ Package: $APP_NAME
 Version: $VERSION
 Section: sound
 Priority: optional
-Architecture: all
-Depends: python3, python3-gi, python3-cairo, python3-dateutil, python3-typing-extensions, python3-isodate, gir1.2-gtk-4.0, gir1.2-adw-1, python3-gst-1.0, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-plugins-ugly
+Architecture: $DEB_ARCH
+Depends: python3, python3-gi, python3-cairo, python3-dateutil, python3-typing-extensions, python3-isodate, gir1.2-gtk-4.0, gir1.2-adw-1, python3-gst-1.0, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-plugins-ugly
 Maintainer: $MAINTAINER
 Description: $DESCRIPTION
  $DISPLAY_NAME is a desktop client for Tidal focusing on High-Res audio.
 EOF
     mkdir -p dist
-    dpkg-deb --build "$BUILD_ROOT" "dist/${APP_NAME}_${VERSION}_all.deb"
+    dpkg-deb --build "$BUILD_ROOT" "dist/${APP_NAME}_${VERSION}_${DEB_ARCH}.deb"
     echo "✅ DEB created."
 
 elif [ "$TYPE" == "rpm" ]; then
     echo "📦 Building Fedora + EL9 RPM packages..."
-    build_rpm_variant "fedora" "fedora" "python3, python3-gobject, gtk4, libadwaita, gstreamer1-plugins-good, gstreamer1-plugins-bad-free, gstreamer1-plugins-ugly-free"
-    build_rpm_variant "el9" "el9" "python3, python3-gobject, gtk4, libadwaita, gstreamer1-plugins-good, gstreamer1-plugins-bad-free, gstreamer1-plugins-ugly-free"
+    build_rpm_variant "fedora" "fedora" "python3, python3-gobject, python3-cairo, gtk4, libadwaita, gstreamer1-plugins-base, gstreamer1-plugins-good, gstreamer1-plugins-bad-free, gstreamer1-plugins-ugly-free"
+    build_rpm_variant "el9" "el9" "python3, python3-gobject, python3-cairo, gtk4, libadwaita, gstreamer1-plugins-base, gstreamer1-plugins-good, gstreamer1-plugins-bad-free, gstreamer1-plugins-ugly-free"
 elif [ "$TYPE" == "rpm-fedora" ]; then
     echo "📦 Building Fedora RPM package..."
-    build_rpm_variant "fedora" "fedora" "python3, python3-gobject, gtk4, libadwaita, gstreamer1-plugins-good, gstreamer1-plugins-bad-free, gstreamer1-plugins-ugly-free"
+    build_rpm_variant "fedora" "fedora" "python3, python3-gobject, python3-cairo, gtk4, libadwaita, gstreamer1-plugins-base, gstreamer1-plugins-good, gstreamer1-plugins-bad-free, gstreamer1-plugins-ugly-free"
 elif [ "$TYPE" == "rpm-el9" ]; then
     echo "📦 Building EL9 RPM package..."
-    build_rpm_variant "el9" "el9" "python3, python3-gobject, gtk4, libadwaita, gstreamer1-plugins-good, gstreamer1-plugins-bad-free, gstreamer1-plugins-ugly-free"
+    build_rpm_variant "el9" "el9" "python3, python3-gobject, python3-cairo, gtk4, libadwaita, gstreamer1-plugins-base, gstreamer1-plugins-good, gstreamer1-plugins-bad-free, gstreamer1-plugins-ugly-free"
 elif [ "$TYPE" == "arch" ]; then
     echo "📦 Building Arch package..."
     build_arch_package
@@ -448,22 +460,22 @@ Package: $APP_NAME
 Version: $VERSION
 Section: sound
 Priority: optional
-Architecture: all
-Depends: python3, python3-gi, python3-cairo, python3-dateutil, python3-typing-extensions, python3-isodate, gir1.2-gtk-4.0, gir1.2-adw-1, python3-gst-1.0, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-plugins-ugly
+Architecture: $DEB_ARCH
+Depends: python3, python3-gi, python3-cairo, python3-dateutil, python3-typing-extensions, python3-isodate, gir1.2-gtk-4.0, gir1.2-adw-1, python3-gst-1.0, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-plugins-ugly
 Maintainer: $MAINTAINER
 Description: $DESCRIPTION
  $DISPLAY_NAME is a desktop client for Tidal focusing on High-Res audio.
 EOF
     mkdir -p dist
-    dpkg-deb --build "$BUILD_ROOT" "dist/${APP_NAME}_${VERSION}_all.deb"
+    dpkg-deb --build "$BUILD_ROOT" "dist/${APP_NAME}_${VERSION}_${DEB_ARCH}.deb"
     echo "✅ DEB created."
 
     # Remove DEBIAN metadata before RPM build to avoid unpackaged-file errors.
     rm -rf "$BUILD_ROOT/DEBIAN"
 
     echo "📦 Building Fedora + EL9 RPM packages..."
-    build_rpm_variant "fedora" "fedora" "python3, python3-gobject, gtk4, libadwaita, gstreamer1-plugins-good, gstreamer1-plugins-bad-free, gstreamer1-plugins-ugly-free"
-    build_rpm_variant "el9" "el9" "python3, python3-gobject, gtk4, libadwaita, gstreamer1-plugins-good, gstreamer1-plugins-bad-free, gstreamer1-plugins-ugly-free"
+    build_rpm_variant "fedora" "fedora" "python3, python3-gobject, python3-cairo, gtk4, libadwaita, gstreamer1-plugins-base, gstreamer1-plugins-good, gstreamer1-plugins-bad-free, gstreamer1-plugins-ugly-free"
+    build_rpm_variant "el9" "el9" "python3, python3-gobject, python3-cairo, gtk4, libadwaita, gstreamer1-plugins-base, gstreamer1-plugins-good, gstreamer1-plugins-bad-free, gstreamer1-plugins-ugly-free"
     echo "📦 Building Arch package..."
     build_arch_package
     echo "📦 Building Flatpak package..."

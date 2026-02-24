@@ -1,7 +1,16 @@
-# hiresTI Desktop 1.0 Dependencies
+# hiresTI Desktop Dependencies
 tidalapi>=0.7.0
 PyGObject>=3.42.0
 requests>=2.28.0
 urllib3>=1.26.0
 pystray>=0.19.5
+Pillow>=9.0.0
 qrcode>=7.4.2
+python-dateutil>=2.8.0
+typing-extensions>=4.0.0
+isodate>=0.6.0
+mpegdash>=0.3.0
+pyaes>=1.6.1
+ratelimit>=2.2.1
+six>=1.16.0
+certifi>=2022.0

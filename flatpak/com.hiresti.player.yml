@@ -50,20 +50,20 @@ modules:
   - name: rust-audio-core
     buildsystem: simple
     build-commands:
-      - cd hiresTI/src_rust/rust_audio_core && cargo build --release --offline
-      - install -Dm755 hiresTI/src_rust/rust_audio_core/target/release/librust_audio_core.so /app/share/hiresti/src_rust/rust_audio_core/target/release/librust_audio_core.so
+      - cd src_rust/rust_audio_core && cargo build --release --offline
+      - install -Dm755 src_rust/rust_audio_core/target/release/librust_audio_core.so /app/share/hiresti/src_rust/rust_audio_core/target/release/librust_audio_core.so
     sources:
       - type: dir
-        path: ../..
+        path: ..
 
   - name: rust-viz-core
     buildsystem: simple
     build-commands:
-      - cd hiresTI/src_rust/rust_viz_core && cargo build --release --offline
-      - install -Dm755 hiresTI/src_rust/rust_viz_core/target/release/libviz_core.so /app/share/hiresti/src_rust/rust_viz_core/target/release/libviz_core.so
+      - cd src_rust/rust_viz_core && cargo build --release --offline
+      - install -Dm755 src_rust/rust_viz_core/target/release/libviz_core.so /app/share/hiresti/src_rust/rust_viz_core/target/release/libviz_core.so
     sources:
       - type: dir
-        path: ../..
+        path: ..
 
   - name: hiresTI-app
     buildsystem: simple
