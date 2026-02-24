@@ -392,18 +392,16 @@ build_flatpak_package() {
         exit 1
     fi
 
-    # Update version in manifest
-    sed -i "s/runtime-version: \"48\"/runtime-version: \"${VERSION}\"/" "$flatpak_builder_file" 2>/dev/null || true
-
     # Clean previous build
     rm -rf "$build_dir"
     mkdir -p dist
 
     # Build the Flatpak using flatpak-builder
+    # Note: runtime-version in manifest should match GNOME SDK version (e.g., 48), not app version
     flatpak-builder --force-clean --repo="$repo_dir" "$build_dir" "$flatpak_builder_file"
 
     # Export to a single .flatpak file
-    flatpak build-export "$repo_dir" "dist/${APP_NAME}-${VERSION}.flatpak" --update
+    flatpak build-export --bundle-refs "$repo_dir" "dist/${APP_NAME}-${VERSION}.flatpak"
 
     echo "✅ Flatpak package created: dist/${APP_NAME}-${VERSION}.flatpak"
 }
