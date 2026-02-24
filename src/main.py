@@ -47,7 +47,7 @@ from core.constants import (
     CacheSettings, LikedTracksCache, VizWarmup, DiagEvents,
 )
 from core.executor import submit_daemon
-from utils.paths import get_cache_dir
+from utils.paths import get_cache_dir, get_config_dir
 
 logger = logging.getLogger(__name__)
 
@@ -440,8 +440,21 @@ class TidalApp(Adw.Application):
         self.app_version = self._detect_app_version()
         self.backend = TidalBackend()
         self._cache_root = get_cache_dir()
+        self._config_root = get_config_dir()
+        os.makedirs(self._config_root, exist_ok=True)
         self._account_scope = "guest"
-        self.settings_file = os.path.join(self._cache_root, "settings.json")
+
+        # Migrate settings.json from old cache location to config dir (one-time).
+        _old_settings = os.path.join(self._cache_root, "settings.json")
+        _new_settings = os.path.join(self._config_root, "settings.json")
+        if os.path.exists(_old_settings) and not os.path.exists(_new_settings):
+            try:
+                os.rename(_old_settings, _new_settings)
+                logger.info("Migrated settings.json: %s -> %s", _old_settings, _new_settings)
+            except Exception as _e:
+                logger.warning("Settings migration failed: %s", _e)
+
+        self.settings_file = _new_settings
         self.settings = load_settings(self.settings_file)
         # Guard against corrupted/extreme sync offset values.
         try:
@@ -2684,7 +2697,7 @@ class TidalApp(Adw.Application):
             mixes = self.build_daily_mixes()
         ui_actions.render_daily_mixes(self, mixes)
 
-    def refresh_liked_songs_dashboard(self):
+    def refresh_liked_songs_dashboard(self, _initial_render_done=False, force=False):
         row = self.nav_list.get_selected_row() if self.nav_list is not None else None
         if not row or getattr(row, "nav_id", None) != "liked_songs":
             return False
@@ -2694,13 +2707,15 @@ class TidalApp(Adw.Application):
             return False
 
         # Render cached data immediately to avoid perceived UI stall when revisiting this page.
+        # Skip when the caller (on_nav_selected) already rendered the cached data.
         cached_tracks = list(getattr(self, "liked_tracks_data", []) or [])
         now = time.time()
         ttl = float(getattr(self, "liked_tracks_cache_ttl_sec", 30.0) or 30.0)
         last_ts = float(getattr(self, "liked_tracks_last_fetch_ts", 0.0) or 0.0)
         if cached_tracks:
-            self.render_liked_songs_dashboard(cached_tracks)
-            if now - last_ts <= max(0.0, ttl):
+            if not _initial_render_done:
+                self.render_liked_songs_dashboard(cached_tracks)
+            if not force and now - last_ts <= max(0.0, ttl):
                 return False
 
         req_id = int(getattr(self, "_liked_tracks_request_id", 0) or 0) + 1
@@ -2726,10 +2741,12 @@ class TidalApp(Adw.Application):
             if _is_stale() or (not _liked_view_active()):
                 return
             # Stage 1: get a small slice for fast first paint.
-            head_tracks = list(self.backend.get_favorite_tracks(limit=100))
-            if head_tracks and not _is_stale():
-                if len(head_tracks) > len(cached_tracks):
-                    GLib.idle_add(lambda: _apply_if_active(head_tracks))
+            # Skip when the cache already covers that many tracks — no benefit in fetching.
+            if len(cached_tracks) < 100:
+                head_tracks = list(self.backend.get_favorite_tracks(limit=100))
+                if head_tracks and not _is_stale():
+                    if len(head_tracks) > len(cached_tracks):
+                        GLib.idle_add(lambda: _apply_if_active(head_tracks))
 
             # Stage 2: fetch full library in background.
             # Skip full fetch if user already left Liked Songs to avoid pointless heavy work.
@@ -4289,21 +4306,10 @@ class TidalApp(Adw.Application):
             btn.set_sensitive(False)
             return
 
-        btn.set_sensitive(False)
-
-        def do():
-            is_fav = self.backend.is_track_favorite(track_id)
-
-            def apply():
-                if getattr(btn, "_track_fav_id", None) != track_id:
-                    return False
-                self._update_fav_icon(btn, is_fav)
-                btn.set_sensitive(True)
-                return False
-
-            GLib.idle_add(apply)
-
-        submit_daemon(do)
+        # is_track_favorite is a local set lookup (O(1)) — no daemon thread needed.
+        is_fav = self.backend.is_track_favorite(track_id)
+        self._update_fav_icon(btn, is_fav)
+        btn.set_sensitive(True)
 
     def on_track_row_fav_clicked(self, btn):
         track_id = getattr(btn, "_track_fav_id", None)
@@ -4325,7 +4331,7 @@ class TidalApp(Adw.Application):
                     if str(getattr(getattr(self, "playing_track", None), "id", "")) == track_id:
                         self.refresh_current_track_favorite_state()
                     self.refresh_visible_track_fav_buttons()
-                    self.refresh_liked_songs_dashboard()
+                    self.refresh_liked_songs_dashboard(force=True)
                 btn.set_sensitive(True)
                 return False
 

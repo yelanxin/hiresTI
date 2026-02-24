@@ -9,7 +9,7 @@ from datetime import datetime
 from urllib.parse import urlparse
 from core.errors import classify_exception
 from core.http_session import get_global_session
-from utils.paths import get_cache_dir
+from utils.paths import get_cache_dir, get_config_dir
 
 logger = logging.getLogger(__name__)
 
@@ -19,15 +19,20 @@ class TidalBackend:
         self._normalize_tls_ca_env()
         self.session = tidalapi.Session()
         self._tune_http_pool()
-        cache_dir = get_cache_dir()
-        self.token_file = os.path.join(cache_dir, "hiresti_token.json")
-        self.legacy_token_file = os.path.join(cache_dir, "hiresti_token.pkl")
+        config_dir = get_config_dir()
+        os.makedirs(config_dir, exist_ok=True)
+        self.token_file = os.path.join(config_dir, "hiresti_token.json")
+        self.legacy_token_file = os.path.join(config_dir, "hiresti_token.pkl")
+        self._migrate_token_from_cache()
         self.user = None
         self.quality = self._get_best_quality()
         self._apply_global_config() 
         self.fav_album_ids = set()
         self.fav_artist_ids = set()
         self.fav_track_ids = set()
+        self._cached_albums = []
+        self._cached_albums_ts = 0.0
+        self._albums_cache_ttl = 300.0
         self._artist_artwork_cache = {}  # LRU cache using dict (ordered in Python 3.7+)
         self.max_artist_artwork_cache = 500  # Limit cache size to prevent memory leak
         self._artist_placeholder_uuids = {
@@ -320,25 +325,34 @@ class TidalBackend:
                 return value
         return value
 
+    def _migrate_token_from_cache(self):
+        """Move token files from the old cache location to the config dir (one-time migration)."""
+        try:
+            old_dir = get_cache_dir()
+            new_dir = os.path.dirname(self.token_file)
+            for fname in ("hiresti_token.json", "hiresti_token.pkl"):
+                old_path = os.path.join(old_dir, fname)
+                new_path = os.path.join(new_dir, fname)
+                if os.path.exists(old_path) and not os.path.exists(new_path):
+                    os.rename(old_path, new_path)
+                    logger.info("Migrated token file: %s -> %s", old_path, new_path)
+        except Exception as e:
+            logger.warning("Token file migration failed: %s", e)
+
     def save_session(self):
-        import sys
-        print(f"[DEBUG] save_session: token_file={self.token_file}", file=sys.stderr)
         os.makedirs(os.path.dirname(self.token_file), exist_ok=True)
-        print(f"[DEBUG] save_session: directory ensured", file=sys.stderr)
         data = {
             'token_type': self.session.token_type,
             'access_token': self.session.access_token,
             'refresh_token': self.session.refresh_token,
             'expiry_time': self._serialize_expiry(self.session.expiry_time),
         }
-
         temp_file = f"{self.token_file}.tmp"
         with open(temp_file, 'w', encoding='utf-8') as f:
             json.dump(data, f)
-        print(f"[DEBUG] save_session: temp file written", file=sys.stderr)
         os.replace(temp_file, self.token_file)
-        print(f"[DEBUG] save_session: file moved", file=sys.stderr)
         os.chmod(self.token_file, 0o600)
+        logger.debug("Session saved to %s", self.token_file)
 
     def try_load_session(self):
         if os.path.exists(self.legacy_token_file) and not os.path.exists(self.token_file):
@@ -379,7 +393,12 @@ class TidalBackend:
     def _refresh_favorite_ids_sync(self):
         try:
             if not self.user: return
-            albums = self.get_recent_albums(limit=20000)
+            # Reuse album cache when fresh to avoid a duplicate full API fetch.
+            now = time.time()
+            if self._cached_albums and now - self._cached_albums_ts < self._albums_cache_ttl:
+                albums = self._cached_albums
+            else:
+                albums = self.get_recent_albums(limit=20000)
             self.fav_album_ids = {
                 str(getattr(a, "id", ""))
                 for a in (albums or [])
@@ -551,7 +570,16 @@ class TidalBackend:
                 return []
             fav = getattr(self.user, "favorites", None)
             albums_api = getattr(fav, "albums", None)
-            return self._paginate_favorites_api(albums_api, limit=limit, page_size=100)
+            result = self._paginate_favorites_api(albums_api, limit=limit, page_size=1000)
+            # Populate cache and fav_album_ids so callers can avoid re-fetching.
+            self._cached_albums = list(result)
+            self._cached_albums_ts = time.time()
+            self.fav_album_ids = {
+                str(getattr(a, "id", ""))
+                for a in result
+                if getattr(a, "id", None) is not None
+            }
+            return result
         except Exception as e:
             logger.warning("Failed to fetch recent albums: %s", e)
             return []
@@ -562,7 +590,7 @@ class TidalBackend:
                 return []
             fav = getattr(self.user, "favorites", None)
             tracks_api = getattr(fav, "tracks", None)
-            return self._paginate_favorites_api(tracks_api, limit=limit, page_size=100)
+            return self._paginate_favorites_api(tracks_api, limit=limit, page_size=1000)
         except Exception as e:
             logger.warning("Failed to fetch favorite tracks: %s", e)
             return []
@@ -1849,4 +1877,6 @@ class TidalBackend:
         self.session = tidalapi.Session()
         self.fav_album_ids = set()
         self.fav_track_ids = set()
+        self._cached_albums = []
+        self._cached_albums_ts = 0.0
         self._apply_global_config()

@@ -47,7 +47,7 @@ class CacheSettings:
 
 
 class LikedTracksCache:
-    TTL_SEC = 30.0
+    TTL_SEC = 300.0  # 5 minutes; fav toggles bypass TTL via force=True
 
 
 class VizWarmup:

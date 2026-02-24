@@ -1600,11 +1600,9 @@ def render_collection_dashboard(app, favorite_tracks=None, favorite_albums=None)
         for alb in albums_page:
             card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, css_classes=["card", "home-card", "history-card"])
             img = Gtk.Image(pixel_size=120, css_classes=["album-cover-img"])
-            cover = app.backend.get_artwork_url(alb, 320)
-            if cover:
-                utils.load_img(img, cover, app.cache_dir, 120)
-            else:
-                img.set_from_icon_name("audio-x-generic-symbolic")
+            # Default icon shown immediately; overridden asynchronously once the URL resolves.
+            img.set_from_icon_name("audio-x-generic-symbolic")
+            utils.load_img(img, lambda a=alb: app.backend.get_artwork_url(a, 320), app.cache_dir, 120)
             card.append(img)
             card.append(
                 Gtk.Label(
@@ -1745,14 +1743,34 @@ def render_queue_dashboard(app):
 
 
 def render_liked_songs_dashboard(app, tracks=None):
-    logger.info("Liked songs dashboard opened: tracks=%s", len(list(tracks or [])))
+    all_tracks = list(tracks or [])
+    n = len(all_tracks)
+    first_id = str(getattr(all_tracks[0], "id", None)) if n > 0 else None
+    last_id = str(getattr(all_tracks[-1], "id", None)) if n > 0 else None
+    curr_sig = (n, first_id, last_id)
+
+    # Fast path: track list identical — skip full widget rebuild, only re-apply filters.
+    prev_sig = getattr(app, "_liked_tracks_view_sig", None)
+    apply_fn = getattr(app, "_liked_tracks_apply_fn", None)
+    if (prev_sig is not None and prev_sig == curr_sig
+            and apply_fn is not None
+            and getattr(app, "liked_track_list", None) is not None):
+        logger.info("Liked songs dashboard: data unchanged (sig=%s), skipping full rebuild", curr_sig)
+        app.liked_tracks_data = all_tracks
+        if hasattr(app, "grid_subtitle_label") and app.grid_subtitle_label is not None:
+            app.grid_subtitle_label.set_text(f"{n} Liked Songs")
+        apply_fn()
+        return
+
+    logger.info("Liked songs dashboard opened: tracks=%s", n)
     _clear_container(app.collection_content_box)
     app.playlist_track_list = None
     app.queue_track_list = None
+    app._liked_tracks_view_sig = None  # clear until full build completes
+    app._liked_tracks_apply_fn = None
 
-    all_tracks = list(tracks or [])
     if hasattr(app, "grid_subtitle_label") and app.grid_subtitle_label is not None:
-        app.grid_subtitle_label.set_text(f"{len(all_tracks)} Liked Songs")
+        app.grid_subtitle_label.set_text(f"{n} Liked Songs")
     app.liked_tracks_data = all_tracks
     app.liked_tracks_sort = getattr(app, "liked_tracks_sort", "recent")
     app.liked_tracks_query = getattr(app, "liked_tracks_query", "")
@@ -2262,7 +2280,7 @@ def render_liked_songs_dashboard(app, tracks=None):
             box.append(d)
 
             fav_btn = app.create_track_fav_button(t)
-            fav_btn.connect("clicked", lambda _b: GLib.timeout_add(260, app.refresh_liked_songs_dashboard))
+            fav_btn.connect("clicked", lambda _b: GLib.timeout_add(260, lambda: app.refresh_liked_songs_dashboard(force=True)))
             box.append(fav_btn)
 
             add_btn = Gtk.Button(icon_name="list-add-symbolic", css_classes=["flat", "circular", "history-scroll-btn"])
@@ -2299,6 +2317,10 @@ def render_liked_songs_dashboard(app, tracks=None):
     prev_page_btn.connect("clicked", _on_prev_page)
     next_page_btn.connect("clicked", _on_next_page)
     _refresh_artist_filter_buttons()
+    # Save signature and filter function so subsequent renders with the same
+    # data can skip the full widget rebuild and just re-run filters.
+    app._liked_tracks_view_sig = curr_sig
+    app._liked_tracks_apply_fn = _apply_filters
     _apply_filters()
 
 

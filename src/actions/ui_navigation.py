@@ -1,5 +1,6 @@
 from threading import Thread
 import logging
+import time
 
 from gi.repository import GLib, Gtk
 from actions import ui_actions
@@ -64,25 +65,38 @@ def on_nav_selected(app, box, row):
 
     if row.nav_id == "collection":
         app.grid_title_label.set_text("My Albums")
-        loading = Gtk.Label(
-            label="Loading albums...",
-            xalign=0,
-            css_classes=["dim-label"],
-            margin_start=8,
-            margin_top=8,
-        )
-        app.collection_content_box.append(loading)
         if app.backend.user:
-            def task():
-                albums = list(app.backend.get_recent_albums())
-                album_count = len(albums)
-                def update():
-                    if hasattr(app, "grid_subtitle_label") and app.grid_subtitle_label is not None:
-                        app.grid_subtitle_label.set_text(f"{album_count} saved albums")
-                    app.render_collection_dashboard([], albums)
-                GLib.idle_add(update)
+            cached = list(getattr(app.backend, "_cached_albums", []) or [])
+            now = time.time()
+            last_ts = float(getattr(app.backend, "_cached_albums_ts", 0.0) or 0.0)
+            ttl = float(getattr(app.backend, "_albums_cache_ttl", 300.0) or 300.0)
 
-            Thread(target=task, daemon=True).start()
+            # Instant first paint: render cached data immediately.
+            if cached:
+                if hasattr(app, "grid_subtitle_label") and app.grid_subtitle_label is not None:
+                    app.grid_subtitle_label.set_text(f"{len(cached)} saved albums")
+                app.render_collection_dashboard([], cached)
+            else:
+                loading = Gtk.Label(
+                    label="Loading albums...",
+                    xalign=0,
+                    css_classes=["dim-label"],
+                    margin_start=8,
+                    margin_top=8,
+                )
+                app.collection_content_box.append(loading)
+
+            # Background refresh only when TTL has expired.
+            if not cached or now - last_ts > ttl:
+                def task():
+                    albums = list(app.backend.get_recent_albums())
+                    album_count = len(albums)
+                    def update():
+                        if hasattr(app, "grid_subtitle_label") and app.grid_subtitle_label is not None:
+                            app.grid_subtitle_label.set_text(f"{album_count} saved albums")
+                        app.render_collection_dashboard([], albums)
+                    GLib.idle_add(update)
+                Thread(target=task, daemon=True).start()
         else:
             if hasattr(app, "grid_subtitle_label") and app.grid_subtitle_label is not None:
                 app.grid_subtitle_label.set_text("0 saved albums")
@@ -96,7 +110,7 @@ def on_nav_selected(app, box, row):
         # Instant first paint: render cached/skeleton UI immediately, then refresh async.
         cached_tracks = list(getattr(app, "liked_tracks_data", []) or [])
         app.render_liked_songs_dashboard(cached_tracks)
-        app.refresh_liked_songs_dashboard()
+        app.refresh_liked_songs_dashboard(_initial_render_done=True)
         return
 
     if row.nav_id == "playlists":

@@ -8,12 +8,16 @@ import time
 import cairo
 from pathlib import Path
 from threading import Thread
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Callable, Any
 from gi.repository import GLib, GdkPixbuf, Gdk
 
 from core.http_session import get_global_session
 
 logger = logging.getLogger(__name__)
+
+# Bounded thread pool for image loading — prevents thread explosion on large pages.
+_IMG_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="img-load")
 
 _TIDAL_IMAGE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
@@ -227,7 +231,7 @@ def load_img(widget: Any, url_provider: Callable[[], str] | str, cache_dir: str,
         except Exception as e:
             logger.warning("load_img: unexpected error: %s", e)
 
-    Thread(target=fetch, daemon=True).start()
+    _IMG_EXECUTOR.submit(fetch)
 
 def set_pointer_cursor(widget, enable):
     try:
