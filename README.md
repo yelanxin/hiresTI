@@ -76,7 +76,7 @@ Please download prebuilt package from release page.
 ### Debian / Ubuntu (DEB)
 
 ```bash
-sudo apt install ./hiresti_<version>_all.deb
+sudo apt install ./hiresti_<version>_amd64.deb
 ```
 
 ### Fedora (RPM)
@@ -96,6 +96,25 @@ sudo dnf install ./hiresti-<version>-1.el9.<arch>.rpm
 ```bash
 sudo pacman -U ./hiresti-<version>-1-<arch>.pkg.tar.zst
 ```
+
+### Flatpak
+
+```bash
+flatpak install ./hiresti-<version>.flatpak
+```
+
+Run:
+
+```bash
+flatpak run com.hiresti.player
+```
+
+> **Note:** Requires GNOME Platform runtime 48. If not already installed:
+> ```bash
+> flatpak install flathub org.gnome.Platform//48 org.gnome.Sdk//48
+> ```
+>
+> User data is stored under `~/.var/app/com.hiresti.player/`.
 
 
 ## Upgrade Guide
