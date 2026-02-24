@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.2.4 - 2026-02-23
+Code quality improvements: duplicate code reduction in utils/paths.py.
+
+### Refactored
+- Extracted `_get_xdg_dir()` helper function in `utils/paths.py` to reduce code duplication across `get_cache_dir()`, `get_config_dir()`, and `get_data_dir()`.
+
+---
+
 ## 1.2.3 - 2026-02-23
 Code quality improvements: HTTP connection pool optimization, cache path unification, and main.py refactoring.
 

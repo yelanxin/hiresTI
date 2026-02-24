@@ -65,7 +65,7 @@ Bundled Python dependencies used by packaging:
 
 ```bash
 python3 -m pip install -r requirements.txt
-python3 main.py
+python3 src/main.py
 ```
 
 ## Install Prebuilt Packages
