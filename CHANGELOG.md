@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.2.7 - 2026-02-24
+Bug fix: login button now works correctly.
+
+### Fixed
+- Fixed `AttributeError` when clicking the login button: the `on_login_clicked` handler in `app_handlers.py` was incorrectly calling `ui_actions.on_login_clicked()` which does not exist. Implemented the login logic directly in the handler.
+
+---
+
 ## 1.2.6 - 2026-02-24
 Performance: Liked Songs and My Albums load speed improvements, config directory fixes, and packaging corrections.
 
