@@ -16,7 +16,7 @@ VERSION="${2:-}"
 USE_PY_BINARY="${HIRESTI_PY_BINARY:-0}"
 
 if [ -z "$TYPE" ] || [ -z "$VERSION" ]; then
-    echo "Usage: ./package.sh [deb|rpm|rpm-fedora|rpm-el9|arch|all] [version]"
+    echo "Usage: ./package.sh [deb|rpm|rpm-fedora|rpm-el9|arch|flatpak|all] [version]"
     echo "Example: ./package.sh all 1.0.0"
     exit 1
 fi
@@ -33,6 +33,11 @@ fi
 
 if [[ "$TYPE" == "arch" || "$TYPE" == "all" ]] && ! command -v zstd &> /dev/null; then
     echo "Error: 'zstd' is required for Arch package build."
+    exit 1
+fi
+
+if [[ "$TYPE" == "flatpak" || "$TYPE" == "all" ]] && ! command -v flatpak-builder &> /dev/null; then
+    echo "Error: 'flatpak-builder' is required for Flatpak build."
     exit 1
 fi
 
@@ -377,6 +382,32 @@ EOF
     echo "✅ Arch package created."
 }
 
+build_flatpak_package() {
+    local flatpak_builder_file="flatpak/com.hiresti.player.yml"
+    local build_dir="build_flatpak"
+    local repo_dir="flatpak/repo"
+
+    if [ ! -f "$flatpak_builder_file" ]; then
+        echo "Error: Flatpak manifest not found: $flatpak_builder_file"
+        exit 1
+    fi
+
+    # Update version in manifest
+    sed -i "s/runtime-version: \"48\"/runtime-version: \"${VERSION}\"/" "$flatpak_builder_file" 2>/dev/null || true
+
+    # Clean previous build
+    rm -rf "$build_dir"
+    mkdir -p dist
+
+    # Build the Flatpak using flatpak-builder
+    flatpak-builder --force-clean --repo="$repo_dir" "$build_dir" "$flatpak_builder_file"
+
+    # Export to a single .flatpak file
+    flatpak build-export "$repo_dir" "dist/${APP_NAME}-${VERSION}.flatpak" --update
+
+    echo "✅ Flatpak package created: dist/${APP_NAME}-${VERSION}.flatpak"
+}
+
 if [ "$TYPE" == "deb" ]; then
     echo "📦 Building .deb package..."
     mkdir -p "$BUILD_ROOT/DEBIAN"
@@ -408,6 +439,9 @@ elif [ "$TYPE" == "rpm-el9" ]; then
 elif [ "$TYPE" == "arch" ]; then
     echo "📦 Building Arch package..."
     build_arch_package
+elif [ "$TYPE" == "flatpak" ]; then
+    echo "📦 Building Flatpak package..."
+    build_flatpak_package
 elif [ "$TYPE" == "all" ]; then
     echo "📦 Building DEB package..."
     mkdir -p "$BUILD_ROOT/DEBIAN"
@@ -434,8 +468,10 @@ EOF
     build_rpm_variant "el9" "el9" "python3, python3-gobject, gtk4, libadwaita, gstreamer1-plugins-good, gstreamer1-plugins-bad-free, gstreamer1-plugins-ugly-free"
     echo "📦 Building Arch package..."
     build_arch_package
+    echo "📦 Building Flatpak package..."
+    build_flatpak_package
 else
-    echo "Error: unsupported type '$TYPE'. Use deb | rpm | rpm-fedora | rpm-el9 | arch | all"
+    echo "Error: unsupported type '$TYPE'. Use deb | rpm | rpm-fedora | rpm-el9 | arch | flatpak | all"
     exit 1
 fi
 
