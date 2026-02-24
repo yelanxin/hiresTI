@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.2.5 - 2026-02-24
+Albums page refactor: search, sorting, pagination, and waveform performance improvements.
+
+### Added
+- Added search functionality to Favorites Albums page - users can now search through their favorite albums by title or artist.
+- Added sorting options to Albums page - support sorting by Name (A-Z, Z-A), Artist, Date Added, and Release Date.
+- Added pagination to Albums page - display albums in pages of 50 items for better performance with large collections.
+
+### Fixed
+- Fixed waveform visualization lag: optimized rendering pipeline to reduce CPU/GPU usage during playback.
+- Fixed waveform performance: implemented lazy loading and frame rate limiting to prevent stuttering.
+
+### Changed
+- Improved UI responsiveness for list pages (Albums, Playlists, Artists): optimized scroll handling and item rendering.
+- Updated Albums page layout: better handling of long album/artist names with ellipsis truncation.
+
+---
+
 ## 1.2.4 - 2026-02-23
 Code quality improvements: duplicate code reduction in utils/paths.py.
 
