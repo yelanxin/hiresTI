@@ -3,22 +3,40 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
 fn resolve_app_dir() -> PathBuf {
+    // Check for src/main.py in new directory structure
     let flatpak_packaged = PathBuf::from("/app/share/hiresti");
-    if flatpak_packaged.join("main.py").is_file() {
+    if flatpak_packaged.join("src/main.py").is_file() {
         return flatpak_packaged;
     }
 
     let packaged = PathBuf::from("/usr/share/hiresti");
+    if packaged.join("src/main.py").is_file() {
+        return packaged;
+    }
+
+    // Also check old structure for backwards compatibility
+    if flatpak_packaged.join("main.py").is_file() {
+        return flatpak_packaged;
+    }
     if packaged.join("main.py").is_file() {
         return packaged;
     }
 
     if let Ok(exe) = env::current_exe() {
         if let Some(exe_dir) = exe.parent() {
+            // Check src/main.py (new structure)
+            if exe_dir.join("src/main.py").is_file() {
+                return exe_dir.to_path_buf();
+            }
+            // Check main.py (old structure / development)
             if exe_dir.join("main.py").is_file() {
                 return exe_dir.to_path_buf();
             }
+            // Check parent/src/main.py
             if let Some(parent) = exe_dir.parent() {
+                if parent.join("src/main.py").is_file() {
+                    return parent.to_path_buf();
+                }
                 if parent.join("main.py").is_file() {
                     return parent.to_path_buf();
                 }
@@ -63,14 +81,24 @@ fn main() -> ExitCode {
         };
     }
 
-    let main_py = app_dir.join("main.py");
-    if !main_py.is_file() {
+    // Check both src/main.py (new) and main.py (old) for backwards compatibility
+    let _main_py = if app_dir.join("src/main.py").is_file() {
+        app_dir.join("src/main.py")
+    } else if app_dir.join("main.py").is_file() {
+        app_dir.join("main.py")
+    } else {
         eprintln!("hiresti launcher error: main.py not found in {}", app_dir.display());
         return ExitCode::from(1);
-    }
+    };
+
+    let main_py_arg = if app_dir.join("src/main.py").is_file() {
+        "src/main.py"
+    } else {
+        "main.py"
+    };
 
     let mut cmd = Command::new("python3");
-    cmd.arg("main.py")
+    cmd.arg(main_py_arg)
         .args(env::args().skip(1))
         .current_dir(&app_dir)
         .env("PYTHONPATH", merged_pythonpath(&app_dir))
