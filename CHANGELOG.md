@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.2.6 - 2026-02-24
+Performance: Liked Songs and My Albums load speed improvements, config directory fixes.
+
+### Added
+- My Albums now shows a cached instant first paint on repeated visits — no more "Loading albums..." wait when returning to the page.
+- Added in-memory album cache in the backend (`_cached_albums`) with a 5-minute TTL, shared across My Albums page loads and favorite ID refresh to eliminate duplicate API calls on login.
+
+### Changed
+- Liked Songs page no longer performs a redundant full UI rebuild when navigating back to the page; cached data is rendered exactly once via a new `_initial_render_done` flag.
+- Liked Songs refresh now skips full widget reconstruction when the track list is unchanged (same count and boundary IDs), reusing existing artist filter chips and only re-running filters.
+- Raised Liked Songs and My Albums cache TTL from 30 seconds to 5 minutes. Fav-toggle actions bypass the TTL via `force=True` to ensure immediate refresh after un-liking a track.
+- Stage 1 head-fetch (limit=100) in Liked Songs refresh is now skipped when the local cache already has 100 or more tracks.
+- `get_favorite_tracks` and `get_recent_albums` pagination increased from page size 100 to 1000, reducing TIDAL API round trips up to 10× for large libraries.
+- `get_artwork_url()` in My Albums card rendering moved from the GTK main thread to a background worker thread; placeholder icon shown immediately.
+- Image loading (`load_img`) now uses a bounded `ThreadPoolExecutor` (max 8 workers) instead of spawning one unbounded `Thread` per image, preventing thread explosion on large album/artist pages.
+- `_refresh_track_fav_button` now performs the favorite state lookup synchronously (O(1) local set read) instead of submitting a daemon thread per track row.
+
+### Fixed
+- Token files (`hiresti_token.json`) and `settings.json` are now stored in the XDG config directory (`~/.config/hiresti` / `~/.var/app/.../config/hiresti`) instead of the cache directory, so clearing the cache no longer logs users out or resets settings.
+- One-time silent migration: on first launch after upgrade, existing token and settings files are automatically moved from the old cache path to the new config path — no manual action or re-login required.
+- Removed leftover `[DEBUG] print()` statements from `save_session()` that were leaking to stderr in production builds.
+- `_refresh_favorite_ids_sync` no longer issues a duplicate `get_recent_albums` API call on login when the album cache is already fresh from the UI load.
+
+---
+
 ## 1.2.5 - 2026-02-24
 Albums page refactor: search, sorting, pagination, and waveform performance improvements.
 
