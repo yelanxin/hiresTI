@@ -4,15 +4,20 @@ Common path utilities for cache, config, and data directories.
 import os
 
 
+def _get_xdg_dir(env_var: str, fallback: str) -> str:
+    """Get XDG-compatible directory with fallback."""
+    xdg = os.environ.get(env_var)
+    if xdg:
+        return os.path.join(xdg, 'hiresti')
+    return os.path.expanduser(fallback)
+
+
 def get_cache_dir() -> str:
     """
     Get cache directory for app data.
     Supports XDG_CACHE_HOME (automatically set by Flatpak).
     """
-    xdg_cache = os.environ.get('XDG_CACHE_HOME')
-    if xdg_cache:
-        return os.path.join(xdg_cache, 'hiresti')
-    return os.path.expanduser('~/.cache/hiresti')
+    return _get_xdg_dir('XDG_CACHE_HOME', '~/.cache/hiresti')
 
 
 def get_config_dir() -> str:
@@ -20,10 +25,7 @@ def get_config_dir() -> str:
     Get config directory for app settings.
     Supports XDG_CONFIG_HOME (automatically set by Flatpak).
     """
-    xdg_config = os.environ.get('XDG_CONFIG_HOME')
-    if xdg_config:
-        return os.path.join(xdg_config, 'hiresti')
-    return os.path.expanduser('~/.config/hiresti')
+    return _get_xdg_dir('XDG_CONFIG_HOME', '~/.config/hiresti')
 
 
 def get_data_dir() -> str:
@@ -31,7 +33,4 @@ def get_data_dir() -> str:
     Get data directory for app data.
     Supports XDG_DATA_HOME (automatically set by Flatpak).
     """
-    xdg_data = os.environ.get('XDG_DATA_HOME')
-    if xdg_data:
-        return os.path.join(xdg_data, 'hiresti')
-    return os.path.expanduser('~/.local/share/hiresti')
+    return _get_xdg_dir('XDG_DATA_HOME', '~/.local/share/hiresti')
