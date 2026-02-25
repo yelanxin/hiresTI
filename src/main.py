@@ -29,9 +29,6 @@ import utils.helpers as utils
 from ui import config as ui_config
 from ui import builders as ui_builders
 from ui import views_builders as ui_views_builders
-from viz.visualizer import SpectrumVisualizer
-from viz.visualizer_glarea import SpectrumVisualizerGLArea
-from viz.visualizer_gpu import SpectrumVisualizerGPU
 from actions import ui_actions
 from actions import ui_navigation
 from actions import playback_actions
@@ -206,25 +203,6 @@ class TidalApp(Adw.Application):
         self._seek_commit_source = 0
         self._seek_user_interacting = False
         self._viz_current_page = "spectrum"
-
-    def _apply_overlay_scroll_padding(self, expanded):
-        extra = 0
-        if expanded:
-            # Use actual overlay height + small breathing room.
-            breathing_px = 12
-            overlay_h = 0
-            # Use stack content height only (exclude switcher/header), closer to actual covered area.
-            if hasattr(self, "viz_stack") and self.viz_stack is not None:
-                overlay_h = self.viz_stack.get_height()
-            if overlay_h <= 1:
-                overlay_h = 250
-            extra = overlay_h + breathing_px
-        if hasattr(self, "collection_content_box") and self.collection_content_box is not None:
-            self.collection_content_box.set_margin_bottom(self.collection_base_margin_bottom + extra)
-        if self.track_list is not None:
-            self.track_list.set_margin_bottom(self.track_list_base_margin_bottom + extra)
-        if self.search_content_box is not None:
-            self.search_content_box.set_margin_bottom(self.search_base_margin_bottom + extra)
 
     def record_diag_event(self, message):
         if current_thread() is not main_thread():
@@ -669,342 +647,6 @@ class TidalApp(Adw.Application):
         self._apply_lyrics_motion_by_index(self.settings.get("lyrics_bg_motion", 1), update_dropdown=True)
         self._apply_lyrics_offset_ms(self.settings.get("lyrics_user_offset_ms", 0))
 
-    def _viz_sync_key(self, driver, device_id=None, device_name=None):
-        drv = str(driver or "Auto").strip() or "Auto"
-        dev = str(device_id or "").strip()
-        if not dev:
-            dev = str(device_name or self.settings.get("device") or "default").strip() or "default"
-        return f"{drv}|{dev}"
-
-    def _get_viz_offset_from_latency_profile(self):
-        profile = str(self.settings.get("latency_profile", "Standard (100ms)") or "").strip()
-        if profile in self.LATENCY_MAP:
-            buf_ms, _lat_ms = self.LATENCY_MAP[profile]
-            return int(max(0, min(500, buf_ms)))
-        return 100
-
-    def _apply_viz_sync_offset_for_device(self, driver, device_id=None, device_name=None):
-        key = self._viz_sync_key(driver, device_id=device_id, device_name=device_name)
-        self._viz_sync_device_key = key
-        profile_off = self._get_viz_offset_from_latency_profile()
-        self.player.visual_sync_offset_ms = profile_off
-        self.settings["viz_sync_offset_ms"] = profile_off
-        if hasattr(self.player, "visual_sync_auto_offset_ms"):
-            self.player.visual_sync_auto_offset_ms = 0.0
-        self._viz_sync_last_saved_ms = profile_off
-        logger.info(
-            "Viz sync offset applied: %dms (source=output-change key=%s)",
-            int(profile_off),
-            key,
-        )
-
-    def on_viz_sync_offset_update(self, learned_offset_ms):
-        # Disabled: runtime auto-learning should not persist to settings.
-        return False
-
-    def _apply_viz_bars_by_count(self, count, update_dropdown=False):
-        try:
-            c = int(count)
-        except Exception:
-            c = 64
-        if c not in self.VIZ_BAR_OPTIONS:
-            c = 64
-        if self.viz is not None:
-            self.viz.set_num_bars(c)
-        self.settings["viz_bar_count"] = c
-        if update_dropdown and self.viz_bars_dd is not None:
-            self.viz_bars_dd.set_selected(self.VIZ_BAR_OPTIONS.index(c))
-
-    def _drop_down_names(self, dd):
-        names = []
-        if dd is None:
-            return names
-        model = dd.get_model()
-        if model is None:
-            return names
-        n = model.get_n_items()
-        for i in range(n):
-            try:
-                names.append(model.get_string(i))
-            except Exception:
-                pass
-        return names
-
-    def _selected_name_from_dropdown(self, dd):
-        names = self._drop_down_names(dd)
-        if not names:
-            return None
-        idx = int(dd.get_selected())
-        if idx < 0 or idx >= len(names):
-            return None
-        return names[idx]
-
-    def _build_visualizer_for_backend(self, backend_key):
-        order = []
-        if backend_key == "cairo":
-            order = [("cairo", SpectrumVisualizer), ("gl", SpectrumVisualizerGLArea), ("gpu", SpectrumVisualizerGPU)]
-        elif backend_key == "gpu":
-            order = [("gpu", SpectrumVisualizerGPU), ("gl", SpectrumVisualizerGLArea), ("cairo", SpectrumVisualizer)]
-        else:
-            order = [("gl", SpectrumVisualizerGLArea), ("gpu", SpectrumVisualizerGPU), ("cairo", SpectrumVisualizer)]
-        for key, ctor in order:
-            try:
-                return ctor(), key
-            except Exception as e:
-                logger.warning("Visualizer backend %s unavailable, falling back: %s", key, e)
-        raise RuntimeError("No visualizer backend available")
-
-    def _resolve_viz_backend_key(self, effect_name=None):
-        if not effect_name:
-            effect_name = self._selected_name_from_dropdown(self.viz_effect_dd)
-        # Force Bars to GL shader path to avoid Cairo/pixman composition overhead.
-        # If GL is unavailable, backend rebuild will gracefully fall back.
-        if effect_name == "Bars":
-            return "gl"
-        try:
-            idx = int(self.settings.get("viz_backend_policy", 0))
-        except Exception:
-            idx = 0
-        idx = max(0, min(len(self.VIZ_BACKEND_POLICIES) - 1, idx))
-        policy = self.VIZ_BACKEND_POLICIES[idx]
-        if policy.startswith("Quality"):
-            return "cairo"
-        if policy.startswith("Performance"):
-            return "gl"
-        return "gl"
-
-    def _sync_viz_dropdown_models(self, theme_name=None, effect_name=None, profile_name=None):
-        self._viz_ui_syncing = True
-        try:
-            if self.viz_theme_dd is not None:
-                t_names = self.viz.get_theme_names() or []
-                self.viz_theme_dd.set_model(Gtk.StringList.new(t_names))
-                if t_names:
-                    idx = t_names.index(theme_name) if theme_name in t_names else 0
-                    self.viz_theme_dd.set_selected(idx)
-            if self.viz_effect_dd is not None:
-                e_names = self.viz.get_effect_names() or []
-                self.viz_effect_dd.set_model(Gtk.StringList.new(e_names))
-                if e_names:
-                    idx = e_names.index(effect_name) if effect_name in e_names else 0
-                    self.viz_effect_dd.set_selected(idx)
-            if self.viz_profile_dd is not None:
-                p_names = self.viz.get_profile_names() or []
-                self.viz_profile_dd.set_model(Gtk.StringList.new(p_names))
-                if p_names:
-                    idx = p_names.index(profile_name) if profile_name in p_names else min(1, len(p_names) - 1)
-                    self.viz_profile_dd.set_selected(idx)
-        finally:
-            self._viz_ui_syncing = False
-
-    def _rebuild_visualizer_backend(self, backend_key, effect_name=None):
-        if self.viz_stack is None:
-            return
-        if effect_name is None:
-            effect_name = self._selected_name_from_dropdown(self.viz_effect_dd)
-        theme_name = self._selected_name_from_dropdown(self.viz_theme_dd)
-        profile_name = self._selected_name_from_dropdown(self.viz_profile_dd)
-        bar_count = int(self.settings.get("viz_bar_count", 32) or 32)
-        vis_name = self.viz_stack.get_visible_child_name() if self.viz_stack is not None else "spectrum"
-
-        new_viz, actual_key = self._build_visualizer_for_backend(backend_key)
-        new_viz.set_num_bars(bar_count)
-        new_viz.set_valign(Gtk.Align.FILL)
-        if theme_name and theme_name in (new_viz.get_theme_names() or []):
-            new_viz.set_theme(theme_name)
-        if profile_name and profile_name in (new_viz.get_profile_names() or []):
-            new_viz.set_profile(profile_name)
-        if effect_name and effect_name in (new_viz.get_effect_names() or []):
-            new_viz.set_effect(effect_name)
-
-        if self.viz is not None:
-            try:
-                self.viz_stack.remove(self.viz)
-            except Exception:
-                pass
-        self.viz = new_viz
-        self._viz_backend_key = actual_key
-        self.viz_stack.add_titled(self.viz, "spectrum", "Spectrum")
-        if vis_name:
-            self.viz_stack.set_visible_child_name(vis_name)
-        self._sync_viz_tab_runtime_state()
-        self._sync_viz_dropdown_models(theme_name=theme_name, effect_name=effect_name, profile_name=profile_name)
-        logger.info("Visualizer backend switched: %s (requested=%s effect=%s)", actual_key, backend_key, effect_name)
-
-    def _apply_viz_backend_policy_by_index(self, idx, update_dropdown=False):
-        if not isinstance(idx, int) or idx < 0 or idx >= len(self.VIZ_BACKEND_POLICIES):
-            idx = 0
-        self.settings["viz_backend_policy"] = idx
-        if update_dropdown and self.viz_policy_dd is not None:
-            self._viz_ui_syncing = True
-            try:
-                self.viz_policy_dd.set_selected(idx)
-            finally:
-                self._viz_ui_syncing = False
-        effect_name = self._selected_name_from_dropdown(self.viz_effect_dd)
-        desired = self._resolve_viz_backend_key(effect_name)
-        if desired != self._viz_backend_key:
-            self._rebuild_visualizer_backend(desired, effect_name=effect_name)
-
-    def on_viz_bars_changed(self, dd, _param):
-        if self._viz_ui_syncing:
-            return
-        idx = dd.get_selected()
-        if idx < 0 or idx >= len(self.VIZ_BAR_OPTIONS):
-            return
-        self._apply_viz_bars_by_count(self.VIZ_BAR_OPTIONS[idx], update_dropdown=False)
-        self.schedule_save_settings()
-
-    def _apply_spectrum_theme_by_index(self, idx, update_dropdown=False):
-        if self.viz is None:
-            return
-        names = self.viz.get_theme_names()
-        if not names:
-            return
-        if not isinstance(idx, int) or idx < 0 or idx >= len(names):
-            idx = 0
-        self.viz.set_theme(names[idx])
-        self.settings["spectrum_theme"] = idx
-        if update_dropdown and self.viz_theme_dd is not None:
-            self.viz_theme_dd.set_selected(idx)
-
-    def _apply_viz_effect_by_index(self, idx, update_dropdown=False):
-        if self.viz is None:
-            return
-        names = self.viz.get_effect_names()
-        if not names:
-            return
-        if not isinstance(idx, int):
-            idx = 0
-        effect_name = None
-        dd_names = self._drop_down_names(self.viz_effect_dd)
-        if 0 <= idx < len(dd_names):
-            effect_name = dd_names[idx]
-        if not effect_name:
-            if idx < 0 or idx >= len(names):
-                idx = 0
-            effect_name = names[idx]
-        desired = self._resolve_viz_backend_key(effect_name)
-        if desired != self._viz_backend_key:
-            self._rebuild_visualizer_backend(desired, effect_name=effect_name)
-            names = self.viz.get_effect_names() or []
-        if effect_name not in names:
-            effect_name = names[0] if names else None
-        if effect_name:
-            self.viz.set_effect(effect_name)
-            eff_idx = names.index(effect_name)
-        else:
-            eff_idx = 0
-        self.settings["viz_effect"] = eff_idx
-        if update_dropdown and self.viz_effect_dd is not None:
-            self._viz_ui_syncing = True
-            try:
-                self.viz_effect_dd.set_selected(eff_idx)
-            finally:
-                self._viz_ui_syncing = False
-
-    def on_viz_effect_changed(self, dd, _param):
-        if self._viz_ui_syncing:
-            return
-        idx = dd.get_selected()
-        if self._viz_effect_apply_source:
-            try:
-                GLib.source_remove(self._viz_effect_apply_source)
-            except Exception:
-                pass
-            self._viz_effect_apply_source = None
-
-        def _apply_effect_later():
-            self._viz_effect_apply_source = None
-            if self._viz_ui_syncing:
-                return False
-            logger.debug("Applying visualizer effect (deferred): idx=%s", idx)
-            self._apply_viz_effect_by_index(idx, update_dropdown=False)
-            self.schedule_save_settings()
-            return False
-
-        # Avoid mutating dropdown model/stack synchronously in GTK activate callback.
-        self._viz_effect_apply_source = GLib.idle_add(_apply_effect_later)
-
-    def _apply_viz_profile_by_index(self, idx, update_dropdown=False):
-        if self.viz is None:
-            return
-        names = self.viz.get_profile_names()
-        if not names:
-            return
-        if not isinstance(idx, int) or idx < 0 or idx >= len(names):
-            idx = 1 if len(names) > 1 else 0
-        self.viz.set_profile(names[idx])
-        self.settings["viz_profile"] = idx
-        if update_dropdown and self.viz_profile_dd is not None:
-            self.viz_profile_dd.set_selected(idx)
-
-    def on_viz_profile_changed(self, dd, _param):
-        if self._viz_ui_syncing:
-            return
-        idx = dd.get_selected()
-        if self._viz_profile_apply_source:
-            try:
-                GLib.source_remove(self._viz_profile_apply_source)
-            except Exception:
-                pass
-            self._viz_profile_apply_source = None
-
-        def _apply_profile_later():
-            self._viz_profile_apply_source = None
-            if self._viz_ui_syncing:
-                return False
-            logger.debug("Applying visualizer profile (deferred): idx=%s", idx)
-            self._apply_viz_profile_by_index(idx, update_dropdown=False)
-            self.schedule_save_settings()
-            return False
-
-        self._viz_profile_apply_source = GLib.idle_add(_apply_profile_later)
-
-    def on_spectrum_theme_changed(self, dd, _param):
-        if self._viz_ui_syncing:
-            return
-        idx = dd.get_selected()
-        if self._viz_theme_apply_source:
-            try:
-                GLib.source_remove(self._viz_theme_apply_source)
-            except Exception:
-                pass
-            self._viz_theme_apply_source = None
-
-        def _apply_theme_later():
-            self._viz_theme_apply_source = None
-            if self._viz_ui_syncing:
-                return False
-            logger.debug("Applying visualizer theme (deferred): idx=%s", idx)
-            self._apply_spectrum_theme_by_index(idx, update_dropdown=False)
-            self.schedule_save_settings()
-            return False
-
-        self._viz_theme_apply_source = GLib.idle_add(_apply_theme_later)
-
-    def on_viz_backend_policy_changed(self, dd, _param):
-        if self._viz_ui_syncing:
-            return
-        idx = dd.get_selected()
-        if self._viz_policy_apply_source:
-            try:
-                GLib.source_remove(self._viz_policy_apply_source)
-            except Exception:
-                pass
-            self._viz_policy_apply_source = None
-
-        def _apply_policy_later():
-            self._viz_policy_apply_source = None
-            if self._viz_ui_syncing:
-                return False
-            logger.debug("Applying visualizer policy (deferred): idx=%s", idx)
-            self._apply_viz_backend_policy_by_index(idx, update_dropdown=False)
-            self.schedule_save_settings()
-            return False
-
-        self._viz_policy_apply_source = GLib.idle_add(_apply_policy_later)
-
     def _apply_lyrics_font_preset_by_index(self, idx, update_dropdown=False):
         if self.lyrics_vbox is None:
             return
@@ -1055,75 +697,6 @@ class TidalApp(Adw.Application):
     def on_lyrics_offset_step(self, _btn, delta_ms):
         self._apply_lyrics_offset_ms(getattr(self, "lyrics_user_offset_ms", 0) + int(delta_ms))
         self.schedule_save_settings()
-
-    def on_viz_page_changed(self, stack, _param):
-        if self.viz_theme_dd is None:
-            return
-        page = stack.get_visible_child_name() if stack is not None else ""
-        self._viz_current_page = page or "spectrum"
-        is_spectrum = page == "spectrum"
-        is_lyrics = page == "lyrics"
-        self.viz_theme_dd.set_visible(is_spectrum)
-        if self.viz_bars_dd is not None:
-            self.viz_bars_dd.set_visible(is_spectrum)
-        if self.viz_policy_dd is not None:
-            self.viz_policy_dd.set_visible(is_spectrum)
-        if self.viz_profile_dd is not None:
-            self.viz_profile_dd.set_visible(is_spectrum)
-        if self.viz_effect_dd is not None:
-            self.viz_effect_dd.set_visible(is_spectrum)
-        if self.lyrics_font_label is not None:
-            self.lyrics_font_label.set_visible(is_lyrics)
-        if self.lyrics_font_dd is not None:
-            self.lyrics_font_dd.set_visible(is_lyrics)
-        if self.lyrics_motion_dd is not None:
-            self.lyrics_motion_dd.set_visible(is_lyrics)
-        if hasattr(self, "lyrics_ctrl_box") and self.lyrics_ctrl_box is not None:
-            self.lyrics_ctrl_box.set_visible(is_lyrics)
-        if hasattr(self, "lyrics_offset_box") and self.lyrics_offset_box is not None:
-            self.lyrics_offset_box.set_visible(is_lyrics)
-        self._sync_viz_tab_runtime_state()
-        self._sync_spectrum_stream_state()
-
-    def _sync_viz_tab_runtime_state(self):
-        revealer = getattr(self, "viz_revealer", None)
-        is_open = bool(revealer is not None and revealer.get_reveal_child())
-        page = str(getattr(self, "_viz_current_page", "spectrum") or "spectrum")
-        spectrum_active = bool(is_open and page == "spectrum")
-        lyrics_active = bool(is_open and page == "lyrics")
-        if getattr(self, "viz", None) is not None and hasattr(self.viz, "set_active"):
-            try:
-                self.viz.set_active(spectrum_active)
-            except Exception:
-                pass
-        if getattr(self, "bg_viz", None) is not None and hasattr(self.bg_viz, "set_active"):
-            try:
-                self.bg_viz.set_active(lyrics_active)
-            except Exception:
-                pass
-
-    def _should_enable_spectrum_stream(self):
-        # Keep the spectrum stream alive regardless of viz visibility so that
-        # _last_spectrum_frame stays fresh and the viz opens instantly without
-        # a 0.5-1 s FFT-restart stutter.  on_spectrum_data() already skips
-        # rendering (early-return) when the revealer is closed, so no extra
-        # draw work is done while the viz is hidden.
-        if getattr(self, "player", None) is None:
-            return False
-        # Lyrics static mode genuinely needs no live data.
-        page = str(getattr(self, "_viz_current_page", "spectrum") or "spectrum")
-        if page == "lyrics":
-            revealer = getattr(self, "viz_revealer", None)
-            if revealer is not None and revealer.get_reveal_child():
-                motion_idx = int(self.settings.get("lyrics_bg_motion", 1) or 0)
-                if motion_idx == 0:
-                    return False
-        return True
-
-    def _sync_spectrum_stream_state(self):
-        self._sync_viz_tab_runtime_state()
-        if self.player is not None and hasattr(self.player, "set_spectrum_enabled"):
-            self.player.set_spectrum_enabled(self._should_enable_spectrum_stream())
 
     def _restore_last_view(self):
         nav_id = self.settings.get("last_nav", "home")
@@ -1259,99 +832,6 @@ class TidalApp(Adw.Application):
         # Ensure overlay handles are visible after UI is fully built.
         GLib.timeout_add(0, self._ensure_overlay_handles_visible)
 
-    def _ensure_overlay_handles_visible(self):
-        """Ensure overlay handles are visible after UI is fully built."""
-        viz_handle_box = getattr(self, "viz_handle_box", None)
-        if viz_handle_box is not None:
-            viz_handle_box.set_visible(True)
-            viz_handle_box.queue_resize()
-        queue_anchor = getattr(self, "queue_anchor", None)
-        if queue_anchor is not None:
-            queue_anchor.set_visible(True)
-            queue_anchor.queue_resize()
-        return GLib.SOURCE_REMOVE
-
-    def _prewarm_gl_visualizer_once(self):
-        # Warm up GLArea realize/shader path once without visible drawer motion.
-        if bool(getattr(self, "_viz_gl_prewarm_done", False)):
-            return False
-        if str(getattr(self, "_viz_backend_key", "")) != "gl":
-            return False
-        revealer = getattr(self, "viz_revealer", None)
-        root = getattr(self, "viz_root", None)
-        handle = getattr(self, "viz_handle_box", None)
-        if revealer is None or root is None:
-            return False
-        if bool(revealer.get_reveal_child()):
-            return False
-
-        self._viz_gl_prewarm_done = True
-        try:
-            old_dur = int(revealer.get_transition_duration() or 0)
-        except Exception:
-            old_dur = 0
-        try:
-            old_opacity = float(root.get_opacity() or 1.0)
-        except Exception:
-            old_opacity = 1.0
-        old_handle_visible = bool(handle.get_visible()) if handle is not None else True
-
-        try:
-            revealer.set_transition_duration(0)
-            root.set_opacity(0.0)
-            if handle is not None:
-                handle.set_visible(False)
-            revealer.set_reveal_child(True)
-        except Exception:
-            # Best-effort only; never block startup.
-            try:
-                revealer.set_transition_duration(old_dur)
-            except Exception:
-                pass
-            if handle is not None:
-                handle.set_visible(old_handle_visible)
-            root.set_opacity(old_opacity)
-            return False
-
-        def _finish():
-            try:
-                revealer.set_reveal_child(False)
-                root.set_opacity(old_opacity)
-                revealer.set_transition_duration(old_dur)
-                if handle is not None:
-                    handle.set_visible(old_handle_visible)
-            except Exception:
-                pass
-            return False
-
-        GLib.timeout_add(70, _finish)
-        return False
-
-    def _start_spectrum_stream_prewarm(self):
-        # Warm up spectrum pipeline once in background to avoid first-open hitch.
-        if self.player is None or (not hasattr(self.player, "set_spectrum_enabled")):
-            return False
-        revealer = getattr(self, "viz_revealer", None)
-        if revealer is not None and bool(revealer.get_reveal_child()):
-            return False
-        try:
-            self.player.set_spectrum_enabled(True)
-        except Exception:
-            return False
-
-        if self._viz_stream_prewarm_source:
-            GLib.source_remove(self._viz_stream_prewarm_source)
-            self._viz_stream_prewarm_source = 0
-
-        def _finish():
-            self._viz_stream_prewarm_source = 0
-            self._sync_spectrum_stream_state()
-            return False
-
-        # Keep warm briefly, then restore to intended state.
-        self._viz_stream_prewarm_source = GLib.timeout_add(900, _finish)
-        return False
-
     def _get_tray_icon_path(self):
         candidates = [
             os.path.join(os.path.dirname(__file__), "icons", "hicolor", "64x64", "apps", "hiresti.png"),
@@ -1446,44 +926,6 @@ class TidalApp(Adw.Application):
         self.style_manager.connect("notify::dark", lambda *_: self._apply_viz_panel_theme())
         self._apply_viz_panel_theme()
         self._apply_app_theme_classes()
-
-    def _apply_viz_panel_theme(self):
-        if self.viz_stack_box is None:
-            return
-        is_dark = self.style_manager.get_dark()
-        self.viz_stack_box.remove_css_class("viz-panel-dark")
-        self.viz_stack_box.remove_css_class("viz-panel-light")
-        if getattr(self, "viz_handle_box", None) is not None:
-            self.viz_handle_box.remove_css_class("viz-handle-dark")
-            self.viz_handle_box.remove_css_class("viz-handle-light")
-        if getattr(self, "queue_anchor", None) is not None:
-            self.queue_anchor.remove_css_class("queue-handle-dark")
-            self.queue_anchor.remove_css_class("queue-handle-light")
-        if getattr(self, "viz_root", None) is not None:
-            self.viz_root.remove_css_class("viz-surface-dark")
-            self.viz_root.remove_css_class("viz-surface-light")
-        if is_dark:
-            self.viz_stack_box.add_css_class("viz-panel-dark")
-            if getattr(self, "viz_handle_box", None) is not None:
-                self.viz_handle_box.add_css_class("viz-handle-dark")
-            if getattr(self, "queue_anchor", None) is not None:
-                self.queue_anchor.add_css_class("queue-handle-dark")
-            if getattr(self, "viz_root", None) is not None:
-                self.viz_root.add_css_class("viz-surface-dark")
-        else:
-            self.viz_stack_box.add_css_class("viz-panel-light")
-            if getattr(self, "viz_handle_box", None) is not None:
-                self.viz_handle_box.add_css_class("viz-handle-light")
-            if getattr(self, "queue_anchor", None) is not None:
-                self.queue_anchor.add_css_class("queue-handle-light")
-            if getattr(self, "viz_root", None) is not None:
-                self.viz_root.add_css_class("viz-surface-light")
-        if self.lyrics_vbox is not None:
-            self.lyrics_vbox.remove_css_class("lyrics-theme-dark")
-            self.lyrics_vbox.remove_css_class("lyrics-theme-light")
-            self.lyrics_vbox.add_css_class("lyrics-theme-dark" if is_dark else "lyrics-theme-light")
-        if self.bg_viz is not None:
-            self.bg_viz.set_theme_mode(is_dark)
 
     def _apply_app_theme_classes(self):
         root = getattr(self, "main_vbox", None)
@@ -1749,163 +1191,6 @@ class TidalApp(Adw.Application):
     def _build_player_bar(self, container):
         ui_builders.build_player_bar(self, container)
 
-
-    def on_spectrum_data(self, magnitudes, position_s=None):
-        if not magnitudes:
-            return
-        trace = str(os.getenv("HIRESTI_VIZ_TRACE", "0")).strip().lower() in ("1", "true", "yes", "on")
-        now_cb = time.monotonic()
-        frame = magnitudes if isinstance(magnitudes, list) else list(magnitudes)
-        self._last_spectrum_frame = frame
-        self._last_spectrum_ts = now_cb
-        if trace:
-            if self._viz_trace_open_ts > 0.0 and (not self._viz_trace_first_real_logged):
-                self._viz_trace_first_real_logged = True
-                logger.info(
-                    "VIZ TRACE first-real: delta_open=%.1fms len=%d page=%s",
-                    (now_cb - self._viz_trace_open_ts) * 1000.0,
-                    len(frame),
-                    str(getattr(self, "_viz_current_page", "spectrum")),
-                )
-            if self._viz_trace_last_cb_ts > 0.0:
-                gap_ms = (now_cb - self._viz_trace_last_cb_ts) * 1000.0
-                if gap_ms >= 80.0:
-                    logger.info("VIZ TRACE callback-gap: %.1fms", gap_ms)
-            self._viz_trace_last_cb_ts = now_cb
-        # Soft handoff: don't cut placeholder on first real frame.
-        # Wait for a short real-frame streak and blend from current placeholder frame.
-        if int(getattr(self, "_viz_placeholder_source", 0) or 0):
-            self._viz_real_frame_streak = int(getattr(self, "_viz_real_frame_streak", 0) or 0) + 1
-            if self._viz_real_frame_streak == 1 and self._viz_placeholder_frame:
-                self._viz_seed_frame = list(self._viz_placeholder_frame)
-                self._viz_warmup_until = time.monotonic() + 0.32
-            if self._viz_real_frame_streak >= 4:
-                self._stop_viz_placeholder()
-        else:
-            self._viz_real_frame_streak = 0
-        revealer = self.viz_revealer
-        if revealer is None or (not revealer.get_reveal_child()):
-            return
-        now = time.monotonic()
-        if self._viz_warmup_until > now and self._viz_seed_frame:
-            t = 1.0 - ((self._viz_warmup_until - now) / max(1e-6, float(self._viz_warmup_duration_s)))
-            t = max(0.0, min(1.0, t))
-            frame = self._blend_spectrum_frames(self._viz_seed_frame, frame, t)
-        elif self._viz_warmup_until <= now:
-            self._viz_seed_frame = None
-            self._viz_warmup_until = 0.0
-        self._apply_viz_frame(frame)
-
-    def _apply_viz_frame(self, frame):
-        if not frame:
-            return
-        current_page = self._viz_current_page
-        if current_page == "lyrics" and self.bg_viz is not None:
-            self.bg_viz.update_energy(frame)
-        if current_page == "spectrum" and self.viz is not None:
-            self.viz.update_data(frame)
-
-    def _stop_viz_placeholder(self):
-        src = int(getattr(self, "_viz_placeholder_source", 0) or 0)
-        if src:
-            GLib.source_remove(src)
-            self._viz_placeholder_source = 0
-        self._viz_real_frame_streak = 0
-
-    def _start_viz_placeholder_if_needed(self):
-        self._stop_viz_placeholder()
-        revealer = getattr(self, "viz_revealer", None)
-        if revealer is None or (not revealer.get_reveal_child()):
-            return
-        # With the always-on stream policy, _last_spectrum_ts is kept current
-        # while audio is playing.  If a fresh frame arrived recently, skip the
-        # synthetic placeholder entirely — real callbacks will flow right away.
-        now = time.monotonic()
-        if (now - float(getattr(self, "_last_spectrum_ts", 0.0) or 0.0)) < 0.35:
-            return
-
-        try:
-            n = int(self.settings.get("viz_bar_count", 32) or 32)
-        except Exception:
-            n = 32
-        n = max(8, min(128, n))
-        if not self._viz_placeholder_frame or len(self._viz_placeholder_frame) != n:
-            self._viz_placeholder_frame = [-60.0] * n
-        self._viz_placeholder_phase = 0.0
-        self._viz_real_frame_streak = 0
-        start_ts = now
-        duration_s = 2.0
-        end_ts = start_ts + duration_s
-
-        def _tick():
-            rev = getattr(self, "viz_revealer", None)
-            if rev is None or (not rev.get_reveal_child()):
-                self._viz_placeholder_source = 0
-                return False
-            # Real data arrived steadily -> handoff in on_spectrum_data.
-            if int(getattr(self, "_viz_real_frame_streak", 0) or 0) >= 4:
-                self._viz_placeholder_source = 0
-                return False
-            if time.monotonic() > end_ts:
-                self._viz_placeholder_source = 0
-                return False
-
-            now_tick = time.monotonic()
-            life = max(0.0, min(1.0, (end_ts - now_tick) / max(1e-6, duration_s)))
-            # Keep lively at beginning, then fade toward floor.
-            energy_gate = pow(life, 0.80)
-
-            self._viz_placeholder_phase += 0.24
-            ph = self._viz_placeholder_phase
-            frame = self._viz_placeholder_frame
-            nn = len(frame)
-            center1 = 0.14 + (0.06 * math.sin(ph * 0.23))
-            center2 = 0.38 + (0.10 * math.sin((ph * 0.15) + 1.2))
-            sigma1 = 0.10
-            sigma2 = 0.16
-            for i in range(nn):
-                x = i / float(max(1, nn - 1))
-                # Low-end dominant envelope + moving "energy hills".
-                low_tilt = 0.36 * pow(max(0.0, 1.0 - x), 1.22)
-                g1 = math.exp(-((x - center1) ** 2) / (2.0 * sigma1 * sigma1))
-                g2 = math.exp(-((x - center2) ** 2) / (2.0 * sigma2 * sigma2))
-                ripple = 0.042 * math.sin((x * 17.0) + (ph * 0.8))
-                # Add jagged per-bin variation so neighbouring bars are less "too smooth".
-                jagged = (0.030 * math.sin((i * 3.5) + (ph * 2.8))) + ((random.random() - 0.5) * 0.11)
-                noise = (random.random() - 0.5) * 0.060
-
-                target = 0.022 + low_tilt + (0.28 * g1) + (0.18 * g2) + ripple + jagged + noise
-                # Rare transient peaks so placeholder feels alive, not static.
-                if random.random() < 0.040:
-                    target += 0.28 * random.random()
-                target = max(0.0, min(0.82, target * energy_gate))
-                # Convert to dB-like spectrum values expected by visualizer path.
-                # Keep in realistic range to avoid full-screen "max level" look.
-                target_db = -60.0 + (target * 48.0)  # ~[-60 dB, -12 dB]
-                # Slightly faster response, and progressively pull to floor near the end.
-                blend = 0.34 if life > 0.45 else 0.24
-                floor_pull = (1.0 - life) * 0.22
-                frame[i] = (frame[i] * (1.0 - blend)) + (target_db * blend)
-                frame[i] = (frame[i] * (1.0 - floor_pull)) + (-60.0 * floor_pull)
-            self._apply_viz_frame(frame)
-            return True
-
-        self._viz_placeholder_source = GLib.timeout_add(33, _tick)
-
-    def _blend_spectrum_frames(self, seed, live, t):
-        if not seed:
-            return list(live or [])
-        if not live:
-            return list(seed)
-        a = list(seed)
-        b = list(live)
-        n = max(len(a), len(b))
-        if len(a) < n:
-            a.extend([a[-1] if a else 0.0] * (n - len(a)))
-        if len(b) < n:
-            b.extend([b[-1] if b else 0.0] * (n - len(b)))
-        k = max(0.0, min(1.0, float(t)))
-        return [a[i] + ((b[i] - a[i]) * k) for i in range(n)]
 
     def _lock_volume_controls(self, locked):
         """
@@ -2581,15 +1866,6 @@ class TidalApp(Adw.Application):
             self.album_sort_asc = True
         self._render_album_tracks()
 
-    def on_playlist_sort_clicked(self, field):
-        if self.playlist_sort_field == field:
-            self.playlist_sort_asc = not self.playlist_sort_asc
-        else:
-            self.playlist_sort_field = field
-            self.playlist_sort_asc = True
-        if self.current_playlist_id:
-            self.render_playlist_detail(self.current_playlist_id)
-
     def _update_track_list_icon(self, target_list=None):
         """
         [升级版] 刷新列表图标：当前播放的显示 ▶，其他的显示数字
@@ -2753,633 +2029,6 @@ class TidalApp(Adw.Application):
         submit_daemon(task)
         return False
 
-    def render_playlists_home(self):
-        self.current_remote_playlist = None
-        if self.right_stack is not None:
-            self.right_stack.set_visible_child_name("grid_view")
-            if hasattr(self, "_remember_last_view"):
-                self._remember_last_view("grid_view")
-        folder_stack = list(getattr(self, "current_playlist_folder_stack", []) or [])
-        if self.back_btn is not None:
-            self.back_btn.set_sensitive(bool(folder_stack))
-        if self.remote_playlist_edit_btn is not None:
-            self.remote_playlist_edit_btn.set_visible(False)
-        if self.remote_playlist_visibility_btn is not None:
-            self.remote_playlist_visibility_btn.set_visible(False)
-        if self.remote_playlist_more_btn is not None:
-            self.remote_playlist_more_btn.set_visible(False)
-        if hasattr(self, "grid_title_label") and self.grid_title_label is not None:
-            self.grid_title_label.set_text("Playlists")
-            self.grid_title_label.set_visible(True)
-        if hasattr(self, "grid_subtitle_label") and self.grid_subtitle_label is not None:
-            self.grid_subtitle_label.set_text("Browse and manage your cloud playlists")
-            self.grid_subtitle_label.set_visible(True)
-        ui_actions.render_playlists_home(self)
-
-    def on_playlist_folder_card_clicked(self, folder_obj):
-        if folder_obj is None:
-            return
-        fid = str(getattr(folder_obj, "id", "") or "")
-        if not fid:
-            return
-        self.current_playlist_folder = folder_obj
-        stack = list(getattr(self, "current_playlist_folder_stack", []) or [])
-        if stack and str(stack[-1].get("id", "")) == fid:
-            pass
-        else:
-            stack.append({"id": fid, "name": str(getattr(folder_obj, "name", "") or "Folder"), "obj": folder_obj})
-        self.current_playlist_folder_stack = stack
-        self.render_playlists_home()
-
-    def on_playlist_folder_up_clicked(self, _btn=None):
-        stack = list(getattr(self, "current_playlist_folder_stack", []) or [])
-        if not stack:
-            self.current_playlist_folder = None
-            self.render_playlists_home()
-            return
-        stack.pop()
-        self.current_playlist_folder_stack = stack
-        if stack:
-            self.current_playlist_folder = stack[-1].get("obj")
-        else:
-            self.current_playlist_folder = None
-        self.render_playlists_home()
-
-    def on_create_playlist_folder_clicked(self, _btn=None):
-        if not getattr(self.backend, "user", None):
-            self._show_simple_dialog("Login Required", "Please login first.")
-            return
-
-        def _submit(name):
-            folder_name = str(name or "").strip() or "New Folder"
-            parent_id = "root"
-            if getattr(self, "current_playlist_folder", None) is not None:
-                parent_id = str(getattr(self.current_playlist_folder, "id", "root") or "root")
-            self.show_output_notice("Creating folder...", "ok", 1500)
-
-            def task():
-                f = self.backend.create_cloud_folder(folder_name, parent_folder_id=parent_id)
-
-                def apply():
-                    if f is None:
-                        self.show_output_notice("Failed to create folder.", "warn", 2600)
-                    else:
-                        self.show_output_notice("Folder created.", "ok", 2200)
-                        self.render_playlists_home()
-                    return False
-
-                GLib.idle_add(apply)
-
-            submit_daemon(task)
-
-        self._prompt_playlist_name(
-            "New Folder",
-            "New Folder",
-            _submit,
-            subtitle="Create a folder to organize your cloud playlists.",
-            placeholder="Folder name",
-            save_label="Create",
-            dialog_size=(480, 220),
-        )
-
-    def on_playlist_folder_rename_clicked(self, folder_obj=None):
-        folder_obj = folder_obj or getattr(self, "current_playlist_folder", None)
-        if folder_obj is None:
-            return
-        old_name = str(getattr(folder_obj, "name", "") or "Folder")
-
-        def _submit(name):
-            new_name = str(name or "").strip()
-            if not new_name or new_name == old_name:
-                return
-            self.show_output_notice("Renaming folder...", "ok", 1500)
-
-            def task():
-                res = self.backend.rename_cloud_folder(folder_obj, new_name)
-
-                def apply():
-                    if bool(res.get("ok")):
-                        self.show_output_notice("Folder renamed.", "ok", 2200)
-                        stack = list(getattr(self, "current_playlist_folder_stack", []) or [])
-                        for item in stack:
-                            if str(item.get("id", "")) == str(getattr(folder_obj, "id", "") or ""):
-                                item["name"] = new_name
-                        self.current_playlist_folder_stack = stack
-                        self.render_playlists_home()
-                    else:
-                        self.show_output_notice("Failed to rename folder.", "warn", 2600)
-                    return False
-
-                GLib.idle_add(apply)
-
-            submit_daemon(task)
-
-        self._prompt_playlist_name(
-            "Rename Folder",
-            old_name,
-            _submit,
-            subtitle="Update folder name for your cloud playlists.",
-            placeholder="Folder name",
-            save_label="Rename",
-            dialog_size=(480, 220),
-        )
-
-    def on_playlist_folder_delete_clicked(self, folder_obj=None):
-        folder_obj = folder_obj or getattr(self, "current_playlist_folder", None)
-        if folder_obj is None:
-            return
-        fname = str(getattr(folder_obj, "name", "") or "this folder")
-        dialog = Gtk.Dialog(title="Delete Folder", transient_for=self.win, modal=True)
-        root = Gtk.Box(
-            orientation=Gtk.Orientation.VERTICAL,
-            spacing=12,
-            margin_top=12,
-            margin_bottom=12,
-            margin_start=12,
-            margin_end=12,
-        )
-        root.append(Gtk.Label(label=f"Delete '{fname}' permanently?", xalign=0))
-        action_row = Gtk.Box(spacing=8, halign=Gtk.Align.END)
-        cancel_btn = Gtk.Button(label="Cancel")
-        delete_btn = Gtk.Button(label="Delete")
-        cancel_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.CANCEL))
-        delete_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.OK))
-        action_row.append(cancel_btn)
-        action_row.append(delete_btn)
-        root.append(action_row)
-        dialog.set_child(root)
-
-        def _on_response(d, resp):
-            if resp != Gtk.ResponseType.OK:
-                d.destroy()
-                return
-            d.destroy()
-            self.show_output_notice("Deleting folder...", "ok", 1600)
-
-            def task():
-                res = self.backend.delete_cloud_folder(folder_obj)
-
-                def apply():
-                    if bool(res.get("ok")):
-                        self.show_output_notice("Folder deleted.", "ok", 2200)
-                        fid = str(getattr(folder_obj, "id", "") or "")
-                        stack = [x for x in list(getattr(self, "current_playlist_folder_stack", []) or []) if str(x.get("id", "")) != fid]
-                        self.current_playlist_folder_stack = stack
-                        self.current_playlist_folder = stack[-1].get("obj") if stack else None
-                        self.render_playlists_home()
-                    else:
-                        self.show_output_notice("Failed to delete folder.", "warn", 2800)
-                    return False
-
-                GLib.idle_add(apply)
-
-            submit_daemon(task)
-
-        dialog.connect("response", _on_response)
-        dialog.present()
-
-    def render_playlist_detail(self, playlist_id):
-        ui_actions.render_playlist_detail(self, playlist_id)
-
-    def on_playlist_card_clicked(self, playlist_id):
-        self.current_remote_playlist = None
-        if self.remote_playlist_edit_btn is not None:
-            self.remote_playlist_edit_btn.set_visible(False)
-        if self.remote_playlist_visibility_btn is not None:
-            self.remote_playlist_visibility_btn.set_visible(False)
-        if self.remote_playlist_more_btn is not None:
-            self.remote_playlist_more_btn.set_visible(False)
-        self.current_playlist_id = playlist_id
-        self.playlist_edit_mode = False
-        self.playlist_rename_mode = False
-        if hasattr(self, "grid_title_label") and self.grid_title_label is not None:
-            self.grid_title_label.set_visible(False)
-        if hasattr(self, "grid_subtitle_label") and self.grid_subtitle_label is not None:
-            self.grid_subtitle_label.set_visible(False)
-        if self.back_btn is not None:
-            self.back_btn.set_sensitive(True)
-        self.render_playlist_detail(playlist_id)
-
-    def on_remote_playlist_card_clicked(self, playlist_obj):
-        if playlist_obj is None:
-            return
-        self.current_remote_playlist = playlist_obj
-        self.current_album = None
-        self.current_playlist_id = None
-        self.playlist_edit_mode = False
-        self.playlist_rename_mode = False
-        self.right_stack.set_visible_child_name("tracks")
-        if hasattr(self, "_remember_last_view"):
-            self._remember_last_view("tracks")
-        self.back_btn.set_sensitive(True)
-
-        title = getattr(playlist_obj, "name", "TIDAL Playlist")
-        creator = getattr(playlist_obj, "creator", None)
-        creator_name = str(getattr(creator, "name", None) or "TIDAL")
-        self.header_kicker.set_text("Playlist")
-        self.header_title.set_text(title)
-        self.header_title.set_tooltip_text(title)
-        self.header_artist.set_text(creator_name)
-        self.header_artist.set_tooltip_text(creator_name)
-        self.header_meta.set_text("")
-        if self.fav_btn is not None:
-            self.fav_btn.set_visible(False)
-        if self.add_playlist_btn is not None:
-            self.add_playlist_btn.set_visible(False)
-        if self.remote_playlist_edit_btn is not None:
-            self.remote_playlist_edit_btn.set_visible(False)
-        if self.remote_playlist_visibility_btn is not None:
-            self.remote_playlist_visibility_btn.set_visible(False)
-        if self.remote_playlist_more_btn is not None:
-            self.remote_playlist_more_btn.set_visible(True)
-        self._refresh_remote_playlist_visibility_button(playlist_obj)
-        # Ensure play/shuffle buttons exist and are visible
-        from actions.ui_actions import _ensure_play_shuffle_btns
-        _ensure_play_shuffle_btns(self)
-        utils.load_img(self.header_art, lambda: self.backend.get_artwork_url(playlist_obj, 640), self.cache_dir, 160)
-
-        while c := self.track_list.get_first_child():
-            self.track_list.remove(c)
-
-        def task():
-            tracks = self.backend.get_tracks(playlist_obj) or []
-
-            def apply():
-                self.header_meta.set_text(f"{len(tracks)} Tracks" if tracks else "0 Tracks")
-                self.load_album_tracks(tracks)
-                return False
-
-            GLib.idle_add(apply)
-
-        submit_daemon(task)
-
-    def _refresh_remote_playlist_visibility_button(self, playlist_obj=None):
-        pl = playlist_obj or getattr(self, "current_remote_playlist", None)
-        if pl is None:
-            return
-        is_public = bool(getattr(pl, "public", False))
-        # Update menu item icon and label
-        icon = getattr(self, "_vis_menu_icon", None)
-        label = getattr(self, "_vis_menu_label", None)
-        if icon is not None:
-            icon.set_from_icon_name("changes-allow-symbolic" if is_public else "changes-prevent-symbolic")
-        if label is not None:
-            label.set_text("Make Private" if is_public else "Make Public")
-
-    def on_remote_playlist_toggle_public_clicked(self, _btn=None, playlist_obj=None):
-        pl = playlist_obj or getattr(self, "current_remote_playlist", None)
-        if pl is None:
-            return
-        target_public = not bool(getattr(pl, "public", False))
-        self.show_output_notice("Updating playlist visibility...", "ok", 1800)
-
-        def task():
-            res = self.backend.update_cloud_playlist(pl, is_public=target_public)
-
-            def apply():
-                if bool(res.get("ok")):
-                    try:
-                        pl.public = target_public
-                    except Exception:
-                        pass
-                    self._refresh_remote_playlist_visibility_button(pl)
-                    self.show_output_notice(
-                        "Playlist is now public." if target_public else "Playlist is now private.",
-                        "ok",
-                        2200,
-                    )
-                else:
-                    self.show_output_notice("Failed to update playlist visibility.", "warn", 3200)
-                return False
-
-            GLib.idle_add(apply)
-
-        submit_daemon(task)
-
-    def _open_cloud_playlist_editor(
-        self,
-        dialog_title,
-        save_label,
-        initial_title,
-        initial_desc="",
-        initial_public=False,
-        playlist_obj=None,
-        folder_options=None,
-        initial_folder_id="root",
-        on_submit=None,
-    ):
-        dialog = Gtk.Dialog(title=dialog_title, transient_for=self.win, modal=True)
-        dialog.set_default_size(586, 413)
-        root = Gtk.Box(
-            orientation=Gtk.Orientation.VERTICAL,
-            spacing=12,
-            margin_top=14,
-            margin_bottom=14,
-            margin_start=14,
-            margin_end=14,
-        )
-        content = Gtk.Box(spacing=16)
-
-        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        cover = Gtk.Image(css_classes=["album-cover-img", "playlist-cover-img"])
-        cover.set_size_request(147, 147)
-        if playlist_obj is not None:
-            utils.load_img(cover, lambda: self.backend.get_artwork_url(playlist_obj, 640), self.cache_dir, 147)
-        else:
-            cover.set_from_icon_name("audio-x-generic-symbolic")
-        left.append(cover)
-        change_btn = Gtk.Button(label="Change image")
-        change_btn.set_sensitive(False)
-        change_btn.set_tooltip_text("Not available in this version")
-        left.append(change_btn)
-        content.append(left)
-
-        right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, hexpand=True)
-        right.append(Gtk.Label(label="Title", xalign=0))
-        title_entry = Gtk.Entry(text=str(initial_title or ""))
-        right.append(title_entry)
-
-        folder_dd = None
-        folder_ids = []
-        if folder_options:
-            right.append(Gtk.Label(label="Folder", xalign=0))
-            folder_labels = [str(item[1] or "Root") for item in folder_options]
-            folder_ids = [str(item[0] or "root") for item in folder_options]
-            folder_dd = Gtk.DropDown(model=Gtk.StringList.new(folder_labels))
-            selected_idx = 0
-            target_id = str(initial_folder_id or "root")
-            for i, fid in enumerate(folder_ids):
-                if fid == target_id:
-                    selected_idx = i
-                    break
-            folder_dd.set_selected(selected_idx)
-            right.append(folder_dd)
-
-        right.append(Gtk.Label(label="Description", xalign=0))
-        desc_view = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR, vexpand=True)
-        desc_buf = desc_view.get_buffer()
-        desc_buf.set_text(str(initial_desc or ""))
-        desc_scroll = Gtk.ScrolledWindow(vexpand=True, min_content_height=120)
-        desc_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        desc_scroll.set_child(desc_view)
-        right.append(desc_scroll)
-        count_lbl = Gtk.Label(xalign=0, css_classes=["dim-label"])
-        right.append(count_lbl)
-
-        public_row = Gtk.Box(spacing=8, margin_top=6)
-        public_lbl_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
-        public_lbl_box.append(Gtk.Label(label="Make it public", xalign=0))
-        public_lbl_box.append(Gtk.Label(label="Your playlist will be visible on your profile and accessible by anyone.", xalign=0, css_classes=["dim-label"]))
-        public_switch = Gtk.Switch(active=bool(initial_public), halign=Gtk.Align.END, valign=Gtk.Align.CENTER)
-        public_row.append(public_lbl_box)
-        public_row.append(public_switch)
-        right.append(public_row)
-
-        content.append(right)
-        root.append(content)
-
-        action_row = Gtk.Box(spacing=8, halign=Gtk.Align.END)
-        cancel_btn = Gtk.Button(label="Cancel")
-        save_btn = Gtk.Button(label=save_label)
-        save_btn.add_css_class("suggested-action")
-        cancel_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.CANCEL))
-        save_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.OK))
-        action_row.append(cancel_btn)
-        action_row.append(save_btn)
-        root.append(action_row)
-        dialog.set_child(root)
-
-        def _update_count(_buf=None):
-            txt = desc_buf.get_text(desc_buf.get_start_iter(), desc_buf.get_end_iter(), True) or ""
-            count_lbl.set_text(f"{len(txt)}/500 characters")
-            if len(txt) > 500:
-                count_lbl.add_css_class("status-error")
-            else:
-                count_lbl.remove_css_class("status-error")
-            return False
-
-        desc_buf.connect("changed", _update_count)
-        _update_count()
-
-        def _on_response(d, resp):
-            if resp != Gtk.ResponseType.OK:
-                d.destroy()
-                return
-            title = str(title_entry.get_text() or "").strip()
-            desc = desc_buf.get_text(desc_buf.get_start_iter(), desc_buf.get_end_iter(), True) or ""
-            is_public = bool(public_switch.get_active())
-            selected_folder_id = str(initial_folder_id or "root")
-            if folder_dd is not None and folder_ids:
-                idx = int(folder_dd.get_selected())
-                if 0 <= idx < len(folder_ids):
-                    selected_folder_id = folder_ids[idx]
-            d.destroy()
-            if not title:
-                self.show_output_notice("Playlist title cannot be empty.", "warn", 2600)
-                return
-            if len(desc) > 500:
-                self.show_output_notice("Description is too long (max 500).", "warn", 2600)
-                return
-            if callable(on_submit):
-                on_submit(title, desc, is_public, selected_folder_id)
-
-        dialog.connect("response", _on_response)
-        dialog.present()
-
-    def on_remote_playlist_rename_clicked(self, playlist_obj=None):
-        pl = playlist_obj or getattr(self, "current_remote_playlist", None)
-        if pl is None:
-            return
-        title_init = str(getattr(pl, "name", None) or "Untitled Playlist")
-        desc_init = str(getattr(pl, "description", None) or "")
-        public_init = bool(getattr(pl, "public", False))
-
-        def _submit(title, desc, is_public, _folder_id):
-            self.show_output_notice("Saving playlist...", "ok", 1800)
-
-            def task():
-                res = self.backend.update_cloud_playlist(pl, name=title, description=desc, is_public=is_public)
-
-                def apply():
-                    if bool(res.get("ok")):
-                        try:
-                            pl.name = title
-                            pl.description = desc
-                            pl.public = is_public
-                        except Exception:
-                            pass
-                        self.show_output_notice("Playlist updated.", "ok", 2400)
-                        if getattr(self, "current_remote_playlist", None) is not None and getattr(self.current_remote_playlist, "id", None) == getattr(pl, "id", None):
-                            self.on_remote_playlist_card_clicked(pl)
-                    else:
-                        self.show_output_notice("Failed to update playlist.", "warn", 3200)
-                    return False
-
-                GLib.idle_add(apply)
-
-            submit_daemon(task)
-
-        self._open_cloud_playlist_editor(
-            dialog_title="Edit playlist",
-            save_label="Save",
-            initial_title=title_init,
-            initial_desc=desc_init,
-            initial_public=public_init,
-            playlist_obj=pl,
-            on_submit=_submit,
-        )
-
-    def on_remote_playlist_delete_clicked(self, playlist_obj=None):
-        pl = playlist_obj or getattr(self, "current_remote_playlist", None)
-        if pl is None:
-            return
-        pname = str(getattr(pl, "name", None) or "this playlist")
-        dialog = Gtk.Dialog(title="Delete Playlist", transient_for=self.win, modal=True)
-        root = Gtk.Box(
-            orientation=Gtk.Orientation.VERTICAL,
-            spacing=12,
-            margin_top=12,
-            margin_bottom=12,
-            margin_start=12,
-            margin_end=12,
-        )
-        root.append(Gtk.Label(label=f"Delete '{pname}' permanently?", xalign=0))
-        action_row = Gtk.Box(spacing=8, halign=Gtk.Align.END)
-        cancel_btn = Gtk.Button(label="Cancel")
-        delete_btn = Gtk.Button(label="Delete")
-        cancel_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.CANCEL))
-        delete_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.OK))
-        action_row.append(cancel_btn)
-        action_row.append(delete_btn)
-        root.append(action_row)
-        dialog.set_child(root)
-
-        def _on_response(d, resp):
-            if resp != Gtk.ResponseType.OK:
-                d.destroy()
-                return
-            d.destroy()
-            self.show_output_notice("Deleting playlist...", "ok", 1600)
-
-            def task():
-                res = self.backend.delete_cloud_playlist(pl)
-
-                def apply():
-                    if bool(res.get("ok")):
-                        self.show_output_notice("Playlist deleted.", "ok", 2200)
-                        if getattr(self, "current_remote_playlist", None) is not None and getattr(self.current_remote_playlist, "id", None) == getattr(pl, "id", None):
-                            self.current_remote_playlist = None
-                        self.render_playlists_home()
-                    else:
-                        self.show_output_notice("Failed to delete playlist.", "warn", 3000)
-                    return False
-
-                GLib.idle_add(apply)
-
-            submit_daemon(task)
-
-        dialog.connect("response", _on_response)
-        dialog.present()
-
-    def on_remote_playlist_move_to_folder_clicked(self, playlist_obj=None):
-        pl = playlist_obj or getattr(self, "current_remote_playlist", None)
-        if pl is None:
-            return
-        folders = [{"id": "root", "path": "Root"}] + list(self.backend.get_all_playlist_folders(limit=1000) or [])
-        options = [(str(f.get("id", "root")), str(f.get("path", "Root"))) for f in folders]
-        if not options:
-            self.show_output_notice("No folders available.", "warn", 2400)
-            return
-        dialog = Gtk.Dialog(title="Move to Folder", transient_for=self.win, modal=True)
-        root = Gtk.Box(
-            orientation=Gtk.Orientation.VERTICAL,
-            spacing=12,
-            margin_top=12,
-            margin_bottom=12,
-            margin_start=12,
-            margin_end=12,
-        )
-        root.append(Gtk.Label(label="Select destination folder:", xalign=0))
-        dd = Gtk.DropDown(model=Gtk.StringList.new([label for _fid, label in options]))
-        dd.set_selected(0)
-        root.append(dd)
-        action_row = Gtk.Box(spacing=8, halign=Gtk.Align.END)
-        cancel_btn = Gtk.Button(label="Cancel")
-        move_btn = Gtk.Button(label="Move")
-        move_btn.add_css_class("suggested-action")
-        cancel_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.CANCEL))
-        move_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.OK))
-        action_row.append(cancel_btn)
-        action_row.append(move_btn)
-        root.append(action_row)
-        dialog.set_child(root)
-
-        def _on_response(d, resp):
-            if resp != Gtk.ResponseType.OK:
-                d.destroy()
-                return
-            idx = int(dd.get_selected())
-            target_id = options[idx][0] if 0 <= idx < len(options) else "root"
-            d.destroy()
-            self.show_output_notice("Moving playlist...", "ok", 1800)
-
-            def task():
-                res = self.backend.move_cloud_playlist_to_folder(pl, target_folder_id=target_id)
-
-                def apply():
-                    if bool(res.get("ok")):
-                        self.show_output_notice("Playlist moved.", "ok", 2200)
-                        self.current_remote_playlist = None
-                        self.current_playlist_folder = None
-                        self.current_playlist_folder_stack = []
-                        self.render_playlists_home()
-                    else:
-                        self.show_output_notice("Failed to move playlist.", "warn", 2800)
-                    return False
-
-                GLib.idle_add(apply)
-
-            submit_daemon(task)
-
-        dialog.connect("response", _on_response)
-        dialog.present()
-
-    def on_remove_single_track_from_remote_playlist(self, track):
-        pl = getattr(self, "current_remote_playlist", None)
-        if pl is None or track is None:
-            return
-
-        def task():
-            res = self.backend.remove_tracks_from_cloud_playlist(pl, [track])
-
-            def apply():
-                if bool(res.get("ok")):
-                    removed = int(res.get("removed", 0) or 0)
-                    self.show_output_notice(f"Removed {removed} track", "ok", 2200)
-                    # Refresh current remote playlist view
-                    self.on_remote_playlist_card_clicked(pl)
-                else:
-                    self.show_output_notice("Failed to remove track from playlist.", "warn", 2800)
-                return False
-
-            GLib.idle_add(apply)
-
-        submit_daemon(task)
-
-    def on_playlist_track_selected(self, box, row):
-        if not row:
-            return
-        idx = getattr(row, "playlist_track_index", -1)
-        tracks = getattr(box, "playlist_tracks", [])
-        if not tracks or idx < 0 or idx >= len(tracks):
-            return
-        self.current_track_list = tracks
-        self._set_play_queue(tracks)
-        self.play_track(idx)
-
-    def _next_playlist_name(self):
-        return "New Playlist"
-
     def _show_simple_dialog(self, title, message):
         dialog = Gtk.Dialog(title=title, transient_for=self.win, modal=True)
         root = Gtk.Box(
@@ -3399,154 +2048,6 @@ class TidalApp(Adw.Application):
         dialog.set_child(root)
         dialog.connect("response", lambda d, _resp: d.destroy())
         dialog.present()
-
-    def on_create_playlist_clicked(self, _btn=None):
-        if not getattr(self.backend, "user", None):
-            self._show_simple_dialog("Login Required", "Please login first.")
-            return
-        default_name = self._next_playlist_name()
-        folder_rows = [{"id": "root", "path": "Root"}] + list(self.backend.get_all_playlist_folders(limit=1000) or [])
-        folder_options = [(str(row.get("id", "root")), str(row.get("path", "Root"))) for row in folder_rows]
-        initial_folder_id = "root"
-        if getattr(self, "current_playlist_folder", None) is not None:
-            initial_folder_id = str(getattr(self.current_playlist_folder, "id", "root") or "root")
-
-        def _submit(name, desc, is_public, folder_id):
-            self.show_output_notice("Creating cloud playlist...", "ok", 1600)
-
-            def task():
-                pl = self.backend.create_cloud_playlist_in_folder(name, desc, parent_folder_id=folder_id)
-                if pl is not None and bool(is_public):
-                    try:
-                        self.backend.update_cloud_playlist(pl, is_public=True)
-                    except Exception:
-                        pass
-
-                def apply():
-                    if pl is None:
-                        self.show_output_notice("Failed to create cloud playlist.", "warn", 2600)
-                        return False
-                    self.show_output_notice(f"Created playlist: {getattr(pl, 'name', name)}", "ok", 2200)
-                    self.render_playlists_home()
-                    return False
-
-                GLib.idle_add(apply)
-
-            submit_daemon(task)
-
-        self._open_cloud_playlist_editor(
-            dialog_title="Create playlist",
-            save_label="Create",
-            initial_title=default_name,
-            initial_desc="Created from HiresTI",
-            initial_public=False,
-            playlist_obj=None,
-            folder_options=folder_options,
-            initial_folder_id=initial_folder_id,
-            on_submit=_submit,
-        )
-
-    def _prompt_playlist_pick(self, on_pick):
-        if not getattr(self.backend, "user", None):
-            self._show_simple_dialog("Login Required", "Please login first.")
-            return
-        playlists = list(self.backend.get_user_playlists(limit=1000) or [])
-        if not playlists:
-            created = self.backend.create_cloud_playlist(self._next_playlist_name(), "Created from HiresTI")
-            if created is not None:
-                on_pick(created, True)
-            else:
-                self.show_output_notice("Failed to create cloud playlist.", "warn", 2600)
-            return
-
-        dialog = Gtk.Dialog(title="Add to Playlist", transient_for=self.win, modal=True)
-        root = Gtk.Box(
-            orientation=Gtk.Orientation.VERTICAL,
-            spacing=12,
-            margin_top=12,
-            margin_bottom=12,
-            margin_start=12,
-            margin_end=12,
-        )
-        box_wrap = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
-        box_wrap.append(Gtk.Label(label="Select a playlist:", xalign=0))
-
-        names = [getattr(p, "name", None) or "Untitled Playlist" for p in playlists]
-        dd = Gtk.DropDown(model=Gtk.StringList.new(names))
-        dd.set_selected(0)
-        box_wrap.append(dd)
-        dedupe_ck = Gtk.CheckButton(label="Auto de-duplicate", active=True)
-        box_wrap.append(dedupe_ck)
-        root.append(box_wrap)
-        action_row = Gtk.Box(spacing=8, halign=Gtk.Align.END)
-        cancel_btn = Gtk.Button(label="Cancel")
-        new_btn = Gtk.Button(label="New Playlist")
-        add_btn = Gtk.Button(label="Add")
-        cancel_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.CANCEL))
-        new_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.APPLY))
-        add_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.OK))
-        action_row.append(cancel_btn)
-        action_row.append(new_btn)
-        action_row.append(add_btn)
-        root.append(action_row)
-        dialog.set_child(root)
-
-        def _on_response(d, resp):
-            if resp == Gtk.ResponseType.OK:
-                idx = dd.get_selected()
-                if 0 <= idx < len(playlists):
-                    on_pick(playlists[idx], dedupe_ck.get_active())
-            elif resp == Gtk.ResponseType.APPLY:
-                created = self.backend.create_cloud_playlist(self._next_playlist_name(), "Created from HiresTI")
-                if created is not None:
-                    on_pick(created, dedupe_ck.get_active())
-                else:
-                    self.show_output_notice("Failed to create cloud playlist.", "warn", 2600)
-            d.destroy()
-
-        dialog.connect("response", _on_response)
-        dialog.present()
-
-    def on_add_tracks_to_playlist(self, tracks):
-        items = [t for t in (tracks or []) if t is not None]
-        if not items:
-            return
-
-        def _do_add(playlist_obj, dedupe):
-            self.show_output_notice("Adding tracks to cloud playlist...", "ok", 1800)
-
-            def task():
-                res = self.backend.add_tracks_to_cloud_playlist(playlist_obj, items, dedupe=bool(dedupe), batch_size=100)
-
-                def apply():
-                    if bool(res.get("ok")):
-                        added = int(res.get("added", 0) or 0)
-                        requested = int(res.get("requested", 0) or 0)
-                        skipped = max(0, requested - added)
-                        msg = f"Added {added} tracks"
-                        if skipped:
-                            msg += f" (skipped {skipped})"
-                        self.show_output_notice(msg, "ok", 2600)
-                    else:
-                        self.show_output_notice("Failed to add tracks to cloud playlist.", "warn", 3000)
-                    return False
-
-                GLib.idle_add(apply)
-
-            submit_daemon(task)
-
-        self._prompt_playlist_pick(_do_add)
-
-    def on_add_single_track_to_playlist(self, track):
-        if track is None:
-            return
-        self.on_add_tracks_to_playlist([track])
-
-    def on_add_current_album_to_playlist(self, _btn=None):
-        tracks = list(getattr(self, "current_track_list", []) or [])
-        if not tracks:
-            return
-        self.on_add_tracks_to_playlist(tracks)
 
     def on_search_track_checkbox_toggled(self, _cb, track_index, checked):
         if not isinstance(getattr(self, "search_selected_indices", None), set):
@@ -3638,121 +2139,6 @@ class TidalApp(Adw.Application):
     def on_search_tracks_next_page(self, _btn=None):
         self.search_tracks_page = int(getattr(self, "search_tracks_page", 0) or 0) + 1
         ui_actions.render_search_tracks_page(self)
-
-    def _prompt_playlist_name(
-        self,
-        title,
-        initial_name,
-        on_submit,
-        subtitle=None,
-        placeholder=None,
-        save_label="Save",
-        dialog_size=None,
-    ):
-        dialog = Gtk.Dialog(title=title, transient_for=self.win, modal=True)
-        if dialog_size:
-            try:
-                dialog.set_default_size(int(dialog_size[0]), int(dialog_size[1]))
-            except Exception:
-                pass
-        root = Gtk.Box(
-            orientation=Gtk.Orientation.VERTICAL,
-            spacing=14,
-            margin_top=14,
-            margin_bottom=14,
-            margin_start=14,
-            margin_end=14,
-        )
-        title_lbl = Gtk.Label(label=str(title or ""), xalign=0, css_classes=["home-section-title"])
-        root.append(title_lbl)
-        if subtitle:
-            root.append(Gtk.Label(label=str(subtitle), xalign=0, css_classes=["dim-label"]))
-        entry = Gtk.Entry(text=initial_name or "")
-        if placeholder:
-            entry.set_placeholder_text(str(placeholder))
-        entry.connect("activate", lambda _e: dialog.response(Gtk.ResponseType.OK))
-        root.append(entry)
-        action_row = Gtk.Box(spacing=8, halign=Gtk.Align.END)
-        cancel_btn = Gtk.Button(label="Cancel")
-        save_btn = Gtk.Button(label=str(save_label or "Save"), css_classes=["suggested-action"])
-        cancel_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.CANCEL))
-        save_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.OK))
-        action_row.append(cancel_btn)
-        action_row.append(save_btn)
-        root.append(action_row)
-        dialog.set_child(root)
-
-        def _on_response(d, resp):
-            if resp == Gtk.ResponseType.OK:
-                on_submit(entry.get_text().strip())
-            d.destroy()
-
-        dialog.connect("response", _on_response)
-        dialog.present()
-        entry.grab_focus()
-
-    def on_playlist_start_inline_rename(self, playlist_id):
-        self.playlist_rename_mode = True
-        self.render_playlist_detail(playlist_id)
-
-    def on_playlist_commit_inline_rename(self, playlist_id, name):
-        new_name = (name or "").strip()
-        if new_name:
-            self.playlist_mgr.rename_playlist(playlist_id, new_name)
-        self.playlist_rename_mode = False
-        self.render_playlist_detail(playlist_id)
-
-    def on_playlist_cancel_inline_rename(self, playlist_id):
-        self.playlist_rename_mode = False
-        self.render_playlist_detail(playlist_id)
-
-    def on_playlist_delete_clicked(self, playlist_id):
-        dialog = Gtk.Dialog(title="Delete Playlist", transient_for=self.win, modal=True)
-        root = Gtk.Box(
-            orientation=Gtk.Orientation.VERTICAL,
-            spacing=12,
-            margin_top=12,
-            margin_bottom=12,
-            margin_start=12,
-            margin_end=12,
-        )
-        root.append(Gtk.Label(label="Delete this playlist permanently?", xalign=0))
-        action_row = Gtk.Box(spacing=8, halign=Gtk.Align.END)
-        cancel_btn = Gtk.Button(label="Cancel")
-        delete_btn = Gtk.Button(label="Delete")
-        cancel_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.CANCEL))
-        delete_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.OK))
-        action_row.append(cancel_btn)
-        action_row.append(delete_btn)
-        root.append(action_row)
-        dialog.set_child(root)
-
-        def _on_response(d, resp):
-            if resp == Gtk.ResponseType.OK:
-                self.playlist_mgr.delete_playlist(playlist_id)
-                self.current_playlist_id = None
-                self.render_playlists_home()
-            d.destroy()
-
-        dialog.connect("response", _on_response)
-        dialog.present()
-
-    def on_playlist_remove_track_clicked(self, playlist_id, track_index):
-        self.playlist_mgr.remove_track(playlist_id, track_index)
-        self.render_playlist_detail(playlist_id)
-
-    def on_playlist_move_track_clicked(self, playlist_id, track_index, direction):
-        self.playlist_mgr.move_track(playlist_id, track_index, direction)
-        self.render_playlist_detail(playlist_id)
-
-    def on_playlist_toggle_edit(self, _btn=None):
-        self.playlist_edit_mode = not bool(getattr(self, "playlist_edit_mode", False))
-        if self.current_playlist_id:
-            self.render_playlist_detail(self.current_playlist_id)
-
-    def on_playlist_reorder_track(self, playlist_id, from_index, to_index):
-        if self.playlist_mgr.move_track_to(playlist_id, from_index, to_index):
-            self.render_playlist_detail(playlist_id)
 
     def on_history_album_clicked(self, album):
         if album is None:
@@ -4205,29 +2591,6 @@ class TidalApp(Adw.Application):
         self.paned.set_position(s_px)
         GLib.idle_add(lambda: (self._schedule_viz_handle_realign(animate=False), False)[1])
 
-    def _schedule_viz_handle_realign(self, animate=True):
-        # Immediate pass + delayed retries to survive fullscreen/restore re-allocation jitter.
-        expanded = bool(getattr(self, "viz_revealer", None) is not None and self.viz_revealer.get_reveal_child())
-        self._position_viz_handle(expanded, animate=animate)
-
-        if self._viz_handle_resize_source:
-            GLib.source_remove(self._viz_handle_resize_source)
-            self._viz_handle_resize_source = 0
-
-        self._viz_handle_resize_retries = 2
-
-        def _retry():
-            expanded_now = bool(getattr(self, "viz_revealer", None) is not None and self.viz_revealer.get_reveal_child())
-            self._position_viz_handle(expanded_now, animate=animate)
-            self._viz_handle_resize_retries -= 1
-            if self._viz_handle_resize_retries <= 0:
-                self._viz_handle_resize_source = 0
-                return False
-            return True
-
-        self._viz_handle_resize_source = GLib.timeout_add(120, _retry)
-        return False
-
     def on_paned_position_changed(self, _paned, _param):
         if self.paned is None:
             return
@@ -4467,273 +2830,96 @@ class TidalApp(Adw.Application):
         pop.set_child(vbox)
         return pop
 
-    def toggle_visualizer(self, btn):
-        """
-        [Overlay 适配版]
-        """
-        is_visible = self.viz_revealer.get_reveal_child()
-        target_state = not is_visible
-        self._set_visualizer_expanded(target_state)
-        self.settings["viz_expanded"] = target_state
-        self.schedule_save_settings()
+# Import visualizer methods and bind to TidalApp class
+from app.app_visualizer import (
+    _apply_overlay_scroll_padding,
+    _ensure_overlay_handles_visible,
+    _viz_sync_key,
+    _get_viz_offset_from_latency_profile,
+    _apply_viz_sync_offset_for_device,
+    on_viz_sync_offset_update,
+    _drop_down_names,
+    _selected_name_from_dropdown,
+    _build_visualizer_for_backend,
+    _resolve_viz_backend_key,
+    _sync_viz_dropdown_models,
+    _rebuild_visualizer_backend,
+    _apply_viz_backend_policy_by_index,
+    on_viz_bars_changed,
+    _apply_viz_bars_by_count,
+    _apply_spectrum_theme_by_index,
+    _apply_viz_effect_by_index,
+    on_viz_effect_changed,
+    _apply_viz_profile_by_index,
+    on_viz_profile_changed,
+    on_spectrum_theme_changed,
+    on_viz_backend_policy_changed,
+    on_viz_page_changed,
+    _sync_viz_tab_runtime_state,
+    _should_enable_spectrum_stream,
+    _sync_spectrum_stream_state,
+    _prewarm_gl_visualizer_once,
+    _start_spectrum_stream_prewarm,
+    _apply_viz_panel_theme,
+    on_spectrum_data,
+    _apply_viz_frame,
+    _stop_viz_placeholder,
+    _start_viz_placeholder_if_needed,
+    _blend_spectrum_frames,
+    _schedule_viz_handle_realign,
+    toggle_visualizer,
+    _set_visualizer_expanded,
+    _set_viz_content_opacity,
+    _start_viz_fade_in,
+    _position_viz_handle,
+    _start_viz_handle_follow_transition,
+    _align_viz_handle_to_play_button,
+    _animate_viz_handle_to,
+)
 
-    def _set_visualizer_expanded(self, expanded):
-        trace = str(os.getenv("HIRESTI_VIZ_TRACE", "0")).strip().lower() in ("1", "true", "yes", "on")
-        if expanded:
-            self._viz_trace_open_ts = time.monotonic()
-            self._viz_trace_last_cb_ts = 0.0
-            self._viz_trace_first_real_logged = False
-            self._viz_seed_frame = list(self._last_spectrum_frame) if self._last_spectrum_frame else None
-            # If the stream was kept alive (always-on policy), _last_spectrum_frame
-            # is fresh (<= 0.5 s old) — no blending warmup is needed.  Only warm up
-            # when opening from a cold state (first ever open, or after a long pause
-            # where no spectrum callbacks arrived).
-            now_open = time.monotonic()
-            last_ts = float(getattr(self, "_last_spectrum_ts", 0.0) or 0.0)
-            frame_is_fresh = self._viz_seed_frame and ((now_open - last_ts) < 0.5)
-            if frame_is_fresh:
-                self._viz_warmup_until = 0.0  # skip warmup; real data is already flowing
-            else:
-                self._viz_warmup_until = now_open + float(self._viz_warmup_duration_s)
-            if trace:
-                logger.info(
-                    "VIZ TRACE drawer-open: seed=%s fresh=%s warmup=%.2fs page=%s",
-                    bool(self._viz_seed_frame),
-                    frame_is_fresh,
-                    max(0.0, self._viz_warmup_until - now_open),
-                    str(getattr(self, "_viz_current_page", "spectrum")),
-                )
-        if self._viz_open_layout_source:
-            GLib.source_remove(self._viz_open_layout_source)
-            self._viz_open_layout_source = 0
-        if self._viz_open_stream_source:
-            GLib.source_remove(self._viz_open_stream_source)
-            self._viz_open_stream_source = 0
-        if self._viz_handle_settle_source:
-            GLib.source_remove(self._viz_handle_settle_source)
-            self._viz_handle_settle_source = 0
-        # 触发 Revealer 动画 (上下滑动)
-        self.viz_revealer.set_reveal_child(expanded)
-        if expanded:
-            self._start_viz_handle_follow_transition()
-        if expanded:
-            # Stream is kept alive (always-on policy), so _sync here is a no-op
-            # in the normal case.  Call it anyway as a safety net for edge cases
-            # (first open, lyrics-static mode change, etc.).
-            self._sync_spectrum_stream_state()
-            # Layout padding / handle position can be deferred (not latency-critical).
-            def _defer_open_layout():
-                self._viz_open_layout_source = 0
-                self._apply_overlay_scroll_padding(True)
-                self._position_viz_handle(True, animate=False)
-                return False
-
-            self._viz_open_layout_source = GLib.timeout_add(220, _defer_open_layout)
-
-            # Seed the visualizer immediately with the last known frame so the
-            # animation tick has something to draw right away.
-            if self._viz_seed_frame:
-                page = str(getattr(self, "_viz_current_page", "spectrum") or "spectrum")
-                if page == "spectrum" and getattr(self, "viz", None) is not None:
-                    self.viz.update_data(self._viz_seed_frame)
-                if page == "lyrics" and getattr(self, "bg_viz", None) is not None:
-                    self.bg_viz.update_energy(self._viz_seed_frame)
-
-            # Placeholder is only needed when there is no fresh real frame yet
-            # (e.g. app just started, no audio ever played).
-            self._start_viz_placeholder_if_needed()
-        else:
-            # Keep the spectrum stream running (always-on) so _last_spectrum_frame
-            # stays fresh for instant re-open.  We only clean up layout and the
-            # placeholder animation — no need to call _sync_spectrum_stream_state()
-            # which would (no longer) disable the stream anyway.
-            self._apply_overlay_scroll_padding(False)
-            self._position_viz_handle(False)
-            self._stop_viz_placeholder()
-            if trace:
-                logger.info("VIZ TRACE drawer-close")
-        if expanded:
-            # Temporarily disable visualizer content fade-in for latency A/B test.
-            if self._viz_fade_source:
-                GLib.source_remove(self._viz_fade_source)
-                self._viz_fade_source = 0
-            self._set_viz_content_opacity(1.0)
-            self._viz_opened_once = True
-
-        # 图标切换
-        if expanded:
-            self.viz_btn.set_icon_name("hiresti-pan-down-symbolic")
-            self.viz_btn.add_css_class("active")
-        else:
-            if self._last_spectrum_frame:
-                self._viz_seed_frame = list(self._last_spectrum_frame)
-            self.viz_btn.set_icon_name("hiresti-pan-up-symbolic")
-            self.viz_btn.remove_css_class("active")
-            if self._viz_fade_source:
-                GLib.source_remove(self._viz_fade_source)
-                self._viz_fade_source = 0
-            self._set_viz_content_opacity(0.0)
-
-    def _set_viz_content_opacity(self, alpha):
-        a = max(0.0, min(1.0, float(alpha)))
-        if getattr(self, "viz", None) is not None:
-            self.viz.set_opacity(a)
-        if getattr(self, "bg_viz", None) is not None:
-            # Keep lyrics background always visible enough; avoid "all black" when
-            # fade state gets out of sync with GLArea rendering.
-            self.bg_viz.set_opacity(max(0.35, a))
-
-    def _start_viz_fade_in(self, duration_ms=1000):
-        if self._viz_fade_source:
-            GLib.source_remove(self._viz_fade_source)
-            self._viz_fade_source = 0
-        start_us = GLib.get_monotonic_time()
-        duration_us = max(1, int(duration_ms) * 1000)
-
-        def _tick():
-            revealer = getattr(self, "viz_revealer", None)
-            if revealer is None or not revealer.get_reveal_child():
-                self._viz_fade_source = 0
-                return False
-            elapsed = GLib.get_monotonic_time() - start_us
-            t = max(0.0, min(1.0, elapsed / float(duration_us)))
-            self._set_viz_content_opacity(t)
-            if t >= 1.0:
-                self._viz_fade_source = 0
-                return False
-            return True
-
-        self._viz_fade_source = GLib.timeout_add(16, _tick)
-
-    def _position_viz_handle(self, expanded, animate=True):
-        box = getattr(self, "viz_handle_box", None)
-        if box is None:
-            return
-        self._align_viz_handle_to_play_button()
-        base_bottom = 0
-        target = 0
-        if not expanded:
-            if animate:
-                self._animate_viz_handle_to(base_bottom, duration_ms=180)
-            else:
-                box.set_margin_bottom(base_bottom)
-            return
-        panel_h = 0
-        revealer = getattr(self, "viz_revealer", None)
-        if revealer is not None:
-            # During reveal animation this is the live visible height.
-            panel_h = int(revealer.get_height() or 0)
-        if getattr(self, "viz_root", None) is not None:
-            panel_h = max(panel_h, int(self.viz_root.get_height() or 0))
-        if panel_h <= 1 and getattr(self, "viz_stack", None) is not None:
-            stack_h = int(self.viz_stack.get_height() or 0)
-            if stack_h > 1:
-                panel_h = stack_h + 36
-        if panel_h <= 1:
-            panel_h = 286
-        target = max(base_bottom, panel_h - 24 + base_bottom - 12 - 7)
-        if animate:
-            self._animate_viz_handle_to(target, duration_ms=180)
-        else:
-            box.set_margin_bottom(target)
-
-    def _start_viz_handle_follow_transition(self):
-        if self._viz_handle_settle_source:
-            GLib.source_remove(self._viz_handle_settle_source)
-            self._viz_handle_settle_source = 0
-        if self._viz_handle_anim_source:
-            GLib.source_remove(self._viz_handle_anim_source)
-            self._viz_handle_anim_source = 0
-        revealer = getattr(self, "viz_revealer", None)
-        box = getattr(self, "viz_handle_box", None)
-        if revealer is None:
-            return
-        if box is None:
-            return
-        duration_ms = int(revealer.get_transition_duration() or 220)
-        start_us = GLib.get_monotonic_time()
-        # Keep watcher alive a bit beyond revealer transition; position is
-        # computed from live revealer height every frame, so no lag drift.
-        span_us = max(120_000, (duration_ms + 120) * 1000)
-
-        def _tick():
-            rev = getattr(self, "viz_revealer", None)
-            if rev is None or (not rev.get_reveal_child()):
-                self._viz_handle_settle_source = 0
-                return False
-            live_h = int(rev.get_height() or 0)
-            if live_h <= 1:
-                live_h = int(getattr(self, "viz_root", None).get_height() or 0) if getattr(self, "viz_root", None) is not None else 0
-            cur = max(0, live_h - 24 - 12 - 7)
-            self._align_viz_handle_to_play_button()
-            box.set_margin_bottom(max(0, cur))
-            elapsed = GLib.get_monotonic_time() - start_us
-            if elapsed >= span_us:
-                self._viz_handle_settle_source = 0
-                # Final settle to exact layout target.
-                self._position_viz_handle(True, animate=False)
-                return False
-            return True
-
-        self._viz_handle_settle_source = GLib.timeout_add(16, _tick)
-
-    def _align_viz_handle_to_play_button(self):
-        box = getattr(self, "viz_handle_box", None)
-        play_btn = getattr(self, "play_btn", None)
-        overlay = getattr(self, "body_overlay", None)
-        if box is None or play_btn is None or overlay is None:
-            return
-        try:
-            ok, rect = play_btn.compute_bounds(overlay)
-        except Exception:
-            return
-        if not ok or rect is None:
-            return
-        viz_btn = getattr(self, "viz_btn", None)
-        handle_w = int(box.get_width() or (viz_btn.get_width() if viz_btn is not None else 0) or 50)
-        overlay_w = int(overlay.get_width() or 0)
-        center_x = float(rect.get_x()) + (float(rect.get_width()) / 2.0)
-        target_start = int(round(center_x - (handle_w / 2.0)))
-        if overlay_w > 0:
-            target_start = max(0, min(max(0, overlay_w - handle_w), target_start))
-        target_start = max(0, target_start)
-        box.set_halign(Gtk.Align.START)
-        box.set_margin_start(target_start)
-        box.set_margin_end(0)
-
-    def _animate_viz_handle_to(self, target_bottom, duration_ms=180):
-        box = getattr(self, "viz_handle_box", None)
-        if box is None:
-            return
-        try:
-            target = int(target_bottom)
-        except Exception:
-            target = 0
-        target = max(0, min(2000, target))
-        start = int(box.get_margin_bottom() or 0)
-        if self._viz_handle_anim_source:
-            GLib.source_remove(self._viz_handle_anim_source)
-            self._viz_handle_anim_source = 0
-        if duration_ms <= 0 or start == target:
-            box.set_margin_bottom(target)
-            return
-
-        start_us = GLib.get_monotonic_time()
-        span_us = max(1, int(duration_ms) * 1000)
-
-        def _tick():
-            elapsed = GLib.get_monotonic_time() - start_us
-            t = min(1.0, max(0.0, float(elapsed) / float(span_us)))
-            # Ease-out curve for a natural "pushed out" feeling.
-            eased = 1.0 - ((1.0 - t) * (1.0 - t))
-            cur = int(round(start + (target - start) * eased))
-            box.set_margin_bottom(max(0, cur))
-            if t >= 1.0:
-                self._viz_handle_anim_source = 0
-                return False
-            return True
-
-        self._viz_handle_anim_source = GLib.timeout_add(16, _tick)
+TidalApp._apply_overlay_scroll_padding = _apply_overlay_scroll_padding
+TidalApp._ensure_overlay_handles_visible = _ensure_overlay_handles_visible
+TidalApp._viz_sync_key = _viz_sync_key
+TidalApp._get_viz_offset_from_latency_profile = _get_viz_offset_from_latency_profile
+TidalApp._apply_viz_sync_offset_for_device = _apply_viz_sync_offset_for_device
+TidalApp.on_viz_sync_offset_update = on_viz_sync_offset_update
+TidalApp._drop_down_names = _drop_down_names
+TidalApp._selected_name_from_dropdown = _selected_name_from_dropdown
+TidalApp._build_visualizer_for_backend = _build_visualizer_for_backend
+TidalApp._resolve_viz_backend_key = _resolve_viz_backend_key
+TidalApp._sync_viz_dropdown_models = _sync_viz_dropdown_models
+TidalApp._rebuild_visualizer_backend = _rebuild_visualizer_backend
+TidalApp._apply_viz_backend_policy_by_index = _apply_viz_backend_policy_by_index
+TidalApp.on_viz_bars_changed = on_viz_bars_changed
+TidalApp._apply_viz_bars_by_count = _apply_viz_bars_by_count
+TidalApp._apply_spectrum_theme_by_index = _apply_spectrum_theme_by_index
+TidalApp._apply_viz_effect_by_index = _apply_viz_effect_by_index
+TidalApp.on_viz_effect_changed = on_viz_effect_changed
+TidalApp._apply_viz_profile_by_index = _apply_viz_profile_by_index
+TidalApp.on_viz_profile_changed = on_viz_profile_changed
+TidalApp.on_spectrum_theme_changed = on_spectrum_theme_changed
+TidalApp.on_viz_backend_policy_changed = on_viz_backend_policy_changed
+TidalApp.on_viz_page_changed = on_viz_page_changed
+TidalApp._sync_viz_tab_runtime_state = _sync_viz_tab_runtime_state
+TidalApp._should_enable_spectrum_stream = _should_enable_spectrum_stream
+TidalApp._sync_spectrum_stream_state = _sync_spectrum_stream_state
+TidalApp._prewarm_gl_visualizer_once = _prewarm_gl_visualizer_once
+TidalApp._start_spectrum_stream_prewarm = _start_spectrum_stream_prewarm
+TidalApp._apply_viz_panel_theme = _apply_viz_panel_theme
+TidalApp.on_spectrum_data = on_spectrum_data
+TidalApp._apply_viz_frame = _apply_viz_frame
+TidalApp._stop_viz_placeholder = _stop_viz_placeholder
+TidalApp._start_viz_placeholder_if_needed = _start_viz_placeholder_if_needed
+TidalApp._blend_spectrum_frames = _blend_spectrum_frames
+TidalApp._schedule_viz_handle_realign = _schedule_viz_handle_realign
+TidalApp.toggle_visualizer = toggle_visualizer
+TidalApp._set_visualizer_expanded = _set_visualizer_expanded
+TidalApp._set_viz_content_opacity = _set_viz_content_opacity
+TidalApp._start_viz_fade_in = _start_viz_fade_in
+TidalApp._position_viz_handle = _position_viz_handle
+TidalApp._start_viz_handle_follow_transition = _start_viz_handle_follow_transition
+TidalApp._align_viz_handle_to_play_button = _align_viz_handle_to_play_button
+TidalApp._animate_viz_handle_to = _animate_viz_handle_to
 
 # Import handlers from app module and bind to TidalApp class
 from app.app_handlers import (
@@ -4783,6 +2969,72 @@ TidalApp.close_queue_drawer = close_queue_drawer
 
 # Playlist methods
 TidalApp.get_sorted_playlist_tracks = get_sorted_playlist_tracks
+
+from app.app_playlist import (
+    on_playlist_sort_clicked,
+    on_playlist_folder_card_clicked,
+    on_playlist_folder_up_clicked,
+    on_create_playlist_folder_clicked,
+    on_playlist_folder_rename_clicked,
+    on_playlist_folder_delete_clicked,
+    on_playlist_card_clicked,
+    on_remote_playlist_card_clicked,
+    _refresh_remote_playlist_visibility_button,
+    on_remote_playlist_toggle_public_clicked,
+    _open_cloud_playlist_editor,
+    on_remote_playlist_rename_clicked,
+    on_remote_playlist_delete_clicked,
+    on_remote_playlist_move_to_folder_clicked,
+    on_remove_single_track_from_remote_playlist,
+    on_playlist_track_selected,
+    _next_playlist_name,
+    on_create_playlist_clicked,
+    _prompt_playlist_pick,
+    on_add_tracks_to_playlist,
+    on_add_single_track_to_playlist,
+    on_add_current_album_to_playlist,
+    _prompt_playlist_name,
+    on_playlist_start_inline_rename,
+    on_playlist_commit_inline_rename,
+    on_playlist_cancel_inline_rename,
+    on_playlist_delete_clicked,
+    on_playlist_remove_track_clicked,
+    on_playlist_move_track_clicked,
+    on_playlist_toggle_edit,
+    on_playlist_reorder_track,
+)
+
+TidalApp.on_playlist_sort_clicked = on_playlist_sort_clicked
+TidalApp.on_playlist_folder_card_clicked = on_playlist_folder_card_clicked
+TidalApp.on_playlist_folder_up_clicked = on_playlist_folder_up_clicked
+TidalApp.on_create_playlist_folder_clicked = on_create_playlist_folder_clicked
+TidalApp.on_playlist_folder_rename_clicked = on_playlist_folder_rename_clicked
+TidalApp.on_playlist_folder_delete_clicked = on_playlist_folder_delete_clicked
+TidalApp.on_playlist_card_clicked = on_playlist_card_clicked
+TidalApp.on_remote_playlist_card_clicked = on_remote_playlist_card_clicked
+TidalApp._refresh_remote_playlist_visibility_button = _refresh_remote_playlist_visibility_button
+TidalApp.on_remote_playlist_toggle_public_clicked = on_remote_playlist_toggle_public_clicked
+TidalApp._open_cloud_playlist_editor = _open_cloud_playlist_editor
+TidalApp.on_remote_playlist_rename_clicked = on_remote_playlist_rename_clicked
+TidalApp.on_remote_playlist_delete_clicked = on_remote_playlist_delete_clicked
+TidalApp.on_remote_playlist_move_to_folder_clicked = on_remote_playlist_move_to_folder_clicked
+TidalApp.on_remove_single_track_from_remote_playlist = on_remove_single_track_from_remote_playlist
+TidalApp.on_playlist_track_selected = on_playlist_track_selected
+TidalApp._next_playlist_name = _next_playlist_name
+TidalApp.on_create_playlist_clicked = on_create_playlist_clicked
+TidalApp._prompt_playlist_pick = _prompt_playlist_pick
+TidalApp.on_add_tracks_to_playlist = on_add_tracks_to_playlist
+TidalApp.on_add_single_track_to_playlist = on_add_single_track_to_playlist
+TidalApp.on_add_current_album_to_playlist = on_add_current_album_to_playlist
+TidalApp._prompt_playlist_name = _prompt_playlist_name
+TidalApp.on_playlist_start_inline_rename = on_playlist_start_inline_rename
+TidalApp.on_playlist_commit_inline_rename = on_playlist_commit_inline_rename
+TidalApp.on_playlist_cancel_inline_rename = on_playlist_cancel_inline_rename
+TidalApp.on_playlist_delete_clicked = on_playlist_delete_clicked
+TidalApp.on_playlist_remove_track_clicked = on_playlist_remove_track_clicked
+TidalApp.on_playlist_move_track_clicked = on_playlist_move_track_clicked
+TidalApp.on_playlist_toggle_edit = on_playlist_toggle_edit
+TidalApp.on_playlist_reorder_track = on_playlist_reorder_track
 
 # Bind delegated methods to actions modules
 TidalApp.on_play_pause = lambda self, btn: playback_actions.on_play_pause(self, btn)
