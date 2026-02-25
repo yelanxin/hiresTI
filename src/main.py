@@ -1951,17 +1951,6 @@ class TidalApp(Adw.Application):
             else:
                 self.eq_btn.set_tooltip_text("Equalizer")
 
-    def on_login_clicked(self, btn):
-        if self.backend.user:
-            self.user_popover.popup()
-            return
-        if self._login_in_progress:
-            self.show_output_notice("Login already in progress.", "warn", 2200)
-            if self._login_dialog is not None:
-                self._login_dialog.present()
-            return
-        self._show_login_method_dialog()
-
     def _show_login_method_dialog(self):
         self._cleanup_login_dialog()
         dialog = Gtk.Dialog(title="Choose Login Method", transient_for=self.win, modal=True)
@@ -2259,22 +2248,6 @@ class TidalApp(Adw.Application):
         self.show_output_notice("Login failed. Please retry.", "error", 2800)
         self._show_simple_dialog("Login failed", message)
         return False
-
-    def on_logout_clicked(self, btn):
-        self.user_popover.popdown()
-        self._login_in_progress = False
-        self._login_attempt_id = None
-        self._login_mode = None
-        self._cleanup_login_dialog()
-        self.backend.logout()
-        self._apply_account_scope(force=True)
-        self._home_sections_cache = None
-        self.stream_prefetch_cache.clear()
-        self._toggle_login_view(False)
-        self.refresh_visible_track_fav_buttons()
-        self.refresh_current_track_favorite_state()
-        while c := self.collection_content_box.get_first_child(): self.collection_content_box.remove(c)
-        logger.info("User logged out.")
 
     def on_login_success(self):
         logger.info("Login successful.")

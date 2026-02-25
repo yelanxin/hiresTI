@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.2.9 - 2026-02-25
+Fix: logout now fully resets all UI and session state.
+
+### Fixed
+- Fixed logout: `on_logout_clicked` in `app_handlers.py` was a stripped-down stub that silently overrode the complete implementation in `main.py`. The active version was missing: closing the user popover, resetting the login-in-progress flag and attempt ID, cleaning up any open login dialogs, switching the account scope back to guest, clearing the stream prefetch cache, and refreshing favorite button states. All of these are now performed on logout.
+- Removed the dead-code `on_login_clicked` and `on_logout_clicked` class methods from `main.py` that were never reached due to being overridden at class-binding time.
+- Upgraded `_rounded_pixbuf` failure log level from `debug` to `warning` so rendering errors are visible in default log output.
+
+### Build
+- DEB `Depends`: added `python3-gi-cairo` (required for Cairo/GDK rendering), `gir1.2-gtksource-4` (GtkSourceView typelib), and `qrencode` (system fallback for QR login when the `qrcode` Python package is absent).
+
+---
+
 ## 1.2.8 - 2026-02-25
 UI: Home page adaptive layout; packaging and test script fixes.
 

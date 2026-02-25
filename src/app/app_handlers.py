@@ -125,11 +125,19 @@ def on_login_clicked(self, btn):
 
 def on_logout_clicked(self, btn):
     """Handle logout button click."""
-    # Implementation in main.py
-    if hasattr(self, 'backend') and self.backend.check_login():
-        self.backend.logout()
+    self.user_popover.popdown()
+    self._login_in_progress = False
+    self._login_attempt_id = None
+    self._login_mode = None
+    self._cleanup_login_dialog()
+    self.backend.logout()
+    self._apply_account_scope(force=True)
+    self._home_sections_cache = None
+    self.stream_prefetch_cache.clear()
     self._toggle_login_view(False)
     self._clear_initial_search_focus()
+    self.refresh_visible_track_fav_buttons()
+    self.refresh_current_track_favorite_state()
     while c := self.collection_content_box.get_first_child():
         self.collection_content_box.remove(c)
     logger.info("User logged out.")

@@ -144,7 +144,7 @@ def _rounded_pixbuf(pb, radius):
         cr.paint()
         return Gdk.pixbuf_get_from_surface(surface, 0, 0, w, h)
     except Exception as e:
-        logger.debug("Rounded pixbuf generation failed: %s", e)
+        logger.warning("Rounded pixbuf generation failed: %s", e)
         return pb
 
 
