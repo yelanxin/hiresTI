@@ -32,7 +32,7 @@ class TidalBackend:
         self.fav_track_ids = set()
         self._cached_albums = []
         self._cached_albums_ts = 0.0
-        self._albums_cache_ttl = 300.0
+        self._albums_cache_ttl = 0.0
         self._artist_artwork_cache = {}  # LRU cache using dict (ordered in Python 3.7+)
         self.max_artist_artwork_cache = 500  # Limit cache size to prevent memory leak
         self._artist_placeholder_uuids = {

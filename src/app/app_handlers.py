@@ -127,7 +127,7 @@ def on_logout_clicked(self, btn):
     """Handle logout button click."""
     # Implementation in main.py
     if hasattr(self, 'backend') and self.backend.check_login():
-        self.backend.session.logout()
+        self.backend.logout()
     self._toggle_login_view(False)
     self._clear_initial_search_focus()
     while c := self.collection_content_box.get_first_child():

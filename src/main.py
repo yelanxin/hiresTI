@@ -1249,7 +1249,6 @@ class TidalApp(Adw.Application):
             self.body_overlay.connect("notify::width", self.update_layout_proportions)
             self.body_overlay.connect("notify::height", self.update_layout_proportions)
         self.paned.connect("notify::position", self.on_paned_position_changed)
-        GLib.idle_add(self._restore_paned_position_after_layout)
         GLib.idle_add(lambda: (self._schedule_viz_handle_realign(animate=False), False)[1])
 
         self._schedule_update_ui_loop(40)
@@ -1656,9 +1655,21 @@ class TidalApp(Adw.Application):
 
     def _toggle_login_view(self, logged_in):
         self._session_restore_pending = False
-        ui_views_builders.toggle_login_view(self, logged_in)
+        # Set paned position BEFORE making any child widget visible so that
+        # GTK's first layout pass sees the correct allocation and does not
+        # warn about GtkStack being measured below its minimum width.
         paned = getattr(self, "paned", None)
         if paned is not None:
+            if not logged_in:
+                paned.set_position(0)
+            else:
+                win_w = (self.win.get_width() if self.win else 0) or ui_config.WINDOW_WIDTH
+                saved = int(self.settings.get("paned_position", 0) or 0) or int(win_w * ui_config.SIDEBAR_RATIO)
+                paned.set_position(min(saved, max(0, win_w - 500)))
+        ui_views_builders.toggle_login_view(self, logged_in)
+        if paned is not None:
+            if logged_in:
+                GLib.idle_add(self._restore_paned_position_after_layout)
             paned.set_visible(True)
         mini_btn = getattr(self, "mini_btn", None)
         if mini_btn is not None:
@@ -4203,6 +4214,13 @@ class TidalApp(Adw.Application):
         self._ui_loop_source = GLib.timeout_add(max(20, next_delay), _tick)
 
     def update_layout_proportions(self, w, p):
+        # Don't touch paned position while the login screen is visible; doing so
+        # would restore the saved sidebar width and leave right_stack too narrow
+        # to fit the login card, producing a GtkStack measurement warning.
+        login_box = getattr(self, "login_prompt_box", None)
+        if login_box is not None and login_box.get_visible():
+            GLib.idle_add(lambda: (self._schedule_viz_handle_realign(animate=False), False)[1])
+            return
         try:
             saved_paned = int(self.settings.get("paned_position", 0) or 0)
         except Exception:

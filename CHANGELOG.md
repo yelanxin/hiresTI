@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.2.8 - 2026-02-25
+UI: Home page adaptive layout; packaging and test script fixes.
+
+### Changed
+- Home page sections now use `FlowBox` adaptive layout instead of a fixed 2-row horizontal scrolling grid — items automatically wrap to fill available width at any window size.
+- Removed "X items" count labels from Home section headers.
+
+### Fixed
+- DEB `Depends`: added `libpipewire-0.3-0` and `libpulse0`, which are required by the Rust audio core (`librust_audio_core.so` links against PipeWire and PulseAudio at runtime). Without these the app failed to start on clean Debian/Ubuntu installs.
+
+### Build / Test
+- `test_packages.sh` rewritten with `--version` / `-v` and `--os` / `-o` parameters; version auto-detected from `dist/` when not specified, systems can be tested individually or in any combination.
+- Removed Ubuntu 22.04 test (container hangs without exit).
+- Fixed EL9 test: enable EPEL and CRB repos before `dnf install` to satisfy `libadwaita`, `gstreamer1-plugins-bad-free`, and `gstreamer1-plugins-ugly-free` dependencies.
+- Fixed Debian test: install `python3-gst-1.0` before other packages to prevent `dpkg` dependency errors.
+- Fixed all DEB tests: pre-install `libpipewire-0.3-0` and `libpulse0`.
+- Fixed Arch test: replaced bare `tar` extraction with proper `pacman -S` (deps) + `pacman -U` (package) + binary run, matching the behaviour of other distro tests.
+- Fixed Flatpak test: use direct flathub URL for `remote-add`, switch from `--user` to `--system` install (root container), remove unnecessary SDK install, add `flatpak run` smoke test.
+- Increased binary output capture from `head -10` to `head -30` across all tests to prevent error tracebacks from being truncated.
+
+---
+
 ## 1.2.7 - 2026-02-24
 Bug fix: login button now works correctly.
 

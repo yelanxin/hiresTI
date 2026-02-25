@@ -427,7 +427,7 @@ Version: $VERSION
 Section: sound
 Priority: optional
 Architecture: $DEB_ARCH
-Depends: python3, python3-gi, python3-cairo, python3-dateutil, python3-typing-extensions, python3-isodate, gir1.2-gtk-4.0, gir1.2-adw-1, python3-gst-1.0, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-plugins-ugly
+Depends: python3, python3-gi, python3-cairo, python3-dateutil, python3-typing-extensions, python3-isodate, gir1.2-gtk-4.0, gir1.2-adw-1, python3-gst-1.0, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-plugins-ugly, libpipewire-0.3-0, libpulse0
 Maintainer: $MAINTAINER
 Description: $DESCRIPTION
  $DISPLAY_NAME is a desktop client for Tidal focusing on High-Res audio.
@@ -461,7 +461,7 @@ Version: $VERSION
 Section: sound
 Priority: optional
 Architecture: $DEB_ARCH
-Depends: python3, python3-gi, python3-cairo, python3-dateutil, python3-typing-extensions, python3-isodate, gir1.2-gtk-4.0, gir1.2-adw-1, python3-gst-1.0, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-plugins-ugly
+Depends: python3, python3-gi, python3-cairo, python3-dateutil, python3-typing-extensions, python3-isodate, gir1.2-gtk-4.0, gir1.2-adw-1, python3-gst-1.0, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-plugins-ugly, libpipewire-0.3-0, libpulse0
 Maintainer: $MAINTAINER
 Description: $DESCRIPTION
  $DISPLAY_NAME is a desktop client for Tidal focusing on High-Res audio.

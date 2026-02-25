@@ -1277,20 +1277,6 @@ def batch_load_home(app, sections):
     render_token = int(getattr(app, "_home_render_token", 0) or 0) + 1
     app._home_render_token = render_token
 
-    def _scroll_h(scroller, direction=1):
-        adj = scroller.get_hadjustment()
-        if adj is None:
-            return
-        page = max(120.0, float(adj.get_page_size()) * 0.85)
-        target = adj.get_value() + (page * direction)
-        lower = float(adj.get_lower())
-        upper = float(adj.get_upper()) - float(adj.get_page_size())
-        if target < lower:
-            target = lower
-        if target > upper:
-            target = upper
-        adj.set_value(target)
-
     def _open_item(item_data):
         if not item_data:
             return
@@ -1349,25 +1335,20 @@ def batch_load_home(app, sections):
         section_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, css_classes=["home-section"])
         section_head = Gtk.Box(spacing=8, css_classes=["home-section-head"])
         section_title = Gtk.Label(label=sec["title"], xalign=0, hexpand=True, css_classes=["home-section-title"])
-        section_count = Gtk.Label(label=f"{len(sec['items'])} items", css_classes=["home-section-count"])
-        left_btn = Gtk.Button(icon_name="go-previous-symbolic", css_classes=["flat", "circular", "home-scroll-btn"])
-        right_btn = Gtk.Button(icon_name="go-next-symbolic", css_classes=["flat", "circular", "home-scroll-btn"])
         section_head.append(section_title)
-        section_head.append(section_count)
-        section_head.append(left_btn)
-        section_head.append(right_btn)
         section_box.append(section_head)
 
-        scroller = Gtk.ScrolledWindow(hexpand=True, vexpand=False, css_classes=["home-row-scroller"])
-        scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
-        grid = Gtk.Grid(column_spacing=20, row_spacing=20)
-        scroller.set_child(grid)
-        left_btn.connect("clicked", lambda _b: _scroll_h(scroller, -1))
-        right_btn.connect("clicked", lambda _b: _scroll_h(scroller, 1))
-        _bind_horizontal_scroll_buttons(scroller, left_btn, right_btn)
-        section_box.append(scroller)
+        flow = Gtk.FlowBox(
+            homogeneous=True,
+            min_children_per_line=2,
+            max_children_per_line=16,
+            column_spacing=16,
+            row_spacing=16,
+            selection_mode=Gtk.SelectionMode.NONE,
+        )
+        section_box.append(flow)
         app.collection_content_box.append(section_box)
-        render_queue.append({"grid": grid, "items": list(sec["items"]), "index": 0})
+        render_queue.append({"flow": flow, "items": list(sec["items"]), "index": 0})
 
     # Render cards progressively to avoid one long UI stall on Home.
     def _render_home_chunk():
@@ -1388,7 +1369,9 @@ def batch_load_home(app, sections):
                 continue
             item_data = items[i]
             btn = _build_home_item_button(item_data)
-            ctx["grid"].attach(btn, i // 2, i % 2, 1, 1)
+            child = Gtk.FlowBoxChild()
+            child.set_child(btn)
+            ctx["flow"].append(child)
             ctx["index"] = i + 1
             budget -= 1
 
@@ -1533,7 +1516,7 @@ def render_collection_dashboard(app, favorite_tracks=None, favorite_albums=None)
 
     # Store all albums for pagination and search
     app._all_albums = list(favorite_albums or [])
-    app._filtered_albums = app._all_albums
+    app._filtered_albums = list(app._all_albums)
     app._albums_page = 0
     app._albums_page_size = 50
 
@@ -1645,7 +1628,7 @@ def render_collection_dashboard(app, favorite_tracks=None, favorite_albums=None)
         """Handle search input."""
         query = entry.get_text().strip().lower()
         if not query:
-            app._filtered_albums = app._all_albums
+            app._filtered_albums = list(app._all_albums)
         else:
             app._filtered_albums = [
                 alb for alb in app._all_albums
@@ -1666,7 +1649,10 @@ def render_collection_dashboard(app, favorite_tracks=None, favorite_albums=None)
         """Apply current sort option to filtered albums."""
         sort_idx = sort_dropdown.get_selected()
         if sort_idx == 0:  # Recently Added
-            pass
+            app._filtered_albums.sort(
+                key=lambda a: getattr(a, "user_date_added", None) or datetime.min,
+                reverse=True,
+            )
         elif sort_idx == 1:  # Album Name (A-Z)
             app._filtered_albums.sort(key=lambda a: getattr(a, "name", "").lower())
         elif sort_idx == 2:  # Album Name (Z-A)
