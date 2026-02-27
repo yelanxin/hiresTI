@@ -208,7 +208,7 @@ def _start_login_flow(self, mode):
     self.record_diag_event(f"AUTH START id={attempt_id} mode={mode}")
 
     try:
-        oauth = self.backend.prepare_oauth()
+        oauth = self.backend.start_oauth()
         login_url = oauth.get("url", "")
         login_future = oauth.get("future")
         if not login_url or login_future is None:
