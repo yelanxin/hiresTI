@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.3.1 - 2026-02-27
+Feature release: MPRIS remote-control integration for Linux desktop media controls.
+
+### Added
+- Added full MPRIS service (`org.mpris.MediaPlayer2.hiresti`) with:
+  - `org.mpris.MediaPlayer2` interface (`Raise`, `Quit`),
+  - `org.mpris.MediaPlayer2.Player` interface (`Play/Pause/PlayPause/Stop/Next/Previous/Seek/SetPosition`),
+  - property exposure for `PlaybackStatus`, `Metadata`, `Position`, `LoopStatus`, `Shuffle`, and `Volume`.
+- Added new MPRIS service module and app wrapper wiring:
+  - `src/services/mpris.py`
+  - `src/app/app_mpris.py`
+
+### Changed
+- MPRIS lifecycle is now managed by app bootstrap:
+  - service starts after app activation,
+  - service stops cleanly during app shutdown.
+- Playback state is now synchronized to MPRIS from core runtime paths:
+  - play/pause/stop and next/previous transitions,
+  - queue mutation (remove/clear/set queue),
+  - progress updates and user seek commits,
+  - loop/shuffle mode toggles and volume changes.
+
+### Tests
+- Added MPRIS helper tests for:
+  - track ID object-path mapping,
+  - play-mode to loop/shuffle mapping,
+  - metadata/playback status snapshot behavior,
+  - loop/shuffle/volume property setter behavior.
+
+---
+
 ## 1.3.0 - 2026-02-27
 Refactor + sync release: main.py modular split, waveform/audio sync stabilization, and UI layout tuning.
 

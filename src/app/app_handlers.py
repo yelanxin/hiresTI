@@ -108,6 +108,8 @@ def on_volume_changed_ui(self, scale):
 
     if self.vol_btn is not None:
         self.vol_btn.set_icon_name(icon)
+    if hasattr(self, "_mpris_sync_volume"):
+        self._mpris_sync_volume()
 
 
 def on_tech_info_clicked(self, btn):
@@ -133,6 +135,8 @@ def on_toggle_mode(self, btn):
         self.shuffle_indices = []
     self.settings["play_mode"] = self.play_mode
     self.schedule_save_settings()
+    if hasattr(self, "_mpris_sync_metadata"):
+        self._mpris_sync_metadata()
 
 
 def on_fav_clicked(self, btn):

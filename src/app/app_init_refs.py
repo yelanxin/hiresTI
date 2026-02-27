@@ -130,6 +130,7 @@ def _init_runtime_refs(self):
     self._tray_icon = None
     self._tray_ready = False
     self._allow_window_close = False
+    self._mpris = None
     self._thumb_smooth_x = None
     self._seek_pending_value = None
     self._seek_commit_source = 0

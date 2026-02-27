@@ -17,6 +17,8 @@ def _get_active_queue(self):
 def _set_play_queue(self, tracks):
     self.play_queue = list(tracks or [])
     self.shuffle_indices = []
+    if hasattr(self, "_mpris_sync_metadata"):
+        self._mpris_sync_metadata()
 
 
 def _is_queue_nav_selected(self):
@@ -102,6 +104,8 @@ def on_queue_remove_track_clicked(self, track_index):
         if self.play_btn is not None:
             self.play_btn.set_icon_name("media-playback-start-symbolic")
         self.refresh_current_track_favorite_state()
+        if hasattr(self, "_mpris_sync_all"):
+            self._mpris_sync_all(force=True)
         GLib.idle_add(self._refresh_queue_views)
         return
 
@@ -110,12 +114,16 @@ def on_queue_remove_track_clicked(self, track_index):
 
     if removed_current:
         new_idx = min(idx, len(tracks) - 1)
+        if hasattr(self, "_mpris_sync_metadata"):
+            self._mpris_sync_metadata()
         GLib.idle_add(self._refresh_queue_views)
         GLib.idle_add(lambda: self.play_track(new_idx) or False)
         return
 
     GLib.idle_add(self._refresh_queue_views)
     self._update_track_list_icon()
+    if hasattr(self, "_mpris_sync_metadata"):
+        self._mpris_sync_metadata()
 
 
 def on_queue_clear_clicked(self, _btn=None):
@@ -133,4 +141,6 @@ def on_queue_clear_clicked(self, _btn=None):
     if self.play_btn is not None:
         self.play_btn.set_icon_name("media-playback-start-symbolic")
     self.refresh_current_track_favorite_state()
+    if hasattr(self, "_mpris_sync_all"):
+        self._mpris_sync_all(force=True)
     GLib.idle_add(self._refresh_queue_views)

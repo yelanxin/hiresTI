@@ -44,6 +44,7 @@ def detect_app_version(self):
 
 def do_shutdown(self):
     logger.info("Shutting down application...")
+    self._stop_mpris_service()
     self._stop_tray_icon()
     self.settings["search_history"] = list(self.search_history)[:10]
     pending = getattr(self, "_settings_save_source", 0)
@@ -100,6 +101,7 @@ def _restore_runtime_state(self):
 
 def _run_post_activate_tasks(app):
     # Run non-critical startup work after first frame to improve perceived launch speed.
+    app._start_mpris_service()
     app._restore_session_async()
     app._schedule_update_ui_loop(40)
     app._schedule_output_status_loop(1000)

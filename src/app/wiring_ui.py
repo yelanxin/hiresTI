@@ -31,6 +31,16 @@ def bind_lifecycle(TidalApp, seen=None):
         _clear_initial_search_focus,
         _restore_last_view,
     )
+    from app.app_mpris import (
+        _start_mpris_service,
+        _stop_mpris_service,
+        _mpris_sync_all,
+        _mpris_sync_metadata,
+        _mpris_sync_playback,
+        _mpris_sync_position,
+        _mpris_sync_volume,
+        _mpris_emit_seeked,
+    )
 
     bind_map(TidalApp, [
         ("_restore_session_async", _restore_session_async),
@@ -38,6 +48,14 @@ def bind_lifecycle(TidalApp, seen=None):
         ("_apply_app_theme_classes", _apply_app_theme_classes),
         ("_clear_initial_search_focus", _clear_initial_search_focus),
         ("_restore_last_view", _restore_last_view),
+        ("_start_mpris_service", _start_mpris_service),
+        ("_stop_mpris_service", _stop_mpris_service),
+        ("_mpris_sync_all", _mpris_sync_all),
+        ("_mpris_sync_metadata", _mpris_sync_metadata),
+        ("_mpris_sync_playback", _mpris_sync_playback),
+        ("_mpris_sync_position", _mpris_sync_position),
+        ("_mpris_sync_volume", _mpris_sync_volume),
+        ("_mpris_emit_seeked", _mpris_emit_seeked),
     ], seen=seen)
 
 

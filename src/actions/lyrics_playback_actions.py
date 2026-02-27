@@ -229,6 +229,10 @@ def play_track(app, index):
     track = queue[index]
     app.playing_track = track
     app.playing_track_id = track.id
+    if hasattr(app, "_mpris_sync_metadata"):
+        app._mpris_sync_metadata()
+    if hasattr(app, "_mpris_sync_playback"):
+        app._mpris_sync_playback()
     if hasattr(app, "refresh_dashboard_playing_state"):
         GLib.idle_add(lambda: (app.refresh_dashboard_playing_state(), False)[1])
     if hasattr(app, "refresh_current_track_favorite_state"):
@@ -323,8 +327,16 @@ def play_track(app, index):
                             cur_state,
                             msg,
                         )
+                        if hasattr(app, "_mpris_sync_playback"):
+                            app._mpris_sync_playback()
+                        if hasattr(app, "_mpris_sync_position"):
+                            app._mpris_sync_position(force=True)
                         return False
                     app.play_btn.set_icon_name("media-playback-pause-symbolic")
+                    if hasattr(app, "_mpris_sync_playback"):
+                        app._mpris_sync_playback()
+                    if hasattr(app, "_mpris_sync_position"):
+                        app._mpris_sync_position(force=True)
                     return False
 
                 GLib.idle_add(apply_playback)
@@ -335,6 +347,8 @@ def play_track(app, index):
                     if request_id != getattr(app, "_play_request_id", 0):
                         return False
                     app.render_lyrics_list(None, user_message("not_found", "playback"))
+                    if hasattr(app, "_mpris_sync_playback"):
+                        app._mpris_sync_playback()
                     return False
 
                 GLib.idle_add(apply_stream_missing)
@@ -355,6 +369,8 @@ def play_track(app, index):
                 if request_id != getattr(app, "_play_request_id", 0):
                     return False
                 app.render_lyrics_list(None, user_message(kind, "playback"))
+                if hasattr(app, "_mpris_sync_playback"):
+                    app._mpris_sync_playback()
                 return False
 
             GLib.idle_add(apply_playback_error)
@@ -453,6 +469,8 @@ def update_ui_loop(app):
                 app.play_btn.set_icon_name(
                     "media-playback-pause-symbolic" if playing_now else "media-playback-start-symbolic"
                 )
+            if hasattr(app, "_mpris_sync_playback"):
+                app._mpris_sync_playback()
     except Exception:
         playing_now = False
 
@@ -573,5 +591,8 @@ def update_ui_loop(app):
         if abs(target_y - current_y) > 0.5:
             new_y = current_y + (target_y - current_y) * 0.08
             adj.set_value(new_y)
+
+    if hasattr(app, "_mpris_sync_position"):
+        app._mpris_sync_position()
 
     return True

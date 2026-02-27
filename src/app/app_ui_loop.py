@@ -33,6 +33,10 @@ def on_seek(self, s):
         try:
             if target is not None:
                 self.player.seek(float(target))
+                if hasattr(self, "_mpris_emit_seeked"):
+                    self._mpris_emit_seeked(float(target))
+                if hasattr(self, "_mpris_sync_position"):
+                    self._mpris_sync_position(force=True)
         finally:
             # Never keep seek-interacting state latched on errors, otherwise
             # progress UI can appear frozen.
