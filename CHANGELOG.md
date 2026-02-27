@@ -6,6 +6,10 @@ Refactor + sync release: main.py modular split, waveform/audio sync stabilizatio
 ### Refactored
 - Included the `main.py` split work in this release: app lifecycle/bootstrap, visualizer control, runtime refs, and wiring are now handled in dedicated `app/` modules with centralized bind-map wiring.
 
+### Added
+- Added dedicated `New` page experience for release/fresh-track browsing.
+- Added dedicated `Top` page experience for chart/top-content browsing.
+
 ### Changed
 - Visualizer backend strategy simplified to a single Cairo path:
   - removed Performance/Quality backend policy switching from UI/runtime,
@@ -19,6 +23,9 @@ Refactor + sync release: main.py modular split, waveform/audio sync stabilizatio
   - Home `FlowBox` switched to non-homogeneous layout to keep card spacing stable across normal/fullscreen states,
   - home/top/new card width updated to `180`,
   - Home track card uses width `100` with cover `90`.
+- History page UI optimized:
+  - Top20 rows now use the same now-playing visual language as Top/New (active background + playing icon),
+  - dashboard track-row cover sizing is unified for History/New/Top.
 - Artist page avatar size increased to `150x150`.
 - Unified dashboard track-cover size via `DASHBOARD_TRACK_COVER_SIZE = 70` for Top/History/New track rows.
 
