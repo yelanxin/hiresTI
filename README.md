@@ -17,6 +17,7 @@
 - Fast collection browsing (Albums, Liked Songs, Artists, Queue, History)
 - Cloud playlist management with folder support and cover collage previews
 - Built-in queue drawer, lyrics support, and visualizer modules
+- MPRIS support (`org.mpris.MediaPlayer2.hiresti`) for desktop media controls
 
 ## Screenshots
 ### Main Window
