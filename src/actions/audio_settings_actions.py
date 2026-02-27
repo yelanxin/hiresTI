@@ -2,7 +2,11 @@ from threading import Thread
 import logging
 import time
 
+import gi
+gi.require_version('Gtk', '4.0')
 from gi.repository import Gtk, GLib
+
+from core.executor import submit_daemon
 
 logger = logging.getLogger(__name__)
 
@@ -608,3 +612,266 @@ def on_device_changed(app, dd, p):
         if hasattr(app, "_apply_viz_sync_offset_for_device"):
             app._apply_viz_sync_offset_for_device(driver_label, device_id=device_info["device_id"], device_name=device_info["name"])
         update_output_status_ui(app)
+
+
+def on_output_state_transition(self, prev_state, state, detail=None):
+    if state == "switching":
+        try:
+            _touch_output_probe_burst(self, seconds=30)
+        except Exception:
+            pass
+        self.show_output_notice("Audio device changed, reconnecting...", "switching", 2400)
+        return
+    if state == "active" and prev_state in ("switching", "fallback", "error"):
+        self.show_output_notice("Audio output reconnected", "ok", 2200)
+        return
+    if state == "fallback":
+        try:
+            _touch_output_probe_burst(self, seconds=60)
+        except Exception:
+            pass
+        if self.play_btn is not None:
+            self.play_btn.set_icon_name("media-playback-start-symbolic")
+        detail_text = str(detail or "")
+        if "disconnected" in detail_text.lower():
+            # Remember the device that was active when disconnect happened, so
+            # hotplug logic can detect "same device came back" and optionally
+            # auto-rebind once.
+            try:
+                drv_item = self.driver_dd.get_selected_item() if self.driver_dd is not None else None
+                dev_item = self.device_dd.get_selected_item() if self.device_dd is not None else None
+                if drv_item is not None:
+                    self._last_disconnected_driver = drv_item.get_string()
+                if dev_item is not None:
+                    self._last_disconnected_device_name = dev_item.get_string()
+            except Exception:
+                pass
+            self.show_output_notice("USB audio device disconnected, rebinding to first available output", "warn", 3600)
+            # Keep selected driver unchanged; refresh devices and bind to first available.
+            try:
+                refresh_devices_keep_driver_select_first(self, reason="usb-disconnect")
+                start_output_hotplug_watch(
+                    self,
+                    seconds=60,
+                    interval_ms=1000,
+                    slow_interval_ms=5000,
+                )
+            except Exception:
+                pass
+        else:
+            self.show_output_notice("Primary output unavailable, switched to fallback", "warn", 3200)
+        return
+    if state == "error":
+        try:
+            _touch_output_probe_burst(self, seconds=45)
+        except Exception:
+            pass
+        if self.play_btn is not None:
+            self.play_btn.set_icon_name("media-playback-start-symbolic")
+        msg = str(detail or "Unknown output error")
+        self.show_output_notice(f"Output error: {msg}", "error", 3600)
+
+
+def _get_output_status_interval_ms(self):
+    try:
+        is_settings = bool(
+            getattr(self, "right_stack", None) is not None
+            and self.right_stack.get_visible_child_name() == "settings"
+        )
+    except Exception:
+        is_settings = False
+    if is_settings:
+        return 1000
+    state = str(getattr(self.player, "output_state", "idle") or "idle")
+    if state in ("fallback", "error", "switching"):
+        return 1200
+    try:
+        is_playing = bool(self.player.is_playing())
+    except Exception:
+        is_playing = False
+    return 2500 if is_playing else 6000
+
+
+def _schedule_output_status_loop(self, delay_ms=None):
+    source = getattr(self, "_output_status_source", 0)
+    if source:
+        try:
+            GLib.source_remove(source)
+        except Exception:
+            pass
+        self._output_status_source = 0
+    next_delay = int(delay_ms if delay_ms is not None else self._get_output_status_interval_ms())
+
+    def _tick():
+        self._output_status_source = 0
+        try:
+            self._refresh_output_status_loop()
+        except Exception:
+            logger.exception("Output status loop tick failed")
+        self._schedule_output_status_loop()
+        return False
+
+    self._output_status_source = GLib.timeout_add(max(250, next_delay), _tick)
+
+
+def _force_driver_selection(self, keyword):
+    model = self.driver_dd.get_model()
+    for i in range(model.get_n_items()):
+        if keyword in model.get_item(i).get_string(): self.driver_dd.set_selected(i); break
+
+
+def update_tech_label(self, info):
+    fmt = str(info.get('fmt_str', '') or '')
+    fmt_norm = " ".join(fmt.replace("\\", " ").split())
+    codec = info.get('codec', '-')
+    if (not fmt_norm) and (not codec or codec in ["-", "Loading..."]):
+        self.lbl_tech.set_text("")
+        self.lbl_tech.set_tooltip_text(None)
+        self.lbl_tech.remove_css_class("tech-label")
+        for cls in ("tech-state-ok", "tech-state-mixed", "tech-state-warn"):
+            self.lbl_tech.remove_css_class(cls)
+        self.lbl_tech.set_visible(True)
+        return
+
+    display_codec = codec if codec and codec not in ["-", "Loading..."] else "PCM"
+    if isinstance(display_codec, str):
+        codec_low = display_codec.lower()
+        if "flac" in codec_low:
+            display_codec = "FLAC"
+        elif "aac" in codec_low:
+            display_codec = "AAC"
+        elif "alac" in codec_low:
+            display_codec = "ALAC"
+        else:
+            display_codec = display_codec.replace("\\", " ").strip()
+
+    # Prefer explicit numeric fields; fmt_str can be missing or escaped.
+    def _pick_int(*keys):
+        for k in keys:
+            try:
+                v = int(info.get(k, 0) or 0)
+            except Exception:
+                v = 0
+            if v > 0:
+                return v
+        return 0
+
+    src_rate = _pick_int("source_rate", "rate", "output_rate")
+    src_depth = _pick_int("source_depth", "depth", "output_depth")
+
+    if src_rate > 0 and src_depth > 0:
+        rate_depth = f"{src_depth}-bit/{(src_rate / 1000.0):g}kHz"
+    else:
+        rate_depth = fmt_norm
+        if "|" in fmt_norm:
+            parts = [p.strip() for p in fmt_norm.split("|")]
+            if len(parts) >= 2:
+                rate = parts[0]
+                depth = parts[1].replace("bit", "-bit")
+                rate_depth = f"{depth}/{rate}"
+        if not rate_depth:
+            rate_depth = "-"
+
+    bitrate = int(info.get("bitrate", 0) or 0)
+    if bitrate > 0:
+        kbps = max(1, int(round(bitrate / 1000.0)))
+        bitrate_text = f" • {kbps}k"
+    else:
+        bitrate_text = ""
+
+    is_bp = bool(getattr(self.player, "bit_perfect_mode", False))
+    is_ex = bool(getattr(self.player, "exclusive_lock_mode", False))
+    output_state = str(getattr(self.player, "output_state", "idle"))
+
+    mode_tag = "BP" if is_bp else "MIX"
+    lock_tag = "EX" if is_ex else "SHR"
+    self.lbl_tech.add_css_class("tech-label")
+    self.lbl_tech.set_text(f"{mode_tag}/{lock_tag} • {rate_depth} • {display_codec}{bitrate_text}")
+
+    # Full detail remains available on hover.
+    dev_name = getattr(self, "current_device_name", "Default")
+    self.lbl_tech.set_tooltip_text(
+        f"{display_codec} | {rate_depth} | {bitrate//1000}kbps | {dev_name} | output={output_state}"
+    )
+
+    for cls in ("tech-state-ok", "tech-state-mixed", "tech-state-warn"):
+        self.lbl_tech.remove_css_class(cls)
+    if output_state in ("fallback", "error"):
+        self.lbl_tech.add_css_class("tech-state-warn")
+    elif is_bp:
+        self.lbl_tech.add_css_class("tech-state-ok")
+    else:
+        self.lbl_tech.add_css_class("tech-state-mixed")
+
+    self.lbl_tech.set_visible(True)
+
+
+def on_bit_perfect_toggled(self, switch, state):
+    self.settings["bit_perfect"] = state; self.save_settings()
+    self._lock_volume_controls(state)
+    self.ex_switch.set_sensitive(state)
+    if not state: self.ex_switch.set_active(False)
+    is_ex = self.ex_switch.get_active()
+    self.player.toggle_bit_perfect(state, exclusive_lock=is_ex)
+    self.eq_btn.set_sensitive(not state)
+    if state: self.eq_pop.popdown()
+    if self.bp_label is not None: self.bp_label.set_visible(state)
+    if is_ex:
+        self._force_driver_selection("ALSA"); self.driver_dd.set_sensitive(False); self.on_driver_changed(self.driver_dd, None)
+    else:
+        self.driver_dd.set_sensitive(True)
+        drv_item = self.driver_dd.get_selected_item() if self.driver_dd is not None else None
+        drv_name = drv_item.get_string() if drv_item is not None else ""
+        if state and drv_name == "PipeWire" and hasattr(self.player, "ensure_pipewire_pro_audio"):
+            def _switch_to_pro_audio():
+                ok = False
+                try:
+                    ok = bool(self.player.ensure_pipewire_pro_audio())
+                except Exception:
+                    ok = False
+
+                def _apply_ui():
+                    try:
+                        _refresh_devices_for_current_driver_ui_only(
+                            self, reason="bit-perfect-pro-audio"
+                        )
+                    except Exception:
+                        pass
+                    if ok:
+                        self.show_output_notice("Bit-perfect enabled: switched card profile to pro-audio.", "ok", 2800)
+                    else:
+                        self.show_output_notice(
+                            "Bit-perfect enabled, but pro-audio switch failed. You can still choose device manually.",
+                            "warn",
+                            3800,
+                        )
+                    return False
+
+                GLib.idle_add(_apply_ui)
+
+            submit_daemon(_switch_to_pro_audio)
+
+
+def on_exclusive_toggled(self, switch, state):
+    self.settings["exclusive_lock"] = state
+    self.save_settings()
+
+    self.player.toggle_bit_perfect(True, exclusive_lock=state)
+
+    self.latency_dd.set_sensitive(state)
+
+    if state:
+        # 开启独占：强制 ALSA，禁用驱动选择
+        self._force_driver_selection("ALSA")
+        self.driver_dd.set_sensitive(False)
+        self.on_driver_changed(self.driver_dd, None)
+    else:
+        # 关闭独占：恢复驱动选择
+        self.driver_dd.set_sensitive(True)
+        # 刷新一下非独占状态下的设备列表
+        self.on_device_changed(self.device_dd, None)
+
+
+def on_auto_rebind_once_toggled(self, switch, state):
+    self.settings["output_auto_rebind_once"] = bool(state)
+    self.save_settings()

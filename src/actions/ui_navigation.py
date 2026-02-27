@@ -12,6 +12,9 @@ def on_nav_selected(app, box, row):
     if not row:
         return
 
+    if hasattr(row, "nav_id") and hasattr(app, "_remember_last_nav"):
+        app._remember_last_nav(row.nav_id)
+
     if hasattr(app, "grid_title_label") and app.grid_title_label is not None:
         app.grid_title_label.set_visible(True)
     if hasattr(app, "grid_subtitle_label") and app.grid_subtitle_label is not None:
@@ -59,8 +62,32 @@ def on_nav_selected(app, box, row):
                     return False
 
                 GLib.idle_add(apply_home)
+                if not getattr(app, "_top_sections_cache", None):
+                    try:
+                        app._top_sections_cache = list(app.backend.get_top_page() or [])
+                    except Exception:
+                        pass
+                if not getattr(app, "_new_sections_cache", None):
+                    try:
+                        app._new_sections_cache = list(app.backend.get_new_page() or [])
+                    except Exception:
+                        pass
 
             Thread(target=task, daemon=True).start()
+        return
+
+    if row.nav_id == "new":
+        app.grid_title_label.set_text("New")
+        if hasattr(app, "grid_subtitle_label") and app.grid_subtitle_label is not None:
+            app.grid_subtitle_label.set_text("Official TIDAL new releases and fresh picks")
+        app.render_new_dashboard()
+        return
+
+    if row.nav_id == "top":
+        app.grid_title_label.set_text("Top")
+        if hasattr(app, "grid_subtitle_label") and app.grid_subtitle_label is not None:
+            app.grid_subtitle_label.set_text("Official TIDAL platform charts and top lists")
+        app.render_top_dashboard()
         return
 
     if row.nav_id == "collection":
@@ -218,8 +245,25 @@ def on_back_clicked(app, btn):
     # Highest priority: when currently inside playlist detail, always go back to playlist list.
     if getattr(app, "current_remote_playlist", None) is not None:
         app.current_remote_playlist = None
-        app.render_playlists_home()
-        btn.set_sensitive(bool(getattr(app, "current_playlist_folder_stack", []) or []))
+        app.right_stack.set_visible_child_name("grid_view")
+        row = app.nav_list.get_selected_row()
+        nav_id = str(getattr(row, "nav_id", "") or "")
+        if nav_id == "top":
+            app.render_top_dashboard(prefer_cache=True)
+            btn.set_sensitive(False)
+        elif nav_id == "new":
+            app.render_new_dashboard(prefer_cache=True)
+            btn.set_sensitive(False)
+        elif nav_id == "home":
+            cached_sections = getattr(app, "_home_sections_cache", None)
+            if cached_sections:
+                app.batch_load_home(cached_sections)
+            else:
+                app.on_nav_selected(None, row)
+            btn.set_sensitive(False)
+        else:
+            app.render_playlists_home()
+            btn.set_sensitive(bool(getattr(app, "current_playlist_folder_stack", []) or []))
         return
 
     if getattr(app, "current_playlist_id", None):
@@ -240,6 +284,7 @@ def on_back_clicked(app, btn):
                 app.current_playlist_id = None
                 app.playlist_edit_mode = False
                 app.playlist_rename_mode = False
+                app.right_stack.set_visible_child_name("grid_view")
                 app.render_playlists_home()
                 btn.set_sensitive(bool(getattr(app, "current_playlist_folder_stack", []) or []))
                 return

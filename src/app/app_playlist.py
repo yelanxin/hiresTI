@@ -32,6 +32,8 @@ def on_playlist_folder_card_clicked(self, folder_obj):
     else:
         stack.append({"id": fid, "name": str(getattr(folder_obj, "name", "") or "Folder"), "obj": folder_obj})
     self.current_playlist_folder_stack = stack
+    if getattr(self, "back_btn", None) is not None:
+        self.back_btn.set_sensitive(True)
     self.render_playlists_home()
 
 
@@ -243,22 +245,119 @@ def on_remote_playlist_card_clicked(self, playlist_obj):
     from actions.ui_actions import _ensure_play_shuffle_btns
     _ensure_play_shuffle_btns(self)
     import utils.helpers as utils
-    utils.load_img(self.header_art, lambda: self.backend.get_artwork_url(playlist_obj, 640), self.cache_dir, 160)
+    utils.load_img(self.header_art, lambda: self.backend.get_artwork_url(playlist_obj, 640), self.cache_dir, utils.COVER_SIZE)
 
     while c := self.track_list.get_first_child():
         self.track_list.remove(c)
 
-    def task():
-        tracks = self.backend.get_tracks(playlist_obj) or []
+    # Clean up previous lazy-load hook (if any).
+    try:
+        old_vadj = getattr(self, "_remote_pl_vadj", None)
+        old_handler = int(getattr(self, "_remote_pl_vadj_handler_id", 0) or 0)
+        if old_vadj is not None and old_handler:
+            old_vadj.disconnect(old_handler)
+    except Exception:
+        pass
+    self._remote_pl_vadj = None
+    self._remote_pl_vadj_handler_id = 0
 
-        def apply():
-            self.header_meta.set_text(f"{len(tracks)} Tracks" if tracks else "0 Tracks")
-            self.load_album_tracks(tracks)
-            return False
+    render_token = int(getattr(self, "_remote_pl_render_token", 0) or 0) + 1
+    self._remote_pl_render_token = render_token
 
-        GLib.idle_add(apply)
+    state = {
+        "tracks": [],
+        "offset": 0,
+        "loading": False,
+        "has_more": True,
+    }
+    initial_limit = 20
+    page_limit = 40
 
-    submit_daemon(task)
+    def _get_total_tracks():
+        for k in ("number_of_tracks", "num_tracks", "numberOfTracks", "total_number_of_items"):
+            try:
+                v = int(getattr(playlist_obj, k, 0) or 0)
+            except Exception:
+                v = 0
+            if v > 0:
+                return v
+        return 0
+
+    def _apply_loaded_tracks():
+        total = _get_total_tracks()
+        loaded = len(state["tracks"])
+        if total > 0:
+            self.header_meta.set_text(f"{loaded}/{total} Tracks")
+        else:
+            self.header_meta.set_text(f"{loaded} Tracks")
+        self.load_album_tracks(list(state["tracks"]))
+
+    def _get_track_scroller():
+        try:
+            return self.track_list.get_ancestor(Gtk.ScrolledWindow)
+        except Exception:
+            return None
+
+    def _maybe_load_more(_adj=None):
+        if int(getattr(self, "_remote_pl_render_token", 0) or 0) != render_token:
+            return
+        if state["loading"] or not state["has_more"]:
+            return
+        scroller = _get_track_scroller()
+        if scroller is None:
+            return
+        vadj = scroller.get_vadjustment()
+        if vadj is None:
+            return
+        # Keep first screen fixed: only start paging after user scrolls.
+        if float(vadj.get_value()) <= 1.0:
+            return
+        remain = float(vadj.get_upper()) - (float(vadj.get_value()) + float(vadj.get_page_size()))
+        if remain <= 320:
+            _load_next_page()
+
+    def _ensure_scroll_hook():
+        if self._remote_pl_vadj_handler_id:
+            return
+        scroller = _get_track_scroller()
+        if scroller is None:
+            return
+        vadj = scroller.get_vadjustment()
+        if vadj is None:
+            return
+        self._remote_pl_vadj = vadj
+        self._remote_pl_vadj_handler_id = vadj.connect("value-changed", _maybe_load_more)
+
+    def _load_next_page():
+        if state["loading"] or not state["has_more"]:
+            return
+        state["loading"] = True
+        offset = int(state["offset"])
+        limit = initial_limit if offset == 0 else page_limit
+
+        def task():
+            page = list(self.backend.get_playlist_tracks_page(playlist_obj, limit=limit, offset=offset) or [])
+
+            def apply():
+                if int(getattr(self, "_remote_pl_render_token", 0) or 0) != render_token:
+                    return False
+                state["loading"] = False
+                if not page:
+                    state["has_more"] = False
+                    return False
+                state["tracks"].extend(page)
+                state["offset"] += len(page)
+                if len(page) < limit:
+                    state["has_more"] = False
+                _apply_loaded_tracks()
+                _ensure_scroll_hook()
+                return False
+
+            GLib.idle_add(apply)
+
+        submit_daemon(task)
+
+    _load_next_page()
 
 
 def _refresh_remote_playlist_visibility_button(self, playlist_obj=None):
@@ -331,11 +430,11 @@ def _open_cloud_playlist_editor(
     content = Gtk.Box(spacing=16)
 
     left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+    import utils.helpers as utils
     cover = Gtk.Image(css_classes=["album-cover-img", "playlist-cover-img"])
-    cover.set_size_request(147, 147)
+    cover.set_size_request(utils.COVER_SIZE, utils.COVER_SIZE)
     if playlist_obj is not None:
-        import utils.helpers as utils
-        utils.load_img(cover, lambda: self.backend.get_artwork_url(playlist_obj, 640), self.cache_dir, 147)
+        utils.load_img(cover, lambda: self.backend.get_artwork_url(playlist_obj, 640), self.cache_dir, utils.COVER_SIZE)
     else:
         cover.set_from_icon_name("audio-x-generic-symbolic")
     left.append(cover)

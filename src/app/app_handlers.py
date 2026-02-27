@@ -1,88 +1,66 @@
+"""Aggregated app handlers.
+
+This module keeps the existing import surface for wiring while delegating
+feature-specific logic to dedicated modules.
 """
-Event handlers for TidalApp.
-Contains on_* callback methods moved from main.py.
-"""
+
 import logging
 import platform
+import random
 
 import gi
+
 gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
 from gi.repository import Gtk, Adw, GLib
 
 from core.executor import submit_daemon
 
+from app.app_auth import (
+    on_login_clicked,
+    on_logout_clicked,
+    _toggle_login_view,
+    _set_login_view_pending,
+    _set_overlay_handles_visible,
+    _show_login_method_dialog,
+    _start_login_flow,
+    _open_login_url,
+    _cleanup_login_dialog,
+    _cancel_login_attempt,
+    _build_qr_tempfile,
+    _show_login_qr_dialog,
+    _on_login_success_for_attempt,
+    _on_login_failed,
+    _on_login_failed_for_attempt,
+    on_login_success,
+)
+from app.app_queue import (
+    _get_active_queue,
+    _set_play_queue,
+    _is_queue_nav_selected,
+    _sync_queue_handle_state,
+    toggle_queue_drawer,
+    close_queue_drawer,
+    on_queue_track_selected,
+    _refresh_queue_views,
+    on_queue_remove_track_clicked,
+    on_queue_clear_clicked,
+)
+from app.app_home_mixes import (
+    refresh_liked_songs_dashboard,
+    on_history_album_clicked,
+    on_history_track_clicked,
+    _debug_dump_button_metrics,
+    build_daily_mixes,
+    render_daily_mixes,
+    on_daily_mix_track_selected,
+    on_daily_mix_item_activated,
+)
+
 logger = logging.getLogger(__name__)
 
 
-# Queue management methods
-def _get_active_queue(self):
-    """Get the current queue."""
-    q = list(getattr(self, "play_queue", []) or [])
-    if q:
-        return q
-    return list(getattr(self, "current_track_list", []) or [])
-
-
-def _set_play_queue(self, tracks):
-    """Set the play queue."""
-    self.play_queue = list(tracks or [])
-    self.shuffle_indices = []
-
-
-def _is_queue_nav_selected(self):
-    """Check if queue is selected in navigation."""
-    row = self.nav_list.get_selected_row() if self.nav_list is not None else None
-    return bool(row and getattr(row, "nav_id", None) == "queue")
-
-
-def _sync_queue_handle_state(self, expanded):
-    """Sync queue handle button state."""
-    btn = getattr(self, "queue_btn", None)
-    if btn is not None:
-        btn.set_icon_name(
-            "hiresti-queue-handle-right-symbolic" if expanded else "hiresti-queue-handle-left-symbolic"
-        )
-        btn.set_tooltip_text("Close Queue" if expanded else "Open Queue")
-        if expanded:
-            btn.add_css_class("active")
-        else:
-            btn.remove_css_class("active")
-    anchor = getattr(self, "queue_anchor", None)
-    if anchor is not None:
-        if expanded:
-            anchor.add_css_class("open")
-        else:
-            anchor.remove_css_class("open")
-
-
-def toggle_queue_drawer(self, _btn=None):
-    """Toggle queue drawer visibility."""
-    revealer = getattr(self, "queue_revealer", None)
-    if revealer is None:
-        return
-    show = not revealer.get_reveal_child()
-    revealer.set_reveal_child(show)
-    if getattr(self, "queue_backdrop", None) is not None:
-        self.queue_backdrop.set_visible(show)
-    _sync_queue_handle_state(self, show)
-    if show:
-        GLib.timeout_add(120, lambda: (self.render_queue_drawer(), False)[1])
-
-
-def close_queue_drawer(self):
-    """Close queue drawer."""
-    revealer = getattr(self, "queue_revealer", None)
-    if revealer is not None:
-        revealer.set_reveal_child(False)
-    if getattr(self, "queue_backdrop", None) is not None:
-        self.queue_backdrop.set_visible(False)
-    _sync_queue_handle_state(self, False)
-
-
-# Playlist methods
 def get_sorted_playlist_tracks(self, playlist_id):
-    """Get sorted tracks from playlist."""
     tracks = self.playlist_mgr.get_tracks(playlist_id) if hasattr(self, "playlist_mgr") else []
     if getattr(self, "playlist_edit_mode", False):
         return tracks
@@ -90,7 +68,6 @@ def get_sorted_playlist_tracks(self, playlist_id):
 
 
 def on_about_clicked(self, _btn=None):
-    """Show about dialog."""
     info_lines = [
         "A desktop TIDAL client focused on audio quality and visual experience.",
         f"Python: {platform.python_version()}",
@@ -110,53 +87,17 @@ def on_about_clicked(self, _btn=None):
     about.present()
 
 
-def on_login_clicked(self, btn):
-    """Handle login button click."""
-    if self.backend.user:
-        self.user_popover.popup()
-        return
-    if self._login_in_progress:
-        self.show_output_notice("Login already in progress.", "warn", 2200)
-        if self._login_dialog is not None:
-            self._login_dialog.present()
-        return
-    self._show_login_method_dialog()
-
-
-def on_logout_clicked(self, btn):
-    """Handle logout button click."""
-    self.user_popover.popdown()
-    self._login_in_progress = False
-    self._login_attempt_id = None
-    self._login_mode = None
-    self._cleanup_login_dialog()
-    self.backend.logout()
-    self._apply_account_scope(force=True)
-    self._home_sections_cache = None
-    self.stream_prefetch_cache.clear()
-    self._toggle_login_view(False)
-    self._clear_initial_search_focus()
-    self.refresh_visible_track_fav_buttons()
-    self.refresh_current_track_favorite_state()
-    while c := self.collection_content_box.get_first_child():
-        self.collection_content_box.remove(c)
-    logger.info("User logged out.")
-
-
 def on_settings_clicked(self, btn):
-    """Handle settings button click."""
-    if hasattr(self, 'right_stack'):
+    if hasattr(self, "right_stack"):
         self.right_stack.set_visible_child_name("settings")
 
 
 def on_volume_changed_ui(self, scale):
-    """Handle volume slider change."""
     val = scale.get_value()
     self.player.set_volume(val / 100.0)
     self.settings["volume"] = int(round(val))
     self.schedule_save_settings()
 
-    # Update volume icon based on level
     icon = "hiresti-volume-high-symbolic"
     if val == 0:
         icon = "hiresti-volume-muted-symbolic"
@@ -170,14 +111,13 @@ def on_volume_changed_ui(self, scale):
 
 
 def on_tech_info_clicked(self, btn):
-    """Show technical info dialog."""
     from services.signal_path import AudioSignalPathWindow
+
     win = AudioSignalPathWindow(self)
     win.present()
 
 
 def on_toggle_mode(self, btn):
-    """Switch play mode: loop -> one -> shuffle -> smart -> loop."""
     self.play_mode = (self.play_mode + 1) % 4
 
     icon = self.MODE_ICONS.get(self.play_mode, "hiresti-mode-loop-symbolic")
@@ -196,7 +136,6 @@ def on_toggle_mode(self, btn):
 
 
 def on_fav_clicked(self, btn):
-    """Handle favorite button click for album."""
     if not self.current_album:
         return
     is_currently_active = "active" in btn.get_css_classes()
@@ -210,7 +149,6 @@ def on_fav_clicked(self, btn):
 
 
 def on_artist_fav_clicked(self, btn):
-    """Handle favorite button click for artist."""
     if not self.current_selected_artist:
         return
     art = self.current_selected_artist
@@ -222,3 +160,28 @@ def on_artist_fav_clicked(self, btn):
             GLib.idle_add(lambda: self._update_fav_icon(btn, is_add))
 
     submit_daemon(do)
+
+
+def _generate_shuffle_list(self):
+    queue = self._get_active_queue()
+    if not queue:
+        self.shuffle_indices = []
+        return
+
+    total = len(queue)
+    if total == 0:
+        self.shuffle_indices = []
+        return
+
+    indices = list(range(total))
+
+    current_idx = getattr(self, "current_track_index", -1)
+    if current_idx is None:
+        current_idx = -1
+
+    if current_idx >= 0 and current_idx < total:
+        if current_idx in indices:
+            indices.remove(current_idx)
+
+    random.shuffle(indices)
+    self.shuffle_indices = indices

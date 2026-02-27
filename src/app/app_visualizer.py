@@ -1098,3 +1098,60 @@ def _animate_viz_handle_to(self, target_bottom, duration_ms=180):
         return True
 
     self._viz_handle_anim_source = GLib.timeout_add(16, _tick)
+
+
+def _apply_lyrics_font_preset_by_index(self, idx, update_dropdown=False):
+    if self.lyrics_vbox is None:
+        return
+    if not isinstance(idx, int) or idx < 0 or idx >= len(self.LYRICS_FONT_PRESETS):
+        idx = 1
+    for cls in ("lyrics-font-live", "lyrics-font-studio", "lyrics-font-compact"):
+        self.lyrics_vbox.remove_css_class(cls)
+    class_map = {0: "lyrics-font-live", 1: "lyrics-font-studio", 2: "lyrics-font-compact"}
+    self.lyrics_vbox.add_css_class(class_map.get(idx, "lyrics-font-studio"))
+    self.settings["lyrics_font_preset"] = idx
+    if update_dropdown and self.lyrics_font_dd is not None:
+        self.lyrics_font_dd.set_selected(idx)
+
+
+def on_lyrics_font_preset_changed(self, dd, _param):
+    idx = dd.get_selected()
+    self._apply_lyrics_font_preset_by_index(idx, update_dropdown=False)
+    self.schedule_save_settings()
+
+
+def _apply_lyrics_motion_by_index(self, idx, update_dropdown=False):
+    if self.bg_viz is None:
+        return
+    names = self.bg_viz.get_motion_mode_names()
+    if not isinstance(idx, int) or idx < 0 or idx >= len(names):
+        idx = 1
+    self.bg_viz.set_motion_mode(names[idx])
+    self.settings["lyrics_bg_motion"] = idx
+    if update_dropdown and self.lyrics_motion_dd is not None:
+        self.lyrics_motion_dd.set_selected(idx)
+
+
+def on_lyrics_motion_changed(self, dd, _param):
+    idx = dd.get_selected()
+    self._apply_lyrics_motion_by_index(idx, update_dropdown=False)
+    self._sync_spectrum_stream_state()
+    self.schedule_save_settings()
+
+
+def _apply_lyrics_offset_ms(self, offset_ms):
+    try:
+        val = int(offset_ms)
+    except Exception:
+        val = 0
+    val = max(-2000, min(2000, val))
+    self.lyrics_user_offset_ms = val
+    self.settings["lyrics_user_offset_ms"] = val
+    if self.lyrics_offset_label is not None:
+        sign = "+" if val > 0 else ""
+        self.lyrics_offset_label.set_text(f"{sign}{val}ms")
+
+
+def on_lyrics_offset_step(self, _btn, delta_ms):
+    self._apply_lyrics_offset_ms(getattr(self, "lyrics_user_offset_ms", 0) + int(delta_ms))
+    self.schedule_save_settings()

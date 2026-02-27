@@ -1,13 +1,15 @@
 import gi
 
 gi.require_version("Gtk", "4.0")
-from gi.repository import Gtk
+gi.require_version("Adw", "1")
+from gi.repository import Gtk, Adw
 
 import utils
 from ui.track_table import build_tracks_header, append_header_action_spacers
 
 
 def build_grid_view(app):
+    content_max_width = 1180
     grid_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["home-view"])
     title_box = Gtk.Box(
         orientation=Gtk.Orientation.VERTICAL,
@@ -22,7 +24,11 @@ def build_grid_view(app):
     app.grid_title_label = Gtk.Label(label="Home", xalign=0, css_classes=["section-title"])
     app.grid_subtitle_label = Gtk.Label(
         label="Fresh picks and playlists tailored to your listening",
-        xalign=0,
+        xalign=1.0,
+        ellipsize=3,
+        max_width_chars=56,
+        hexpand=True,
+        halign=Gtk.Align.END,
         css_classes=["home-subtitle", "dim-label"],
     )
     app.artist_fav_btn = Gtk.Button(
@@ -33,10 +39,12 @@ def build_grid_view(app):
     app.artist_fav_btn.connect("clicked", app.on_artist_fav_clicked)
     title_row.append(app.grid_title_label)
     title_row.append(Gtk.Box(hexpand=True))
+    title_row.append(app.grid_subtitle_label)
     title_row.append(app.artist_fav_btn)
     title_box.append(title_row)
-    title_box.append(app.grid_subtitle_label)
-    grid_vbox.append(title_box)
+    top_clamp = Adw.Clamp(maximum_size=content_max_width, tightening_threshold=920)
+    top_clamp.set_child(title_box)
+    grid_vbox.append(top_clamp)
 
     app.login_prompt_box = Gtk.Box(
         orientation=Gtk.Orientation.VERTICAL,
@@ -57,7 +65,9 @@ def build_grid_view(app):
         halign=Gtk.Align.CENTER,
         css_classes=["login-hero-card"],
     )
-    prompt_card.set_size_request(460, -1)
+    # Avoid forcing a hard minimum width; small windows (e.g. mini mode / narrow
+    # restored width) can otherwise trigger GtkStack measure warnings.
+    prompt_card.set_size_request(-1, -1)
     prompt_icon = Gtk.Image(
         icon_name="hiresti",
         pixel_size=104,
@@ -96,13 +106,15 @@ def build_grid_view(app):
     app.collection_content_box = Gtk.Box(
         orientation=Gtk.Orientation.VERTICAL,
         spacing=20,
-        margin_start=32,
-        margin_end=32,
+        margin_start=20,
+        margin_end=20,
         margin_bottom=32,
         css_classes=["home-content-box"],
     )
     app.collection_base_margin_bottom = 32
-    app.alb_scroll.set_child(app.collection_content_box)
+    content_clamp = Adw.Clamp(maximum_size=content_max_width, tightening_threshold=920)
+    content_clamp.set_child(app.collection_content_box)
+    app.alb_scroll.set_child(content_clamp)
     grid_vbox.append(app.alb_scroll)
     app.right_stack.add_named(grid_vbox, "grid_view")
 
@@ -161,7 +173,7 @@ def build_tracks_view(app):
 
     app.album_header_box = Gtk.Box(spacing=24, css_classes=["album-header-box"])
     app.header_art = Gtk.Picture()
-    app.header_art.set_size_request(160, 160)
+    app.header_art.set_size_request(utils.COVER_SIZE, utils.COVER_SIZE)
     app.header_art.set_can_shrink(True)
     try:
         app.header_art.set_content_fit(Gtk.ContentFit.COVER)
@@ -469,6 +481,7 @@ def build_settings_page(app):
 
 
 def build_search_view(app):
+    content_max_width = 1180
     app.search_scroll = Gtk.ScrolledWindow(vexpand=True)
     vbox = Gtk.Box(
         orientation=Gtk.Orientation.VERTICAL,
@@ -479,7 +492,9 @@ def build_search_view(app):
         margin_end=32,
         css_classes=["home-view", "search-view"],
     )
-    app.search_scroll.set_child(vbox)
+    search_clamp = Adw.Clamp(maximum_size=content_max_width, tightening_threshold=920)
+    search_clamp.set_child(vbox)
+    app.search_scroll.set_child(search_clamp)
     app.search_content_box = vbox
     app.search_base_margin_bottom = 32
 

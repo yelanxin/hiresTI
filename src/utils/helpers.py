@@ -19,6 +19,9 @@ logger = logging.getLogger(__name__)
 # Bounded thread pool for image loading — prevents thread explosion on large pages.
 _IMG_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="img-load")
 
+# Unified cover/artwork display size (px) — change here to resize all non-track/non-artist covers.
+COVER_SIZE = 170
+
 _TIDAL_IMAGE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
     "Referer": "https://listen.tidal.com/",

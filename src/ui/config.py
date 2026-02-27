@@ -1,4 +1,4 @@
-SIDEBAR_RATIO = 0.20
+SIDEBAR_RATIO = 0.25
 VOLUME_RATIO  = 0.10 
 SIDEBAR_MIN_WIDTH = 260
 VOLUME_MIN_WIDTH = 150 
@@ -529,6 +529,17 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
     min-height: 28px;
     padding: 0;
 }
+.history-card-btn.track-row-playing {
+    border-radius: 10px;
+    background-color: alpha(@accent_bg_color, 0.16);
+}
+.history-card-btn.track-row-playing:hover {
+    background-color: alpha(@accent_bg_color, 0.22);
+}
+.track-row-playing-icon {
+    color: @accent_bg_color;
+    margin-right: 4px;
+}
 .home-scroll-btn,
 .playlist-tool-btn,
 .player-side-btn,
@@ -551,6 +562,28 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
     font-weight: 700;
     color: alpha(currentColor, 0.92);
     background-color: alpha(currentColor, 0.16);
+}
+.history-rank-chip {
+    min-width: 24px;
+    min-height: 24px;
+    padding: 0;
+    border-radius: 999px;
+    font-size: 9px;
+    font-weight: 800;
+    color: alpha(currentColor, 0.95);
+    background-color: alpha(currentColor, 0.14);
+}
+.history-rank-top1 {
+    color: #1f1f1f;
+    background-color: #ffd54f;
+}
+.history-rank-top2 {
+    color: #1f1f1f;
+    background-color: #cfd8dc;
+}
+.history-rank-top3 {
+    color: #1f1f1f;
+    background-color: #ffcc80;
 }
 .history-play-count-badge {
     padding: 2px 8px;

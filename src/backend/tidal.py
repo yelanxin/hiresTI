@@ -1269,6 +1269,328 @@ class TidalBackend:
             
         return home_sections
 
+    def get_top_page(self):
+        """
+        Fetch official TIDAL platform Top page sections from /pages/explore_top_music.
+        """
+        def _norm_path(path):
+            p = str(path or "").strip()
+            if not p:
+                return None
+            return p[1:] if p.startswith("/") else p
+
+        sections = []
+        seen_paths = set()
+        seen_titles = set()
+
+        def _norm_text(v):
+            s = str(v or "").strip().lower()
+            keep = []
+            for ch in s:
+                if ch.isalnum() or ch.isspace():
+                    keep.append(ch)
+            return " ".join("".join(keep).split())
+
+        def _dedupe_items(items):
+            out = []
+            seen = set()
+            for it in list(items or []):
+                if not isinstance(it, dict):
+                    continue
+                obj = it.get("obj")
+                item_id = None
+                if obj is not None:
+                    item_id = getattr(obj, "id", None) or getattr(obj, "track_id", None)
+                    if item_id is None and isinstance(obj, dict):
+                        item_id = obj.get("id") or obj.get("track_id")
+                typ = str(it.get("type") or "")
+                if item_id is not None and str(item_id).strip():
+                    key = (typ, str(item_id).strip())
+                else:
+                    key = (typ, _norm_text(it.get("name")), _norm_text(it.get("sub_title")))
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(it)
+            return out
+
+        def _collect_category_items(category):
+            items = list(getattr(category, "items", None) or [])
+            more = getattr(category, "_more", None)
+            more_path = _norm_path(getattr(more, "api_path", None) if more is not None else None)
+            if not more_path or not hasattr(self.session, "page") or self.session.page is None:
+                return items
+            try:
+                more_page = self.session.page.get(more_path, params={"deviceType": "BROWSER"})
+            except Exception as e:
+                logger.debug("Top category view-all fetch failed for %s: %s", more_path, e)
+                return items
+
+            merged = list(items)
+            for sub_cat in list(getattr(more_page, "categories", None) or []):
+                sub_items = list(getattr(sub_cat, "items", None) or [])
+                if sub_items:
+                    merged.extend(sub_items)
+            return merged
+
+        def _top_image_url_from_uuid(image_id, size=320):
+            val = str(image_id or "").strip()
+            if not val:
+                return None
+            if val.startswith("http://") or val.startswith("https://"):
+                return val
+            token = val.replace("-", "/")
+            return f"https://resources.tidal.com/images/{token}/{int(size)}x{int(size)}.jpg"
+
+        def _process_top_item(item):
+            # Fast path: avoid eager item.get() network calls during page load.
+            try:
+                if item is None:
+                    return None
+                if hasattr(item, "header") and hasattr(item, "type"):
+                    raw_type = str(getattr(item, "type", "") or "").strip().upper()
+                    type_map = {
+                        "TRACK": "Track",
+                        "ALBUM": "Album",
+                        "ARTIST": "Artist",
+                        "PLAYLIST": "Playlist",
+                        "VIDEO": "Video",
+                        "MIX": "Mix",
+                    }
+                    return {
+                        "obj": item,
+                        "name": str(getattr(item, "header", "") or getattr(item, "short_header", "") or "Unknown"),
+                        "sub_title": str(getattr(item, "short_sub_header", "") or ""),
+                        "image_url": _top_image_url_from_uuid(getattr(item, "image_id", None), size=320),
+                        "type": type_map.get(raw_type, "PageItem"),
+                    }
+                if hasattr(item, "title") and hasattr(item, "api_path"):
+                    return {
+                        "obj": item,
+                        "name": str(getattr(item, "title", "") or "Top"),
+                        "sub_title": "",
+                        "image_url": _top_image_url_from_uuid(getattr(item, "image_id", None), size=320),
+                        "type": "PageLink",
+                    }
+            except Exception:
+                return None
+            return None
+
+        try:
+            if not hasattr(self.session, "page") or self.session.page is None:
+                return sections
+
+            queue = ["pages/explore_top_music"]
+            while queue:
+                path = _norm_path(queue.pop(0))
+                if not path or path in seen_paths:
+                    continue
+                seen_paths.add(path)
+
+                try:
+                    page_obj = self.session.page.get(path, params={"deviceType": "BROWSER"})
+                except Exception as e:
+                    logger.debug("Top page fetch failed for %s: %s", path, e)
+                    continue
+
+                categories = list(getattr(page_obj, "categories", None) or [])
+                for category in categories:
+                    title = str(getattr(category, "title", "") or "").strip() or "Top"
+                    raw_items = _collect_category_items(category)
+                    sec_items = []
+
+                    for item in raw_items:
+                        link_path = getattr(item, "api_path", None)
+                        if link_path is None and isinstance(item, dict):
+                            link_path = item.get("apiPath")
+                        link_norm = _norm_path(link_path)
+                        if link_norm and "explore_top" in link_norm and link_norm not in seen_paths:
+                            queue.append(link_norm)
+
+                        processed = _process_top_item(item)
+                        if not processed:
+                            processed = self._process_generic_item(item)
+                        if processed:
+                            sec_items.append(processed)
+
+                    sec_items = _dedupe_items(sec_items)
+                    if not sec_items:
+                        continue
+                    dedupe_key = f"{path}:{title.lower()}"
+                    if dedupe_key in seen_titles:
+                        continue
+                    seen_titles.add(dedupe_key)
+                    sections.append({"title": title, "items": sec_items})
+        except Exception as e:
+            logger.warning("Get top page error [%s]: %s", classify_exception(e), e)
+        return sections
+
+    def get_new_page(self):
+        """
+        Fetch official TIDAL New page sections from /pages/explore_new_music.
+        Excludes music-video categories/items.
+        """
+        def _norm_path(path):
+            p = str(path or "").strip()
+            if not p:
+                return None
+            return p[1:] if p.startswith("/") else p
+
+        def _is_video_text(text):
+            s = str(text or "").strip().lower()
+            if not s:
+                return False
+            return ("video" in s) or ("mv" in s) or ("音乐视频" in s) or ("音樂視頻" in s)
+
+        def _collect_category_items(category):
+            items = list(getattr(category, "items", None) or [])
+            more = getattr(category, "_more", None)
+            more_path = _norm_path(getattr(more, "api_path", None) if more is not None else None)
+            if not more_path or not hasattr(self.session, "page") or self.session.page is None:
+                return items
+            try:
+                more_page = self.session.page.get(more_path, params={"deviceType": "BROWSER"})
+            except Exception as e:
+                logger.debug("New category view-all fetch failed for %s: %s", more_path, e)
+                return items
+
+            merged = list(items)
+            for sub_cat in list(getattr(more_page, "categories", None) or []):
+                sub_items = list(getattr(sub_cat, "items", None) or [])
+                if sub_items:
+                    merged.extend(sub_items)
+            return merged
+
+        def _image_url_from_uuid(image_id, size=320):
+            val = str(image_id or "").strip()
+            if not val:
+                return None
+            if val.startswith("http://") or val.startswith("https://"):
+                return val
+            token = val.replace("-", "/")
+            return f"https://resources.tidal.com/images/{token}/{int(size)}x{int(size)}.jpg"
+
+        def _process_item(item):
+            try:
+                if item is None:
+                    return None
+                if hasattr(item, "header") and hasattr(item, "type"):
+                    raw_type = str(getattr(item, "type", "") or "").strip().upper()
+                    if raw_type == "VIDEO":
+                        return None
+                    type_map = {
+                        "TRACK": "Track",
+                        "ALBUM": "Album",
+                        "ARTIST": "Artist",
+                        "PLAYLIST": "Playlist",
+                        "MIX": "Mix",
+                    }
+                    return {
+                        "obj": item,
+                        "name": str(getattr(item, "header", "") or getattr(item, "short_header", "") or "Unknown"),
+                        "sub_title": str(getattr(item, "short_sub_header", "") or ""),
+                        "image_url": _image_url_from_uuid(getattr(item, "image_id", None), size=320),
+                        "type": type_map.get(raw_type, "PageItem"),
+                    }
+                if hasattr(item, "title") and hasattr(item, "api_path"):
+                    if _is_video_text(getattr(item, "title", "")):
+                        return None
+                    return {
+                        "obj": item,
+                        "name": str(getattr(item, "title", "") or "New"),
+                        "sub_title": "",
+                        "image_url": _image_url_from_uuid(getattr(item, "image_id", None), size=320),
+                        "type": "PageLink",
+                    }
+            except Exception:
+                return None
+            return None
+
+        sections = []
+        seen_paths = set()
+        seen_titles = set()
+
+        def _norm_text(v):
+            s = str(v or "").strip().lower()
+            keep = []
+            for ch in s:
+                if ch.isalnum() or ch.isspace():
+                    keep.append(ch)
+            return " ".join("".join(keep).split())
+
+        def _dedupe_items(items):
+            out = []
+            seen = set()
+            for it in list(items or []):
+                if not isinstance(it, dict):
+                    continue
+                obj = it.get("obj")
+                item_id = None
+                if obj is not None:
+                    item_id = getattr(obj, "id", None) or getattr(obj, "track_id", None)
+                    if item_id is None and isinstance(obj, dict):
+                        item_id = obj.get("id") or obj.get("track_id")
+                typ = str(it.get("type") or "")
+                if item_id is not None and str(item_id).strip():
+                    key = (typ, str(item_id).strip())
+                else:
+                    key = (typ, _norm_text(it.get("name")), _norm_text(it.get("sub_title")))
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(it)
+            return out
+        try:
+            if not hasattr(self.session, "page") or self.session.page is None:
+                return sections
+
+            queue = ["pages/explore_new_music"]
+            while queue:
+                path = _norm_path(queue.pop(0))
+                if not path or path in seen_paths:
+                    continue
+                seen_paths.add(path)
+
+                try:
+                    page_obj = self.session.page.get(path, params={"deviceType": "BROWSER"})
+                except Exception as e:
+                    logger.debug("New page fetch failed for %s: %s", path, e)
+                    continue
+
+                categories = list(getattr(page_obj, "categories", None) or [])
+                for category in categories:
+                    title = str(getattr(category, "title", "") or "").strip() or "New"
+                    if _is_video_text(title):
+                        continue
+                    raw_items = _collect_category_items(category)
+                    sec_items = []
+
+                    for item in raw_items:
+                        link_path = getattr(item, "api_path", None)
+                        if link_path is None and isinstance(item, dict):
+                            link_path = item.get("apiPath")
+                        link_norm = _norm_path(link_path)
+                        if link_norm and "explore_new" in link_norm and link_norm not in seen_paths:
+                            queue.append(link_norm)
+
+                        processed = _process_item(item)
+                        if not processed:
+                            processed = self._process_generic_item(item)
+                        if processed and not _is_video_text(processed.get("name")) and not _is_video_text(processed.get("sub_title")):
+                            sec_items.append(processed)
+
+                    sec_items = _dedupe_items(sec_items)
+                    if not sec_items:
+                        continue
+                    dedupe_key = f"{path}:{title.lower()}"
+                    if dedupe_key in seen_titles:
+                        continue
+                    seen_titles.add(dedupe_key)
+                    sections.append({"title": title, "items": sec_items})
+        except Exception as e:
+            logger.warning("Get new page error [%s]: %s", classify_exception(e), e)
+        return sections
+
     def _process_generic_item(self, item):
         try:
             # 基础信息
@@ -1366,6 +1688,28 @@ class TidalBackend:
         except Exception as e:
             logger.warning("Get tracks error [%s]: %s", classify_exception(e), e)
             return []
+
+    def get_playlist_tracks_page(self, playlist_or_id, limit=100, offset=0):
+        pl = self._resolve_user_playlist(playlist_or_id)
+        if pl is None:
+            return []
+        page_size = max(1, min(200, int(limit or 100)))
+        page_offset = max(0, int(offset or 0))
+        try:
+            if hasattr(pl, "tracks") and callable(pl.tracks):
+                return list(pl.tracks(limit=page_size, offset=page_offset) or [])
+            if hasattr(pl, "items") and callable(pl.items):
+                return self._extract_tracks_from_items(pl.items(limit=page_size, offset=page_offset))
+        except Exception as e:
+            logger.warning(
+                "Get playlist page error [%s]: playlist=%s limit=%s offset=%s err=%s",
+                classify_exception(e),
+                getattr(pl, "id", None),
+                page_size,
+                page_offset,
+                e,
+            )
+        return []
 
     def _is_server_error(self, exc):
         text = str(exc).lower()

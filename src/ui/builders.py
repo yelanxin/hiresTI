@@ -384,6 +384,8 @@ def build_body(app, container):
 
     nav_items = [
         ("home", "hiresti-home-symbolic", "Home"),
+        ("new", "starred-symbolic", "New"),
+        ("top", "view-grid-symbolic", "Top"),
         ("collection", "hiresti-collection-symbolic", "My Albums"),
         ("liked_songs", "hiresti-favorite-symbolic", "Liked Songs"),
         ("artists", "hiresti-artists-symbolic", "Artists"),

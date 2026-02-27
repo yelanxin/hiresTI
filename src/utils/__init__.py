@@ -8,6 +8,7 @@ from .helpers import (
     get_cached_audio_uri,
     cache_audio_from_url,
     prune_audio_cache,
+    COVER_SIZE,
 )
 
 __all__ = [
@@ -19,4 +20,5 @@ __all__ = [
     'get_cached_audio_uri',
     'cache_audio_from_url',
     'prune_audio_cache',
+    'COVER_SIZE',
 ]
