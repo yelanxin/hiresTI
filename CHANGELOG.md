@@ -1,5 +1,37 @@
 # Changelog
 
+## 1.3.0 - 2026-02-27
+Refactor + sync release: main.py modular split, waveform/audio sync stabilization, and UI layout tuning.
+
+### Refactored
+- Included the `main.py` split work in this release: app lifecycle/bootstrap, visualizer control, runtime refs, and wiring are now handled in dedicated `app/` modules with centralized bind-map wiring.
+
+### Changed
+- Visualizer backend strategy simplified to a single Cairo path:
+  - removed Performance/Quality backend policy switching from UI/runtime,
+  - removed GL/GPU prewarm and policy handlers from visualizer wiring.
+- Sidebar and window defaults updated:
+  - `SIDEBAR_RATIO` set to `0.15`,
+  - default window size set to `1250x800`.
+- Queue drawer layout changed to adaptive height with vertical breathing room:
+  - top and bottom margins are each `10%` of window/overlay height (drawer body follows remaining `80%`).
+- Home page card layout adjusted:
+  - Home `FlowBox` switched to non-homogeneous layout to keep card spacing stable across normal/fullscreen states,
+  - home/top/new card width updated to `180`,
+  - Home track card uses width `100` with cover `90`.
+- Artist page avatar size increased to `150x150`.
+- Unified dashboard track-cover size via `DASHBOARD_TRACK_COVER_SIZE = 70` for Top/History/New track rows.
+
+### Fixed
+- Waveform/audio sync offset no longer depends on ALSA buffer/latency profile:
+  - removed buffer-based minimum offset clamp in Rust audio visual sync delay path,
+  - latency profile changes/startup no longer overwrite visual sync offset,
+  - visual sync now consistently uses dedicated `viz_sync_offset_ms`.
+- Restored now-playing indicator consistency:
+  - History Top20 rows now show playing icon and active background, aligned with Top/New behavior.
+
+---
+
 ## 1.2.9 - 2026-02-25
 Fix: logout now fully resets all UI and session state.
 

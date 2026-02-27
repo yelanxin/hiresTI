@@ -10,8 +10,6 @@ import logging
 
 from gi.repository import Gtk, GLib
 from viz.visualizer import SpectrumVisualizer
-from viz.visualizer_glarea import SpectrumVisualizerGLArea
-from viz.visualizer_gpu import SpectrumVisualizerGPU
 
 logger = logging.getLogger(__name__)
 
@@ -64,25 +62,30 @@ def _viz_sync_key(self, driver, device_id=None, device_name=None):
 
 
 def _get_viz_offset_from_latency_profile(self):
-    profile = str(self.settings.get("latency_profile", "Standard (100ms)") or "").strip()
-    if profile in self.LATENCY_MAP:
-        buf_ms, _lat_ms = self.LATENCY_MAP[profile]
-        return int(max(0, min(500, buf_ms)))
-    return 100
+    # Latency profile no longer drives visual sync offset.
+    # Keep a dedicated visual offset setting only.
+    try:
+        return int(self.settings.get("viz_sync_offset_ms", 0) or 0)
+    except Exception:
+        return 0
 
 
 def _apply_viz_sync_offset_for_device(self, driver, device_id=None, device_name=None):
     key = self._viz_sync_key(driver, device_id=device_id, device_name=device_name)
     self._viz_sync_device_key = key
-    profile_off = self._get_viz_offset_from_latency_profile()
-    self.player.visual_sync_offset_ms = profile_off
-    self.settings["viz_sync_offset_ms"] = profile_off
+    try:
+        offset_ms = int(self.settings.get("viz_sync_offset_ms", self._viz_sync_last_saved_ms) or 0)
+    except Exception:
+        offset_ms = int(getattr(self, "_viz_sync_last_saved_ms", 0) or 0)
+    offset_ms = int(max(-500, min(500, offset_ms)))
+    self.player.visual_sync_offset_ms = offset_ms
+    self.settings["viz_sync_offset_ms"] = offset_ms
     if hasattr(self.player, "visual_sync_auto_offset_ms"):
         self.player.visual_sync_auto_offset_ms = 0.0
-    self._viz_sync_last_saved_ms = profile_off
+    self._viz_sync_last_saved_ms = offset_ms
     logger.info(
-        "Viz sync offset applied: %dms (source=output-change key=%s)",
-        int(profile_off),
+        "Viz sync offset applied: %dms (source=output-change key=%s, latency-profile-offset-disabled)",
+        int(offset_ms),
         key,
     )
 
@@ -126,40 +129,12 @@ def _selected_name_from_dropdown(self, dd):
 # Backend selection & rebuild
 # ---------------------------------------------------------------------------
 
-def _build_visualizer_for_backend(self, backend_key):
-    order = []
-    if backend_key == "cairo":
-        order = [("cairo", SpectrumVisualizer), ("gl", SpectrumVisualizerGLArea), ("gpu", SpectrumVisualizerGPU)]
-    elif backend_key == "gpu":
-        order = [("gpu", SpectrumVisualizerGPU), ("gl", SpectrumVisualizerGLArea), ("cairo", SpectrumVisualizer)]
-    else:
-        order = [("gl", SpectrumVisualizerGLArea), ("gpu", SpectrumVisualizerGPU), ("cairo", SpectrumVisualizer)]
-    for key, ctor in order:
-        try:
-            return ctor(), key
-        except Exception as e:
-            logger.warning("Visualizer backend %s unavailable, falling back: %s", key, e)
-    raise RuntimeError("No visualizer backend available")
+def _build_visualizer_for_backend(self, _backend_key):
+    return SpectrumVisualizer(), "cairo"
 
 
 def _resolve_viz_backend_key(self, effect_name=None):
-    if not effect_name:
-        effect_name = self._selected_name_from_dropdown(self.viz_effect_dd)
-    # Force Bars to GL shader path to avoid Cairo/pixman composition overhead.
-    # If GL is unavailable, backend rebuild will gracefully fall back.
-    if effect_name == "Bars":
-        return "gl"
-    try:
-        idx = int(self.settings.get("viz_backend_policy", 0))
-    except Exception:
-        idx = 0
-    idx = max(0, min(len(self.VIZ_BACKEND_POLICIES) - 1, idx))
-    policy = self.VIZ_BACKEND_POLICIES[idx]
-    if policy.startswith("Quality"):
-        return "cairo"
-    if policy.startswith("Performance"):
-        return "gl"
-    return "gl"
+    return "cairo"
 
 
 def _sync_viz_dropdown_models(self, theme_name=None, effect_name=None, profile_name=None):
@@ -220,22 +195,6 @@ def _rebuild_visualizer_backend(self, backend_key, effect_name=None):
     self._sync_viz_tab_runtime_state()
     self._sync_viz_dropdown_models(theme_name=theme_name, effect_name=effect_name, profile_name=profile_name)
     logger.info("Visualizer backend switched: %s (requested=%s effect=%s)", actual_key, backend_key, effect_name)
-
-
-def _apply_viz_backend_policy_by_index(self, idx, update_dropdown=False):
-    if not isinstance(idx, int) or idx < 0 or idx >= len(self.VIZ_BACKEND_POLICIES):
-        idx = 0
-    self.settings["viz_backend_policy"] = idx
-    if update_dropdown and self.viz_policy_dd is not None:
-        self._viz_ui_syncing = True
-        try:
-            self.viz_policy_dd.set_selected(idx)
-        finally:
-            self._viz_ui_syncing = False
-    effect_name = self._selected_name_from_dropdown(self.viz_effect_dd)
-    desired = self._resolve_viz_backend_key(effect_name)
-    if desired != self._viz_backend_key:
-        self._rebuild_visualizer_backend(desired, effect_name=effect_name)
 
 
 # ---------------------------------------------------------------------------
@@ -400,29 +359,6 @@ def on_spectrum_theme_changed(self, dd, _param):
     self._viz_theme_apply_source = GLib.idle_add(_apply_theme_later)
 
 
-def on_viz_backend_policy_changed(self, dd, _param):
-    if self._viz_ui_syncing:
-        return
-    idx = dd.get_selected()
-    if self._viz_policy_apply_source:
-        try:
-            GLib.source_remove(self._viz_policy_apply_source)
-        except Exception:
-            pass
-        self._viz_policy_apply_source = None
-
-    def _apply_policy_later():
-        self._viz_policy_apply_source = None
-        if self._viz_ui_syncing:
-            return False
-        logger.debug("Applying visualizer policy (deferred): idx=%s", idx)
-        self._apply_viz_backend_policy_by_index(idx, update_dropdown=False)
-        self.schedule_save_settings()
-        return False
-
-    self._viz_policy_apply_source = GLib.idle_add(_apply_policy_later)
-
-
 # ---------------------------------------------------------------------------
 # Page / tab state
 # ---------------------------------------------------------------------------
@@ -437,8 +373,6 @@ def on_viz_page_changed(self, stack, _param):
     self.viz_theme_dd.set_visible(is_spectrum)
     if self.viz_bars_dd is not None:
         self.viz_bars_dd.set_visible(is_spectrum)
-    if self.viz_policy_dd is not None:
-        self.viz_policy_dd.set_visible(is_spectrum)
     if self.viz_profile_dd is not None:
         self.viz_profile_dd.set_visible(is_spectrum)
     if self.viz_effect_dd is not None:
@@ -498,67 +432,6 @@ def _sync_spectrum_stream_state(self):
     self._sync_viz_tab_runtime_state()
     if self.player is not None and hasattr(self.player, "set_spectrum_enabled"):
         self.player.set_spectrum_enabled(self._should_enable_spectrum_stream())
-
-
-# ---------------------------------------------------------------------------
-# Prewarm (called once from do_activate)
-# ---------------------------------------------------------------------------
-
-def _prewarm_gl_visualizer_once(self):
-    # Warm up GLArea realize/shader path once without visible drawer motion.
-    if bool(getattr(self, "_viz_gl_prewarm_done", False)):
-        return False
-    if str(getattr(self, "_viz_backend_key", "")) != "gl":
-        return False
-    revealer = getattr(self, "viz_revealer", None)
-    root = getattr(self, "viz_root", None)
-    handle = getattr(self, "viz_handle_box", None)
-    if revealer is None or root is None:
-        return False
-    if bool(revealer.get_reveal_child()):
-        return False
-
-    self._viz_gl_prewarm_done = True
-    try:
-        old_dur = int(revealer.get_transition_duration() or 0)
-    except Exception:
-        old_dur = 0
-    try:
-        old_opacity = float(root.get_opacity() or 1.0)
-    except Exception:
-        old_opacity = 1.0
-    old_handle_visible = bool(handle.get_visible()) if handle is not None else True
-
-    try:
-        revealer.set_transition_duration(0)
-        root.set_opacity(0.0)
-        if handle is not None:
-            handle.set_visible(False)
-        revealer.set_reveal_child(True)
-    except Exception:
-        # Best-effort only; never block startup.
-        try:
-            revealer.set_transition_duration(old_dur)
-        except Exception:
-            pass
-        if handle is not None:
-            handle.set_visible(old_handle_visible)
-        root.set_opacity(old_opacity)
-        return False
-
-    def _finish():
-        try:
-            revealer.set_reveal_child(False)
-            root.set_opacity(old_opacity)
-            revealer.set_transition_duration(old_dur)
-            if handle is not None:
-                handle.set_visible(old_handle_visible)
-        except Exception:
-            pass
-        return False
-
-    GLib.timeout_add(70, _finish)
-    return False
 
 
 def _start_spectrum_stream_prewarm(self):

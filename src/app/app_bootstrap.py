@@ -89,7 +89,6 @@ def _restore_runtime_state(self):
         sidebar_px = int(max(120, self.win.get_width() * float(ui_config.SIDEBAR_RATIO)))
         self.paned.set_position(sidebar_px)
 
-    self._apply_viz_backend_policy_by_index(self.settings.get("viz_backend_policy", 0), update_dropdown=True)
     self._apply_viz_bars_by_count(self.settings.get("viz_bar_count", 32), update_dropdown=True)
     self._apply_viz_profile_by_index(self.settings.get("viz_profile", 1), update_dropdown=True)
     self._apply_viz_effect_by_index(self.settings.get("viz_effect", 3), update_dropdown=True)
@@ -104,7 +103,6 @@ def _run_post_activate_tasks(app):
     app._restore_session_async()
     app._schedule_update_ui_loop(40)
     app._schedule_output_status_loop(1000)
-    GLib.timeout_add(260, app._prewarm_gl_visualizer_once)
     GLib.timeout_add(80, app._start_spectrum_stream_prewarm)
     GLib.timeout_add(220, lambda: (app._init_tray_icon(), False)[1])
     GLib.timeout_add(0, app._ensure_overlay_handles_visible)

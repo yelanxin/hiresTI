@@ -19,6 +19,7 @@ from core.errors import classify_exception, user_message
 
 logger = logging.getLogger(__name__)
 MAX_SEARCH_HISTORY = 10
+DASHBOARD_TRACK_COVER_SIZE = 70
 _RUST_COLLECTION_CORE = None
 
 
@@ -1250,8 +1251,8 @@ def batch_load_artists(app, artists, batch=10):
     curr, rem = artists[:batch], artists[batch:]
     for art in curr:
         v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, css_classes=["card", "home-card"])
-        img = Gtk.Image(pixel_size=120, css_classes=["circular-avatar"])
-        utils.load_img(img, lambda a=art: app.backend.get_artist_artwork_url(a, 320), app.cache_dir, 120)
+        img = Gtk.Image(pixel_size=150, css_classes=["circular-avatar"])
+        utils.load_img(img, lambda a=art: app.backend.get_artist_artwork_url(a, 320), app.cache_dir, 150)
         v.append(img)
         v.append(
             Gtk.Label(
@@ -1321,15 +1322,17 @@ def batch_load_home(app, sections):
 
     def _build_home_item_button(item_data):
         v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, css_classes=["card", "home-card"])
-        v.set_size_request(210, -1)
+        card_width = 180
         img_size = utils.COVER_SIZE
         img_cls = "album-cover-img"
         if item_data["type"] == "Track":
-            img_size = 88
+            card_width = 100
+            img_size = 90
             v.add_css_class("home-track-card")
         elif item_data["type"] == "Artist" or "Radio" in item_data["name"]:
             img_size = 150
             img_cls = "circular-avatar"
+        v.set_size_request(card_width, -1)
         img = Gtk.Image(pixel_size=img_size, css_classes=[img_cls])
         if item_data["image_url"]:
             utils.load_img(img, item_data["image_url"], app.cache_dir, img_size)
@@ -1358,7 +1361,7 @@ def batch_load_home(app, sections):
                 )
             )
         btn = Gtk.Button(css_classes=["flat", "history-card-btn"])
-        btn.set_size_request(210, -1)
+        btn.set_size_request(card_width, -1)
         btn.set_child(v)
         btn.connect("clicked", lambda _b, d=item_data: _open_item(d))
         return btn
@@ -1372,7 +1375,7 @@ def batch_load_home(app, sections):
         section_box.append(section_head)
 
         flow = Gtk.FlowBox(
-            homogeneous=True,
+            homogeneous=False,
             min_children_per_line=2,
             max_children_per_line=16,
             column_spacing=16,
@@ -1461,6 +1464,19 @@ def render_history_dashboard(app):
     history_stack.set_visible_child_name("history-top20")
     app.collection_content_box.append(tabs_box)
 
+    def _norm_text(v):
+        s = str(v or "").strip().lower()
+        keep = []
+        for ch in s:
+            if ch.isalnum() or ch.isspace():
+                keep.append(ch)
+        return " ".join("".join(keep).split())
+
+    _playing_track = getattr(app, "playing_track", None)
+    _playing_id = str(getattr(app, "playing_track_id", "") or "").strip()
+    _now_name = _norm_text(getattr(_playing_track, "name", "")) if _playing_track else ""
+    _now_artist = _norm_text(getattr(getattr(_playing_track, "artist", None), "name", "")) if _playing_track else ""
+
     # --- Populate Tab 1 immediately (data is local, 20 items max) ---
     for i, tr in enumerate(top_tracks):
         row_box = Gtk.Box(spacing=10, margin_start=6, margin_end=6, margin_top=4, margin_bottom=4)
@@ -1477,14 +1493,14 @@ def render_history_dashboard(app):
         rank_label.set_vexpand(False)
         row_box.append(rank_label)
 
-        img = Gtk.Image(pixel_size=56, css_classes=["album-cover-img"])
+        img = Gtk.Image(pixel_size=DASHBOARD_TRACK_COVER_SIZE, css_classes=["album-cover-img"])
         cover = app.backend.get_artwork_url(tr, 320)
         if not cover:
             cover = getattr(tr, "cover", None)
         if not cover:
             cover = getattr(getattr(tr, "album", None), "cover", None)
         if cover:
-            utils.load_img(img, cover, app.cache_dir, 56)
+            utils.load_img(img, cover, app.cache_dir, DASHBOARD_TRACK_COVER_SIZE)
         else:
             img.set_from_icon_name("audio-x-generic-symbolic")
         row_box.append(img)
@@ -1516,7 +1532,43 @@ def render_history_dashboard(app):
         play_count_label.set_size_request(42, -1)
         row_box.append(play_count_label)
 
+        track_id = getattr(tr, "id", None) or getattr(tr, "track_id", None)
+        row_name_norm = _norm_text(track_name)
+        row_artist_norm = _norm_text(artist_name)
+        is_playing = False
+        if _playing_id and track_id is not None and str(track_id).strip() == _playing_id:
+            is_playing = True
+        else:
+            name_match = bool(
+                _now_name
+                and row_name_norm
+                and (row_name_norm == _now_name or row_name_norm in _now_name or _now_name in row_name_norm)
+            )
+            if name_match:
+                if not _now_artist:
+                    is_playing = True
+                else:
+                    is_playing = bool(
+                        row_artist_norm
+                        and (row_artist_norm == _now_artist or row_artist_norm in _now_artist or _now_artist in row_artist_norm)
+                    )
+
+        playing_icon = Gtk.Image(icon_name="media-playback-start-symbolic", pixel_size=14)
+        playing_icon.set_halign(Gtk.Align.END)
+        playing_icon.set_valign(Gtk.Align.CENTER)
+        playing_icon.add_css_class("track-row-playing-icon")
+        playing_icon.set_visible(is_playing)
+        row_box.append(playing_icon)
+
         btn = Gtk.Button(css_classes=["flat", "history-card-btn"])
+        btn.set_hexpand(True)
+        btn.set_halign(Gtk.Align.FILL)
+        btn._dashboard_track_id = str(track_id or "").strip()
+        btn._dashboard_track_name = row_name_norm
+        btn._dashboard_track_artist = row_artist_norm
+        btn._dashboard_playing_icon = playing_icon
+        if is_playing:
+            btn.add_css_class("track-row-playing")
         btn.set_child(row_box)
         btn.connect("clicked", lambda _b, idx=i: app.on_history_track_clicked(top_tracks, idx))
 
@@ -1630,7 +1682,7 @@ def render_top_dashboard(app, prefer_cache=True):
 
             def _build_home_item_button(item_data):
                 v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, css_classes=["card", "home-card"])
-                v.set_size_request(210, -1)
+                v.set_size_request(180, -1)
                 img_size = utils.COVER_SIZE
                 img_cls = "album-cover-img"
                 if item_data["type"] == "Track":
@@ -1667,7 +1719,7 @@ def render_top_dashboard(app, prefer_cache=True):
                         )
                     )
                 btn = Gtk.Button(css_classes=["flat", "history-card-btn"])
-                btn.set_size_request(210, -1)
+                btn.set_size_request(180, -1)
                 btn.set_child(v)
                 btn.connect("clicked", lambda _b, d=item_data: _open_item(d))
                 return btn
@@ -1775,10 +1827,10 @@ def render_top_dashboard(app, prefer_cache=True):
                 rank_label.set_valign(Gtk.Align.CENTER)
                 row_box.append(rank_label)
 
-                img = Gtk.Image(pixel_size=56, css_classes=["album-cover-img"])
+                img = Gtk.Image(pixel_size=DASHBOARD_TRACK_COVER_SIZE, css_classes=["album-cover-img"])
                 cover = item_data.get("image_url")
                 if cover:
-                    utils.load_img(img, cover, app.cache_dir, 56)
+                    utils.load_img(img, cover, app.cache_dir, DASHBOARD_TRACK_COVER_SIZE)
                 else:
                     img.set_from_icon_name("audio-x-generic-symbolic")
                 row_box.append(img)
@@ -2031,7 +2083,7 @@ def render_new_dashboard(app, prefer_cache=True):
 
             def _build_item_button(item_data):
                 v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, css_classes=["card", "home-card"])
-                v.set_size_request(210, -1)
+                v.set_size_request(180, -1)
                 img_size = utils.COVER_SIZE
                 img_cls = "album-cover-img"
                 if item_data["type"] == "Track":
@@ -2068,7 +2120,7 @@ def render_new_dashboard(app, prefer_cache=True):
                         )
                     )
                 btn = Gtk.Button(css_classes=["flat", "history-card-btn"])
-                btn.set_size_request(210, -1)
+                btn.set_size_request(180, -1)
                 btn.set_child(v)
                 btn.connect("clicked", lambda _b, d=item_data: _open_item(d))
                 return btn
@@ -2165,10 +2217,10 @@ def render_new_dashboard(app, prefer_cache=True):
                 row_box = Gtk.Box(spacing=10, margin_start=6, margin_end=6, margin_top=4, margin_bottom=4)
                 row_box.set_hexpand(True)
 
-                img = Gtk.Image(pixel_size=56, css_classes=["album-cover-img"])
+                img = Gtk.Image(pixel_size=DASHBOARD_TRACK_COVER_SIZE, css_classes=["album-cover-img"])
                 cover = item_data.get("image_url")
                 if cover:
-                    utils.load_img(img, cover, app.cache_dir, 56)
+                    utils.load_img(img, cover, app.cache_dir, DASHBOARD_TRACK_COVER_SIZE)
                 else:
                     img.set_from_icon_name("audio-x-generic-symbolic")
                 row_box.append(img)

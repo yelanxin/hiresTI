@@ -36,7 +36,6 @@ class TidalApp(Adw.Application):
     LATENCY_OPTIONS = AudioLatency.OPTIONS
     LATENCY_MAP = AudioLatency.MAP
     VIZ_BAR_OPTIONS = VisualizerSettings.BAR_OPTIONS
-    VIZ_BACKEND_POLICIES = VisualizerSettings.BACKEND_POLICIES
 
     def _init_ui_refs(self):
         return app_init_refs.init_ui_refs(self)

@@ -11,9 +11,6 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Gtk, Adw, Pango
 
-from visualizer import SpectrumVisualizer
-from visualizer_gpu import SpectrumVisualizerGPU
-from visualizer_glarea import SpectrumVisualizerGLArea
 from background_viz import BackgroundVisualizer
 from ui import config as ui_config
 
@@ -128,7 +125,7 @@ def build_body(app, container):
     app.queue_revealer.set_vexpand(True)
 
     app.queue_drawer_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0, css_classes=["queue-drawer"])
-    app.queue_drawer_box.set_size_request(240, 500)
+    app.queue_drawer_box.set_size_request(240, -1)
     app.queue_drawer_box.set_vexpand(True)
 
     q_head = Gtk.Box(spacing=8, margin_start=12, margin_end=12, margin_top=10, margin_bottom=10)
@@ -168,11 +165,14 @@ def build_body(app, container):
         orientation=Gtk.Orientation.HORIZONTAL,
         spacing=0,
         halign=Gtk.Align.END,
-        valign=Gtk.Align.CENTER,
+        valign=Gtk.Align.FILL,
         hexpand=True,
         vexpand=True,
         css_classes=["queue-anchor"],
     )
+    queue_gap = int(max(0, ui_config.WINDOW_HEIGHT * 0.10))
+    app.queue_anchor.set_margin_top(queue_gap)
+    app.queue_anchor.set_margin_bottom(queue_gap)
     app.queue_anchor.append(app.queue_handle_shell)
     app.queue_anchor.append(app.queue_revealer)
     app.body_overlay.add_overlay(app.queue_anchor)
@@ -252,21 +252,8 @@ def build_body(app, container):
     app.viz_switcher.set_stack(app.viz_stack)
     app.viz_stack.connect("notify::visible-child-name", app.on_viz_page_changed)
 
-    try:
-        app.viz = SpectrumVisualizerGLArea()
-        app._viz_backend_key = "gl"
-        logger.info("Visualizer backend selected: GLArea")
-    except Exception as e_gl:
-        logger.warning("GLArea visualizer unavailable, falling back: %s", e_gl)
-        try:
-            app.viz = SpectrumVisualizerGPU()
-            app._viz_backend_key = "gpu"
-            logger.info("Visualizer backend selected: Snapshot GPU fallback")
-        except Exception as e_gpu:
-            logger.warning("Snapshot GPU visualizer unavailable, falling back: %s", e_gpu)
-            app.viz = SpectrumVisualizer()
-            app._viz_backend_key = "cairo"
-            logger.info("Visualizer backend selected: Cairo fallback")
+    app.viz, app._viz_backend_key = app._build_visualizer_for_backend("cairo")
+    logger.info("Visualizer backend selected: %s", app._viz_backend_key)
     app.viz.set_num_bars(32)
     app.viz.set_valign(Gtk.Align.FILL)
     app.viz_stack.add_titled(app.viz, "spectrum", "Spectrum")
@@ -276,11 +263,6 @@ def build_body(app, container):
     app.viz_bars_dd.add_css_class("viz-right-first")
     app.viz_bars_dd.set_valign(Gtk.Align.CENTER)
     app.viz_bars_dd.connect("notify::selected", app.on_viz_bars_changed)
-
-    app.viz_policy_dd = Gtk.DropDown(model=Gtk.StringList.new(app.VIZ_BACKEND_POLICIES))
-    app.viz_policy_dd.add_css_class("viz-theme-dd")
-    app.viz_policy_dd.set_valign(Gtk.Align.CENTER)
-    app.viz_policy_dd.connect("notify::selected", app.on_viz_backend_policy_changed)
 
     app.viz_theme_dd = Gtk.DropDown(model=Gtk.StringList.new(app.viz.get_theme_names()))
     app.viz_theme_dd.add_css_class("viz-theme-dd")
@@ -322,7 +304,6 @@ def build_body(app, container):
     right_ctrl_box.set_halign(Gtk.Align.END)
     theme_row.append(right_ctrl_box)
     right_ctrl_box.append(app.viz_bars_dd)
-    right_ctrl_box.append(app.viz_policy_dd)
     right_ctrl_box.append(app.viz_profile_dd)
     right_ctrl_box.append(app.viz_effect_dd)
     right_ctrl_box.append(app.viz_theme_dd)

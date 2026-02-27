@@ -15,7 +15,6 @@ def _init_widget_refs(self):
     self.viz_bars_dd = None
     self.viz_effect_dd = None
     self.viz_profile_dd = None
-    self.viz_policy_dd = None
     self.lyrics_font_dd = None
     self.lyrics_motion_dd = None
     self.lyrics_font_label = None
@@ -72,7 +71,6 @@ def _init_viz_refs(self):
     self._viz_effect_apply_source = None
     self._viz_profile_apply_source = None
     self._viz_theme_apply_source = None
-    self._viz_policy_apply_source = None
     self._viz_handle_anim_source = 0
     self._viz_handle_settle_source = 0
     self._viz_handle_resize_source = 0
@@ -82,7 +80,6 @@ def _init_viz_refs(self):
     self._viz_open_stream_source = 0
     self._viz_stream_prewarm_source = 0
     self._viz_opened_once = False
-    self._viz_gl_prewarm_done = False
     self._last_spectrum_frame = None
     self._last_spectrum_ts = 0.0
     self._viz_seed_frame = None

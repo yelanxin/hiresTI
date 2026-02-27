@@ -37,7 +37,7 @@ class AudioLatency:
 
 class VisualizerSettings:
     BAR_OPTIONS = [4, 8, 16, 32, 48, 64, 96, 128]
-    BACKEND_POLICIES = ["Perf", "Quality"]
+    BACKEND_POLICIES = ["Quality"]
 
 
 class CacheSettings:

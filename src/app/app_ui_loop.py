@@ -151,6 +151,26 @@ def update_layout_proportions(self, w, p):
         return
     s_px = int(max(120, self.win.get_width() * float(ui_config.SIDEBAR_RATIO)))
     self.paned.set_position(s_px)
+    overlay_h = 0
+    if getattr(self, "body_overlay", None) is not None:
+        try:
+            overlay_h = int(self.body_overlay.get_height() or 0)
+        except Exception:
+            overlay_h = 0
+    if overlay_h <= 0 and getattr(self, "win", None) is not None:
+        try:
+            overlay_h = int(self.win.get_height() or 0)
+        except Exception:
+            overlay_h = 0
+    if overlay_h <= 0:
+        overlay_h = int(ui_config.WINDOW_HEIGHT)
+    queue_gap = int(max(0, round(overlay_h * 0.10)))
+    queue_anchor = getattr(self, "queue_anchor", None)
+    if queue_anchor is not None:
+        if int(queue_anchor.get_margin_top() or 0) != queue_gap:
+            queue_anchor.set_margin_top(queue_gap)
+        if int(queue_anchor.get_margin_bottom() or 0) != queue_gap:
+            queue_anchor.set_margin_bottom(queue_gap)
     GLib.idle_add(lambda: (self._schedule_viz_handle_realign(animate=False), False)[1])
 
 

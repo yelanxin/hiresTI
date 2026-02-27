@@ -1654,17 +1654,9 @@ class RustAudioPlayerAdapter:
             target_ms = max(0.0, self._viz_latency_smooth_ms - self._viz_msg_age_smooth_ms)
 
         learned_offset_ms = float(self.visual_sync_offset_ms or 0)
-        # Ensure visual delay never drops below current output buffer target.
-        # This avoids "visual ahead of audio" when runtime offset state is stale.
-        cfg_buffer_ms = 0.0
-        try:
-            cfg_buffer_ms = max(0.0, float(getattr(self, "alsa_buffer_time", 0) or 0.0) / 1000.0)
-        except Exception:
-            cfg_buffer_ms = 0.0
-        effective_offset_ms = max(learned_offset_ms, cfg_buffer_ms)
         base_ms = float(getattr(self, "visual_sync_base_ms", 0) or 0)
         lead_ms = float(getattr(self, "visual_sync_lead_ms", 0) or 0)
-        total_ms = target_ms + base_ms + effective_offset_ms - lead_ms
+        total_ms = target_ms + base_ms + learned_offset_ms - lead_ms
 
         if logger.isEnabledFor(logging.DEBUG) and (now - self._viz_debug_last_ts) >= 1.0:
             self._viz_debug_last_ts = now
@@ -1674,19 +1666,17 @@ class RustAudioPlayerAdapter:
                 target_ms,
                 self._viz_latency_smooth_ms,
                 self._viz_msg_age_smooth_ms,
-                int(round(effective_offset_ms)),
+                int(round(learned_offset_ms)),
                 float(current_pos_s or 0.0),
                 float(msg_pos_s or -1.0),
             )
         if self._viz_trace_enabled and (now - self._viz_debug_last_ts) >= 1.0:
             self._viz_debug_last_ts = now
             logger.info(
-                "VIZ TRACE sync-delay: total=%.1fms target=%.1fms lat=%.1fms off=%.1fms(buf=%.1f/setting=%.1f) lead=%.1f",
+                "VIZ TRACE sync-delay: total=%.1fms target=%.1fms lat=%.1fms off=%.1fms(setting) lead=%.1f",
                 total_ms,
                 target_ms,
                 self._viz_latency_smooth_ms,
-                effective_offset_ms,
-                cfg_buffer_ms,
                 learned_offset_ms,
                 lead_ms,
             )

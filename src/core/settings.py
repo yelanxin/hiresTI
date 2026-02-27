@@ -85,7 +85,7 @@ _VALIDATION_RULES = {
     "last_view": (str, None, None, "grid_view"),
     "viz_expanded": (bool, None, None, False),
     "spectrum_theme": (int, 0, 64, 0),
-    "viz_backend_policy": (int, 0, 1, 0),
+    "viz_backend_policy": (int, 0, 0, 0),
     "viz_bar_count": (int, 4, 128, 32),
     "viz_profile": (int, 0, 3, 1),
     "viz_effect": (int, 0, 16, 3),
@@ -172,7 +172,7 @@ def normalize_settings(raw: Optional[dict[str, Any]]) -> dict[str, Any]:
     normalized["last_view"] = _as_str(raw.get("last_view"), DEFAULT_SETTINGS["last_view"])
     normalized["viz_expanded"] = _as_bool(raw.get("viz_expanded"), DEFAULT_SETTINGS["viz_expanded"])
     normalized["spectrum_theme"] = _as_int(raw.get("spectrum_theme"), DEFAULT_SETTINGS["spectrum_theme"], minimum=0, maximum=64)
-    normalized["viz_backend_policy"] = _as_int(raw.get("viz_backend_policy"), DEFAULT_SETTINGS["viz_backend_policy"], minimum=0, maximum=1)
+    normalized["viz_backend_policy"] = _as_int(raw.get("viz_backend_policy"), DEFAULT_SETTINGS["viz_backend_policy"], minimum=0, maximum=0)
     normalized["viz_bar_count"] = _as_int(raw.get("viz_bar_count"), DEFAULT_SETTINGS["viz_bar_count"], minimum=4, maximum=128)
     # Current profile options: Soft/Dynamic/Extreme/Insane => 0..3
     normalized["viz_profile"] = _as_int(raw.get("viz_profile"), DEFAULT_SETTINGS["viz_profile"], minimum=0, maximum=3)

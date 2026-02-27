@@ -496,13 +496,10 @@ def on_latency_changed(app, dd, p):
     if profile_name in app.LATENCY_MAP:
         buf_ms, lat_ms = app.LATENCY_MAP[profile_name]
         app.player.set_alsa_latency(buf_ms, lat_ms)
-        app.player.visual_sync_offset_ms = int(buf_ms)
-        app.settings["viz_sync_offset_ms"] = int(buf_ms)
-        if hasattr(app, "_viz_sync_last_saved_ms"):
-            app._viz_sync_last_saved_ms = int(buf_ms)
         logger.info(
-            "Viz sync offset applied: %dms (source=latency-change profile=%s)",
+            "Audio latency profile applied: buffer=%dms latency=%dms (latency-change, viz offset unchanged, profile=%s)",
             int(buf_ms),
+            int(lat_ms),
             profile_name,
         )
 

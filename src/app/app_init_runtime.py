@@ -80,12 +80,11 @@ def _init_audio_and_data_services(self):
         saved_profile = "Standard (100ms)"
     buf_ms, lat_ms = self.LATENCY_MAP[saved_profile]
     self.player.set_alsa_latency(buf_ms, lat_ms)
-    self.player.visual_sync_offset_ms = int(buf_ms)
-    self.settings["viz_sync_offset_ms"] = int(buf_ms)
-    self._viz_sync_last_saved_ms = int(buf_ms)
     logger.info(
-        "Viz sync offset applied: %dms (source=startup latency_profile=%s)",
+        "Audio latency profile applied: buffer=%dms latency=%dms (startup, viz offset unchanged=%dms, profile=%s)",
         int(buf_ms),
+        int(lat_ms),
+        int(getattr(self.player, "visual_sync_offset_ms", 0) or 0),
         saved_profile,
     )
 
