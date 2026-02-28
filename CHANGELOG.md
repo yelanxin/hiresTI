@@ -15,7 +15,6 @@ UI + packaging fix release: search suggestions polish, logout view reset, and ic
 - Home card subtitles are now aligned with My Albums subtitle styling.
 - Liked Songs artist filter avatars increased to `60x60`.
 - Liked Songs artist filter labels now use lighter text weight (`300`).
-- Added generic explore/genre page section loading and app wiring via `get_page_sections()` / `open_explore_category()`.
 
 ### Fixed
 - Logout now resets the right-side content stack back to the login/home surface even when triggered from `search_view`.
