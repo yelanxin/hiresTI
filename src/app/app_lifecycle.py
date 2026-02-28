@@ -63,11 +63,8 @@ def _restore_last_view(self):
         return
 
     if view == "search_view":
-        self.right_stack.set_visible_child_name("search_view")
-        self.back_btn.set_sensitive(True)
-        self.nav_list.select_row(None)
-        self.grid_title_label.set_text("Search")
-        return
+        view = "grid_view"
+        nav_id = "home"
 
     target = None
     child = self.nav_list.get_first_child()

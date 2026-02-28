@@ -119,7 +119,6 @@ def refresh_visible_track_fav_buttons(self):
         getattr(self, "queue_track_list", None),
         getattr(self, "queue_drawer_list", None),
         getattr(self, "res_trk_list", None),
-        getattr(self, "res_hist_list", None),
     ]
 
     def walk(widget):

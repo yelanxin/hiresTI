@@ -49,6 +49,7 @@ def bind_action_delegates(TidalApp, seen=None):
         render_new_dashboard,
         render_top_dashboard,
         show_album_details,
+        open_explore_category,
     )
     from actions.ui_navigation import on_artist_clicked, on_back_clicked, on_nav_selected
     from ui.builders import build_body, build_header
@@ -99,6 +100,7 @@ def bind_action_delegates(TidalApp, seen=None):
         ("render_search_results", render_search_results),
         ("render_new_dashboard", render_new_dashboard),
         ("refresh_dashboard_playing_state", refresh_dashboard_playing_state),
+        ("open_explore_category", open_explore_category),
     ], seen=seen)
 
 

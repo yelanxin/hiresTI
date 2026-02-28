@@ -682,7 +682,7 @@ def _schedule_viz_handle_realign(self, animate=True):
         GLib.source_remove(self._viz_handle_resize_source)
         self._viz_handle_resize_source = 0
 
-    self._viz_handle_resize_retries = 2
+    self._viz_handle_resize_retries = 4
 
     def _retry():
         expanded_now = bool(getattr(self, "viz_revealer", None) is not None and self.viz_revealer.get_reveal_child())
@@ -693,7 +693,7 @@ def _schedule_viz_handle_realign(self, animate=True):
             return False
         return True
 
-    self._viz_handle_resize_source = GLib.timeout_add(120, _retry)
+    self._viz_handle_resize_source = GLib.timeout_add(100, _retry)
     return False
 
 
@@ -918,17 +918,23 @@ def _align_viz_handle_to_play_button(self):
     play_btn = getattr(self, "play_btn", None)
     overlay = getattr(self, "body_overlay", None)
     if box is None or play_btn is None or overlay is None:
-        return
+        return False
+    root = getattr(self, "main_vbox", None) or getattr(self, "window_handle", None) or overlay
     try:
-        ok, rect = play_btn.compute_bounds(overlay)
+        play_ok, play_rect = play_btn.compute_bounds(root)
+        overlay_ok, overlay_rect = overlay.compute_bounds(root)
     except Exception:
-        return
-    if not ok or rect is None:
-        return
+        return False
+    if not play_ok or play_rect is None or not overlay_ok or overlay_rect is None:
+        return False
+    play_w = float(play_rect.get_width() or 0.0)
+    overlay_x = float(overlay_rect.get_x() or 0.0)
+    overlay_w = int(overlay.get_width() or overlay_rect.get_width() or 0)
+    if play_w <= 1.0 or overlay_w <= 1:
+        return False
     viz_btn = getattr(self, "viz_btn", None)
     handle_w = int(box.get_width() or (viz_btn.get_width() if viz_btn is not None else 0) or 50)
-    overlay_w = int(overlay.get_width() or 0)
-    center_x = float(rect.get_x()) + (float(rect.get_width()) / 2.0)
+    center_x = (float(play_rect.get_x()) - overlay_x) + (play_w / 2.0)
     target_start = int(round(center_x - (handle_w / 2.0)))
     if overlay_w > 0:
         target_start = max(0, min(max(0, overlay_w - handle_w), target_start))
@@ -936,6 +942,7 @@ def _align_viz_handle_to_play_button(self):
     box.set_halign(Gtk.Align.START)
     box.set_margin_start(target_start)
     box.set_margin_end(0)
+    return True
 
 
 def _animate_viz_handle_to(self, target_bottom, duration_ms=180):

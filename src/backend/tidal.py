@@ -1591,6 +1591,72 @@ class TidalBackend:
             logger.warning("Get new page error [%s]: %s", classify_exception(e), e)
         return sections
 
+    def get_page_sections(self, api_path):
+        """
+        Generic Tidal page fetcher for genre/mood/explore sub-pages.
+        Returns sections in the same format as get_top_page / get_new_page.
+        Falls back to [] if the path is invalid or the page has no content.
+        """
+        def _norm(p):
+            p = str(p or "").strip()
+            return p[1:] if p.startswith("/") else p or None
+
+        def _img(image_id, size=320):
+            val = str(image_id or "").strip()
+            if not val:
+                return None
+            if val.startswith("http"):
+                return val
+            return f"https://resources.tidal.com/images/{val.replace('-', '/')}/{size}x{size}.jpg"
+
+        def _process(item):
+            try:
+                if item is None:
+                    return None
+                # PageItem (has header + type) returned by page.get()
+                if hasattr(item, "header") and hasattr(item, "type"):
+                    raw_type = str(getattr(item, "type", "") or "").strip().upper()
+                    if raw_type == "VIDEO":
+                        return None
+                    type_map = {"TRACK": "Track", "ALBUM": "Album", "ARTIST": "Artist",
+                                "PLAYLIST": "Playlist", "MIX": "Mix"}
+                    return {
+                        "obj": item,
+                        "name": str(getattr(item, "header", "") or getattr(item, "short_header", "") or ""),
+                        "sub_title": str(getattr(item, "short_sub_header", "") or ""),
+                        "image_url": _img(getattr(item, "image_id", None)),
+                        "type": type_map.get(raw_type, "PageItem"),
+                    }
+                # PageLink (has title + api_path)
+                if hasattr(item, "title") and hasattr(item, "api_path"):
+                    return {
+                        "obj": item,
+                        "name": str(getattr(item, "title", "") or ""),
+                        "sub_title": "",
+                        "image_url": _img(getattr(item, "image_id", None)),
+                        "type": "PageLink",
+                    }
+                # Regular objects (Album, Artist, Playlist, Track…)
+                return self._process_generic_item(item)
+            except Exception:
+                return None
+
+        path = _norm(api_path)
+        if not path or not hasattr(self.session, "page") or self.session.page is None:
+            return []
+        sections = []
+        try:
+            page_obj = self.session.page.get(path, params={"deviceType": "BROWSER"})
+            for cat in list(getattr(page_obj, "categories", None) or []):
+                title = str(getattr(cat, "title", "") or "").strip()
+                items = [_process(it) for it in list(getattr(cat, "items", None) or [])]
+                items = [it for it in items if it]
+                if items:
+                    sections.append({"title": title, "items": items})
+        except Exception as e:
+            logger.warning("get_page_sections(%s) error: %s", path, e)
+        return sections
+
     def _process_generic_item(self, item):
         try:
             # 基础信息

@@ -53,6 +53,7 @@ def _init_widget_refs(self):
     self.decoder_status_label = None
     self.events_btn = None
     self.search_content_box = None
+    self.search_suggest_popover = None
     self.add_playlist_btn = None
     self.remote_playlist_edit_btn = None
     self.remote_playlist_visibility_btn = None
@@ -135,6 +136,7 @@ def _init_runtime_refs(self):
     self._seek_pending_value = None
     self._seek_commit_source = 0
     self._seek_user_interacting = False
+    self._search_suggest_focus_check_source = 0
 
 
 def init_ui_refs(self):

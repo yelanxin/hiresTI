@@ -498,24 +498,6 @@ def build_search_view(app):
     app.search_content_box = vbox
     app.search_base_margin_bottom = 32
 
-    app.search_history_section = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, css_classes=["home-section"])
-    history_head = Gtk.Box(spacing=8)
-    history_head.append(Gtk.Label(label="Recent Searches", xalign=0, css_classes=["home-section-title"], hexpand=True))
-    app.clear_history_btn = Gtk.Button(label="Clear", css_classes=["flat"])
-    app.clear_history_btn.connect("clicked", app.clear_search_history)
-    history_head.append(app.clear_history_btn)
-    app.search_history_section.append(history_head)
-
-    app.search_history_flow = Gtk.FlowBox(
-        max_children_per_line=8,
-        selection_mode=Gtk.SelectionMode.NONE,
-        column_spacing=8,
-        row_spacing=8,
-    )
-    app.search_history_section.append(app.search_history_flow)
-    app.search_history_section.set_visible(False)
-    vbox.append(app.search_history_section)
-
     app.search_status_label = Gtk.Label(xalign=0, css_classes=["dim-label", "search-status-label"])
     app.search_status_label.set_visible(False)
     vbox.append(app.search_status_label)
@@ -530,6 +512,7 @@ def build_search_view(app):
     )
     app.res_art_flow.connect("child-activated", app.on_grid_item_activated)
     app.res_art_box.append(app.res_art_flow)
+    app.res_art_box.set_visible(False)
     vbox.append(app.res_art_box)
 
     app.res_alb_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, css_classes=["home-section"])
@@ -542,6 +525,7 @@ def build_search_view(app):
     )
     app.res_alb_flow.connect("child-activated", app.on_grid_item_activated)
     app.res_alb_box.append(app.res_alb_flow)
+    app.res_alb_box.set_visible(False)
     vbox.append(app.res_alb_box)
 
     app.res_pl_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, css_classes=["home-section"])
@@ -553,14 +537,8 @@ def build_search_view(app):
         row_spacing=24,
     )
     app.res_pl_box.append(app.res_pl_flow)
+    app.res_pl_box.set_visible(False)
     vbox.append(app.res_pl_box)
-
-    app.res_hist_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, css_classes=["home-section"])
-    app.res_hist_box.append(Gtk.Label(label="History Tracks", xalign=0, css_classes=["home-section-title"]))
-    app.res_hist_list = Gtk.ListBox(css_classes=["boxed-list", "tracks-list", "search-tracks-list"])
-    app.res_hist_list.connect("row-activated", app.on_search_history_track_selected)
-    app.res_hist_box.append(app.res_hist_list)
-    vbox.append(app.res_hist_box)
 
     app.res_trk_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, css_classes=["home-section"])
     trk_head = Gtk.Box(spacing=8)
@@ -587,6 +565,7 @@ def build_search_view(app):
     app.res_trk_list = Gtk.ListBox(css_classes=["boxed-list", "tracks-list", "search-tracks-list"])
     app.res_trk_list.connect("row-activated", app.on_search_track_selected)
     app.res_trk_box.append(app.res_trk_list)
+    app.res_trk_box.set_visible(False)
     vbox.append(app.res_trk_box)
 
     app.right_stack.add_named(app.search_scroll, "search_view")

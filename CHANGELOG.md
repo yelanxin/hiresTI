@@ -8,17 +8,25 @@ UI + packaging fix release: search suggestions polish, logout view reset, and ic
   - clicking a recent search now closes the popover before navigating to results,
   - recent-search chips now wrap by available width instead of fixed columns,
   - chip spacing, padding, and top spacing were tightened for a denser layout.
+- Search page structure simplified:
+  - removed the in-page Recent Searches block in favor of the header popover flow,
+  - removed the separate History Tracks search section,
+  - search result sections now start hidden until they have content.
 - Home card subtitles are now aligned with My Albums subtitle styling.
 - Liked Songs artist filter avatars increased to `60x60`.
 - Liked Songs artist filter labels now use lighter text weight (`300`).
+- Added generic explore/genre page section loading and app wiring via `get_page_sections()` / `open_explore_category()`.
 
 ### Fixed
 - Logout now resets the right-side content stack back to the login/home surface even when triggered from `search_view`.
+- Session restore no longer reopens stale `search_view`; it falls back to Home/grid state instead.
 - Bundled icon coverage improved:
   - Flatpak now installs the full `hicolor` icon set, not just the app icon,
   - runtime icon-theme search now checks bundled app paths more robustly,
   - all app-referenced symbolic icons are now shipped locally,
   - bundled symbolic icons now use theme-aware color (`currentColor`) for light/dark adaptation.
+- Visualizer handle realignment is now more robust after layout changes and uses a more stable overlay-relative bounds calculation.
+- Favorite-button refresh no longer traverses removed search history result widgets.
 
 ### Tests
 - Added regression coverage for:
