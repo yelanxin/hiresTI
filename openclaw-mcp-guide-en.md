@@ -31,6 +31,7 @@ If hiresTI is set to `LAN`, replace `http://127.0.0.1:18473/mcp` with the endpoi
 
 ```bash
 # List configured MCP services
+cd ~/.openclaw/workspace
 mcporter list
 
 # Show hiresTI tools
