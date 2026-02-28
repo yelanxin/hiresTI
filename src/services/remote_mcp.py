@@ -1,4 +1,4 @@
-"""Minimal MCP stdio adapter that forwards to the remote JSON-RPC API."""
+"""Minimal MCP adapters for hiresTI remote control."""
 
 from __future__ import annotations
 
@@ -8,6 +8,9 @@ import sys
 import urllib.error
 import urllib.request
 
+
+MCP_PROTOCOL_VERSION = "2025-06-18"
+MCP_SERVER_INFO = {"name": "hiresTI Remote MCP", "version": "1.0"}
 
 TOOLS = [
     {
@@ -56,6 +59,92 @@ TOOLS = [
         "rpcMethod": "queue.replace_with_track_ids",
     },
     {
+        "name": "queue_append_track_ids",
+        "description": "Append TIDAL track IDs to the playback queue.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "track_ids": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["track_ids"],
+            "additionalProperties": False,
+        },
+        "rpcMethod": "queue.append_track_ids",
+    },
+    {
+        "name": "queue_insert_at",
+        "description": "Insert TIDAL track IDs at a specific queue index.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "track_ids": {"type": "array", "items": {"type": "string"}},
+                "index": {"type": "integer"},
+            },
+            "required": ["track_ids", "index"],
+            "additionalProperties": False,
+        },
+        "rpcMethod": "queue.insert_at",
+    },
+    {
+        "name": "queue_insert_next",
+        "description": "Insert TIDAL track IDs immediately after the current track.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "track_ids": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["track_ids"],
+            "additionalProperties": False,
+        },
+        "rpcMethod": "queue.insert_next",
+    },
+    {
+        "name": "queue_move",
+        "description": "Move an existing queue item to a new index.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "from_index": {"type": "integer"},
+                "to_index": {"type": "integer"},
+            },
+            "required": ["from_index", "to_index"],
+            "additionalProperties": False,
+        },
+        "rpcMethod": "queue.move",
+    },
+    {
+        "name": "queue_remove_index",
+        "description": "Remove a track from the queue by index.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "index": {"type": "integer"},
+            },
+            "required": ["index"],
+            "additionalProperties": False,
+        },
+        "rpcMethod": "queue.remove_index",
+    },
+    {
+        "name": "queue_clear",
+        "description": "Clear the active playback queue.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "rpcMethod": "queue.clear",
+    },
+    {
+        "name": "queue_play_index",
+        "description": "Start playback from a specific queue index.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "index": {"type": "integer"},
+            },
+            "required": ["index"],
+            "additionalProperties": False,
+        },
+        "rpcMethod": "queue.play_index",
+    },
+    {
         "name": "search_match_tracks",
         "description": "Match structured title/artist candidates to playable TIDAL track IDs.",
         "inputSchema": {
@@ -85,6 +174,10 @@ TOOLS = [
 
 def _tool_map():
     return {item["name"]: item for item in TOOLS}
+
+
+def list_mcp_tools():
+    return [{key: value for key, value in item.items() if key != "rpcMethod"} for item in TOOLS]
 
 
 class RemoteRPCClient:
@@ -129,20 +222,43 @@ class RemoteRPCClient:
 def _read_message(stream):
     headers = {}
     while True:
-        line = stream.readline()
+        try:
+            line = stream.readline()
+        except Exception:
+            return None
         if not line:
             return None
         if line in (b"\r\n", b"\n"):
-            break
-        key, _, value = line.decode("utf-8").partition(":")
+            if headers:
+                break
+            continue
+        try:
+            decoded = line.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        if ":" not in decoded:
+            continue
+        key, _, value = decoded.partition(":")
         headers[key.strip().lower()] = value.strip()
-    length = int(headers.get("content-length", "0") or "0")
+
+    try:
+        length = int(headers.get("content-length", "0") or "0")
+    except ValueError:
+        return None
     if length <= 0:
         return None
-    payload = stream.read(length)
-    if not payload:
+
+    try:
+        payload = stream.read(length)
+    except Exception:
         return None
-    return json.loads(payload.decode("utf-8"))
+    if not payload or len(payload) < length:
+        return None
+
+    try:
+        return json.loads(payload.decode("utf-8"))
+    except json.JSONDecodeError:
+        return None
 
 
 def _write_message(stream, payload):
@@ -161,31 +277,64 @@ def _jsonrpc_error(req_id, code, message):
     return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
 
 
-def _handle_request(client: RemoteRPCClient, request: dict):
+def handle_mcp_request(rpc_call, request: dict):
+    if not isinstance(request, dict):
+        return _jsonrpc_error(None, -32600, "Invalid request.")
+
     req_id = request.get("id")
-    method = str(request.get("method", "") or "")
+    is_notification = req_id is None
+    method = str(request.get("method", "") or "").strip()
     params = request.get("params") or {}
+
+    if not method:
+        if is_notification:
+            return None
+        return _jsonrpc_error(req_id, -32600, "Invalid request.")
+
     if method == "initialize":
+        if is_notification:
+            return None
         return _jsonrpc_result(
             req_id,
             {
-                "protocolVersion": "2025-06-18",
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": "hiresTI Remote MCP", "version": "1.0"},
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": dict(MCP_SERVER_INFO),
             },
         )
+
+    if method == "notifications/initialized":
+        return None
+
     if method == "tools/list":
-        tools = [{k: v for k, v in item.items() if k != "rpcMethod"} for item in TOOLS]
-        return _jsonrpc_result(req_id, {"tools": tools})
+        if is_notification:
+            return None
+        return _jsonrpc_result(req_id, {"tools": list_mcp_tools()})
+
     if method == "tools/call":
-        tool_name = str(params.get("name", "") or "")
+        if not isinstance(params, dict):
+            if is_notification:
+                return None
+            return _jsonrpc_error(req_id, -32602, "Params must be an object.")
+
+        tool_name = str(params.get("name", "") or "").strip()
         tool = _tool_map().get(tool_name)
         if tool is None:
+            if is_notification:
+                return None
             return _jsonrpc_error(req_id, -32601, f"Unknown tool: {tool_name}")
+
         arguments = params.get("arguments") or {}
+        if not isinstance(arguments, dict):
+            if is_notification:
+                return None
+            return _jsonrpc_error(req_id, -32602, "Tool arguments must be an object.")
+
         try:
-            result = client.call(tool["rpcMethod"], arguments)
+            result = rpc_call(tool["rpcMethod"], arguments)
         except Exception as exc:
+            if is_notification:
+                return None
             return _jsonrpc_result(
                 req_id,
                 {
@@ -193,17 +342,29 @@ def _handle_request(client: RemoteRPCClient, request: dict):
                     "isError": True,
                 },
             )
+
+        if is_notification:
+            return None
         return _jsonrpc_result(
             req_id,
             {
                 "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=2)}],
+                "structuredContent": result,
             },
         )
+
     if method == "ping":
+        if is_notification:
+            return None
         return _jsonrpc_result(req_id, {})
-    if req_id is None:
+
+    if is_notification:
         return None
     return _jsonrpc_error(req_id, -32601, f"Unknown method: {method}")
+
+
+def _handle_request(client: RemoteRPCClient, request: dict):
+    return handle_mcp_request(client.call, request)
 
 
 def main(argv=None):

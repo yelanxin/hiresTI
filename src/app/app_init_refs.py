@@ -64,11 +64,14 @@ def _init_widget_refs(self):
     self.remote_playlist_more_pop = None
     self.remote_api_switch = None
     self.remote_api_access_dd = None
+    self.remote_api_network_row = None
     self.remote_api_bind_entry = None
     self.remote_api_port_spin = None
+    self.remote_api_allowlist_row = None
     self.remote_api_allowlist_entry = None
     self.remote_api_apply_btn = None
     self.remote_api_endpoint_label = None
+    self.remote_api_endpoint_copy_btn = None
     self.remote_api_status_label = None
     self.remote_api_key_entry = None
     self.remote_api_generate_btn = None

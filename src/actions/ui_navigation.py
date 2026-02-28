@@ -96,7 +96,13 @@ def on_nav_selected(app, box, row):
             cached = list(getattr(app.backend, "_cached_albums", []) or [])
             now = time.time()
             last_ts = float(getattr(app.backend, "_cached_albums_ts", 0.0) or 0.0)
-            ttl = float(getattr(app.backend, "_albums_cache_ttl", 300.0) or 300.0)
+            if hasattr(app.backend, "_album_cache_ttl_seconds"):
+                ttl = float(app.backend._album_cache_ttl_seconds())
+            else:
+                try:
+                    ttl = float(getattr(app.backend, "_albums_cache_ttl", 300.0))
+                except Exception:
+                    ttl = 300.0
 
             # Instant first paint: render cached data immediately.
             if cached:

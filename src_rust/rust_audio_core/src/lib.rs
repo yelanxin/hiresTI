@@ -1,16 +1,21 @@
+use gst::prelude::*;
 use gstreamer as gst;
 use libpulse_binding as pulse;
 use pipewire as pw;
-use gst::prelude::*;
 use pulse::callbacks::ListResult;
 use pulse::context::{Context as PaContext, FlagSet as PaContextFlagSet, State as PaContextState};
 use pulse::mainloop::standard::Mainloop as PaMainloop;
 use pulse::operation::State as PaOperationState;
-use pw::{context::Context as PwContext, keys, main_loop::MainLoop as PwMainLoop, metadata::Metadata as PwMetadata, registry::GlobalObject, types::ObjectType};
+use pw::{
+    context::Context as PwContext, keys, main_loop::MainLoop as PwMainLoop,
+    metadata::Metadata as PwMetadata, registry::GlobalObject, types::ObjectType,
+};
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::env;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_double, c_int, c_void};
+use std::path::Path;
 use std::ptr;
 use std::rc::Rc;
 use std::sync::Once;
@@ -84,13 +89,21 @@ impl Engine {
         });
     }
 
-    fn pipewire_set_settings_metadata(key: &str, value: &str, value_type: Option<&str>) -> Result<(), String> {
+    fn pipewire_set_settings_metadata(
+        key: &str,
+        value: &str,
+        value_type: Option<&str>,
+    ) -> Result<(), String> {
         Self::ensure_pw_init();
         let result = (|| -> Result<(), String> {
             let mainloop = PwMainLoop::new(None).map_err(|e| format!("pw mainloop: {e}"))?;
             let context = PwContext::new(&mainloop).map_err(|e| format!("pw context: {e}"))?;
-            let core = context.connect(None).map_err(|e| format!("pw connect: {e}"))?;
-            let registry = core.get_registry().map_err(|e| format!("pw registry: {e}"))?;
+            let core = context
+                .connect(None)
+                .map_err(|e| format!("pw connect: {e}"))?;
+            let registry = core
+                .get_registry()
+                .map_err(|e| format!("pw registry: {e}"))?;
 
             use std::{cell::Cell, rc::Rc};
             let done = Rc::new(Cell::new(false));
@@ -143,7 +156,9 @@ impl Engine {
                 version: pw::sys::PW_VERSION_METADATA,
                 props: Option::<pw::properties::Properties>::None,
             };
-            let metadata: PwMetadata = registry.bind(&obj).map_err(|e| format!("pw bind metadata: {e}"))?;
+            let metadata: PwMetadata = registry
+                .bind(&obj)
+                .map_err(|e| format!("pw bind metadata: {e}"))?;
             metadata.set_property(0, key, value_type, Some(value));
             // set_property is asynchronous. Wait for a core sync round-trip so
             // subsequent readers are less likely to observe stale metadata.
@@ -169,7 +184,11 @@ impl Engine {
     }
 
     fn pipewire_set_clock_force_rate(rate: i32) -> Result<(), String> {
-        let value = if rate <= 0 { "0".to_string() } else { rate.to_string() };
+        let value = if rate <= 0 {
+            "0".to_string()
+        } else {
+            rate.to_string()
+        };
         Self::pipewire_set_settings_metadata("clock.force-rate", &value, Some("Spa:Int"))
     }
 
@@ -193,7 +212,10 @@ impl Engine {
         vals.dedup();
         let arr = format!(
             "[ {} ]",
-            vals.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" ")
+            vals.iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
         );
         // Keep type empty for array-like values.
         Self::pipewire_set_settings_metadata("clock.allowed-rates", &arr, None)
@@ -204,8 +226,12 @@ impl Engine {
         let result = (|| -> Result<(i32, String, i32, i32), String> {
             let mainloop = PwMainLoop::new(None).map_err(|e| format!("pw mainloop: {e}"))?;
             let context = PwContext::new(&mainloop).map_err(|e| format!("pw context: {e}"))?;
-            let core = context.connect(None).map_err(|e| format!("pw connect: {e}"))?;
-            let registry = core.get_registry().map_err(|e| format!("pw registry: {e}"))?;
+            let core = context
+                .connect(None)
+                .map_err(|e| format!("pw connect: {e}"))?;
+            let registry = core
+                .get_registry()
+                .map_err(|e| format!("pw registry: {e}"))?;
 
             let done = Rc::new(Cell::new(false));
             let found_meta_id = Rc::new(Cell::new(u32::MAX));
@@ -261,7 +287,9 @@ impl Engine {
                 version: pw::sys::PW_VERSION_METADATA,
                 props: Option::<pw::properties::Properties>::None,
             };
-            let metadata: PwMetadata = registry.bind(&obj).map_err(|e| format!("pw bind metadata: {e}"))?;
+            let metadata: PwMetadata = registry
+                .bind(&obj)
+                .map_err(|e| format!("pw bind metadata: {e}"))?;
 
             let fr = force_rate.clone();
             let ar = allowed_raw.clone();
@@ -312,7 +340,12 @@ impl Engine {
             }
 
             let allowed = allowed_raw.borrow().clone();
-            Ok((force_rate.get(), allowed, clock_quantum.get(), clock_rate.get()))
+            Ok((
+                force_rate.get(),
+                allowed,
+                clock_quantum.get(),
+                clock_rate.get(),
+            ))
         })();
         result
     }
@@ -384,7 +417,9 @@ impl Engine {
                             return;
                         }
                         // Fallback heuristic for wrapped python runtimes.
-                        if app_bin.contains("python") || app_name.to_ascii_lowercase().contains("hiresti") {
+                        if app_bin.contains("python")
+                            || app_name.to_ascii_lowercase().contains("hiresti")
+                        {
                             found_clone.set(ms);
                             return;
                         }
@@ -416,7 +451,11 @@ impl Engine {
                 Some(v)
             } else {
                 let fb = mut_fallback.get();
-                if fb >= 0.0 { Some(fb) } else { None }
+                if fb >= 0.0 {
+                    Some(fb)
+                } else {
+                    None
+                }
             }
         })();
         result
@@ -626,7 +665,10 @@ impl Engine {
     }
 
     fn setup_spectrum_filter(playbin: &gst::Element) -> Option<gst::Bin> {
-        let spectrum = gst::ElementFactory::make("spectrum").name("rust-spectrum").build().ok()?;
+        let spectrum = gst::ElementFactory::make("spectrum")
+            .name("rust-spectrum")
+            .build()
+            .ok()?;
         for p in spectrum.list_properties() {
             let pn = p.name();
             if pn == "bands" {
@@ -684,14 +726,21 @@ impl Engine {
             if self.spectrum_seen_msgs % 120 == 0 {
                 self.emit_event(
                     EVT_STATE,
-                    &format!("spectrum-msgs={} parsed={}", self.spectrum_seen_msgs, self.spectrum_msg_count),
+                    &format!(
+                        "spectrum-msgs={} parsed={}",
+                        self.spectrum_seen_msgs, self.spectrum_msg_count
+                    ),
                 );
             }
             return;
         };
         let rest = &text[kpos..];
         let mag_only = if let Some(open_pos) = rest.find('{').or_else(|| rest.find('<')) {
-            let close_char = if rest.as_bytes().get(open_pos) == Some(&b'{') { '}' } else { '>' };
+            let close_char = if rest.as_bytes().get(open_pos) == Some(&b'{') {
+                '}'
+            } else {
+                '>'
+            };
             if let Some(close_rel) = rest[(open_pos + 1)..].find(close_char) {
                 &rest[(open_pos + 1)..(open_pos + 1 + close_rel)]
             } else {
@@ -704,7 +753,9 @@ impl Engine {
         let mut n = 0usize;
         // Same numeric extraction contract as Python fallback parser:
         // extract only floats from magnitude payload.
-        for part in mag_only.split(|c: char| !(c.is_ascii_digit() || matches!(c, '-' | '+' | '.' | 'e' | 'E'))) {
+        for part in mag_only
+            .split(|c: char| !(c.is_ascii_digit() || matches!(c, '-' | '+' | '.' | 'e' | 'E')))
+        {
             if n >= tmp.len() {
                 break;
             }
@@ -724,7 +775,10 @@ impl Engine {
             if self.spectrum_seen_msgs % 120 == 0 {
                 self.emit_event(
                     EVT_STATE,
-                    &format!("spectrum-msgs={} parsed={}", self.spectrum_seen_msgs, self.spectrum_msg_count),
+                    &format!(
+                        "spectrum-msgs={} parsed={}",
+                        self.spectrum_seen_msgs, self.spectrum_msg_count
+                    ),
                 );
             }
             return;
@@ -777,7 +831,10 @@ impl Engine {
             );
         }
         if self.spectrum_msg_count % 120 == 0 {
-            self.emit_event(EVT_STATE, &format!("spectrum-frames={}", self.spectrum_msg_count));
+            self.emit_event(
+                EVT_STATE,
+                &format!("spectrum-frames={}", self.spectrum_msg_count),
+            );
         }
     }
 
@@ -786,7 +843,11 @@ impl Engine {
             let _ = gst::init();
         });
 
-        let Some(playbin) = gst::ElementFactory::make("playbin").name("rust-audio-player").build().ok() else {
+        let Some(playbin) = gst::ElementFactory::make("playbin")
+            .name("rust-audio-player")
+            .build()
+            .ok()
+        else {
             return Err("failed to create playbin".to_string());
         };
 
@@ -796,7 +857,11 @@ impl Engine {
             .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
             .unwrap_or(false)
         {
-            if let Some(fake) = gst::ElementFactory::make("fakesink").name("rust-audio-fakesink").build().ok() {
+            if let Some(fake) = gst::ElementFactory::make("fakesink")
+                .name("rust-audio-fakesink")
+                .build()
+                .ok()
+            {
                 playbin.set_property("audio-sink", &fake);
             }
         }
@@ -967,9 +1032,15 @@ impl Engine {
         let device_norm = device.map(|d| d.trim()).filter(|d| !d.is_empty());
 
         let sink = if driver_norm.is_empty() || driver_norm.starts_with("auto") {
-            gst::ElementFactory::make("autoaudiosink").name("rust-auto-sink").build().ok()
+            gst::ElementFactory::make("autoaudiosink")
+                .name("rust-auto-sink")
+                .build()
+                .ok()
         } else if driver_norm.contains("pipewire") {
-            let s = gst::ElementFactory::make("pipewiresink").name("rust-pw-sink").build().ok();
+            let s = gst::ElementFactory::make("pipewiresink")
+                .name("rust-pw-sink")
+                .build()
+                .ok();
             match s {
                 Some(ref elem) => {
                     if let Some(dev) = device_norm {
@@ -1021,7 +1092,10 @@ impl Engine {
                 }
             }
         } else if driver_norm.contains("pulse") {
-            let s = gst::ElementFactory::make("pulsesink").name("rust-pa-sink").build().ok();
+            let s = gst::ElementFactory::make("pulsesink")
+                .name("rust-pa-sink")
+                .build()
+                .ok();
             match s {
                 Some(ref elem) => {
                     if let Some(dev) = device_norm {
@@ -1049,7 +1123,10 @@ impl Engine {
                 }
             }
         } else if driver_norm.contains("alsa") {
-            let s = gst::ElementFactory::make("alsasink").name("rust-alsa-sink").build().ok();
+            let s = gst::ElementFactory::make("alsasink")
+                .name("rust-alsa-sink")
+                .build()
+                .ok();
             match s {
                 Some(ref elem) => {
                     if let Some(dev) = device_norm {
@@ -1101,7 +1178,10 @@ impl Engine {
         self.playbin.set_property("audio-sink", &sink_elem);
         self.emit_event(
             EVT_STATE,
-            &format!("output-switched driver={driver} device={}", device_norm.unwrap_or("default")),
+            &format!(
+                "output-switched driver={driver} device={}",
+                device_norm.unwrap_or("default")
+            ),
         );
 
         // Restore runtime state.
@@ -1205,8 +1285,15 @@ pub extern "C" fn rac_get_spectrum_frame(
     if out_vals.is_null() || out_len.is_null() || out_pos_s.is_null() || out_seq.is_null() {
         return -2;
     }
-    let max_n = if max_len <= 0 { 0usize } else { max_len as usize };
-    let n = engine.spectrum_len.min(max_n).min(engine.spectrum_vals.len());
+    let max_n = if max_len <= 0 {
+        0usize
+    } else {
+        max_len as usize
+    };
+    let n = engine
+        .spectrum_len
+        .min(max_n)
+        .min(engine.spectrum_vals.len());
     if n == 0 {
         unsafe {
             *out_len = 0;
@@ -1239,11 +1326,24 @@ pub extern "C" fn rac_get_spectrum_frames_since(
     let Some(engine) = as_engine(ptr) else {
         return -1;
     };
-    if out_vals.is_null() || out_frames.is_null() || out_lens.is_null() || out_pos_s.is_null() || out_seq.is_null() {
+    if out_vals.is_null()
+        || out_frames.is_null()
+        || out_lens.is_null()
+        || out_pos_s.is_null()
+        || out_seq.is_null()
+    {
         return -2;
     }
-    let max_f = if max_frames <= 0 { 0usize } else { max_frames as usize };
-    let max_b = if max_bands <= 0 { 0usize } else { max_bands as usize };
+    let max_f = if max_frames <= 0 {
+        0usize
+    } else {
+        max_frames as usize
+    };
+    let max_b = if max_bands <= 0 {
+        0usize
+    } else {
+        max_bands as usize
+    };
     if max_f == 0 || max_b == 0 {
         unsafe {
             *out_frames = 0;
@@ -1267,10 +1367,16 @@ pub extern "C" fn rac_get_spectrum_frames_since(
         if written >= max_f {
             break;
         }
-        let len = (engine.spectrum_ring_len[idx] as usize).min(max_b).min(SPECTRUM_BANDS_MAX);
+        let len = (engine.spectrum_ring_len[idx] as usize)
+            .min(max_b)
+            .min(SPECTRUM_BANDS_MAX);
         let base = written * max_b;
         unsafe {
-            ptr::copy_nonoverlapping(engine.spectrum_ring_vals[idx].as_ptr(), out_vals.add(base), len);
+            ptr::copy_nonoverlapping(
+                engine.spectrum_ring_vals[idx].as_ptr(),
+                out_vals.add(base),
+                len,
+            );
             *out_lens.add(written) = len as c_int;
             *out_pos_s.add(written) = engine.spectrum_ring_pos_s[idx];
             *out_seq.add(written) = seq;
@@ -1312,20 +1418,22 @@ fn list_pulseaudio_sinks() -> Vec<(String, Option<String>)> {
 
     let shared_cb = Rc::clone(&shared);
     let done_cb = Rc::clone(&done);
-    let mut op = context.introspect().get_sink_info_list(move |res| match res {
-        ListResult::Item(info) => {
-            let dev = str_opt_to_string(info.name.as_ref().cloned());
-            if dev.is_empty() || dev.ends_with(".monitor") {
-                return;
+    let mut op = context
+        .introspect()
+        .get_sink_info_list(move |res| match res {
+            ListResult::Item(info) => {
+                let dev = str_opt_to_string(info.name.as_ref().cloned());
+                if dev.is_empty() || dev.ends_with(".monitor") {
+                    return;
+                }
+                let desc = str_opt_to_string(info.description.as_ref().cloned());
+                let name = if desc.is_empty() { dev.clone() } else { desc };
+                shared_cb.borrow_mut().push((name, Some(dev)));
             }
-            let desc = str_opt_to_string(info.description.as_ref().cloned());
-            let name = if desc.is_empty() { dev.clone() } else { desc };
-            shared_cb.borrow_mut().push((name, Some(dev)));
-        }
-        ListResult::End | ListResult::Error => {
-            done_cb.set(true);
-        }
-    });
+            ListResult::End | ListResult::Error => {
+                done_cb.set(true);
+            }
+        });
 
     pa_wait_for_list(&mut mainloop, &context, &done, &mut op);
     out.extend(shared.borrow().iter().cloned());
@@ -1333,7 +1441,8 @@ fn list_pulseaudio_sinks() -> Vec<(String, Option<String>)> {
 }
 
 fn pa_connect() -> Result<(PaMainloop, PaContext), String> {
-    let mut mainloop = PaMainloop::new().ok_or_else(|| "pulseaudio mainloop init failed".to_string())?;
+    let mut mainloop =
+        PaMainloop::new().ok_or_else(|| "pulseaudio mainloop init failed".to_string())?;
     let mut context = PaContext::new(&mainloop, "hiresTI")
         .ok_or_else(|| "pulseaudio context init failed".to_string())?;
     context
@@ -1343,7 +1452,10 @@ fn pa_connect() -> Result<(PaMainloop, PaContext), String> {
         match context.get_state() {
             PaContextState::Ready => return Ok((mainloop, context)),
             PaContextState::Failed | PaContextState::Terminated => {
-                return Err(format!("pulseaudio context state: {:?}", context.get_state()));
+                return Err(format!(
+                    "pulseaudio context state: {:?}",
+                    context.get_state()
+                ));
             }
             _ => {
                 let _ = mainloop.iterate(false);
@@ -1375,8 +1487,12 @@ fn list_pipewire_sinks() -> Vec<(String, Option<String>)> {
     let result = (|| -> Result<Vec<(String, Option<String>)>, String> {
         let mainloop = PwMainLoop::new(None).map_err(|e| format!("pw mainloop: {e}"))?;
         let context = PwContext::new(&mainloop).map_err(|e| format!("pw context: {e}"))?;
-        let core = context.connect(None).map_err(|e| format!("pw connect: {e}"))?;
-        let registry = core.get_registry().map_err(|e| format!("pw registry: {e}"))?;
+        let core = context
+            .connect(None)
+            .map_err(|e| format!("pw connect: {e}"))?;
+        let registry = core
+            .get_registry()
+            .map_err(|e| format!("pw registry: {e}"))?;
 
         let done = Rc::new(Cell::new(false));
         let sinks: Rc<RefCell<Vec<(String, Option<String>)>>> = Rc::new(RefCell::new(Vec::new()));
@@ -1433,7 +1549,11 @@ fn list_pipewire_sinks() -> Vec<(String, Option<String>)> {
 
         let mut out = sinks.borrow().clone();
         out.sort_by_key(|(n, dev)| {
-            let hay = format!("{} {}", n.to_ascii_uppercase(), dev.clone().unwrap_or_default().to_ascii_uppercase());
+            let hay = format!(
+                "{} {}",
+                n.to_ascii_uppercase(),
+                dev.clone().unwrap_or_default().to_ascii_uppercase()
+            );
             if hay.contains("USB") {
                 0
             } else {
@@ -1446,11 +1566,8 @@ fn list_pipewire_sinks() -> Vec<(String, Option<String>)> {
     result.unwrap_or_default()
 }
 
-fn list_alsa_cards() -> Vec<(String, Option<String>)> {
-    let mut out: Vec<(String, Option<String>)> = Vec::new();
-    let Ok(content) = std::fs::read_to_string("/proc/asound/cards") else {
-        return out;
-    };
+fn parse_alsa_card_labels(content: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
     for raw in content.lines() {
         let line = raw.trim_start();
         if line.is_empty() {
@@ -1465,16 +1582,126 @@ fn list_alsa_cards() -> Vec<(String, Option<String>)> {
             Some(v) => v,
             None => continue,
         };
-        let long_name = line[(dash_pos + 3)..].trim();
-        if long_name.is_empty() {
+        let label = line[(dash_pos + 3)..].trim();
+        if label.is_empty() {
             continue;
         }
-        let friendly = format!("{long_name} (Card {idx})");
-        let hw_id = format!("hw:{idx},0");
-        out.push((friendly, Some(hw_id)));
+        out.insert(idx, label.to_string());
     }
-    out.sort_by_key(|(name, _)| if name.contains("USB") { 0 } else { 1 });
     out
+}
+
+fn parse_alsa_playback_pcm_index(entry_name: &str) -> Option<String> {
+    if !(entry_name.starts_with("pcm") && entry_name.ends_with('p')) {
+        return None;
+    }
+    let middle = &entry_name[3..(entry_name.len() - 1)];
+    if middle.is_empty() || !middle.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(middle.to_string())
+}
+
+fn read_alsa_pcm_label(info_path: &Path) -> Option<String> {
+    let Ok(content) = std::fs::read_to_string(info_path) else {
+        return None;
+    };
+    for raw in content.lines() {
+        let line = raw.trim();
+        if let Some(rest) = line.strip_prefix("name:") {
+            let label = rest.trim();
+            if !label.is_empty() {
+                return Some(label.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn format_alsa_playback_label(
+    card_label: &str,
+    card_idx: &str,
+    pcm_idx: &str,
+    pcm_label: Option<&str>,
+) -> String {
+    match pcm_label.map(|v| v.trim()).filter(|v| !v.is_empty()) {
+        Some(label) if !label.eq_ignore_ascii_case(card_label) => {
+            format!("{card_label} / {label} (hw:{card_idx},{pcm_idx})")
+        }
+        _ => format!("{card_label} (PCM {pcm_idx}, Card {card_idx})"),
+    }
+}
+
+fn list_alsa_cards_from_proc_root(proc_root: &Path) -> Vec<(String, Option<String>)> {
+    let card_labels = std::fs::read_to_string(proc_root.join("cards"))
+        .ok()
+        .map(|v| parse_alsa_card_labels(&v))
+        .unwrap_or_default();
+    let mut out: Vec<(String, Option<String>)> = Vec::new();
+    let Ok(entries) = std::fs::read_dir(proc_root) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let entry_name = entry.file_name().to_string_lossy().to_string();
+        let Some(card_idx) = entry_name
+            .strip_prefix("card")
+            .filter(|v| !v.is_empty() && v.chars().all(|c| c.is_ascii_digit()))
+        else {
+            continue;
+        };
+        let card_idx = card_idx.to_string();
+        let card_label = card_labels
+            .get(&card_idx)
+            .cloned()
+            .unwrap_or_else(|| format!("ALSA Card {card_idx}"));
+        let mut saw_playback_pcm = false;
+        let Ok(pcms) = std::fs::read_dir(entry.path()) else {
+            continue;
+        };
+        for pcm in pcms.flatten() {
+            let pcm_entry = pcm.file_name().to_string_lossy().to_string();
+            let Some(pcm_idx) = parse_alsa_playback_pcm_index(&pcm_entry) else {
+                continue;
+            };
+            let pcm_info_path = pcm.path().join("info");
+            let pcm_label = read_alsa_pcm_label(&pcm_info_path);
+            let friendly =
+                format_alsa_playback_label(&card_label, &card_idx, &pcm_idx, pcm_label.as_deref());
+            let hw_id = format!("hw:{card_idx},{pcm_idx}");
+            out.push((friendly, Some(hw_id)));
+            saw_playback_pcm = true;
+        }
+        if !saw_playback_pcm {
+            let friendly = format!("{card_label} (Card {card_idx})");
+            let hw_id = format!("hw:{card_idx},0");
+            out.push((friendly, Some(hw_id)));
+        }
+    }
+    if out.is_empty() {
+        for (idx, label) in card_labels {
+            let friendly = format!("{label} (Card {idx})");
+            let hw_id = format!("hw:{idx},0");
+            out.push((friendly, Some(hw_id)));
+        }
+    }
+    out.sort_by_key(|(name, dev)| {
+        let hay = format!(
+            "{} {}",
+            name.to_ascii_uppercase(),
+            dev.clone().unwrap_or_default().to_ascii_uppercase()
+        );
+        (
+            if hay.contains("USB") { 0 } else { 1 },
+            name.to_ascii_uppercase(),
+            dev.clone().unwrap_or_default(),
+        )
+    });
+    out.dedup_by(|a, b| a.1 == b.1);
+    out
+}
+
+fn list_alsa_cards() -> Vec<(String, Option<String>)> {
+    list_alsa_cards_from_proc_root(Path::new("/proc/asound"))
 }
 
 fn devices_for_driver(driver: &str) -> Vec<(String, Option<String>)> {
@@ -1551,25 +1778,27 @@ fn pulseaudio_card_active_profile(card: &str) -> Option<String> {
 
     let found_cb = Rc::clone(&found);
     let done_cb = Rc::clone(&done);
-    let mut op = context.introspect().get_card_info_list(move |res| match res {
-        ListResult::Item(info) => {
-            let name = str_opt_to_string(info.name.as_ref().cloned());
-            if name != target {
-                return;
+    let mut op = context
+        .introspect()
+        .get_card_info_list(move |res| match res {
+            ListResult::Item(info) => {
+                let name = str_opt_to_string(info.name.as_ref().cloned());
+                if name != target {
+                    return;
+                }
+                let profile = info
+                    .active_profile
+                    .as_ref()
+                    .map(|p| str_opt_to_string(p.name.as_ref().cloned()))
+                    .unwrap_or_default();
+                if !profile.is_empty() {
+                    *found_cb.borrow_mut() = Some(profile);
+                }
             }
-            let profile = info
-                .active_profile
-                .as_ref()
-                .map(|p| str_opt_to_string(p.name.as_ref().cloned()))
-                .unwrap_or_default();
-            if !profile.is_empty() {
-                *found_cb.borrow_mut() = Some(profile);
+            ListResult::End | ListResult::Error => {
+                done_cb.set(true);
             }
-        }
-        ListResult::End | ListResult::Error => {
-            done_cb.set(true);
-        }
-    });
+        });
     pa_wait_for_list(&mut mainloop, &context, &done, &mut op);
     let result = found.borrow().clone();
     result
@@ -1743,7 +1972,11 @@ pub extern "C" fn rac_seek(ptr: *mut Engine, pos_s: c_double) -> c_int {
     let Some(engine) = as_mut_engine(ptr) else {
         return -1;
     };
-    let clamped = if pos_s.is_finite() { pos_s.max(0.0) } else { 0.0 };
+    let clamped = if pos_s.is_finite() {
+        pos_s.max(0.0)
+    } else {
+        0.0
+    };
     let rc = engine.playbin.seek_simple(
         // Keep FLUSH for responsiveness/stability across sinks; UI side handles
         // brief position rebound after flush-seek.
@@ -1764,7 +1997,11 @@ pub extern "C" fn rac_set_volume(ptr: *mut Engine, vol: c_double) -> c_int {
     let Some(engine) = as_mut_engine(ptr) else {
         return -1;
     };
-    let v = if vol.is_finite() { vol.clamp(0.0, 1.5) } else { 1.0 };
+    let v = if vol.is_finite() {
+        vol.clamp(0.0, 1.5)
+    } else {
+        1.0
+    };
     engine.playbin.set_property("volume", v);
     0
 }
@@ -1859,7 +2096,11 @@ pub extern "C" fn rac_get_latency(ptr: *const Engine, lat_out: *mut c_double) ->
     let (latency_s, _src) = probe_latency(engine);
 
     unsafe {
-        *lat_out = if latency_s.is_finite() && latency_s > 0.0 { latency_s } else { 0.0 };
+        *lat_out = if latency_s.is_finite() && latency_s > 0.0 {
+            latency_s
+        } else {
+            0.0
+        };
     }
     0
 }
@@ -1872,7 +2113,11 @@ pub extern "C" fn rac_get_latency_probe_json(ptr: *const Engine) -> *mut c_char 
     let (latency_s, src) = probe_latency(engine);
     let s = format!(
         "{{\"latency_s\":{},\"source\":\"{}\"}}",
-        if latency_s.is_finite() && latency_s > 0.0 { latency_s } else { 0.0 },
+        if latency_s.is_finite() && latency_s > 0.0 {
+            latency_s
+        } else {
+            0.0
+        },
         src
     );
     match CString::new(s) {
@@ -1918,7 +2163,11 @@ pub extern "C" fn rac_free_string(s: *mut c_char) {
 }
 
 #[no_mangle]
-pub extern "C" fn rac_set_event_callback(ptr: *mut Engine, cb: Option<EventCallback>, user_data: *mut c_void) -> c_int {
+pub extern "C" fn rac_set_event_callback(
+    ptr: *mut Engine,
+    cb: Option<EventCallback>,
+    user_data: *mut c_void,
+) -> c_int {
     let Some(engine) = as_mut_engine(ptr) else {
         return -1;
     };
@@ -1936,7 +2185,11 @@ pub extern "C" fn rac_pump_events(ptr: *mut Engine) -> c_int {
 }
 
 #[no_mangle]
-pub extern "C" fn rac_set_output(ptr: *mut Engine, driver: *const c_char, device: *const c_char) -> c_int {
+pub extern "C" fn rac_set_output(
+    ptr: *mut Engine,
+    driver: *const c_char,
+    device: *const c_char,
+) -> c_int {
     let Some(engine) = as_mut_engine(ptr) else {
         return -1;
     };
@@ -2003,13 +2256,7 @@ pub extern "C" fn rac_set_output_tuned(
         d.to_str().ok()
     };
 
-    engine.set_output_tuned(
-        drv_str,
-        dev_opt,
-        buffer_us,
-        latency_us,
-        exclusive != 0,
-    )
+    engine.set_output_tuned(drv_str, dev_opt, buffer_us, latency_us, exclusive != 0)
 }
 
 #[no_mangle]
@@ -2074,12 +2321,18 @@ pub extern "C" fn rac_set_pipewire_allowed_rates(ptr: *mut Engine, csv: *const c
     let csv_s = unsafe { CStr::from_ptr(csv) }.to_string_lossy().to_string();
     match Engine::pipewire_set_clock_allowed_rates_csv(&csv_s) {
         Ok(_) => {
-            engine.emit_event(EVT_STATE, &format!("pipewire clock.allowed-rates={}", csv_s));
+            engine.emit_event(
+                EVT_STATE,
+                &format!("pipewire clock.allowed-rates={}", csv_s),
+            );
             0
         }
         Err(e) => {
             engine.set_error(format!("pipewire clock.allowed-rates failed: {e}"));
-            engine.emit_event(EVT_ERROR, &format!("pipewire clock.allowed-rates failed: {e}"));
+            engine.emit_event(
+                EVT_ERROR,
+                &format!("pipewire clock.allowed-rates failed: {e}"),
+            );
             -3
         }
     }
@@ -2094,10 +2347,15 @@ pub extern "C" fn rac_set_pipewire_pro_audio(ptr: *mut Engine, device: *const c_
         engine.set_error("null device for pro-audio switch");
         return -2;
     }
-    let dev_s = unsafe { CStr::from_ptr(device) }.to_string_lossy().to_string();
+    let dev_s = unsafe { CStr::from_ptr(device) }
+        .to_string_lossy()
+        .to_string();
     match ensure_pipewire_pro_audio_for_device(&dev_s) {
         Ok(card) => {
-            engine.emit_event(EVT_STATE, &format!("pipewire card profile=pro-audio card={card}"));
+            engine.emit_event(
+                EVT_STATE,
+                &format!("pipewire card profile=pro-audio card={card}"),
+            );
             0
         }
         Err(e) => {
@@ -2171,8 +2429,19 @@ pub extern "C" fn rac_get_runtime_snapshot(ptr: *const Engine) -> *mut c_char {
     let mut s = String::from("{");
     s.push_str("\"pipewire\":{");
     s.push_str(&format!("\"force_rate\":{},", pw_force_rate.max(0)));
-    s.push_str(&format!("\"quantum\":{},\"rate\":{},", pw_quantum.max(0), pw_rate.max(0)));
-    s.push_str(&format!("\"latency_ms\":{},", if pw_latency_ms >= 0.0 { pw_latency_ms } else { -1.0 }));
+    s.push_str(&format!(
+        "\"quantum\":{},\"rate\":{},",
+        pw_quantum.max(0),
+        pw_rate.max(0)
+    ));
+    s.push_str(&format!(
+        "\"latency_ms\":{},",
+        if pw_latency_ms >= 0.0 {
+            pw_latency_ms
+        } else {
+            -1.0
+        }
+    ));
     s.push_str("\"allowed_rates_raw\":\"");
     s.push_str(&json_escape(&pw_allowed_raw));
     s.push_str("\"},");
@@ -2219,5 +2488,88 @@ pub extern "C" fn rac_get_runtime_snapshot(ptr: *const Engine) -> *mut c_char {
     match CString::new(s) {
         Ok(c) => c.into_raw(),
         Err(_) => ptr::null_mut(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempProcRoot {
+        path: PathBuf,
+    }
+
+    impl TempProcRoot {
+        fn new(name: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let path = std::env::temp_dir().join(format!(
+                "rust_audio_core_{name}_{}_{}",
+                std::process::id(),
+                unique
+            ));
+            fs::create_dir_all(&path).expect("create temp proc root");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn write(&self, rel: &str, content: &str) {
+            let path = self.path.join(rel);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).expect("create temp proc parent");
+            }
+            fs::write(path, content).expect("write temp proc file");
+        }
+    }
+
+    impl Drop for TempProcRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn alsa_enum_uses_real_playback_pcm_indices() {
+        let proc_root = TempProcRoot::new("alsa_pcm_enum");
+        proc_root.write("cards", " 2 [USB            ]: USB-Audio - Fancy DAC\n");
+        proc_root.write(
+            "card2/pcm7p/info",
+            "card: 2\ndevice: 7\nname: USB Audio Output\nsubdevices_count: 1\n",
+        );
+
+        let devices = list_alsa_cards_from_proc_root(proc_root.path());
+
+        assert_eq!(
+            devices,
+            vec![(
+                "Fancy DAC / USB Audio Output (hw:2,7)".to_string(),
+                Some("hw:2,7".to_string()),
+            )]
+        );
+    }
+
+    #[test]
+    fn alsa_enum_falls_back_to_card_zero_when_pcm_dirs_missing() {
+        let proc_root = TempProcRoot::new("alsa_card_fallback");
+        proc_root.write("cards", " 1 [PCH            ]: HDA-Intel - HDA Intel PCH\n");
+        fs::create_dir_all(proc_root.path().join("card1")).expect("create fallback card dir");
+
+        let devices = list_alsa_cards_from_proc_root(proc_root.path());
+
+        assert_eq!(
+            devices,
+            vec![(
+                "HDA Intel PCH (Card 1)".to_string(),
+                Some("hw:1,0".to_string()),
+            )]
+        );
     }
 }

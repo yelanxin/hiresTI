@@ -1,36 +1,60 @@
 # Changelog
 
 ## 1.4.0 - 2026-02-28
-Feature release: LAN-capable remote control API and MCP bridge for OpenClaw-style integrations.
+Remote control + playback reliability release: LAN-capable remote API, MCP integration, queue/event automation, and immediate UI/state fixes.
 
 ### Added
 - Added a built-in remote-control service with HTTP JSON-RPC transport:
-  - supports playback control, queue inspection, queue replacement/append/remove/clear, and indexed queue playback,
-  - exposes structured `search.match_tracks` so external agents can resolve `title + artist` into playable TIDAL track IDs.
-- Added an MCP stdio bridge that forwards tool calls to the remote JSON-RPC service.
+  - supports playback control, queue inspection, queue replacement/append/insert/move/remove/clear, indexed queue playback, and structured `search.match_tracks`,
+  - exposes `auth.status` with both RPC and MCP endpoints for client auto-configuration.
+- Added native MCP support for OpenClaw-style integrations:
+  - `/mcp` HTTP endpoint with MCP initialize/tools flow,
+  - tool metadata for player, queue, and search operations,
+  - structured MCP tool responses and notification handling.
+- Added live remote event fanout:
+  - `/events` SSE stream for playback/queue changes,
+  - queue/playback event publishing from track start, pause/resume, seek, queue mutation, and playback error paths.
+- Added a dedicated OpenClaw setup guide: `openclaw-mcp-guide-en.md`.
 - Added remote-control secret storage with generated Bearer API keys saved separately from normal settings.
 
 ### Changed
-- Settings now include a dedicated `Remote Control` section with:
-  - enable/disable toggle,
-  - `Local only` vs `LAN` access mode,
-  - bind address, port, and optional client CIDR allowlist,
-  - API key generation and clipboard copy actions,
-  - live endpoint and runtime status display.
+- Remote Control settings expanded and polished:
+  - dedicated section with enable toggle, access mode, port, endpoint, API key generation, and copy actions,
+  - `Bind IP` and `Allowed Clients` now stay hidden in `Local only` mode and only appear in `LAN`,
+  - endpoint row now includes a direct `Copy` action.
 - App startup/shutdown now manages the remote-control service lifecycle automatically when the feature is enabled.
+- Key regeneration now takes effect immediately:
+  - restarting the remote service closes existing MCP/event/HTTP connections,
+  - stale long-lived clients must reconnect with the new key.
+- My Albums favorite toggles now update collection state immediately without requiring an app restart:
+  - un-favoriting removes the album from the cached My Albums list right away,
+  - adding a favorite invalidates the recent-albums cache so ordering reloads from TIDAL cleanly.
+- Mini mode restore no longer leaves the global search box spuriously focused.
+- ALSA exclusive-mode device enumeration is now more robust:
+  - the Rust audio core enumerates real playback PCM devices from `/proc/asound/card*/pcm*p`,
+  - ALSA output selection now uses the correct `hw:<card>,<pcm>` target instead of assuming PCM `0`.
 
 ### Security
 - Remote control is disabled by default.
 - LAN access requires a Bearer API key on every request.
 - Optional IP/CIDR allowlists can restrict which local-network clients may connect.
+- MCP requests now enforce host/origin checks in addition to Bearer auth.
 - Remote API secrets are stored in a dedicated file with restricted permissions.
+
+### Fixed
+- Fixed stale My Albums UI after removing a TIDAL album favorite from the album page.
+- Fixed remote-control key rotation not invalidating active long-lived MCP/event connections until full app restart.
+- Fixed mini-mode restore activating the search box unexpectedly.
+- Fixed ALSA exclusive-mode failures on hardware whose playback PCM index is not `0`.
 
 ### Tests
 - Added regression coverage for:
-  - remote API key generation and rotation,
-  - CIDR parsing and client allowlist checks,
-  - JSON-RPC dispatch for player state, queue replacement, and structured track matching,
-  - runtime initialization including remote-control state setup.
+  - remote API key generation, rotation, invalid-key rejection, loopback-only binding, and allowlist enforcement,
+  - MCP HTTP initialize/notification handling and tool-call structured responses,
+  - SSE event fanout and formatting,
+  - JSON-RPC queue move/insert/append/replace behavior and public queue snapshots,
+  - My Albums cache invalidation/synchronization after album favorite toggles,
+  - ALSA playback PCM enumeration fallback and real-device selection in the Rust audio core.
 
 ---
 

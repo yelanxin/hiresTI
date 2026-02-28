@@ -11,6 +11,35 @@ from ui import config as ui_config
 logger = logging.getLogger(__name__)
 
 
+def _reset_search_focus_after_layout_change(self, duration_ms=260):
+    try:
+        now_us = GLib.get_monotonic_time()
+    except Exception:
+        now_us = 0
+    self._search_focus_suppressed_until_us = int(now_us) + (int(duration_ms) * 1000)
+
+    pop = getattr(self, "search_suggest_popover", None)
+    if pop is not None:
+        try:
+            pop.popdown()
+        except Exception:
+            pass
+
+    def _clear():
+        win = getattr(self, "win", None)
+        if win is not None:
+            try:
+                win.set_focus(None)
+            except Exception:
+                pass
+        return False
+
+    _clear()
+    GLib.idle_add(_clear)
+    GLib.timeout_add(max(60, int(duration_ms // 2)), _clear)
+    GLib.timeout_add(int(duration_ms), _clear)
+
+
 def _build_volume_popover(self):
     pop = Gtk.Popover()
     vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
@@ -78,6 +107,7 @@ def toggle_mini_mode(self, btn):
         self.settings["viz_expanded"] = False
         self.schedule_save_settings()
     self.close_queue_drawer()
+    _reset_search_focus_after_layout_change(self)
 
     self.is_mini_mode = not self.is_mini_mode
 
@@ -138,6 +168,7 @@ def toggle_mini_mode(self, btn):
         # at this point because the window resize is asynchronous.
         sidebar_px = int(max(120, self.saved_width * float(ui_config.SIDEBAR_RATIO)))
         self.paned.set_position(sidebar_px)
+        _reset_search_focus_after_layout_change(self, duration_ms=320)
 
 
 def _build_user_popover(self):

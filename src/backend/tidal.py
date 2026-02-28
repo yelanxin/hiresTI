@@ -395,7 +395,7 @@ class TidalBackend:
             if not self.user: return
             # Reuse album cache when fresh to avoid a duplicate full API fetch.
             now = time.time()
-            if self._cached_albums and now - self._cached_albums_ts < self._albums_cache_ttl:
+            if self._has_fresh_recent_albums_cache(now=now):
                 albums = self._cached_albums
             else:
                 albums = self.get_recent_albums(limit=20000)
@@ -439,6 +439,50 @@ class TidalBackend:
     def is_track_favorite(self, track_id):
         return str(track_id) in self.fav_track_ids
 
+    def _album_cache_ttl_seconds(self, default=300.0):
+        try:
+            return float(getattr(self, "_albums_cache_ttl", default))
+        except Exception:
+            return float(default)
+
+    def _has_fresh_recent_albums_cache(self, now=None):
+        cached = list(getattr(self, "_cached_albums", []) or [])
+        if not cached:
+            return False
+        ttl = self._album_cache_ttl_seconds()
+        if ttl <= 0.0:
+            return False
+        current_time = float(time.time() if now is None else now)
+        last_ts = float(getattr(self, "_cached_albums_ts", 0.0) or 0.0)
+        return (current_time - last_ts) < ttl
+
+    def _sync_recent_albums_cache_after_favorite_toggle(self, album_id, add):
+        album_key = str(album_id or "").strip()
+        if add:
+            # Added albums should be reloaded from server so ordering stays correct.
+            self._cached_albums = []
+            self._cached_albums_ts = 0.0
+            return
+
+        cached = list(getattr(self, "_cached_albums", []) or [])
+        if not cached or not album_key:
+            self._cached_albums = []
+            self._cached_albums_ts = 0.0
+            return
+
+        filtered = [
+            alb for alb in cached
+            if str(getattr(alb, "id", "") or "") != album_key
+        ]
+        if len(filtered) != len(cached):
+            self._cached_albums = filtered
+            self._cached_albums_ts = time.time()
+            return
+
+        # If cache content does not match the removed album, force a clean refetch.
+        self._cached_albums = []
+        self._cached_albums_ts = 0.0
+
     def toggle_album_favorite(self, album_id, add=True):
         try:
             if add:
@@ -447,6 +491,7 @@ class TidalBackend:
             else:
                 self.user.favorites.remove_album(album_id)
                 self.fav_album_ids.discard(str(album_id))
+            self._sync_recent_albums_cache_after_favorite_toggle(album_id, add)
             return True
         except Exception as e:
             logger.warning("Failed to toggle album favorite for %s (add=%s): %s", album_id, add, e)

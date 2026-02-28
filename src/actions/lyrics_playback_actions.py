@@ -237,6 +237,8 @@ def play_track(app, index):
         GLib.idle_add(lambda: (app.refresh_dashboard_playing_state(), False)[1])
     if hasattr(app, "refresh_current_track_favorite_state"):
         GLib.idle_add(app.refresh_current_track_favorite_state)
+    if hasattr(app, "_remote_publish_track_event"):
+        app._remote_publish_track_event("track_selected")
 
     logger.info("Playing: %s", track.name)
 
@@ -331,12 +333,16 @@ def play_track(app, index):
                             app._mpris_sync_playback()
                         if hasattr(app, "_mpris_sync_position"):
                             app._mpris_sync_position(force=True)
+                        if hasattr(app, "_remote_publish_playback_event"):
+                            app._remote_publish_playback_event("playback_error")
                         return False
                     app.play_btn.set_icon_name("media-playback-pause-symbolic")
                     if hasattr(app, "_mpris_sync_playback"):
                         app._mpris_sync_playback()
                     if hasattr(app, "_mpris_sync_position"):
                         app._mpris_sync_position(force=True)
+                    if hasattr(app, "_remote_publish_playback_event"):
+                        app._remote_publish_playback_event("track_started")
                     return False
 
                 GLib.idle_add(apply_playback)
@@ -349,6 +355,8 @@ def play_track(app, index):
                     app.render_lyrics_list(None, user_message("not_found", "playback"))
                     if hasattr(app, "_mpris_sync_playback"):
                         app._mpris_sync_playback()
+                    if hasattr(app, "_remote_publish_playback_event"):
+                        app._remote_publish_playback_event("stream_missing")
                     return False
 
                 GLib.idle_add(apply_stream_missing)
@@ -371,6 +379,8 @@ def play_track(app, index):
                 app.render_lyrics_list(None, user_message(kind, "playback"))
                 if hasattr(app, "_mpris_sync_playback"):
                     app._mpris_sync_playback()
+                if hasattr(app, "_remote_publish_playback_event"):
+                    app._remote_publish_playback_event("playback_error")
                 return False
 
             GLib.idle_add(apply_playback_error)

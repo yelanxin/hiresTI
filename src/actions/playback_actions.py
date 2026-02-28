@@ -12,6 +12,8 @@ def on_play_pause(app, btn):
             app._mpris_sync_playback()
         if hasattr(app, "_mpris_sync_position"):
             app._mpris_sync_position(force=True)
+        if hasattr(app, "_remote_publish_playback_event"):
+            app._remote_publish_playback_event("paused")
     else:
         app.player.play()
         audio_settings_actions.update_output_status_ui(app)
@@ -30,6 +32,8 @@ def on_play_pause(app, btn):
                 app._mpris_sync_playback()
             if hasattr(app, "_mpris_sync_position"):
                 app._mpris_sync_position(force=True)
+            if hasattr(app, "_remote_publish_playback_event"):
+                app._remote_publish_playback_event("playback_error")
             return
         if btn is not None:
             btn.set_icon_name("media-playback-pause-symbolic")
@@ -37,6 +41,8 @@ def on_play_pause(app, btn):
             app._mpris_sync_playback()
         if hasattr(app, "_mpris_sync_position"):
             app._mpris_sync_position(force=True)
+        if hasattr(app, "_remote_publish_playback_event"):
+            app._remote_publish_playback_event("resumed")
 
 
 def on_next_track(app, btn=None):

@@ -11,6 +11,8 @@ from gi.repository import GLib
 
 from services.remote_api import RemoteAPIService, parse_allowed_cidrs
 from services.remote_auth import ensure_secret, load_secret
+from services.remote_dispatch import player_state_snapshot, queue_public_snapshot
+from services.remote_events import RemoteEventHub
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +32,8 @@ def _init_remote_control_state(self):
     self.remote_api_secret_file = os.path.join(self._config_root, "remote_api_secret.json")
     self.remote_api_key = str(load_secret(self.remote_api_secret_file).get("api_key", "") or "").strip()
     self._remote_api_service = None
+    self._remote_event_hub = RemoteEventHub()
+    self._remote_queue_event_suppression = 0
     self.remote_api_status_state = "stopped"
     self.remote_api_status_text = "Stopped"
     self.remote_api_last_error = ""
@@ -46,6 +50,12 @@ def get_remote_api_endpoint(self):
     host = self._effective_remote_api_host()
     port = int(self.settings.get("remote_api_port", 18473) or 18473)
     return f"http://{host}:{port}/rpc"
+
+
+def get_remote_mcp_endpoint(self):
+    host = self._effective_remote_api_host()
+    port = int(self.settings.get("remote_api_port", 18473) or 18473)
+    return f"http://{host}:{port}/mcp"
 
 
 def _set_remote_api_status(self, state, text, detail=""):
@@ -71,6 +81,7 @@ def _refresh_remote_api_settings_ui(self):
     try:
         enabled = bool(self.settings.get("remote_api_enabled", False))
         mode = str(self.settings.get("remote_api_access_mode", "local") or "local")
+        is_lan = mode == "lan"
         mode_label = REMOTE_ACCESS_LABEL_BY_VALUE.get(mode, "Local only")
         bind_host = str(self.settings.get("remote_api_bind_host", "0.0.0.0") or "0.0.0.0")
         allowed = ", ".join(self.settings.get("remote_api_allowed_cidrs", []) or [])
@@ -88,14 +99,22 @@ def _refresh_remote_api_settings_ui(self):
             except ValueError:
                 dd.set_selected(0)
 
+        network_row = getattr(self, "remote_api_network_row", None)
+        if network_row is not None:
+            network_row.set_visible(is_lan)
+
         bind_entry = getattr(self, "remote_api_bind_entry", None)
         if bind_entry is not None:
             bind_entry.set_text(bind_host)
-            bind_entry.set_sensitive(mode == "lan")
+            bind_entry.set_sensitive(is_lan)
 
         port_spin = getattr(self, "remote_api_port_spin", None)
         if port_spin is not None:
             port_spin.set_value(float(int(self.settings.get("remote_api_port", 18473) or 18473)))
+
+        allowlist_row = getattr(self, "remote_api_allowlist_row", None)
+        if allowlist_row is not None:
+            allowlist_row.set_visible(is_lan)
 
         allow_entry = getattr(self, "remote_api_allowlist_entry", None)
         if allow_entry is not None:
@@ -199,6 +218,37 @@ def _start_remote_api_if_enabled(self):
     return False
 
 
+def _remote_publish_event(self, event_type, payload=None):
+    hub = getattr(self, "_remote_event_hub", None)
+    if hub is None:
+        return None
+    return hub.publish(str(event_type or "message"), payload if isinstance(payload, dict) else {})
+
+
+def _remote_publish_queue_event(self, reason="queue_changed"):
+    if int(getattr(self, "_remote_queue_event_suppression", 0) or 0) > 0:
+        return None
+    payload = queue_public_snapshot(self)
+    payload["reason"] = str(reason or "queue_changed")
+    return self._remote_publish_event("queue_changed", payload)
+
+
+def _remote_publish_track_event(self, reason="track_changed"):
+    payload = {
+        "reason": str(reason or "track_changed"),
+        "state": player_state_snapshot(self),
+    }
+    return self._remote_publish_event("track_changed", payload)
+
+
+def _remote_publish_playback_event(self, reason="playback_changed"):
+    payload = {
+        "reason": str(reason or "playback_changed"),
+        "state": player_state_snapshot(self),
+    }
+    return self._remote_publish_event("playback_changed", payload)
+
+
 def _parse_allowed_cidrs(value):
     text = str(value or "").strip()
     if not text:
@@ -212,9 +262,9 @@ def _parse_allowed_cidrs(value):
     return parse_allowed_cidrs(cidrs)
 
 
-def _copy_remote_api_key_to_clipboard(self):
-    key = str(getattr(self, "remote_api_key", "") or "").strip()
-    if not key:
+def _copy_remote_text_to_clipboard(self, value, label):
+    text = str(value or "").strip()
+    if not text:
         return False
     win = getattr(self, "win", None)
     if win is None:
@@ -223,11 +273,15 @@ def _copy_remote_api_key_to_clipboard(self):
     if display is None:
         return False
     try:
-        display.get_clipboard().set(key)
+        display.get_clipboard().set(text)
         return True
     except Exception:
-        logger.exception("Failed to copy remote API key")
+        logger.exception("Failed to copy remote %s", label)
         return False
+
+
+def _copy_remote_api_key_to_clipboard(self):
+    return _copy_remote_text_to_clipboard(self, getattr(self, "remote_api_key", ""), "API key")
 
 
 def on_remote_api_enabled_toggled(self, _switch, state):
@@ -310,6 +364,16 @@ def on_remote_api_copy_key_clicked(self, _btn=None):
         )
 
 
+def on_remote_api_copy_endpoint_clicked(self, _btn=None):
+    copied = _copy_remote_text_to_clipboard(self, self.get_remote_api_endpoint(), "endpoint")
+    if hasattr(self, "show_output_notice"):
+        self.show_output_notice(
+            "Remote endpoint copied." if copied else "Failed to copy remote endpoint.",
+            "ok" if copied else "warn",
+            2200,
+        )
+
+
 def _remote_invoke_on_main(self, fn, *args, timeout=6.0):
     done = threading.Event()
     box = {"result": None, "error": None}
@@ -331,12 +395,22 @@ def _remote_invoke_on_main(self, fn, *args, timeout=6.0):
     return box["result"]
 
 
+def _remote_close_event_streams(self):
+    hub = getattr(self, "_remote_event_hub", None)
+    if hub is not None:
+        hub.close_all()
+
+
 def _remote_replace_queue(self, tracks, autoplay=True, start_index=0):
     queue = list(tracks or [])
-    if hasattr(self, "_set_play_queue"):
-        self._set_play_queue(queue)
-    else:
-        self.play_queue = queue
+    self._remote_queue_event_suppression = int(getattr(self, "_remote_queue_event_suppression", 0) or 0) + 1
+    try:
+        if hasattr(self, "_set_play_queue"):
+            self._set_play_queue(queue)
+        else:
+            self.play_queue = queue
+    finally:
+        self._remote_queue_event_suppression = max(0, int(getattr(self, "_remote_queue_event_suppression", 1) or 1) - 1)
     self.shuffle_indices = []
 
     if not queue:
@@ -353,6 +427,8 @@ def _remote_replace_queue(self, tracks, autoplay=True, start_index=0):
             self._mpris_sync_all(force=True)
         if hasattr(self, "_refresh_queue_views"):
             GLib.idle_add(self._refresh_queue_views)
+        self._remote_publish_queue_event("queue_replaced")
+        self._remote_publish_playback_event("queue_cleared")
         return {"queue_size": 0, "autoplay": False, "start_index": -1}
 
     if not autoplay:
@@ -369,11 +445,14 @@ def _remote_replace_queue(self, tracks, autoplay=True, start_index=0):
             self._mpris_sync_all(force=True)
         if hasattr(self, "_refresh_queue_views"):
             GLib.idle_add(self._refresh_queue_views)
+        self._remote_publish_queue_event("queue_replaced")
+        self._remote_publish_playback_event("queue_loaded")
         return {"queue_size": len(queue), "autoplay": False, "start_index": 0}
 
     idx = int(start_index or 0)
     if idx < 0 or idx >= len(queue):
         idx = 0
+    self._remote_publish_queue_event("queue_replaced")
     self.play_track(idx)
     if hasattr(self, "_refresh_queue_views"):
         GLib.idle_add(self._refresh_queue_views)
@@ -384,12 +463,110 @@ def _remote_append_queue(self, tracks):
     additions = list(tracks or [])
     base_queue = list(self._get_active_queue() if hasattr(self, "_get_active_queue") else [])
     new_queue = base_queue + additions
-    if hasattr(self, "_set_play_queue"):
-        self._set_play_queue(new_queue)
-    else:
-        self.play_queue = new_queue
+    self._remote_queue_event_suppression = int(getattr(self, "_remote_queue_event_suppression", 0) or 0) + 1
+    try:
+        if hasattr(self, "_set_play_queue"):
+            self._set_play_queue(new_queue)
+        else:
+            self.play_queue = new_queue
+    finally:
+        self._remote_queue_event_suppression = max(0, int(getattr(self, "_remote_queue_event_suppression", 1) or 1) - 1)
     if hasattr(self, "_refresh_queue_views"):
         GLib.idle_add(self._refresh_queue_views)
     if hasattr(self, "_mpris_sync_metadata"):
         self._mpris_sync_metadata()
+    self._remote_publish_queue_event("queue_appended")
     return {"queue_size": len(new_queue), "added": len(additions)}
+
+
+def _remote_move_queue_item(self, from_index, to_index):
+    queue = list(self._get_active_queue() if hasattr(self, "_get_active_queue") else [])
+    total = len(queue)
+    src = int(from_index)
+    dst = int(to_index)
+    if src < 0 or src >= total or dst < 0 or dst >= total:
+        raise ValueError("Queue move indexes are out of range.")
+    if src == dst:
+        return {
+            "queue_size": total,
+            "from_index": src,
+            "to_index": dst,
+            "current_index": int(getattr(self, "current_track_index", -1)),
+        }
+
+    moved = queue.pop(src)
+    queue.insert(dst, moved)
+    current_index = int(getattr(self, "current_track_index", -1))
+    if current_index == src:
+        current_index = dst
+    elif src < current_index <= dst:
+        current_index -= 1
+    elif dst <= current_index < src:
+        current_index += 1
+
+    self._remote_queue_event_suppression = int(getattr(self, "_remote_queue_event_suppression", 0) or 0) + 1
+    try:
+        if hasattr(self, "_set_play_queue"):
+            self._set_play_queue(queue)
+        else:
+            self.play_queue = queue
+    finally:
+        self._remote_queue_event_suppression = max(0, int(getattr(self, "_remote_queue_event_suppression", 1) or 1) - 1)
+
+    self.current_track_index = current_index if 0 <= current_index < len(queue) else -1
+    if 0 <= self.current_track_index < len(queue):
+        self.playing_track = queue[self.current_track_index]
+        self.playing_track_id = getattr(self.playing_track, "id", None)
+    if hasattr(self, "_refresh_queue_views"):
+        GLib.idle_add(self._refresh_queue_views)
+    if hasattr(self, "_mpris_sync_metadata"):
+        self._mpris_sync_metadata()
+    self._remote_publish_queue_event("queue_moved")
+    return {
+        "queue_size": len(queue),
+        "from_index": src,
+        "to_index": dst,
+        "current_index": self.current_track_index,
+    }
+
+
+def _remote_insert_queue_at(self, tracks, index):
+    additions = list(tracks or [])
+    base_queue = list(self._get_active_queue() if hasattr(self, "_get_active_queue") else [])
+    insert_index = max(0, min(int(index), len(base_queue)))
+    new_queue = base_queue[:insert_index] + additions + base_queue[insert_index:]
+    current_index = int(getattr(self, "current_track_index", -1))
+    if current_index >= insert_index:
+        current_index += len(additions)
+
+    self._remote_queue_event_suppression = int(getattr(self, "_remote_queue_event_suppression", 0) or 0) + 1
+    try:
+        if hasattr(self, "_set_play_queue"):
+            self._set_play_queue(new_queue)
+        else:
+            self.play_queue = new_queue
+    finally:
+        self._remote_queue_event_suppression = max(0, int(getattr(self, "_remote_queue_event_suppression", 1) or 1) - 1)
+
+    self.current_track_index = current_index if 0 <= current_index < len(new_queue) else -1
+    if 0 <= self.current_track_index < len(new_queue):
+        self.playing_track = new_queue[self.current_track_index]
+        self.playing_track_id = getattr(self.playing_track, "id", None)
+    if hasattr(self, "_refresh_queue_views"):
+        GLib.idle_add(self._refresh_queue_views)
+    if hasattr(self, "_mpris_sync_metadata"):
+        self._mpris_sync_metadata()
+    self._remote_publish_queue_event("queue_inserted")
+    return {
+        "queue_size": len(new_queue),
+        "insert_index": insert_index,
+        "inserted": len(additions),
+        "current_index": self.current_track_index,
+    }
+
+
+def _remote_insert_queue_next(self, tracks):
+    current_index = int(getattr(self, "current_track_index", -1))
+    base_queue = list(self._get_active_queue() if hasattr(self, "_get_active_queue") else [])
+    insert_index = current_index + 1 if 0 <= current_index < len(base_queue) else 0
+    return self._remote_insert_queue_at(tracks, insert_index)

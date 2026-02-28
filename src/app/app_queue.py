@@ -19,6 +19,8 @@ def _set_play_queue(self, tracks):
     self.shuffle_indices = []
     if hasattr(self, "_mpris_sync_metadata"):
         self._mpris_sync_metadata()
+    if hasattr(self, "_remote_publish_queue_event"):
+        self._remote_publish_queue_event("queue_set")
 
 
 def _is_queue_nav_selected(self):
@@ -89,7 +91,7 @@ def on_queue_remove_track_clicked(self, track_index):
     idx = int(track_index)
     if idx < 0 or idx >= len(tracks):
         return
-    removed_current = idx == int(getattr(self, "current_track_index", -1) or -1)
+    removed_current = idx == int(getattr(self, "current_track_index", -1))
     tracks.pop(idx)
     self.play_queue = tracks
 
@@ -106,6 +108,10 @@ def on_queue_remove_track_clicked(self, track_index):
         self.refresh_current_track_favorite_state()
         if hasattr(self, "_mpris_sync_all"):
             self._mpris_sync_all(force=True)
+        if hasattr(self, "_remote_publish_queue_event"):
+            self._remote_publish_queue_event("queue_removed")
+        if hasattr(self, "_remote_publish_playback_event"):
+            self._remote_publish_playback_event("queue_cleared")
         GLib.idle_add(self._refresh_queue_views)
         return
 
@@ -116,6 +122,8 @@ def on_queue_remove_track_clicked(self, track_index):
         new_idx = min(idx, len(tracks) - 1)
         if hasattr(self, "_mpris_sync_metadata"):
             self._mpris_sync_metadata()
+        if hasattr(self, "_remote_publish_queue_event"):
+            self._remote_publish_queue_event("queue_removed")
         GLib.idle_add(self._refresh_queue_views)
         GLib.idle_add(lambda: self.play_track(new_idx) or False)
         return
@@ -124,6 +132,8 @@ def on_queue_remove_track_clicked(self, track_index):
     self._update_track_list_icon()
     if hasattr(self, "_mpris_sync_metadata"):
         self._mpris_sync_metadata()
+    if hasattr(self, "_remote_publish_queue_event"):
+        self._remote_publish_queue_event("queue_removed")
 
 
 def on_queue_clear_clicked(self, _btn=None):
@@ -143,4 +153,8 @@ def on_queue_clear_clicked(self, _btn=None):
     self.refresh_current_track_favorite_state()
     if hasattr(self, "_mpris_sync_all"):
         self._mpris_sync_all(force=True)
+    if hasattr(self, "_remote_publish_queue_event"):
+        self._remote_publish_queue_event("queue_cleared")
+    if hasattr(self, "_remote_publish_playback_event"):
+        self._remote_publish_playback_event("queue_cleared")
     GLib.idle_add(self._refresh_queue_views)

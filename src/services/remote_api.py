@@ -5,10 +5,15 @@ from __future__ import annotations
 import ipaddress
 import json
 import logging
+import queue
+import socket
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 
 from services.remote_dispatch import RemoteDispatchError, dispatch_rpc
+from services.remote_mcp import MCP_PROTOCOL_VERSION, handle_mcp_request
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +59,42 @@ def _bearer_token(headers) -> str:
     return auth[7:].strip()
 
 
+def _mcp_origin_allowed(headers, server_host="") -> bool:
+    origin = str(headers.get("Origin", "") or "").strip()
+    if not origin:
+        return True
+    parsed = urlsplit(origin)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return False
+    request_host = str(headers.get("Host", "") or "").strip().lower()
+    if request_host:
+        return parsed.netloc.lower() == request_host
+    fallback_host = str(server_host or "").strip().lower()
+    if not fallback_host:
+        return False
+    origin_host = str(parsed.hostname or "").strip().lower()
+    server_hostname = fallback_host.split(":", 1)[0]
+    return bool(origin_host) and origin_host == server_hostname
+
+
+def _dispatch_mcp_http_request(app, payload):
+    if not isinstance(payload, dict):
+        return 400, {"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid request."}, "id": None}
+
+    try:
+        response = handle_mcp_request(
+            lambda method, params=None: dispatch_rpc(app, method, params),
+            payload,
+        )
+    except Exception:
+        logger.exception("MCP request failed")
+        return 500, {"jsonrpc": "2.0", "error": {"code": -32000, "message": "Internal error."}, "id": payload.get("id")}
+
+    if response is None:
+        return 202, None
+    return 200, response
+
+
 class _RemoteHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -62,27 +103,93 @@ class _RemoteHTTPServer(ThreadingHTTPServer):
         self.app = app
         self.api_key = str(api_key or "")
         self.allowed_cidrs = list(allowed_cidrs or [])
+        self._active_handlers = set()
+        self._active_handlers_lock = threading.Lock()
         super().__init__((host, int(port)), _RemoteRequestHandler)
+
+    def register_handler(self, handler):
+        with self._active_handlers_lock:
+            self._active_handlers.add(handler)
+
+    def unregister_handler(self, handler):
+        with self._active_handlers_lock:
+            self._active_handlers.discard(handler)
+
+    def close_active_connections(self):
+        with self._active_handlers_lock:
+            handlers = list(self._active_handlers)
+        for handler in handlers:
+            conn = getattr(handler, "connection", None)
+            if conn is None:
+                continue
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 class _RemoteRequestHandler(BaseHTTPRequestHandler):
     server_version = "HiresTIRemoteAPI/1.0"
 
+    def setup(self):
+        super().setup()
+        server = getattr(self, "server", None)
+        if server is not None and hasattr(server, "register_handler"):
+            try:
+                server.register_handler(self)
+            except Exception:
+                pass
+
+    def finish(self):
+        try:
+            super().finish()
+        finally:
+            server = getattr(self, "server", None)
+            if server is not None and hasattr(server, "unregister_handler"):
+                try:
+                    server.unregister_handler(self)
+                except Exception:
+                    pass
+
     def log_message(self, fmt, *args):
         logger.debug("Remote API %s - %s", self.address_string(), fmt % args)
 
-    def _write_json(self, status_code, payload):
+    def _write_json(self, status_code, payload, extra_headers=None):
         body = json.dumps(payload).encode("utf-8")
         self.send_response(int(status_code))
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        for key, value in dict(extra_headers or {}).items():
+            self.send_header(str(key), str(value))
         self.end_headers()
         self.wfile.write(body)
 
-    def _write_empty(self, status_code):
+    def _write_empty(self, status_code, extra_headers=None):
         self.send_response(int(status_code))
         self.send_header("Content-Length", "0")
+        for key, value in dict(extra_headers or {}).items():
+            self.send_header(str(key), str(value))
         self.end_headers()
+
+    def _write_sse(self, event_name, payload, event_id=None):
+        chunks = []
+        if event_id is not None:
+            chunks.append(f"id: {event_id}\n")
+        if event_name:
+            chunks.append(f"event: {event_name}\n")
+        body = json.dumps(payload if isinstance(payload, dict) else {})
+        for line in body.splitlines() or ["{}"]:
+            chunks.append(f"data: {line}\n")
+        chunks.append("\n")
+        self.wfile.write("".join(chunks).encode("utf-8"))
+        self.wfile.flush()
+
+    def _request_path(self):
+        return urlsplit(self.path).path.rstrip("/") or "/"
 
     def _check_access(self):
         client_ip = self.client_address[0] if self.client_address else ""
@@ -95,8 +202,100 @@ class _RemoteRequestHandler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def _check_mcp_access(self):
+        server_host = ""
+        if getattr(self, "server", None) is not None:
+            host, port = self.server.server_address[:2]
+            server_host = f"{host}:{port}"
+        if not _mcp_origin_allowed(self.headers, server_host=server_host):
+            self._write_json(403, {"error": "origin_not_allowed"})
+            return False
+        return self._check_access()
+
     def do_GET(self):
-        if self.path.rstrip("/") != "/health":
+        path = self._request_path()
+        if path == "/mcp":
+            if not self._check_mcp_access():
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("MCP-Protocol-Version", MCP_PROTOCOL_VERSION)
+            self.end_headers()
+            heartbeat = queue.Queue()
+            last_keepalive = time.monotonic()
+            try:
+                self.wfile.write(b": connected\n\n")
+                self.wfile.flush()
+                while True:
+                    try:
+                        item = heartbeat.get(timeout=1.0)
+                    except queue.Empty:
+                        if (time.monotonic() - last_keepalive) >= 15.0:
+                            self.wfile.write(b": keepalive\n\n")
+                            self.wfile.flush()
+                            last_keepalive = time.monotonic()
+                        continue
+                    if item is None:
+                        break
+                    if (time.monotonic() - last_keepalive) >= 15.0:
+                        self.wfile.write(b": keepalive\n\n")
+                        self.wfile.flush()
+                        last_keepalive = time.monotonic()
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                pass
+            return
+        if path == "/events":
+            if not self._check_access():
+                return
+            hub = getattr(getattr(self.server, "app", None), "_remote_event_hub", None)
+            if hub is None or not hasattr(hub, "subscribe"):
+                self._write_json(503, {"error": "event_stream_unavailable"})
+                return
+            subscription_id, event_queue = hub.subscribe()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+            app = getattr(self.server, "app", None)
+            self._write_sse(
+                "ready",
+                {
+                    "ok": True,
+                    "service": "hiresTI-remote-api",
+                    "version": str(getattr(app, "app_version", "dev") or "dev"),
+                },
+                event_id="0",
+            )
+            try:
+                last_keepalive = time.monotonic()
+                while True:
+                    try:
+                        event = event_queue.get(timeout=15.0)
+                    except queue.Empty:
+                        if (time.monotonic() - last_keepalive) >= 15.0:
+                            self.wfile.write(b": keepalive\n\n")
+                            self.wfile.flush()
+                            last_keepalive = time.monotonic()
+                        continue
+                    if event is None:
+                        break
+                    self._write_sse(
+                        event.get("type", "message"),
+                        event.get("payload", {}),
+                        event_id=event.get("id"),
+                    )
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                pass
+            finally:
+                try:
+                    hub.unsubscribe(subscription_id)
+                except Exception:
+                    pass
+            return
+        if path != "/health":
             self._write_json(404, {"error": "not_found"})
             return
         app = getattr(self.server, "app", None)
@@ -108,10 +307,14 @@ class _RemoteRequestHandler(BaseHTTPRequestHandler):
         self._write_json(200, payload)
 
     def do_POST(self):
-        if self.path.rstrip("/") != "/rpc":
+        path = self._request_path()
+        if path == "/mcp":
+            if not self._check_mcp_access():
+                return
+        elif path != "/rpc":
             self._write_json(404, {"error": "not_found"})
             return
-        if not self._check_access():
+        elif not self._check_access():
             return
 
         try:
@@ -119,14 +322,31 @@ class _RemoteRequestHandler(BaseHTTPRequestHandler):
         except ValueError:
             length = 0
         if length <= 0:
-            self._write_json(400, {"jsonrpc": "2.0", "error": {"code": -32600, "message": "Empty request."}, "id": None})
+            payload = {"jsonrpc": "2.0", "error": {"code": -32600, "message": "Empty request."}, "id": None}
+            if path == "/mcp":
+                self._write_json(400, payload, extra_headers={"MCP-Protocol-Version": MCP_PROTOCOL_VERSION})
+            else:
+                self._write_json(400, payload)
             return
 
         raw = self.rfile.read(length)
         try:
             payload = json.loads(raw.decode("utf-8"))
         except Exception:
-            self._write_json(400, {"jsonrpc": "2.0", "error": {"code": -32700, "message": "Parse error."}, "id": None})
+            error = {"jsonrpc": "2.0", "error": {"code": -32700, "message": "Parse error."}, "id": None}
+            if path == "/mcp":
+                self._write_json(400, error, extra_headers={"MCP-Protocol-Version": MCP_PROTOCOL_VERSION})
+            else:
+                self._write_json(400, error)
+            return
+
+        if path == "/mcp":
+            status_code, response = _dispatch_mcp_http_request(self.server.app, payload)
+            headers = {"MCP-Protocol-Version": MCP_PROTOCOL_VERSION}
+            if response is None:
+                self._write_empty(status_code, extra_headers=headers)
+            else:
+                self._write_json(status_code, response, extra_headers=headers)
             return
 
         if not isinstance(payload, dict):
@@ -173,6 +393,10 @@ class RemoteAPIService:
     def endpoint(self) -> str:
         return f"http://{self.host}:{self.port}/rpc"
 
+    @property
+    def mcp_endpoint(self) -> str:
+        return f"http://{self.host}:{self.port}/mcp"
+
     def start(self):
         if self._httpd is not None:
             return
@@ -206,6 +430,11 @@ class RemoteAPIService:
         if httpd is None:
             return
         try:
+            hub = getattr(self.app, "_remote_event_hub", None)
+            if hub is not None and hasattr(hub, "close_all"):
+                hub.close_all()
+            if hasattr(httpd, "close_active_connections"):
+                httpd.close_active_connections()
             httpd.shutdown()
         finally:
             try:

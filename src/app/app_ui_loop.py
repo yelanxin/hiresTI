@@ -37,6 +37,8 @@ def on_seek(self, s):
                     self._mpris_emit_seeked(float(target))
                 if hasattr(self, "_mpris_sync_position"):
                     self._mpris_sync_position(force=True)
+                if hasattr(self, "_remote_publish_playback_event"):
+                    self._remote_publish_playback_event("seek")
         finally:
             # Never keep seek-interacting state latched on errors, otherwise
             # progress UI can appear frozen.

@@ -151,6 +151,19 @@ def _player_state_snapshot(app):
     }
 
 
+def queue_public_snapshot(app):
+    queue_state = _queue_snapshot(app)
+    return {
+        "current_index": queue_state["current_index"],
+        "queue_size": len(queue_state["queue"]),
+        "tracks": [_serialize_track(track) for track in queue_state["queue"]],
+    }
+
+
+def player_state_snapshot(app):
+    return _player_state_snapshot(app)
+
+
 def _require_dict_params(params):
     if params is None:
         return {}
@@ -209,11 +222,12 @@ def _rpc_auth_status(app, _params):
         "remote_control_enabled": bool(getattr(app, "settings", {}).get("remote_api_enabled", False)),
         "access_mode": str(getattr(app, "settings", {}).get("remote_api_access_mode", "local") or "local"),
         "endpoint": getattr(app, "get_remote_api_endpoint", lambda: "")(),
+        "mcp_endpoint": getattr(app, "get_remote_mcp_endpoint", lambda: "")(),
     }
 
 
 def _rpc_player_get_state(app, _params):
-    return _invoke_on_main(app, _player_state_snapshot, app)
+    return _invoke_on_main(app, player_state_snapshot, app)
 
 
 def _do_player_play(app):
@@ -232,6 +246,8 @@ def _do_player_play(app):
             app._mpris_sync_playback()
         if hasattr(app, "_mpris_sync_position"):
             app._mpris_sync_position(force=True)
+        if hasattr(app, "_remote_publish_playback_event"):
+            app._remote_publish_playback_event("resumed")
         return _player_state_snapshot(app)
     if not queue:
         raise RemoteDispatchError(-32020, "No track available to play.")
@@ -288,6 +304,8 @@ def _rpc_player_stop(app, _params):
             app._mpris_sync_playback()
         if hasattr(app, "_mpris_sync_position"):
             app._mpris_sync_position(force=True)
+        if hasattr(app, "_remote_publish_playback_event"):
+            app._remote_publish_playback_event("stopped")
         return _player_state_snapshot(app)
 
     return _invoke_on_main(app, _stop)
@@ -308,21 +326,15 @@ def _rpc_player_seek(app, params):
             app._mpris_emit_seeked(float(target))
         if hasattr(app, "_mpris_sync_position"):
             app._mpris_sync_position(force=True)
+        if hasattr(app, "_remote_publish_playback_event"):
+            app._remote_publish_playback_event("seek")
         return _player_state_snapshot(app)
 
     return _invoke_on_main(app, _seek)
 
 
 def _rpc_queue_get(app, _params):
-    def _snapshot():
-        queue_state = _queue_snapshot(app)
-        return {
-            "current_index": queue_state["current_index"],
-            "queue_size": len(queue_state["queue"]),
-            "tracks": [_serialize_track(track) for track in queue_state["queue"]],
-        }
-
-    return _invoke_on_main(app, _snapshot)
+    return _invoke_on_main(app, queue_public_snapshot, app)
 
 
 def _rpc_queue_replace(app, params):
@@ -398,6 +410,59 @@ def _rpc_queue_play_index(app, params):
         return _player_state_snapshot(app)
 
     return _invoke_on_main(app, _play_index)
+
+
+def _rpc_queue_move(app, params):
+    payload = _require_dict_params(params)
+    from_index = _safe_int(payload.get("from_index"), -1)
+    to_index = _safe_int(payload.get("to_index"), -1)
+    if from_index < 0 or to_index < 0:
+        raise RemoteDispatchError(-32602, "from_index and to_index must be >= 0.")
+    try:
+        result = _invoke_on_main(app, app._remote_move_queue_item, from_index, to_index)
+    except (IndexError, ValueError) as exc:
+        raise RemoteDispatchError(-32602, str(exc)) from exc
+    result["queue"] = queue_public_snapshot(app)
+    return result
+
+
+def _rpc_queue_insert_at(app, params):
+    payload = _require_dict_params(params)
+    index = _safe_int(payload.get("index"), -1)
+    track_ids = payload.get("track_ids")
+    if index < 0:
+        raise RemoteDispatchError(-32602, "index must be >= 0.")
+    if not isinstance(track_ids, list) or not track_ids:
+        raise RemoteDispatchError(-32602, "track_ids must be a non-empty array.")
+    tracks, missing = _resolve_tracks_by_ids(app, track_ids)
+    if not tracks:
+        raise RemoteDispatchError(-32021, "No tracks could be resolved.", {"missing_ids": missing})
+    try:
+        result = _invoke_on_main(app, app._remote_insert_queue_at, tracks, index)
+    except (IndexError, ValueError) as exc:
+        raise RemoteDispatchError(-32602, str(exc)) from exc
+    result["missing_ids"] = missing
+    result["tracks"] = [_serialize_track(track) for track in tracks]
+    result["queue"] = queue_public_snapshot(app)
+    return result
+
+
+def _rpc_queue_insert_next(app, params):
+    payload = _require_dict_params(params)
+    track_ids = payload.get("track_ids")
+    if not isinstance(track_ids, list) or not track_ids:
+        raise RemoteDispatchError(-32602, "track_ids must be a non-empty array.")
+    tracks, missing = _resolve_tracks_by_ids(app, track_ids)
+    if not tracks:
+        raise RemoteDispatchError(-32021, "No tracks could be resolved.", {"missing_ids": missing})
+    try:
+        result = _invoke_on_main(app, app._remote_insert_queue_next, tracks)
+    except (IndexError, ValueError) as exc:
+        raise RemoteDispatchError(-32602, str(exc)) from exc
+    result["missing_ids"] = missing
+    result["tracks"] = [_serialize_track(track) for track in tracks]
+    result["queue"] = queue_public_snapshot(app)
+    return result
 
 
 def _match_score(item, track):
@@ -514,6 +579,9 @@ _METHODS = {
     "queue.clear": _rpc_queue_clear,
     "queue.remove_index": _rpc_queue_remove_index,
     "queue.play_index": _rpc_queue_play_index,
+    "queue.move": _rpc_queue_move,
+    "queue.insert_at": _rpc_queue_insert_at,
+    "queue.insert_next": _rpc_queue_insert_next,
     "search.match_tracks": _rpc_search_match_tracks,
 }
 

@@ -114,7 +114,12 @@ def _make_app():
     app._mpris_sync_all = lambda *a, **k: None
     app._mpris_emit_seeked = lambda *a, **k: None
     app._refresh_queue_views = lambda: None
+    app._remote_publish_event = lambda *a, **k: None
+    app._remote_publish_queue_event = lambda *a, **k: None
+    app._remote_publish_track_event = lambda *a, **k: None
+    app._remote_publish_playback_event = lambda *a, **k: None
     app.get_remote_api_endpoint = lambda: "http://0.0.0.0:18473/rpc"
+    app.get_remote_mcp_endpoint = lambda: "http://0.0.0.0:18473/mcp"
 
     def play_track(index):
         app.current_track_index = int(index)
@@ -164,6 +169,40 @@ def _make_app():
         app.play_queue.extend(list(tracks))
         return {"queue_size": len(app.play_queue), "added": len(list(tracks))}
 
+    def _remote_move_queue_item(from_index, to_index):
+        moved = app.play_queue.pop(from_index)
+        app.play_queue.insert(to_index, moved)
+        if app.current_track_index == from_index:
+            app.current_track_index = to_index
+            app.current_index = to_index
+            app.playing_track = app.play_queue[to_index]
+            app.playing_track_id = app.playing_track.id
+        return {
+            "queue_size": len(app.play_queue),
+            "from_index": int(from_index),
+            "to_index": int(to_index),
+            "current_index": app.current_track_index,
+        }
+
+    def _remote_insert_queue_at(tracks, index):
+        items = list(tracks)
+        app.play_queue[index:index] = items
+        if app.current_track_index >= index:
+            app.current_track_index += len(items)
+            app.current_index = app.current_track_index
+            app.playing_track = app.play_queue[app.current_track_index]
+            app.playing_track_id = app.playing_track.id
+        return {
+            "queue_size": len(app.play_queue),
+            "insert_index": int(index),
+            "inserted": len(items),
+            "current_index": app.current_track_index,
+        }
+
+    def _remote_insert_queue_next(tracks):
+        insert_index = app.current_track_index + 1 if app.current_track_index >= 0 else 0
+        return _remote_insert_queue_at(tracks, insert_index)
+
     app.play_track = play_track
     app.on_play_pause = on_play_pause
     app.on_next_track = on_next_track
@@ -172,6 +211,9 @@ def _make_app():
     app.on_queue_remove_track_clicked = on_queue_remove_track_clicked
     app._remote_replace_queue = _remote_replace_queue
     app._remote_append_queue = _remote_append_queue
+    app._remote_move_queue_item = _remote_move_queue_item
+    app._remote_insert_queue_at = _remote_insert_queue_at
+    app._remote_insert_queue_next = _remote_insert_queue_next
     return app
 
 
@@ -213,3 +255,54 @@ def test_search_match_tracks_prefers_title_and_artist_match():
     assert result["matched_count"] == 1
     assert result["results"][0]["matched"] is True
     assert result["results"][0]["track"]["id"] == "1"
+
+
+def test_auth_status_exposes_rpc_and_mcp_endpoints():
+    app = _make_app()
+
+    result = dispatch_rpc(app, "auth.status")
+
+    assert result["endpoint"] == "http://0.0.0.0:18473/rpc"
+    assert result["mcp_endpoint"] == "http://0.0.0.0:18473/mcp"
+
+
+def test_queue_move_reorders_tracks():
+    app = _make_app()
+
+    result = dispatch_rpc(
+        app,
+        "queue.move",
+        {"from_index": 0, "to_index": 1},
+    )
+
+    assert [track.id for track in app.play_queue] == ["2", "1"]
+    assert result["queue"]["tracks"][0]["id"] == "2"
+    assert result["current_index"] == 1
+
+
+def test_queue_insert_at_inserts_resolved_tracks():
+    app = _make_app()
+
+    result = dispatch_rpc(
+        app,
+        "queue.insert_at",
+        {"index": 1, "track_ids": ["3"]},
+    )
+
+    assert [track.id for track in app.play_queue] == ["1", "3", "2"]
+    assert result["insert_index"] == 1
+    assert result["inserted"] == 1
+    assert result["queue"]["queue_size"] == 3
+
+
+def test_queue_insert_next_uses_current_track_anchor():
+    app = _make_app()
+
+    result = dispatch_rpc(
+        app,
+        "queue.insert_next",
+        {"track_ids": ["3"]},
+    )
+
+    assert [track.id for track in app.play_queue] == ["1", "3", "2"]
+    assert result["insert_index"] == 1

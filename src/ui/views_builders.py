@@ -487,6 +487,7 @@ def build_settings_page(app):
     group_remote.append(row_remote_mode)
 
     row_remote_network = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
+    app.remote_api_network_row = row_remote_network
     network_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
     network_info.append(Gtk.Label(label="Network Binding", xalign=0, css_classes=["settings-label"]))
     network_info.append(
@@ -513,6 +514,7 @@ def build_settings_page(app):
     group_remote.append(row_remote_network)
 
     row_remote_allow = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
+    app.remote_api_allowlist_row = row_remote_allow
     allow_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
     allow_info.append(Gtk.Label(label="Allowed Clients", xalign=0, css_classes=["settings-label"]))
     allow_info.append(
@@ -532,9 +534,14 @@ def build_settings_page(app):
     row_remote_endpoint = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
     row_remote_endpoint.append(Gtk.Label(label="Endpoint", xalign=0, css_classes=["settings-label"]))
     row_remote_endpoint.append(Gtk.Box(hexpand=True))
+    endpoint_controls = Gtk.Box(spacing=8, halign=Gtk.Align.END)
     app.remote_api_endpoint_label = Gtk.Label(label="", xalign=1, css_classes=["dim-label"])
     app.remote_api_endpoint_label.set_selectable(True)
-    row_remote_endpoint.append(app.remote_api_endpoint_label)
+    endpoint_controls.append(app.remote_api_endpoint_label)
+    app.remote_api_endpoint_copy_btn = Gtk.Button(label="Copy", css_classes=["flat"])
+    app.remote_api_endpoint_copy_btn.connect("clicked", app.on_remote_api_copy_endpoint_clicked)
+    endpoint_controls.append(app.remote_api_endpoint_copy_btn)
+    row_remote_endpoint.append(endpoint_controls)
     group_remote.append(row_remote_endpoint)
 
     row_remote_status = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
