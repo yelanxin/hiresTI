@@ -63,8 +63,12 @@ Bundled Python dependencies used by packaging:
 
 ```bash
 python3 -m pip install -r requirements.txt
+cargo build --manifest-path src_rust/rust_audio_core/Cargo.toml --release
+cargo build --manifest-path src_rust/rust_viz_core/Cargo.toml --release
 python3 src/main.py
 ```
+
+`hiresTI` loads the Rust audio and visualizer cores from `src_rust/*/target/release`, so the `--release` build step is required before running from source.
 
 ## Remote Control / MCP (OpenClaw)
 
