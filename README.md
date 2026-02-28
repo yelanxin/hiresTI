@@ -84,6 +84,7 @@ Typical OpenClaw setup:
 5. Register the MCP service in OpenClaw:
 
 ```bash
+cd ~/.openclaw/workspace
 mcporter config add hires_ti http://127.0.0.1:18473/mcp \
   --header "Authorization=Bearer <YOUR_REMOTE_TOKEN>"
 ```
@@ -91,6 +92,7 @@ mcporter config add hires_ti http://127.0.0.1:18473/mcp \
 Then verify it:
 
 ```bash
+mcporter list
 mcporter list hires_ti --schema
 mcporter call hires_ti.player_get_state
 ```
