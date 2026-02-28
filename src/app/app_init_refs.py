@@ -137,6 +137,12 @@ def _init_runtime_refs(self):
     self._seek_commit_source = 0
     self._seek_user_interacting = False
     self._search_suggest_focus_check_source = 0
+    self._search_focus_suppressed_until_us = 0
+    self._search_press_active = False
+    self._search_press_start_x = 0.0
+    self._search_press_start_y = 0.0
+    self._search_press_in_header = False
+    self._search_header_dragging = False
 
 
 def init_ui_refs(self):

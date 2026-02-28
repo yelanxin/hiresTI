@@ -19,6 +19,9 @@ UI + packaging fix release: search suggestions polish, logout view reset, and ic
 ### Fixed
 - Logout now resets the right-side content stack back to the login/home surface even when triggered from `search_view`.
 - Session restore no longer reopens stale `search_view`; it falls back to Home/grid state instead.
+- Search focus handling is now more consistent:
+  - dragging the header no longer leaves the search entry spuriously focused on release,
+  - clicking non-interactive blank areas now clears search focus and closes suggestions more reliably.
 - Bundled icon coverage improved:
   - Flatpak now installs the full `hicolor` icon set, not just the app icon,
   - runtime icon-theme search now checks bundled app paths more robustly,
@@ -30,6 +33,7 @@ UI + packaging fix release: search suggestions polish, logout view reset, and ic
 ### Tests
 - Added regression coverage for:
   - closing search suggestions when a search is executed,
+  - clearing search focus on blank-area clicks and suppressing focus after header drag,
   - resetting logout view state back to `grid_view`.
 
 ---

@@ -15,6 +15,7 @@ from background_viz import BackgroundVisualizer
 from ui import config as ui_config
 
 logger = logging.getLogger(__name__)
+_SEARCH_HEADER_DRAG_THRESHOLD_PX = 6.0
 
 
 
@@ -22,6 +23,17 @@ def _close_search_suggestions(app):
     pop = getattr(app, "search_suggest_popover", None)
     if pop is not None:
         pop.popdown()
+
+
+def _clear_search_focus(app):
+    _close_search_suggestions(app)
+    win = getattr(app, "win", None)
+    if win is not None:
+        try:
+            win.set_focus(None)
+        except Exception:
+            pass
+    return False
 
 
 def _widget_is_descendant(widget, ancestor):
@@ -34,6 +46,67 @@ def _widget_is_descendant(widget, ancestor):
         except Exception:
             return False
     return False
+
+
+def _widget_chain_preserves_search_focus(widget):
+    cur = widget
+    interactive_types = tuple(
+        cls for cls in (
+            getattr(Gtk, "Button", None),
+            getattr(Gtk, "ToggleButton", None),
+            getattr(Gtk, "CheckButton", None),
+            getattr(Gtk, "Switch", None),
+            getattr(Gtk, "DropDown", None),
+            getattr(Gtk, "ComboBox", None),
+            getattr(Gtk, "ComboBoxText", None),
+            getattr(Gtk, "Entry", None),
+            getattr(Gtk, "SearchEntry", None),
+            getattr(Gtk, "SpinButton", None),
+            getattr(Gtk, "Scale", None),
+            getattr(Gtk, "TextView", None),
+        )
+        if cls is not None
+    )
+    while cur is not None:
+        if interactive_types and isinstance(cur, interactive_types):
+            return True
+        if not isinstance(cur, Gtk.Widget):
+            getter = getattr(cur, "get_focusable", None)
+            if getter is not None:
+                try:
+                    if getter():
+                        return True
+                except Exception:
+                    pass
+        try:
+            cur = cur.get_parent()
+        except Exception:
+            return False
+    return False
+
+
+def _suppress_search_focus(app, duration_ms=220):
+    try:
+        now_us = GLib.get_monotonic_time()
+    except Exception:
+        now_us = 0
+    app._search_focus_suppressed_until_us = int(now_us) + (int(duration_ms) * 1000)
+
+
+def _search_focus_is_suppressed(app):
+    try:
+        now_us = GLib.get_monotonic_time()
+    except Exception:
+        now_us = 0
+    return int(getattr(app, "_search_focus_suppressed_until_us", 0) or 0) > int(now_us)
+
+
+def _reset_search_press_state(app):
+    app._search_press_active = False
+    app._search_press_start_x = 0.0
+    app._search_press_start_y = 0.0
+    app._search_press_in_header = False
+    app._search_header_dragging = False
 
 
 def _check_search_suggestions_focus(app):
@@ -73,6 +146,8 @@ def _maybe_show_search_suggestions(app):
     pop = getattr(app, "search_suggest_popover", None)
     if entry is None or pop is None:
         return
+    if _search_focus_is_suppressed(app):
+        return
     pending = int(getattr(app, "_search_suggest_focus_check_source", 0) or 0)
     if pending:
         GLib.source_remove(pending)
@@ -97,6 +172,13 @@ def _on_search_entry_changed_for_suggestions(app, entry):
         _maybe_show_search_suggestions(app)
 
 
+def _on_search_entry_focus_enter(app):
+    if _search_focus_is_suppressed(app):
+        GLib.idle_add(lambda: _clear_search_focus(app))
+        return
+    _maybe_show_search_suggestions(app)
+
+
 def _click_is_on_entry(entry, win, x, y):
     try:
         ok, rect = entry.compute_bounds(win)
@@ -109,18 +191,82 @@ def _click_is_on_entry(entry, win, x, y):
         return hit is not None and _widget_is_descendant(hit, entry)
 
 
+def _should_track_header_drag(app, hit):
+    if hit is None:
+        return False
+    header = getattr(app, "header", None)
+    if header is None:
+        return False
+    if not _widget_is_descendant(hit, header):
+        return False
+    if _widget_chain_preserves_search_focus(hit):
+        return False
+    return True
+
+
 def _on_window_pressed_for_dismiss(app, x, y):
     pop = getattr(app, "search_suggest_popover", None)
     entry = getattr(app, "search_entry", None)
     win = getattr(app, "win", None)
     if pop is None or entry is None or win is None:
         return
+    hit = None
+    try:
+        hit = win.pick(x, y, Gtk.PickFlags.DEFAULT)
+    except Exception:
+        hit = None
+    app._search_press_active = True
+    app._search_press_start_x = float(x)
+    app._search_press_start_y = float(y)
+    app._search_press_in_header = _should_track_header_drag(app, hit)
+    app._search_header_dragging = False
     if _click_is_on_entry(entry, win, x, y):
         if not pop.get_visible():
             GLib.idle_add(lambda: (_maybe_show_search_suggestions(app), False)[1])
         return
+    if hit is not None and _widget_is_descendant(hit, pop):
+        return
     if pop.get_visible():
         _close_search_suggestions(app)
+    if not _widget_chain_preserves_search_focus(hit):
+        GLib.idle_add(lambda: _clear_search_focus(app))
+
+
+def _on_window_motion_for_search_focus(app, x, y):
+    if not bool(getattr(app, "_search_press_active", False)):
+        return
+    if not bool(getattr(app, "_search_press_in_header", False)):
+        return
+    if bool(getattr(app, "_search_header_dragging", False)):
+        return
+    dx = abs(float(x) - float(getattr(app, "_search_press_start_x", 0.0) or 0.0))
+    dy = abs(float(y) - float(getattr(app, "_search_press_start_y", 0.0) or 0.0))
+    if dx >= _SEARCH_HEADER_DRAG_THRESHOLD_PX or dy >= _SEARCH_HEADER_DRAG_THRESHOLD_PX:
+        app._search_header_dragging = True
+
+
+def _on_window_released_for_search_focus(app):
+    dragged = bool(getattr(app, "_search_header_dragging", False))
+    _reset_search_press_state(app)
+    if not dragged:
+        return
+    _suppress_search_focus(app)
+    GLib.idle_add(lambda: _clear_search_focus(app))
+
+
+def _on_window_focus_widget_changed(app):
+    if _search_focus_is_suppressed(app):
+        win = getattr(app, "win", None)
+        entry = getattr(app, "search_entry", None)
+        if win is not None and entry is not None:
+            try:
+                focus = win.get_focus()
+            except Exception:
+                focus = None
+            if focus is not None and _widget_is_descendant(focus, entry):
+                GLib.idle_add(lambda: _clear_search_focus(app))
+                return
+    _queue_search_suggestions_focus_check(app, delay_ms=10)
 
 
 def _setup_window_click_dismiss(app):
@@ -130,8 +276,15 @@ def _setup_window_click_dismiss(app):
     win_click = Gtk.GestureClick()
     win_click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
     win_click.connect("pressed", lambda _gest, _n, x, y: _on_window_pressed_for_dismiss(app, x, y))
+    win_click.connect("released", lambda *_args: _on_window_released_for_search_focus(app))
+    win_click.connect("stopped", lambda *_args: _reset_search_press_state(app))
     win.add_controller(win_click)
+    motion = Gtk.EventControllerMotion()
+    motion.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+    motion.connect("motion", lambda _ctrl, x, y: _on_window_motion_for_search_focus(app, x, y))
+    win.add_controller(motion)
     app._search_dismiss_gesture = win_click
+    app._search_focus_motion = motion
 
 
 def _build_search_suggestions_popover(app):
@@ -220,12 +373,12 @@ def build_header(app, container):
     app.search_entry.connect("changed", lambda entry: _on_search_entry_changed_for_suggestions(app, entry))
 
     focus_controller = Gtk.EventControllerFocus()
-    focus_controller.connect("enter", lambda *_args: _maybe_show_search_suggestions(app))
+    focus_controller.connect("enter", lambda *_args: _on_search_entry_focus_enter(app))
     focus_controller.connect("leave", lambda *_args: _queue_search_suggestions_focus_check(app))
     app.search_entry.add_controller(focus_controller)
 
     if getattr(app, "win", None) is not None:
-        app.win.connect("notify::focus-widget", lambda *_args: _queue_search_suggestions_focus_check(app, delay_ms=10))
+        app.win.connect("notify::focus-widget", lambda *_args: _on_window_focus_widget_changed(app))
         _setup_window_click_dismiss(app)
 
     box_right = Gtk.Box(spacing=6)
