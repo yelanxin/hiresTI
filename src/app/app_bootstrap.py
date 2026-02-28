@@ -42,6 +42,30 @@ def detect_app_version(self):
     return "dev"
 
 
+def _configure_icon_theme(display):
+    icon_theme = Gtk.IconTheme.get_for_display(display)
+    app_root = os.path.dirname(os.path.dirname(__file__))
+    project_root = os.path.dirname(app_root)
+    search_paths = [
+        os.path.join(app_root, "icons"),
+        os.path.join(project_root, "icons"),
+    ]
+    added = []
+    seen = set()
+    for path in search_paths:
+        norm = os.path.abspath(path)
+        if norm in seen or not os.path.isdir(norm):
+            continue
+        icon_theme.add_search_path(norm)
+        added.append(norm)
+        seen.add(norm)
+    if added:
+        logger.info("Added GTK icon theme search paths: %s", ", ".join(added))
+    else:
+        logger.warning("No bundled GTK icon theme search path found.")
+    return icon_theme
+
+
 def do_shutdown(self):
     logger.info("Shutting down application...")
     self._stop_mpris_service()
@@ -123,13 +147,7 @@ def do_activate(self):
         return
 
     src_dir = os.path.dirname(os.path.dirname(__file__))
-    project_root = os.path.dirname(src_dir)
-
-    icon_theme = Gtk.IconTheme.get_for_display(display)
-    # icons directory is in project root, not in src/
-    icons_path = os.path.join(project_root, "icons")
-    if os.path.exists(icons_path):
-        icon_theme.add_search_path(icons_path)
+    _configure_icon_theme(display)
 
     provider = Gtk.CssProvider()
     logo_svg = os.path.join(src_dir, "icons", "hicolor", "scalable", "apps", "hiresti.svg")

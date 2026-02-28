@@ -69,10 +69,12 @@ modules:
     buildsystem: simple
     build-commands:
       - install -d /app/share/hiresti
+      - install -d /app/share/icons/hicolor
       # Copy all Python source files from src/
       - cp -a src/* /app/share/hiresti/
       # Copy icons
       - cp -a icons /app/share/hiresti/
+      - cp -a icons/hicolor/. /app/share/icons/hicolor/
       # Copy version
       - cp version.txt /app/share/hiresti/version.txt
       # Desktop and metainfo files

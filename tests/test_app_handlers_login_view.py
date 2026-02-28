@@ -11,9 +11,13 @@ from app import app_auth
 class _Widget:
     def __init__(self):
         self.visible = None
+        self.sensitive = None
 
     def set_visible(self, v):
         self.visible = bool(v)
+
+    def set_sensitive(self, v):
+        self.sensitive = bool(v)
 
 
 class _Paned(_Widget):
@@ -23,6 +27,14 @@ class _Paned(_Widget):
 
     def set_position(self, pos):
         self.position = int(pos)
+
+
+class _Stack:
+    def __init__(self):
+        self.visible_child_name = None
+
+    def set_visible_child_name(self, name):
+        self.visible_child_name = name
 
 
 def _make_app():
@@ -36,10 +48,14 @@ def _make_app():
     app.tools_btn = _Widget()
     app.player_overlay = _Widget()
     app.bottom_bar = _Widget()
+    app.back_btn = _Widget()
     app.login_prompt_box = _Widget()
     app.alb_scroll = _Widget()
     app.sidebar_box = _Widget()
     app.search_entry = _Widget()
+    app.artist_fav_btn = _Widget()
+    app.right_stack = _Stack()
+    app.nav_history = ["search"]
     app.overlay_vis = []
     app._set_overlay_handles_visible = lambda v: app.overlay_vis.append(bool(v))
     return app
@@ -57,13 +73,17 @@ def test_toggle_login_view_logged_out(monkeypatch):
     app_handlers._toggle_login_view(app, False)
 
     assert app._session_restore_pending is False
+    assert app.right_stack.visible_child_name == "grid_view"
+    assert app.nav_history == []
     assert app.paned.position == 0
     assert app.paned.visible is True
     assert calls == [False]
+    assert app.back_btn.sensitive is False
     assert app.mini_btn.visible is False
     assert app.tools_btn.visible is False
     assert app.player_overlay.visible is False
     assert app.bottom_bar.visible is False
+    assert app.artist_fav_btn.visible is False
     assert app.overlay_vis[-1] is False
 
 
@@ -80,8 +100,8 @@ def test_toggle_login_view_logged_in(monkeypatch):
 
     app_handlers._toggle_login_view(app, True)
 
-    # win_w=800 and SIDEBAR_RATIO=0.20 -> paned pos is 160
-    assert app.paned.position == 160
+    # win_w=800 and SIDEBAR_RATIO=0.15 -> paned pos is 120
+    assert app.paned.position == 120
     assert app.paned.visible is True
     assert calls == [True]
     assert len(idle_calls) == 1

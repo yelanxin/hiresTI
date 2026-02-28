@@ -767,8 +767,12 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
 }
 
 .liked-artist-filter-img {
-    min-width: 54px;
-    min-height: 54px;
+    min-width: 60px;
+    min-height: 60px;
+}
+
+.liked-artist-filter-name {
+    font-weight: 300;
 }
 
 .liked-artist-count-badge {
@@ -801,6 +805,47 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
 .tracks-list row:hover,
 .boxed-list row:hover {
     background-color: alpha(currentColor, 0.06);
+}
+
+.search-suggest-popover {
+    padding: 0;
+}
+
+.search-suggest-scroll,
+.search-suggest-scroll viewport {
+    background: transparent;
+}
+
+.search-suggest-content {
+    min-width: 600px;
+}
+
+.search-suggest-title {
+    font-size: 16px;
+    font-weight: 800;
+}
+
+.search-suggest-chip {
+    min-height: 42px;
+    padding: 0 10px;
+    border-radius: 14px;
+    border: 1px solid alpha(currentColor, 0.16);
+    background-image: none;
+    background-color: alpha(currentColor, 0.10);
+    box-shadow: none;
+}
+
+.search-suggest-chip:hover {
+    border-color: alpha(@accent_bg_color, 0.50);
+    background-color: alpha(@accent_bg_color, 0.20);
+}
+
+.search-suggest-chip:active {
+    background-color: alpha(@accent_bg_color, 0.28);
+}
+
+.home-card-subtitle {
+    font-weight: 300;
 }
 
 """

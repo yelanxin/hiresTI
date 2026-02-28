@@ -1,5 +1,32 @@
 # Changelog
 
+## 1.3.2 - 2026-02-28
+UI + packaging fix release: search suggestions polish, logout view reset, and icon reliability hardening.
+
+### Changed
+- Recent Searches popover polished:
+  - clicking a recent search now closes the popover before navigating to results,
+  - recent-search chips now wrap by available width instead of fixed columns,
+  - chip spacing, padding, and top spacing were tightened for a denser layout.
+- Home card subtitles are now aligned with My Albums subtitle styling.
+- Liked Songs artist filter avatars increased to `60x60`.
+- Liked Songs artist filter labels now use lighter text weight (`300`).
+
+### Fixed
+- Logout now resets the right-side content stack back to the login/home surface even when triggered from `search_view`.
+- Bundled icon coverage improved:
+  - Flatpak now installs the full `hicolor` icon set, not just the app icon,
+  - runtime icon-theme search now checks bundled app paths more robustly,
+  - all app-referenced symbolic icons are now shipped locally,
+  - bundled symbolic icons now use theme-aware color (`currentColor`) for light/dark adaptation.
+
+### Tests
+- Added regression coverage for:
+  - closing search suggestions when a search is executed,
+  - resetting logout view state back to `grid_view`.
+
+---
+
 ## 1.3.1 - 2026-02-27
 Feature release: MPRIS remote-control integration for Linux desktop media controls.
 

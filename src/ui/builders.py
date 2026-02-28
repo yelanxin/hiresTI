@@ -9,12 +9,193 @@ if _viz_dir not in sys.path:
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Gtk, Adw, Pango
+from gi.repository import Gtk, Adw, Pango, GLib
 
 from background_viz import BackgroundVisualizer
 from ui import config as ui_config
 
 logger = logging.getLogger(__name__)
+
+
+
+def _close_search_suggestions(app):
+    pop = getattr(app, "search_suggest_popover", None)
+    if pop is not None:
+        pop.popdown()
+
+
+def _widget_is_descendant(widget, ancestor):
+    cur = widget
+    while cur is not None:
+        if cur is ancestor:
+            return True
+        try:
+            cur = cur.get_parent()
+        except Exception:
+            return False
+    return False
+
+
+def _check_search_suggestions_focus(app):
+    app._search_suggest_focus_check_source = 0
+    pop = getattr(app, "search_suggest_popover", None)
+    entry = getattr(app, "search_entry", None)
+    win = getattr(app, "win", None)
+    if pop is None or entry is None or win is None or not pop.get_visible():
+        return False
+    try:
+        focus = win.get_focus()
+    except Exception:
+        focus = None
+    if focus is not None and (_widget_is_descendant(focus, entry) or _widget_is_descendant(focus, pop)):
+        return False
+    _close_search_suggestions(app)
+    return False
+
+
+def _queue_search_suggestions_focus_check(app, delay_ms=0):
+    pending = int(getattr(app, "_search_suggest_focus_check_source", 0) or 0)
+    if pending:
+        GLib.source_remove(pending)
+        app._search_suggest_focus_check_source = 0
+
+    def _run():
+        return _check_search_suggestions_focus(app)
+
+    if int(delay_ms or 0) > 0:
+        app._search_suggest_focus_check_source = GLib.timeout_add(int(delay_ms), _run)
+    else:
+        app._search_suggest_focus_check_source = GLib.idle_add(_run)
+
+
+def _maybe_show_search_suggestions(app):
+    entry = getattr(app, "search_entry", None)
+    pop = getattr(app, "search_suggest_popover", None)
+    if entry is None or pop is None:
+        return
+    pending = int(getattr(app, "_search_suggest_focus_check_source", 0) or 0)
+    if pending:
+        GLib.source_remove(pending)
+        app._search_suggest_focus_check_source = 0
+    if not entry.get_visible() or not entry.get_sensitive():
+        pop.popdown()
+        return
+    if not list(getattr(app, "search_history", [])):
+        pop.popdown()
+        return
+    if hasattr(app, "render_search_history"):
+        app.render_search_history()
+    pop.popup()
+
+
+
+def _on_search_entry_changed_for_suggestions(app, entry):
+    if str(entry.get_text() or "").strip():
+        _close_search_suggestions(app)
+        return
+    if entry.has_focus():
+        _maybe_show_search_suggestions(app)
+
+
+def _click_is_on_entry(entry, win, x, y):
+    try:
+        ok, rect = entry.compute_bounds(win)
+        if not ok or rect is None:
+            return False
+        return (rect.get_x() <= x <= rect.get_x() + rect.get_width() and
+                rect.get_y() <= y <= rect.get_y() + rect.get_height())
+    except Exception:
+        hit = win.pick(x, y, Gtk.PickFlags.DEFAULT)
+        return hit is not None and _widget_is_descendant(hit, entry)
+
+
+def _on_window_pressed_for_dismiss(app, x, y):
+    pop = getattr(app, "search_suggest_popover", None)
+    entry = getattr(app, "search_entry", None)
+    win = getattr(app, "win", None)
+    if pop is None or entry is None or win is None:
+        return
+    if _click_is_on_entry(entry, win, x, y):
+        if not pop.get_visible():
+            GLib.idle_add(lambda: (_maybe_show_search_suggestions(app), False)[1])
+        return
+    if pop.get_visible():
+        _close_search_suggestions(app)
+
+
+def _setup_window_click_dismiss(app):
+    win = getattr(app, "win", None)
+    if win is None:
+        return
+    win_click = Gtk.GestureClick()
+    win_click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+    win_click.connect("pressed", lambda _gest, _n, x, y: _on_window_pressed_for_dismiss(app, x, y))
+    win.add_controller(win_click)
+    app._search_dismiss_gesture = win_click
+
+
+def _build_search_suggestions_popover(app):
+    pop = Gtk.Popover()
+    pop.set_parent(app.search_entry)
+    pop.set_has_arrow(False)
+    pop.set_autohide(False)
+    pop.add_css_class("search-suggest-popover")
+
+    try:
+        pop.set_position(Gtk.PositionType.BOTTOM)
+    except Exception:
+        pass
+    try:
+        pop.set_offset(0, 8)
+    except Exception:
+        pass
+
+    scroll = Gtk.ScrolledWindow()
+    scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+    scroll.set_propagate_natural_height(True)
+    scroll.set_min_content_width(600)
+    scroll.set_max_content_height(480)
+    scroll.add_css_class("search-suggest-scroll")
+
+    content = Gtk.Box(
+        orientation=Gtk.Orientation.VERTICAL,
+        spacing=12,
+        margin_top=0,
+        margin_bottom=14,
+        margin_start=14,
+        margin_end=14,
+        css_classes=["search-suggest-content"],
+    )
+
+    history_section = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, css_classes=["search-suggest-section"])
+    history_head = Gtk.Box(spacing=8)
+    history_head.append(Gtk.Label(label="Recent Searches", xalign=0, css_classes=["search-suggest-title"], hexpand=True))
+    clear_btn = Gtk.Button(label="Clear", css_classes=["flat"])
+    clear_btn.connect("clicked", lambda _b: app.clear_search_history())
+    history_head.append(clear_btn)
+    history_section.append(history_head)
+
+    history_flow = Gtk.FlowBox(
+        selection_mode=Gtk.SelectionMode.NONE,
+        column_spacing=4,
+        row_spacing=6,
+        css_classes=["search-suggest-flow"],
+    )
+    history_flow.set_min_children_per_line(1)
+    history_flow.set_max_children_per_line(100)
+    history_flow.set_homogeneous(False)
+    history_flow.set_hexpand(True)
+    history_flow.set_halign(Gtk.Align.FILL)
+    history_section.append(history_flow)
+    content.append(history_section)
+
+    app.search_history_section = history_section
+    app.search_history_flow = history_flow
+    app.clear_history_btn = clear_btn
+
+    scroll.set_child(content)
+    pop.set_child(scroll)
+    return pop
 
 
 def build_header(app, container):
@@ -33,6 +214,19 @@ def build_header(app, container):
     app.search_entry.connect("activate", app.on_search)
     app.search_entry.connect("changed", app.on_search_changed)
     app.header.set_title_widget(app.search_entry)
+    app.search_suggest_popover = _build_search_suggestions_popover(app)
+
+    app.search_entry.connect("activate", lambda _entry: _close_search_suggestions(app))
+    app.search_entry.connect("changed", lambda entry: _on_search_entry_changed_for_suggestions(app, entry))
+
+    focus_controller = Gtk.EventControllerFocus()
+    focus_controller.connect("enter", lambda *_args: _maybe_show_search_suggestions(app))
+    focus_controller.connect("leave", lambda *_args: _queue_search_suggestions_focus_check(app))
+    app.search_entry.add_controller(focus_controller)
+
+    if getattr(app, "win", None) is not None:
+        app.win.connect("notify::focus-widget", lambda *_args: _queue_search_suggestions_focus_check(app, delay_ms=10))
+        _setup_window_click_dismiss(app)
 
     box_right = Gtk.Box(spacing=6)
 

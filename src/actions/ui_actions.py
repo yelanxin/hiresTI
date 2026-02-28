@@ -548,13 +548,17 @@ def render_search_history(app):
         return
 
     for query in history:
-        btn = Gtk.Button(label=query, css_classes=["flat"])
+        btn = Gtk.Button(label=query, css_classes=["search-suggest-chip"])
+        btn.set_hexpand(False)
+        btn.set_halign(Gtk.Align.START)
         btn.connect("clicked", lambda _b, q=query: _run_search(app, q))
         child = Gtk.FlowBoxChild()
+        child.set_hexpand(False)
+        child.set_halign(Gtk.Align.START)
         child.set_child(btn)
         app.search_history_flow.append(child)
 
-    app.search_history_section.set_visible(not app.search_entry.get_text().strip())
+    app.search_history_section.set_visible(True)
 
 
 def _remember_query(app, query):
@@ -590,14 +594,12 @@ def on_search_changed(app, entry):
         app.res_art_box.set_visible(False)
         app.res_alb_box.set_visible(False)
         app.res_pl_box.set_visible(False)
-        app.res_hist_box.set_visible(False)
         app.res_trk_box.set_visible(False)
         render_search_history(app)
         return
 
     # Enter-only search mode:
     # typing updates UI state only; no remote/local search is started here.
-    app.search_history_section.set_visible(False)
 
 
 def on_search(app, entry):
@@ -615,6 +617,13 @@ def _run_search(app, q):
         render_search_history(app)
         return
 
+    pop = getattr(app, "search_suggest_popover", None)
+    if pop is not None:
+        try:
+            pop.popdown()
+        except Exception:
+            logger.debug("Failed to close search suggestions popover", exc_info=True)
+
     query_variants = _generate_search_variants(q)
     if not query_variants:
         query_variants = [q]
@@ -627,7 +636,6 @@ def _run_search(app, q):
         app._remember_last_view("search_view")
     app.nav_list.select_row(None)
     app.back_btn.set_sensitive(True)
-    app.search_history_section.set_visible(False)
     set_search_status(app, "Searching...")
     app._search_request_id = getattr(app, "_search_request_id", 0) + 1
     request_id = app._search_request_id
@@ -636,13 +644,11 @@ def _run_search(app, q):
     _clear_container(app.res_art_flow)
     _clear_container(app.res_alb_flow)
     _clear_container(app.res_pl_flow)
-    _clear_container(app.res_hist_list)
     _clear_container(app.res_trk_list)
 
     app.res_art_box.set_visible(False)
     app.res_alb_box.set_visible(False)
     app.res_pl_box.set_visible(False)
-    app.res_hist_box.set_visible(False)
     app.res_trk_box.set_visible(False)
 
     def do_search():
@@ -716,28 +722,26 @@ def render_search_results(app, res):
     albums = res.get("albums", [])
     tracks = res.get("tracks", [])
     playlists = res.get("playlists", [])
-    history_tracks = res.get("history_tracks", [])
-    if artists or albums or tracks or playlists or history_tracks:
+    if artists or albums or tracks or playlists:
         set_search_status(app, None)
     else:
         set_search_status(app, "No results found.")
 
     logger.info(
-        "Rendering search results: %s artists, %s albums, %s playlists, %s history tracks, %s tracks",
+        "Rendering search results: %s artists, %s albums, %s playlists, %s tracks",
         len(artists),
         len(albums),
         len(playlists),
-        len(history_tracks),
         len(tracks),
     )
 
     app.res_art_box.set_visible(bool(artists))
     for art in artists:
         card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, css_classes=["card", "home-card"])
-        img = Gtk.Image(pixel_size=100, css_classes=["circular-avatar"])
+        img = Gtk.Image(pixel_size=utils.COVER_SIZE, css_classes=["circular-avatar"])
         url = app.backend.get_artist_artwork_url(art, 320)
         logger.debug("Artist '%s' image URL: %s", getattr(art, "name", "Unknown"), url)
-        utils.load_img(img, url, app.cache_dir, 100)
+        utils.load_img(img, url, app.cache_dir, utils.COVER_SIZE)
         card.append(img)
         card.append(
             Gtk.Label(
@@ -813,53 +817,6 @@ def render_search_results(app, res):
         child = Gtk.FlowBoxChild()
         child.set_child(btn)
         app.res_pl_flow.append(child)
-
-    app.res_hist_box.set_visible(bool(history_tracks))
-    app.search_history_track_data = history_tracks
-    for t in history_tracks:
-        row_box = Gtk.Box(spacing=12, margin_top=8, margin_bottom=8, margin_start=12, margin_end=12)
-        img = Gtk.Image(pixel_size=48, css_classes=["album-cover-img"])
-        cover = app.backend.get_artwork_url(t, 80)
-        if not cover:
-            cover = getattr(t, "cover", None)
-        if not cover:
-            cover = getattr(getattr(t, "album", None), "cover", None)
-        if cover:
-            utils.load_img(img, cover, app.cache_dir, 48)
-        else:
-            img.set_from_icon_name("audio-x-generic-symbolic")
-        row_box.append(img)
-
-        info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, valign=Gtk.Align.CENTER)
-        track_name = getattr(t, "name", "Unknown")
-        info.append(Gtk.Label(label=track_name, xalign=0, ellipsize=3, css_classes=["heading", "track-title"]))
-        artist_name = getattr(getattr(t, "artist", None), "name", "Unknown")
-        info.append(Gtk.Label(label=artist_name, xalign=0, css_classes=["dim-label", "track-artist"]))
-        row_box.append(info)
-
-        dur_sec = int(getattr(t, "duration", 0) or 0)
-        if dur_sec > 0:
-            m, s = divmod(dur_sec, 60)
-            dur_str = f"{m}:{s:02d}"
-            lbl_dur = Gtk.Label(label=dur_str, xalign=1, css_classes=["dim-label", "track-duration"])
-            lbl_dur.set_attributes(Pango.AttrList.from_string("font-features 'tnum=1'"))
-            lbl_dur.set_size_request(64, -1)
-            row_box.append(Gtk.Box(hexpand=True))
-            row_box.append(lbl_dur)
-        else:
-            row_box.append(Gtk.Box(hexpand=True))
-
-        add_btn = Gtk.Button(icon_name="list-add-symbolic", css_classes=["flat", "circular", "history-scroll-btn"])
-        add_btn.set_tooltip_text("Add to Playlist")
-        add_btn.connect("clicked", lambda _b, tr=t: app.on_add_single_track_to_playlist(tr))
-        fav_btn = app.create_track_fav_button(t)
-        row_box.append(fav_btn)
-        row_box.append(add_btn)
-
-        lb_row = Gtk.ListBoxRow()
-        lb_row.add_css_class("track-row")
-        lb_row.set_child(row_box)
-        app.res_hist_list.append(lb_row)
 
     app.res_trk_box.set_visible(bool(tracks))
     app.search_track_data = tracks
@@ -971,40 +928,76 @@ def render_search_tracks_page(app):
     for i, pair in enumerate(page_items):
         abs_idx = int(pair[0])
         t = pair[1]
-        row_box = Gtk.Box(spacing=12, margin_top=8, margin_bottom=8, margin_start=12, margin_end=12)
+        row_box = Gtk.Box(
+            spacing=LAYOUT["col_gap"],
+            margin_top=LAYOUT["row_margin_y"],
+            margin_bottom=LAYOUT["row_margin_y"],
+            margin_start=LAYOUT["row_margin_x"],
+            margin_end=LAYOUT["row_margin_x"],
+        )
         sel_cb = Gtk.CheckButton()
         sel_cb.set_valign(Gtk.Align.CENTER)
         sel_cb.set_active(abs_idx in (getattr(app, "search_selected_indices", set()) or set()))
         sel_cb.connect("toggled", lambda cb, idx=abs_idx: app.on_search_track_checkbox_toggled(cb, idx, cb.get_active()))
         row_box.append(sel_cb)
-        img = Gtk.Image(pixel_size=48, css_classes=["album-cover-img"])
-        url = app.backend.get_artwork_url(t, 80)
-        utils.load_img(img, url, app.cache_dir, 48)
+
+        stack = Gtk.Stack()
+        stack.set_size_request(LAYOUT["index_width"], -1)
+        stack.add_css_class("track-index-stack")
+        lbl_idx = Gtk.Label(label=str(i + 1), css_classes=["dim-label"])
+        stack.add_named(lbl_idx, "num")
+        icon = Gtk.Image(icon_name="media-playback-start-symbolic")
+        icon.add_css_class("accent")
+        stack.add_named(icon, "icon")
+        if getattr(app, "playing_track_id", None) and getattr(t, "id", None) == app.playing_track_id:
+            stack.set_visible_child_name("icon")
+        else:
+            stack.set_visible_child_name("num")
+        row_box.append(stack)
+
+        img = Gtk.Image(pixel_size=DASHBOARD_TRACK_COVER_SIZE, css_classes=["album-cover-img"])
+        cover = app.backend.get_artwork_url(t, 320)
+        if cover is None:
+            cover = getattr(getattr(t, "album", None), "cover", None)
+        if cover:
+            utils.load_img(img, cover, app.cache_dir, DASHBOARD_TRACK_COVER_SIZE)
+        else:
+            img.set_from_icon_name("audio-x-generic-symbolic")
         row_box.append(img)
 
-        info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, valign=Gtk.Align.CENTER)
-        info.append(Gtk.Label(label=getattr(t, "name", "Unknown"), xalign=0, ellipsize=3, css_classes=["heading", "track-title"]))
-        artist_name = getattr(t.artist, "name", "Unknown") if hasattr(t, "artist") else "Unknown"
-        info.append(Gtk.Label(label=artist_name, xalign=0, css_classes=["dim-label", "track-artist"]))
-        row_box.append(info)
+        lbl_title = Gtk.Label(label=getattr(t, "name", "Unknown"), xalign=0, hexpand=True, ellipsize=3, css_classes=["track-title"])
+        lbl_title.set_tooltip_text(getattr(t, "name", ""))
+        row_box.append(lbl_title)
+
+        artist_name = getattr(getattr(t, "artist", None), "name", "Unknown")
+        lbl_art = Gtk.Label(label=artist_name, xalign=0, ellipsize=3, css_classes=["dim-label", "track-artist"])
+        lbl_art.set_tooltip_text(artist_name)
+        lbl_art.set_size_request(LAYOUT["artist_width"], -1)
+        lbl_art.set_max_width_chars(16)
+        lbl_art.set_margin_end(LAYOUT["cell_margin_end"])
+        row_box.append(lbl_art)
+
+        alb_name = getattr(getattr(t, "album", None), "name", "-") or "-"
+        lbl_alb = Gtk.Label(label=alb_name, xalign=0, ellipsize=3, css_classes=["dim-label", "track-album"])
+        lbl_alb.set_tooltip_text(alb_name)
+        lbl_alb.set_size_request(LAYOUT["album_width"], -1)
+        lbl_alb.set_max_width_chars(16)
+        lbl_alb.set_margin_end(LAYOUT["cell_margin_end"])
+        row_box.append(lbl_alb)
 
         dur_sec = getattr(t, "duration", 0)
         if dur_sec:
             m, s = divmod(dur_sec, 60)
-            dur_str = f"{m}:{s:02d}"
-            lbl_dur = Gtk.Label(label=dur_str, xalign=1, css_classes=["dim-label", "track-duration"])
+            lbl_dur = Gtk.Label(label=f"{m}:{s:02d}", xalign=1, css_classes=["dim-label", "track-duration"])
             lbl_dur.set_attributes(Pango.AttrList.from_string("font-features 'tnum=1'"))
-            lbl_dur.set_size_request(64, -1)
-            row_box.append(Gtk.Box(hexpand=True))
+            lbl_dur.set_size_request(LAYOUT["time_width"], -1)
             row_box.append(lbl_dur)
-        else:
-            row_box.append(Gtk.Box(hexpand=True))
 
+        fav_btn = app.create_track_fav_button(t)
+        row_box.append(fav_btn)
         add_btn = Gtk.Button(icon_name="list-add-symbolic", css_classes=["flat", "circular", "history-scroll-btn"])
         add_btn.set_tooltip_text("Add to Playlist")
         add_btn.connect("clicked", lambda _b, tr=t: app.on_add_single_track_to_playlist(tr))
-        fav_btn = app.create_track_fav_button(t)
-        row_box.append(fav_btn)
         row_box.append(add_btn)
 
         lb_row = Gtk.ListBoxRow()
@@ -1357,7 +1350,7 @@ def batch_load_home(app, sections):
                     halign=Gtk.Align.CENTER,
                     wrap=False,
                     max_width_chars=22,
-                    css_classes=["caption", "dim-label", "home-card-subtitle"],
+                    css_classes=["dim-label", "home-card-subtitle"],
                 )
             )
         btn = Gtk.Button(css_classes=["flat", "history-card-btn"])
@@ -1715,7 +1708,7 @@ def render_top_dashboard(app, prefer_cache=True):
                             halign=Gtk.Align.CENTER,
                             wrap=False,
                             max_width_chars=22,
-                            css_classes=["caption", "dim-label", "home-card-subtitle"],
+                            css_classes=["dim-label", "home-card-subtitle"],
                         )
                     )
                 btn = Gtk.Button(css_classes=["flat", "history-card-btn"])
@@ -2116,7 +2109,7 @@ def render_new_dashboard(app, prefer_cache=True):
                             halign=Gtk.Align.CENTER,
                             wrap=False,
                             max_width_chars=22,
-                            css_classes=["caption", "dim-label", "home-card-subtitle"],
+                            css_classes=["dim-label", "home-card-subtitle"],
                         )
                     )
                 btn = Gtk.Button(css_classes=["flat", "history-card-btn"])
@@ -2922,8 +2915,8 @@ def render_liked_songs_dashboard(app, tracks=None):
         card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, halign=Gtk.Align.CENTER)
         overlay = Gtk.Overlay()
         img = Gtk.Image(css_classes=["circular-avatar", "liked-artist-filter-img"])
-        img.set_size_request(54, 54)
-        img.set_pixel_size(54)
+        img.set_size_request(60, 60)
+        img.set_pixel_size(60)
         img.set_from_icon_name("avatar-default-symbolic")
         if artist_obj is not None:
             utils.load_img(
@@ -2932,7 +2925,7 @@ def render_liked_songs_dashboard(app, tracks=None):
                 # including album-art fallback when artist artwork is unavailable.
                 lambda a=artist_obj: app.backend.get_artist_artwork_url(a, 320),
                 app.cache_dir,
-                54,
+                60,
             )
         overlay.set_child(img)
 
@@ -2941,7 +2934,7 @@ def render_liked_songs_dashboard(app, tracks=None):
         badge.set_valign(Gtk.Align.END)
         overlay.add_overlay(badge)
         card.append(overlay)
-        card.append(Gtk.Label(label=name, css_classes=["dim-label"], max_width_chars=16, ellipsize=3))
+        card.append(Gtk.Label(label=name, css_classes=["dim-label", "liked-artist-filter-name"], max_width_chars=16, ellipsize=3))
 
         btn = Gtk.Button(css_classes=["flat", "liked-artist-filter-btn"])
         btn.set_tooltip_text(f"Show {name} tracks")
@@ -3901,3 +3894,59 @@ def render_daily_mixes(app, mixes):
 
         section_box.append(flow)
         app.collection_content_box.append(section_box)
+
+
+def open_explore_category(app, title, api_path):
+    """
+    Navigate to grid_view and render a Tidal genre/mood explore page
+    (e.g. pages/genre/hip_hop) using the same Home-style card layout.
+    Falls back to a keyword text search if the page returns no content.
+    """
+    _clear_container(app.collection_content_box)
+    app.right_stack.set_visible_child_name("grid_view")
+    if hasattr(app, "_remember_last_view"):
+        app._remember_last_view("grid_view")
+    app.nav_list.select_row(None)
+    app.back_btn.set_sensitive(True)
+    app.artist_fav_btn.set_visible(False)
+    app.nav_history.clear()
+
+    if hasattr(app, "grid_title_label") and app.grid_title_label is not None:
+        app.grid_title_label.set_text(title)
+        app.grid_title_label.set_visible(True)
+    if hasattr(app, "grid_subtitle_label") and app.grid_subtitle_label is not None:
+        app.grid_subtitle_label.set_text("Explore on TIDAL")
+        app.grid_subtitle_label.set_visible(True)
+
+    loading = Gtk.Label(
+        label=f"Loading {title}...",
+        xalign=0,
+        css_classes=["dim-label"],
+        margin_start=8,
+        margin_top=8,
+    )
+    app.collection_content_box.append(loading)
+
+    def task():
+        sections = []
+        try:
+            sections = list(app.backend.get_page_sections(api_path) or [])
+        except Exception:
+            pass
+
+        def apply():
+            _clear_container(app.collection_content_box)
+            if sections:
+                app.batch_load_home(sections)
+            else:
+                # Graceful fallback: keyword text search
+                entry = getattr(app, "search_entry", None)
+                if entry is not None:
+                    entry.set_text(title)
+                    entry.set_position(-1)
+                app.on_search(entry)
+            return False
+
+        GLib.idle_add(apply)
+
+    Thread(target=task, daemon=True).start()

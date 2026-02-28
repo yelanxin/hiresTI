@@ -60,6 +60,19 @@ def on_logout_clicked(self, btn):
 
 def _toggle_login_view(self, logged_in):
     self._session_restore_pending = False
+    if not logged_in:
+        right_stack = getattr(self, "right_stack", None)
+        if right_stack is not None:
+            right_stack.set_visible_child_name("grid_view")
+        nav_history = getattr(self, "nav_history", None)
+        if hasattr(nav_history, "clear"):
+            nav_history.clear()
+        back_btn = getattr(self, "back_btn", None)
+        if back_btn is not None:
+            back_btn.set_sensitive(False)
+        artist_fav_btn = getattr(self, "artist_fav_btn", None)
+        if artist_fav_btn is not None:
+            artist_fav_btn.set_visible(False)
     paned = getattr(self, "paned", None)
     if paned is not None:
         if not logged_in:
@@ -86,6 +99,9 @@ def _toggle_login_view(self, logged_in):
     if bottom_bar is not None:
         bottom_bar.set_visible(bool(logged_in))
     self._set_overlay_handles_visible(bool(logged_in))
+    if logged_in and hasattr(self, "_schedule_viz_handle_realign"):
+        GLib.idle_add(lambda: (self._schedule_viz_handle_realign(animate=False), False)[1])
+        GLib.timeout_add(160, lambda: (self._schedule_viz_handle_realign(animate=False), False)[1])
 
 
 def _set_login_view_pending(self):
