@@ -148,3 +148,5 @@ def init_runtime(self):
     _init_paths_and_settings(self)
     _init_audio_and_data_services(self)
     _init_runtime_state(self)
+    if hasattr(self, "_init_remote_control_state"):
+        self._init_remote_control_state()

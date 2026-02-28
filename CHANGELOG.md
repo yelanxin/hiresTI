@@ -1,5 +1,39 @@
 # Changelog
 
+## 1.4.0 - 2026-02-28
+Feature release: LAN-capable remote control API and MCP bridge for OpenClaw-style integrations.
+
+### Added
+- Added a built-in remote-control service with HTTP JSON-RPC transport:
+  - supports playback control, queue inspection, queue replacement/append/remove/clear, and indexed queue playback,
+  - exposes structured `search.match_tracks` so external agents can resolve `title + artist` into playable TIDAL track IDs.
+- Added an MCP stdio bridge that forwards tool calls to the remote JSON-RPC service.
+- Added remote-control secret storage with generated Bearer API keys saved separately from normal settings.
+
+### Changed
+- Settings now include a dedicated `Remote Control` section with:
+  - enable/disable toggle,
+  - `Local only` vs `LAN` access mode,
+  - bind address, port, and optional client CIDR allowlist,
+  - API key generation and clipboard copy actions,
+  - live endpoint and runtime status display.
+- App startup/shutdown now manages the remote-control service lifecycle automatically when the feature is enabled.
+
+### Security
+- Remote control is disabled by default.
+- LAN access requires a Bearer API key on every request.
+- Optional IP/CIDR allowlists can restrict which local-network clients may connect.
+- Remote API secrets are stored in a dedicated file with restricted permissions.
+
+### Tests
+- Added regression coverage for:
+  - remote API key generation and rotation,
+  - CIDR parsing and client allowlist checks,
+  - JSON-RPC dispatch for player state, queue replacement, and structured track matching,
+  - runtime initialization including remote-control state setup.
+
+---
+
 ## 1.3.2 - 2026-02-28
 UI + packaging fix release: search suggestions polish, logout view reset, and icon reliability hardening.
 

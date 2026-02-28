@@ -62,6 +62,17 @@ def _init_widget_refs(self):
     self.remote_playlist_visibility_btn = None
     self.remote_playlist_more_btn = None
     self.remote_playlist_more_pop = None
+    self.remote_api_switch = None
+    self.remote_api_access_dd = None
+    self.remote_api_bind_entry = None
+    self.remote_api_port_spin = None
+    self.remote_api_allowlist_entry = None
+    self.remote_api_apply_btn = None
+    self.remote_api_endpoint_label = None
+    self.remote_api_status_label = None
+    self.remote_api_key_entry = None
+    self.remote_api_generate_btn = None
+    self.remote_api_copy_btn = None
     self.add_selected_tracks_btn = None
     self.like_selected_tracks_btn = None
     self.search_prev_page_btn = None
@@ -147,6 +158,13 @@ def _init_runtime_refs(self):
     self._search_press_in_header = False
     self._search_header_dragging = False
     self._global_share_gesture = None
+    self.remote_api_secret_file = None
+    self.remote_api_key = ""
+    self.remote_api_status_state = "stopped"
+    self.remote_api_status_text = "Stopped"
+    self.remote_api_last_error = ""
+    self._remote_api_service = None
+    self._remote_ui_syncing = False
 
 
 def init_ui_refs(self):

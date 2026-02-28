@@ -117,9 +117,9 @@ def test_init_runtime_calls_stages_in_order(monkeypatch):
     monkeypatch.setattr(mod, "_init_paths_and_settings", lambda self: calls.append("paths"))
     monkeypatch.setattr(mod, "_init_audio_and_data_services", lambda self: calls.append("audio"))
     monkeypatch.setattr(mod, "_init_runtime_state", lambda self: calls.append("state"))
-
     app = SimpleNamespace()
     app._detect_app_version = lambda: "1.2.3"
+    app._init_remote_control_state = lambda: calls.append("remote")
 
     mod.init_runtime(app)
 
@@ -130,4 +130,5 @@ def test_init_runtime_calls_stages_in_order(monkeypatch):
         "paths",
         "audio",
         "state",
+        "remote",
     ]

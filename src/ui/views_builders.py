@@ -4,6 +4,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Gtk, Adw
 
+from app.app_remote_control import REMOTE_ACCESS_MODES
 import utils
 from ui.track_table import build_tracks_header, append_header_action_spacers
 
@@ -447,6 +448,129 @@ def build_settings_page(app):
 
     settings_vbox.append(group_out)
 
+    settings_vbox.append(Gtk.Label(label="Remote Control", xalign=0, css_classes=["section-title"], margin_top=10))
+    group_remote = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["settings-group"])
+
+    row_remote_enable = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
+    remote_enable_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
+    remote_enable_info.append(Gtk.Label(label="Enable Remote Control", xalign=0, css_classes=["settings-label"]))
+    remote_enable_info.append(
+        Gtk.Label(
+            label="Expose playback and queue control over HTTP JSON-RPC",
+            xalign=0,
+            css_classes=["dim-label"],
+        )
+    )
+    row_remote_enable.append(remote_enable_info)
+    row_remote_enable.append(Gtk.Box(hexpand=True))
+    app.remote_api_switch = Gtk.Switch(valign=Gtk.Align.CENTER)
+    app.remote_api_switch.connect("state-set", app.on_remote_api_enabled_toggled)
+    row_remote_enable.append(app.remote_api_switch)
+    group_remote.append(row_remote_enable)
+
+    row_remote_mode = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
+    mode_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
+    mode_info.append(Gtk.Label(label="Access Mode", xalign=0, css_classes=["settings-label"]))
+    mode_info.append(
+        Gtk.Label(
+            label="Local only is for same-machine clients. LAN is for another device on your network.",
+            xalign=0,
+            css_classes=["dim-label"],
+            wrap=True,
+        )
+    )
+    row_remote_mode.append(mode_info)
+    row_remote_mode.append(Gtk.Box(hexpand=True))
+    app.remote_api_access_dd = Gtk.DropDown(model=Gtk.StringList.new(REMOTE_ACCESS_MODES))
+    app.remote_api_access_dd.connect("notify::selected-item", app.on_remote_api_access_mode_changed)
+    row_remote_mode.append(app.remote_api_access_dd)
+    group_remote.append(row_remote_mode)
+
+    row_remote_network = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
+    network_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
+    network_info.append(Gtk.Label(label="Network Binding", xalign=0, css_classes=["settings-label"]))
+    network_info.append(
+        Gtk.Label(
+            label="Configure the bind address and port. Apply is required before changes take effect.",
+            xalign=0,
+            css_classes=["dim-label"],
+            wrap=True,
+        )
+    )
+    row_remote_network.append(network_info)
+    network_controls = Gtk.Box(spacing=8, hexpand=True, halign=Gtk.Align.END)
+    app.remote_api_bind_entry = Gtk.Entry(placeholder_text="0.0.0.0")
+    app.remote_api_bind_entry.set_width_chars(13)
+    network_controls.append(app.remote_api_bind_entry)
+    app.remote_api_port_spin = Gtk.SpinButton.new_with_range(1, 65535, 1)
+    app.remote_api_port_spin.set_numeric(True)
+    app.remote_api_port_spin.set_width_chars(6)
+    network_controls.append(app.remote_api_port_spin)
+    app.remote_api_apply_btn = Gtk.Button(label="Apply", css_classes=["flat"])
+    app.remote_api_apply_btn.connect("clicked", app.on_remote_api_apply_network_settings)
+    network_controls.append(app.remote_api_apply_btn)
+    row_remote_network.append(network_controls)
+    group_remote.append(row_remote_network)
+
+    row_remote_allow = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
+    allow_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
+    allow_info.append(Gtk.Label(label="Allowed Clients", xalign=0, css_classes=["settings-label"]))
+    allow_info.append(
+        Gtk.Label(
+            label="Optional CIDRs, e.g. 192.168.1.0/24 or 192.168.1.50/32",
+            xalign=0,
+            css_classes=["dim-label"],
+        )
+    )
+    row_remote_allow.append(allow_info)
+    row_remote_allow.append(Gtk.Box(hexpand=True))
+    app.remote_api_allowlist_entry = Gtk.Entry(placeholder_text="192.168.1.0/24, 192.168.1.50/32")
+    app.remote_api_allowlist_entry.set_width_chars(28)
+    row_remote_allow.append(app.remote_api_allowlist_entry)
+    group_remote.append(row_remote_allow)
+
+    row_remote_endpoint = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
+    row_remote_endpoint.append(Gtk.Label(label="Endpoint", xalign=0, css_classes=["settings-label"]))
+    row_remote_endpoint.append(Gtk.Box(hexpand=True))
+    app.remote_api_endpoint_label = Gtk.Label(label="", xalign=1, css_classes=["dim-label"])
+    app.remote_api_endpoint_label.set_selectable(True)
+    row_remote_endpoint.append(app.remote_api_endpoint_label)
+    group_remote.append(row_remote_endpoint)
+
+    row_remote_status = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
+    row_remote_status.append(Gtk.Label(label="Status", xalign=0, css_classes=["settings-label"]))
+    row_remote_status.append(Gtk.Box(hexpand=True))
+    app.remote_api_status_label = Gtk.Label(label="Stopped", xalign=1, css_classes=["dim-label"])
+    app.remote_api_status_label.set_selectable(True)
+    row_remote_status.append(app.remote_api_status_label)
+    group_remote.append(row_remote_status)
+
+    row_remote_key = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
+    key_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
+    key_info.append(Gtk.Label(label="API Key", xalign=0, css_classes=["settings-label"]))
+    key_info.append(
+        Gtk.Label(
+            label="Use this bearer token from OpenClaw or the MCP bridge.",
+            xalign=0,
+            css_classes=["dim-label"],
+        )
+    )
+    row_remote_key.append(key_info)
+    key_controls = Gtk.Box(spacing=8, hexpand=True, halign=Gtk.Align.END)
+    app.remote_api_key_entry = Gtk.Entry(editable=False, hexpand=True)
+    app.remote_api_key_entry.set_width_chars(32)
+    key_controls.append(app.remote_api_key_entry)
+    app.remote_api_copy_btn = Gtk.Button(label="Copy", css_classes=["flat"])
+    app.remote_api_copy_btn.connect("clicked", app.on_remote_api_copy_key_clicked)
+    key_controls.append(app.remote_api_copy_btn)
+    app.remote_api_generate_btn = Gtk.Button(label="Generate Key", css_classes=["flat"])
+    app.remote_api_generate_btn.connect("clicked", app.on_remote_api_generate_key_clicked)
+    key_controls.append(app.remote_api_generate_btn)
+    row_remote_key.append(key_controls)
+    group_remote.append(row_remote_key)
+
+    settings_vbox.append(group_remote)
+
     settings_vbox.append(Gtk.Label(label="Diagnostics", xalign=0, css_classes=["section-title"], margin_top=10))
     group_diag = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["settings-group"])
     row_diag = Gtk.Box(spacing=10, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
@@ -477,6 +601,8 @@ def build_settings_page(app):
     pop_box.append(sw)
     app._diag_pop.set_child(pop_box)
     app.events_btn.connect("clicked", app.show_diag_events)
+    if hasattr(app, "_refresh_remote_api_settings_ui"):
+        app._refresh_remote_api_settings_ui()
     app.right_stack.add_named(settings_scroll, "settings")
 
 

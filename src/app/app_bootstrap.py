@@ -68,6 +68,8 @@ def _configure_icon_theme(display):
 
 def do_shutdown(self):
     logger.info("Shutting down application...")
+    if hasattr(self, "_stop_remote_api"):
+        self._stop_remote_api(show_notice=False)
     self._stop_mpris_service()
     self._stop_tray_icon()
     self.settings["search_history"] = list(self.search_history)[:10]
@@ -126,6 +128,8 @@ def _restore_runtime_state(self):
 def _run_post_activate_tasks(app):
     # Run non-critical startup work after first frame to improve perceived launch speed.
     app._start_mpris_service()
+    if hasattr(app, "_start_remote_api_if_enabled"):
+        app._start_remote_api_if_enabled()
     app._restore_session_async()
     app._schedule_update_ui_loop(40)
     app._schedule_output_status_loop(1000)

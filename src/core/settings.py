@@ -38,6 +38,11 @@ class SettingsSchema:
     search_history: list = field(default_factory=list)
     audio_cache_tracks: int = 20
     output_auto_rebind_once: bool = False
+    remote_api_enabled: bool = False
+    remote_api_access_mode: str = "local"
+    remote_api_bind_host: str = "0.0.0.0"
+    remote_api_port: int = 18473
+    remote_api_allowed_cidrs: list = field(default_factory=list)
 
 
 # Default settings as dict for quick access
@@ -67,6 +72,11 @@ DEFAULT_SETTINGS = {
     "search_history": [],
     "audio_cache_tracks": 20,
     "output_auto_rebind_once": False,
+    "remote_api_enabled": False,
+    "remote_api_access_mode": "local",
+    "remote_api_bind_host": "0.0.0.0",
+    "remote_api_port": 18473,
+    "remote_api_allowed_cidrs": [],
 }
 
 
@@ -97,6 +107,11 @@ _VALIDATION_RULES = {
     "search_history": (list, None, None, []),
     "audio_cache_tracks": (int, 0, 200, 20),
     "output_auto_rebind_once": (bool, None, None, False),
+    "remote_api_enabled": (bool, None, None, False),
+    "remote_api_access_mode": (str, None, None, "local"),
+    "remote_api_bind_host": (str, None, None, "0.0.0.0"),
+    "remote_api_port": (int, 1, 65535, 18473),
+    "remote_api_allowed_cidrs": (list, None, None, []),
 }
 
 
@@ -195,6 +210,12 @@ def normalize_settings(raw: Optional[dict[str, Any]]) -> dict[str, Any]:
     normalized["search_history"] = _as_str_list(raw.get("search_history"), DEFAULT_SETTINGS["search_history"])
     normalized["audio_cache_tracks"] = _as_int(raw.get("audio_cache_tracks"), DEFAULT_SETTINGS["audio_cache_tracks"], minimum=0, maximum=200)
     normalized["output_auto_rebind_once"] = _as_bool(raw.get("output_auto_rebind_once"), DEFAULT_SETTINGS["output_auto_rebind_once"])
+    normalized["remote_api_enabled"] = _as_bool(raw.get("remote_api_enabled"), DEFAULT_SETTINGS["remote_api_enabled"])
+    remote_mode = _as_str(raw.get("remote_api_access_mode"), DEFAULT_SETTINGS["remote_api_access_mode"]).lower()
+    normalized["remote_api_access_mode"] = remote_mode if remote_mode in ("local", "lan") else DEFAULT_SETTINGS["remote_api_access_mode"]
+    normalized["remote_api_bind_host"] = _as_str(raw.get("remote_api_bind_host"), DEFAULT_SETTINGS["remote_api_bind_host"])
+    normalized["remote_api_port"] = _as_int(raw.get("remote_api_port"), DEFAULT_SETTINGS["remote_api_port"], minimum=1, maximum=65535)
+    normalized["remote_api_allowed_cidrs"] = _as_str_list(raw.get("remote_api_allowed_cidrs"), DEFAULT_SETTINGS["remote_api_allowed_cidrs"], max_items=32)
     normalized["settings_version"] = CURRENT_SETTINGS_VERSION
 
     # Exclusive lock requires bit-perfect mode.
