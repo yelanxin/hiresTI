@@ -164,6 +164,10 @@ When reporting, include:
 - steps to reproduce
 - relevant log snippets (or the full log file path above)
 
+## Acknowledgements
+
+Special thanks to everyone who shares feedback. In particular, [ilijagosp](https://github.com/ilijagosp) has provided feedback and suggestions with every new release.
+
 ## License
 
 GPL-3.0
