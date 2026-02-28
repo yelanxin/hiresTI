@@ -54,6 +54,9 @@ def _init_widget_refs(self):
     self.events_btn = None
     self.search_content_box = None
     self.search_suggest_popover = None
+    self.global_share_popover = None
+    self.content_window_handle = None
+    self.content_vbox = None
     self.add_playlist_btn = None
     self.remote_playlist_edit_btn = None
     self.remote_playlist_visibility_btn = None
@@ -143,6 +146,7 @@ def _init_runtime_refs(self):
     self._search_press_start_y = 0.0
     self._search_press_in_header = False
     self._search_header_dragging = False
+    self._global_share_gesture = None
 
 
 def init_ui_refs(self):

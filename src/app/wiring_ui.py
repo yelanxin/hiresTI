@@ -7,6 +7,8 @@ def bind_tray(TidalApp, seen=None):
     from app.app_tray import (
         _get_tray_icon_path,
         _show_from_tray,
+        _copy_share_url_to_clipboard,
+        _share_from_tray,
         _quit_from_tray,
         _init_tray_icon,
         _stop_tray_icon,
@@ -16,6 +18,8 @@ def bind_tray(TidalApp, seen=None):
     bind_map(TidalApp, [
         ("_get_tray_icon_path", _get_tray_icon_path),
         ("_show_from_tray", _show_from_tray),
+        ("_copy_share_url_to_clipboard", _copy_share_url_to_clipboard),
+        ("_share_from_tray", _share_from_tray),
         ("_quit_from_tray", _quit_from_tray),
         ("_init_tray_icon", _init_tray_icon),
         ("_stop_tray_icon", _stop_tray_icon),

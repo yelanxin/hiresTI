@@ -8,6 +8,9 @@ UI + packaging fix release: search suggestions polish, logout view reset, and ic
   - clicking a recent search now closes the popover before navigating to results,
   - recent-search chips now wrap by available width instead of fixed columns,
   - chip spacing, padding, and top spacing were tightened for a denser layout.
+- Non-header right-click now opens an app context menu with `Share...` and `Close`:
+  - `Share...` copies the project's GitHub link and shows a copied notice,
+  - `Close` follows the app's normal window close behavior.
 - Search page structure simplified:
   - removed the in-page Recent Searches block in favor of the header popover flow,
   - removed the separate History Tracks search section,
@@ -22,6 +25,10 @@ UI + packaging fix release: search suggestions polish, logout view reset, and ic
 - Search focus handling is now more consistent:
   - dragging the header no longer leaves the search entry spuriously focused on release,
   - clicking non-interactive blank areas now clears search focus and closes suggestions more reliably.
+- Header and non-header window interactions are now split correctly:
+  - header right-click keeps the system default window menu,
+  - non-header drag-to-move behavior was restored,
+  - content layout stays expanded after the drag-handle restructuring.
 - Bundled icon coverage improved:
   - Flatpak now installs the full `hicolor` icon set, not just the app icon,
   - runtime icon-theme search now checks bundled app paths more robustly,
@@ -34,6 +41,7 @@ UI + packaging fix release: search suggestions polish, logout view reset, and ic
 - Added regression coverage for:
   - closing search suggestions when a search is executed,
   - clearing search focus on blank-area clicks and suppressing focus after header drag,
+  - global share context-menu interactions and clipboard copy behavior,
   - resetting logout view state back to `grid_view`.
 
 ---

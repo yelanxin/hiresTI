@@ -164,15 +164,20 @@ def do_activate(self):
     self.window_created = True
     self.win.connect("close-request", self.on_window_close_request)
 
-    self.window_handle = Gtk.WindowHandle()
-    self.win.set_content(self.window_handle)
-
     self.main_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-    self.window_handle.set_child(self.main_vbox)
+    self.win.set_content(self.main_vbox)
 
     self._build_header(self.main_vbox)
-    self._build_body(self.main_vbox)
-    self._build_player_bar(self.main_vbox)
+    self.content_window_handle = Gtk.WindowHandle()
+    self.content_window_handle.set_hexpand(True)
+    self.content_window_handle.set_vexpand(True)
+    self.main_vbox.append(self.content_window_handle)
+    self.content_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+    self.content_vbox.set_hexpand(True)
+    self.content_vbox.set_vexpand(True)
+    self.content_window_handle.set_child(self.content_vbox)
+    self._build_body(self.content_vbox)
+    self._build_player_bar(self.content_vbox)
     self._setup_theme_watch()
     self._restore_runtime_state()
     self._set_login_view_pending()
