@@ -6,7 +6,7 @@
 ![License](https://img.shields.io/badge/License-GPL--3.0-purple)
 
 
-`hiresTI` is a native Linux desktop client for TIDAL, focused on stable playback, high-quality output paths, and a responsive GTK4/Libadwaita user experience.
+`hiresTI` is an AI-ready native Linux desktop client for TIDAL, focused on stable playback, high-quality output paths, a responsive GTK4/Libadwaita user experience, and OpenClaw/MCP integration for AI-driven control.
 
 ## Highlights
 
