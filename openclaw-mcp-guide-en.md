@@ -20,6 +20,7 @@ http://127.0.0.1:18473/mcp
 Use this command to register hiresTI in OpenClaw:
 
 ```bash
+cd ~/.openclaw/workspace
 mcporter config add hires_ti http://127.0.0.1:18473/mcp \
   --header "Authorization=Bearer <YOUR_REMOTE_TOKEN>"
 ```
