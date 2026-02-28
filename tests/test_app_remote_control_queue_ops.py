@@ -76,3 +76,23 @@ def test_remote_move_queue_item_handles_first_track_index_zero():
     assert [track.id for track in app.play_queue] == ["2", "3", "1"]
     assert app.current_track_index == 2
     assert result["current_index"] == 2
+
+
+def test_display_remote_api_host_prefers_detected_lan_ip_for_wildcard_bind(monkeypatch):
+    app = SimpleNamespace(settings={"remote_api_access_mode": "lan", "remote_api_bind_host": "0.0.0.0"})
+    app._effective_remote_api_host = lambda: app_remote_control._effective_remote_api_host(app)
+    app._display_remote_api_host = lambda: app_remote_control._display_remote_api_host(app)
+    monkeypatch.setattr(app_remote_control, "_discover_non_loopback_ipv4", lambda: "192.168.1.23")
+
+    assert app_remote_control._display_remote_api_host(app) == "192.168.1.23"
+    assert app_remote_control.get_remote_mcp_endpoint(app) == "http://192.168.1.23:18473/mcp"
+    assert app_remote_control.get_remote_api_endpoint(app) == "http://192.168.1.23:18473/rpc"
+
+
+def test_display_remote_api_host_keeps_explicit_bind_host(monkeypatch):
+    app = SimpleNamespace(settings={"remote_api_access_mode": "lan", "remote_api_bind_host": "192.168.50.10"})
+    app._effective_remote_api_host = lambda: app_remote_control._effective_remote_api_host(app)
+    app._display_remote_api_host = lambda: app_remote_control._display_remote_api_host(app)
+    monkeypatch.setattr(app_remote_control, "_discover_non_loopback_ipv4", lambda: "192.168.1.23")
+
+    assert app_remote_control._display_remote_api_host(app) == "192.168.50.10"

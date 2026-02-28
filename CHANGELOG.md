@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.4.1 - 2026-02-28
+Remote control UI clarification release: clearer MCP/RPC endpoint presentation and better LAN endpoint display.
+
+### Changed
+- Remote Control settings now show `MCP Endpoint` and `RPC Endpoint` as separate rows instead of a single ambiguous endpoint field.
+- Each endpoint row now has its own dedicated `Copy` action so OpenClaw/MCP setup uses the correct `/mcp` URL by default.
+- In `LAN` mode, when the bind host is `0.0.0.0`, the displayed endpoints now prefer the detected local machine IPv4 address instead of showing the wildcard bind address.
+
+### Fixed
+- Fixed Remote Control settings misleading MCP users by showing the `/rpc` endpoint as the primary endpoint.
+- Fixed `LAN` endpoint display showing `0.0.0.0`, which is valid for binding but not useful for clients connecting from another device.
+
+### Tests
+- Added regression coverage for endpoint display host selection with wildcard LAN bind addresses versus explicit bind hosts.
+
+---
+
 ## 1.4.0 - 2026-02-28
 Remote control + playback reliability release: LAN-capable remote API, MCP integration, queue/event automation, and immediate UI/state fixes.
 

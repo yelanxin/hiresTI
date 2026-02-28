@@ -5,6 +5,7 @@ from __future__ import annotations
 import ipaddress
 import logging
 import os
+import socket
 import threading
 
 from gi.repository import GLib
@@ -46,14 +47,50 @@ def _effective_remote_api_host(self):
     return str(self.settings.get("remote_api_bind_host", "0.0.0.0") or "0.0.0.0").strip() or "0.0.0.0"
 
 
+def _discover_non_loopback_ipv4():
+    candidates = []
+    try:
+        host_ip = socket.gethostbyname(socket.gethostname())
+        candidates.append(host_ip)
+    except Exception:
+        pass
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("198.51.100.1", 1))
+            candidates.append(sock.getsockname()[0])
+    except Exception:
+        pass
+    for ip in candidates:
+        token = str(ip or "").strip()
+        if not token or token.startswith("127."):
+            continue
+        try:
+            addr = ipaddress.ip_address(token)
+        except ValueError:
+            continue
+        if not addr.is_loopback:
+            return token
+    return None
+
+
+def _display_remote_api_host(self):
+    host = str(self._effective_remote_api_host() or "").strip() or "127.0.0.1"
+    if host not in ("0.0.0.0", "::", "[::]"):
+        return host
+    detected = _discover_non_loopback_ipv4()
+    if detected:
+        return detected
+    return host
+
+
 def get_remote_api_endpoint(self):
-    host = self._effective_remote_api_host()
+    host = self._display_remote_api_host()
     port = int(self.settings.get("remote_api_port", 18473) or 18473)
     return f"http://{host}:{port}/rpc"
 
 
 def get_remote_mcp_endpoint(self):
-    host = self._effective_remote_api_host()
+    host = self._display_remote_api_host()
     port = int(self.settings.get("remote_api_port", 18473) or 18473)
     return f"http://{host}:{port}/mcp"
 
@@ -122,7 +159,11 @@ def _refresh_remote_api_settings_ui(self):
 
         endpoint_label = getattr(self, "remote_api_endpoint_label", None)
         if endpoint_label is not None:
-            endpoint_label.set_label(self.get_remote_api_endpoint())
+            endpoint_label.set_label(self.get_remote_mcp_endpoint())
+
+        rpc_endpoint_label = getattr(self, "remote_api_rpc_endpoint_label", None)
+        if rpc_endpoint_label is not None:
+            rpc_endpoint_label.set_label(self.get_remote_api_endpoint())
 
         status_label = getattr(self, "remote_api_status_label", None)
         if status_label is not None:
@@ -365,10 +406,20 @@ def on_remote_api_copy_key_clicked(self, _btn=None):
 
 
 def on_remote_api_copy_endpoint_clicked(self, _btn=None):
-    copied = _copy_remote_text_to_clipboard(self, self.get_remote_api_endpoint(), "endpoint")
+    copied = _copy_remote_text_to_clipboard(self, self.get_remote_mcp_endpoint(), "MCP endpoint")
     if hasattr(self, "show_output_notice"):
         self.show_output_notice(
-            "Remote endpoint copied." if copied else "Failed to copy remote endpoint.",
+            "Remote MCP endpoint copied." if copied else "Failed to copy remote MCP endpoint.",
+            "ok" if copied else "warn",
+            2200,
+        )
+
+
+def on_remote_api_copy_rpc_endpoint_clicked(self, _btn=None):
+    copied = _copy_remote_text_to_clipboard(self, self.get_remote_api_endpoint(), "RPC endpoint")
+    if hasattr(self, "show_output_notice"):
+        self.show_output_notice(
+            "Remote RPC endpoint copied." if copied else "Failed to copy remote RPC endpoint.",
             "ok" if copied else "warn",
             2200,
         )

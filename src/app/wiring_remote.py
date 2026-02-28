@@ -5,6 +5,7 @@ from app.wiring_utils import bind_map
 
 def bind_remote_control(TidalApp, seen=None):
     from app.app_remote_control import (
+        _display_remote_api_host,
         _copy_remote_api_key_to_clipboard,
         _effective_remote_api_host,
         _ensure_remote_api_key,
@@ -31,12 +32,14 @@ def bind_remote_control(TidalApp, seen=None):
         on_remote_api_access_mode_changed,
         on_remote_api_apply_network_settings,
         on_remote_api_copy_endpoint_clicked,
+        on_remote_api_copy_rpc_endpoint_clicked,
         on_remote_api_copy_key_clicked,
         on_remote_api_enabled_toggled,
         on_remote_api_generate_key_clicked,
     )
 
     bind_map(TidalApp, [
+        ("_display_remote_api_host", _display_remote_api_host),
         ("_copy_remote_api_key_to_clipboard", _copy_remote_api_key_to_clipboard),
         ("_effective_remote_api_host", _effective_remote_api_host),
         ("_ensure_remote_api_key", _ensure_remote_api_key),
@@ -63,6 +66,7 @@ def bind_remote_control(TidalApp, seen=None):
         ("on_remote_api_access_mode_changed", on_remote_api_access_mode_changed),
         ("on_remote_api_apply_network_settings", on_remote_api_apply_network_settings),
         ("on_remote_api_copy_endpoint_clicked", on_remote_api_copy_endpoint_clicked),
+        ("on_remote_api_copy_rpc_endpoint_clicked", on_remote_api_copy_rpc_endpoint_clicked),
         ("on_remote_api_copy_key_clicked", on_remote_api_copy_key_clicked),
         ("on_remote_api_enabled_toggled", on_remote_api_enabled_toggled),
         ("on_remote_api_generate_key_clicked", on_remote_api_generate_key_clicked),

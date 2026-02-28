@@ -72,6 +72,8 @@ def _init_widget_refs(self):
     self.remote_api_apply_btn = None
     self.remote_api_endpoint_label = None
     self.remote_api_endpoint_copy_btn = None
+    self.remote_api_rpc_endpoint_label = None
+    self.remote_api_rpc_endpoint_copy_btn = None
     self.remote_api_status_label = None
     self.remote_api_key_entry = None
     self.remote_api_generate_btn = None

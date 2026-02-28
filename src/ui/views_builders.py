@@ -532,7 +532,7 @@ def build_settings_page(app):
     group_remote.append(row_remote_allow)
 
     row_remote_endpoint = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
-    row_remote_endpoint.append(Gtk.Label(label="Endpoint", xalign=0, css_classes=["settings-label"]))
+    row_remote_endpoint.append(Gtk.Label(label="MCP Endpoint", xalign=0, css_classes=["settings-label"]))
     row_remote_endpoint.append(Gtk.Box(hexpand=True))
     endpoint_controls = Gtk.Box(spacing=8, halign=Gtk.Align.END)
     app.remote_api_endpoint_label = Gtk.Label(label="", xalign=1, css_classes=["dim-label"])
@@ -543,6 +543,19 @@ def build_settings_page(app):
     endpoint_controls.append(app.remote_api_endpoint_copy_btn)
     row_remote_endpoint.append(endpoint_controls)
     group_remote.append(row_remote_endpoint)
+
+    row_remote_rpc_endpoint = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
+    row_remote_rpc_endpoint.append(Gtk.Label(label="RPC Endpoint", xalign=0, css_classes=["settings-label"]))
+    row_remote_rpc_endpoint.append(Gtk.Box(hexpand=True))
+    rpc_endpoint_controls = Gtk.Box(spacing=8, halign=Gtk.Align.END)
+    app.remote_api_rpc_endpoint_label = Gtk.Label(label="", xalign=1, css_classes=["dim-label"])
+    app.remote_api_rpc_endpoint_label.set_selectable(True)
+    rpc_endpoint_controls.append(app.remote_api_rpc_endpoint_label)
+    app.remote_api_rpc_endpoint_copy_btn = Gtk.Button(label="Copy", css_classes=["flat"])
+    app.remote_api_rpc_endpoint_copy_btn.connect("clicked", app.on_remote_api_copy_rpc_endpoint_clicked)
+    rpc_endpoint_controls.append(app.remote_api_rpc_endpoint_copy_btn)
+    row_remote_rpc_endpoint.append(rpc_endpoint_controls)
+    group_remote.append(row_remote_rpc_endpoint)
 
     row_remote_status = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
     row_remote_status.append(Gtk.Label(label="Status", xalign=0, css_classes=["settings-label"]))
