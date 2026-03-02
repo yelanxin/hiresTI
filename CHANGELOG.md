@@ -6,10 +6,12 @@ ALSA exclusive reliability + signal-path clarity release: one-shot D-Bus reserva
 ### Added
 - Added D-Bus `org.freedesktop.ReserveDevice1` ALSA reservation support via `src/services/alsa_reserve.py` so exclusive `hw:N,M` playback can politely ask PipeWire/WirePlumber to release the card only after a direct exclusive open fails.
 - Added ALSA exclusive runtime diagnostics that log the container adapter format, source bit depth, and active kernel `hw_params` when a 32-bit container-only DAC is in use.
+- Added a dedicated `Now Playing` overlay with synchronized playback progress, queue/track panels, lyrics view, and dynamic cover-driven visuals.
 - Added regression coverage for:
   - one-shot ALSA reservation retry behavior,
   - active ALSA `hw_params` parsing and container-adapter diagnostic dedupe,
-  - ALSA bit-perfect verdict rules that now allow lossless container widening such as `16-bit -> 32-bit`.
+  - ALSA bit-perfect verdict rules that now allow lossless container widening such as `16-bit -> 32-bit`,
+  - now-playing overlay state/lyrics sync, favorites sync, and shortcut behavior.
 
 ### Changed
 - ALSA exclusive output now tries direct hardware open first and only falls back to D-Bus reservation on failure, instead of reserving the device preemptively.
@@ -17,6 +19,7 @@ ALSA exclusive reliability + signal-path clarity release: one-shot D-Bus reserva
 - `Audio Signal Path` bit-perfect rules now treat ALSA exclusive playback as valid when the sample rate matches, the system mixer is bypassed, and output bit depth is greater than or equal to source bit depth.
 - `Bit-Perfect Mode` settings now include an explicit help popover explaining the difference between PipeWire source-rate following and true ALSA exclusive bit-perfect playback.
 - `Audio Signal Path` now uses a dedicated terminal-style black/green presentation with tighter row spacing.
+- Main player, queue, favorites, lyrics, and transport state now mirror into the `Now Playing` overlay so overlay controls stay in sync with the primary UI.
 
 ### Fixed
 - Fixed an ALSA exclusive retry loop caused by scheduling `set_output()` directly with `GLib.idle_add`, which repeatedly re-applied output switching after reservation success.
@@ -24,6 +27,7 @@ ALSA exclusive reliability + signal-path clarity release: one-shot D-Bus reserva
 - Fixed transport/output switch error reporting to include the last Rust/GStreamer error detail when available.
 - Fixed GTK slider warnings in the Signal Path window by removing the custom scrollbar slider override that conflicted with GTK sizing.
 - Fixed album favorite updates not appearing in time in the UI after toggling favorite state.
+- Fixed stale active lyric rows and delayed favorite/queue state refresh inside the `Now Playing` overlay.
 
 ### Tests
 - Verified with:
