@@ -134,6 +134,10 @@ class _RustAudioCore:
             lib.rac_free_string.restype = None
             lib.rac_free_string.argtypes = [ctypes.c_void_p]
 
+            if hasattr(lib, "rac_get_last_error"):
+                lib.rac_get_last_error.restype = ctypes.c_void_p
+                lib.rac_get_last_error.argtypes = [ctypes.c_void_p]
+
             lib.rac_get_spectrum_frame.restype = ctypes.c_int
             lib.rac_get_spectrum_frame.argtypes = [
                 ctypes.c_void_p,
@@ -487,6 +491,34 @@ class _RustAudioCore:
                 except Exception:
                     pass
 
+    def get_last_error(self):
+        """Return the last GStreamer error string from the Rust engine, or empty string."""
+        if (not self.available) or self._closed:
+            return ""
+        fn = getattr(self.lib, "rac_get_last_error", None)
+        if fn is None:
+            return ""
+        raw_ptr = None
+        try:
+            with self._call_lock:
+                if self._closed or not self.handle:
+                    return ""
+                raw_ptr = fn(self.handle)
+            if not raw_ptr:
+                return ""
+            raw = ctypes.cast(raw_ptr, ctypes.c_char_p).value
+            return (raw or b"").decode("utf-8", "replace")
+        except Exception:
+            return ""
+        finally:
+            if raw_ptr:
+                try:
+                    with self._call_lock:
+                        if not self._closed:
+                            self.lib.rac_free_string(ctypes.c_void_p(raw_ptr))
+                except Exception:
+                    pass
+
     def get_spectrum_frame(self):
         if (not self.available) or self._closed:
             return None
@@ -594,14 +626,28 @@ class RustAudioPlayerAdapter:
     Phase-1 adapter: keeps existing Python AudioPlayer behavior, while
     mirroring core transport state into Rust audio core for progressive migration.
     """
+    # Keywords that unambiguously indicate a physical device disconnect.
+    # Note: "alsa" is intentionally NOT here — the GStreamer element name
+    # "rust-alsa-sink" contains "alsa" and would cause false positives.
+    # ALSA-specific disconnect detection is handled in _classify_rust_error.
     _ERR_DEVICE_KEYS = (
         "disconnected",
         "no such device",
         "device has been disconnected",
-        "alsa",
         "pulseaudio",
         "pipewire",
         "outputting to audio device",
+    )
+    # Additional ALSA-specific keywords that, combined with "alsa" in the
+    # error text, indicate a real hardware problem (not just a sink name).
+    _ERR_ALSA_FAULT_KEYS = (
+        "cannot open",
+        "no such device",
+        "device or resource busy",
+        "input/output error",
+        "broken pipe",
+        "not available",
+        "unavailable",
     )
     _ERR_NETWORK_KEYS = ("timeout", "timed out", "network", "connection", "dns", "tls", "ssl")
     _ERR_CODEC_KEYS = ("decode", "decoder", "codec", "not-negotiated", "caps", "demux", "parser")
@@ -885,6 +931,7 @@ class RustAudioPlayerAdapter:
         self.visual_sync_auto_offset_ms = 0.0
         self.active_rate_switch = False
         self.exclusive_lock_mode = False
+        self._alsa_reservation = None  # AlsaDeviceReservation when held
         self.alsa_buffer_time = 100000
         self.alsa_latency_time = 10000
         self.output_state = "idle"
@@ -947,6 +994,9 @@ class RustAudioPlayerAdapter:
         self._output_switch_pending = None
         self._last_output_switch_sig = None
         self._last_output_switch_ts = 0.0
+        self._alsa_container_adapter_active = False
+        self._alsa_container_adapter_format = ""
+        self._alsa_container_adapter_diag_sig = ""
         self._pw_target_rate_hz = 0
         self._pw_allowed_rates_applied = False
         self._pw_last_enforce_ts = 0.0
@@ -1090,12 +1140,98 @@ class RustAudioPlayerAdapter:
             return
 
         self.stream_info = info
+        self._maybe_log_alsa_container_adapter_runtime()
         cb = getattr(self, "_on_tag_callback", None)
         if callable(cb):
             try:
                 GLib.idle_add(cb, self.stream_info)
             except Exception:
                 pass
+
+    def _read_active_alsa_hw_details(self):
+        device_id = str(getattr(self, "current_device_id", "") or "").strip()
+        m = re.match(r"hw:(\d+)(?:,(\d+))?$", device_id)
+        if not m:
+            return {}
+        card_idx = str(m.group(1))
+        pcm_idx = str(m.group(2) or "0")
+        proc_root = Path(getattr(self, "_alsa_proc_root", "/proc/asound"))
+        pcm_dir = proc_root / f"card{card_idx}" / f"pcm{pcm_idx}p"
+        if not pcm_dir.exists():
+            return {}
+
+        subdirs = sorted(pcm_dir.glob("sub*"))
+        if not subdirs:
+            return {}
+
+        for subdir in subdirs:
+            status_path = subdir / "status"
+            hw_path = subdir / "hw_params"
+            try:
+                status_text = status_path.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                status_text = ""
+            if status_text and ("RUNNING" not in status_text.upper()) and ("PREPARED" not in status_text.upper()):
+                continue
+            try:
+                hw_text = hw_path.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            details = {}
+            for raw in hw_text.splitlines():
+                line = str(raw or "").strip()
+                if ":" not in line:
+                    continue
+                key, val = line.split(":", 1)
+                key = key.strip().lower()
+                val = val.strip()
+                if key and val:
+                    details[key] = val
+            if details:
+                return details
+        return {}
+
+    def _maybe_log_alsa_container_adapter_runtime(self):
+        if not bool(getattr(self, "_alsa_container_adapter_active", False)):
+            return
+        if str(getattr(self, "current_driver", "") or "").upper() != "ALSA":
+            return
+        if not bool(getattr(self, "exclusive_lock_mode", False)):
+            return
+        info = dict(getattr(self, "stream_info", {}) or {})
+        source_depth = int(info.get("source_depth", 0) or info.get("depth", 0) or 0)
+        hw = self._read_active_alsa_hw_details()
+        hw_format = str(hw.get("format", "") or "").strip()
+        hw_rate = str(hw.get("rate", "") or "").strip()
+        access = str(hw.get("access", "") or "").strip()
+        period_size = str(hw.get("period_size", "") or "").strip()
+        buffer_size = str(hw.get("buffer_size", "") or "").strip()
+        if source_depth <= 0 and not hw_format:
+            return
+        sig = "|".join([
+            str(getattr(self, "_alsa_container_adapter_format", "") or ""),
+            str(source_depth or 0),
+            hw_format,
+            hw_rate,
+            access,
+            period_size,
+            buffer_size,
+            str(getattr(self, "current_device_id", "") or ""),
+        ])
+        if sig == str(getattr(self, "_alsa_container_adapter_diag_sig", "") or ""):
+            return
+        self._alsa_container_adapter_diag_sig = sig
+        logger.info(
+            "ALSA exclusive container adapter runtime: device=%s adapter_format=%s source_depth=%s hw_format=%s hw_rate=%s access=%s period_size=%s buffer_size=%s",
+            str(getattr(self, "current_device_id", "") or "default"),
+            str(getattr(self, "_alsa_container_adapter_format", "") or "unknown"),
+            source_depth if source_depth > 0 else "unknown",
+            hw_format or "unknown",
+            hw_rate or "unknown",
+            access or "unknown",
+            period_size or "unknown",
+            buffer_size or "unknown",
+        )
 
     def _maybe_pre_adjust_pipewire_rate(self, uri):
         """
@@ -1314,6 +1450,11 @@ class RustAudioPlayerAdapter:
         t = str(text or "").lower()
         if any(k in t for k in self._ERR_DEVICE_KEYS):
             return "device"
+        # "alsa" alone matches the GStreamer element name "rust-alsa-sink" and
+        # produces false positives.  Only classify as device error when the
+        # message also contains a specific hardware fault keyword.
+        if "alsa" in t and any(k in t for k in self._ERR_ALSA_FAULT_KEYS):
+            return "device"
         if any(k in t for k in self._ERR_NETWORK_KEYS):
             return "network"
         if any(k in t for k in self._ERR_CODEC_KEYS):
@@ -1322,6 +1463,16 @@ class RustAudioPlayerAdapter:
 
     def _apply_rust_error_policy(self, category, err_text):
         if category == "device":
+            # In exclusive ALSA mode, errors from the sink (clock drift, underruns,
+            # slave-method=none conflicts) must NOT trigger the reconnect recovery
+            # loop — that would call set_output repeatedly, creating an infinite cycle.
+            # Release the reservation and show the error; user can recover manually.
+            if bool(getattr(self, "exclusive_lock_mode", False)) and \
+                    str(getattr(self, "current_driver", "") or "").upper() == "ALSA":
+                self._release_alsa_reservation()
+                self.output_state = "error"
+                self.output_error = str(err_text or "ALSA exclusive mode error")
+                return
             self.output_state = "fallback"
             self.output_error = "USB audio device disconnected; switching output"
             if not self._rust_disconnect_recovering:
@@ -1346,9 +1497,14 @@ class RustAudioPlayerAdapter:
 
     def _mark_transport_error(self, op, rc):
         self.output_state = "error"
-        self.output_error = f"rust {op} rc={rc}"
+        detail = ""
         try:
-            self.event_log.append(f"Rust transport failure: op={op} rc={rc}")
+            detail = (self._rust.get_last_error() or "").strip()
+        except Exception:
+            pass
+        self.output_error = f"rust {op} rc={rc}" + (f": {detail}" if detail else "")
+        try:
+            self.event_log.append(f"Rust transport failure: op={op} rc={rc}" + (f": {detail}" if detail else ""))
             if len(self.event_log) > 50:
                 self.event_log[:] = self.event_log[-50:]
         except Exception:
@@ -1361,10 +1517,49 @@ class RustAudioPlayerAdapter:
         return True
 
     def toggle_bit_perfect(self, enabled, exclusive_lock=False):
+        old_exclusive = bool(getattr(self, "exclusive_lock_mode", False))
         self.bit_perfect_mode = bool(enabled)
         self.exclusive_lock_mode = bool(exclusive_lock)
         self.active_rate_switch = bool(enabled) and (not bool(exclusive_lock))
+        if old_exclusive and not exclusive_lock:
+            self._release_alsa_reservation()
         return True
+
+    def _release_alsa_reservation(self):
+        res = getattr(self, "_alsa_reservation", None)
+        if res is None:
+            return
+        self._alsa_reservation = None
+        threading.Thread(target=res.release, daemon=True).start()
+
+    def _start_alsa_reservation_async(self, driver, device_id, card_num):
+        """Acquire D-Bus device reservation in background, then retry set_output."""
+        from services.alsa_reserve import AlsaDeviceReservation
+
+        res = AlsaDeviceReservation(card_num)
+        self._alsa_reservation = res
+
+        def _thread():
+            ok = res.acquire()
+            logger.info(
+                "AlsaReserve: async acquisition result=%s card=%d", ok, card_num
+            )
+            if not ok:
+                self._alsa_reservation = None
+            def _retry_set_output_once():
+                try:
+                    self.set_output(driver, device_id)
+                except Exception:
+                    logger.exception(
+                        "AlsaReserve: deferred output retry failed: driver=%s device=%s",
+                        driver,
+                        device_id,
+                    )
+                return False
+
+            GLib.idle_add(_retry_set_output_once)
+
+        threading.Thread(target=_thread, daemon=True).start()
 
     def set_eq_band(self, band_index, gain):
         # Rust engine path has no Python equalizer chain.
@@ -1415,6 +1610,12 @@ class RustAudioPlayerAdapter:
                 self.output_error = None
             if msg:
                 lmsg = msg.lower()
+                if "container-adapter" in lmsg:
+                    m = re.search(r"format=([A-Za-z0-9_]+)", str(msg or ""))
+                    self._alsa_container_adapter_active = True
+                    self._alsa_container_adapter_format = str(m.group(1) if m else "")
+                    self._alsa_container_adapter_diag_sig = ""
+                    self._maybe_log_alsa_container_adapter_runtime()
                 if "playing" in lmsg:
                     self._cached_is_playing = True
                 elif "paused" in lmsg or "null" in lmsg or "ready" in lmsg:
@@ -1422,6 +1623,7 @@ class RustAudioPlayerAdapter:
                 if (
                     ("output-switched" in lmsg)
                     or ("pipewire-sink" in lmsg)
+                    or ("container-adapter" in lmsg)
                     or ("playing" in lmsg)
                     or ("paused" in lmsg)
                     or ("null" == lmsg)
@@ -1789,6 +1991,7 @@ class RustAudioPlayerAdapter:
             self._seek_flush_source = 0
         try:
             self._release_pipewire_clock_override(reason="cleanup")
+            self._release_alsa_reservation()
         finally:
             self._rust.close()
 
@@ -2055,6 +2258,9 @@ class RustAudioPlayerAdapter:
         self.requested_device_id = resolved_device_id
         self.current_driver = driver
         self.current_device_id = resolved_device_id
+        self._alsa_container_adapter_active = False
+        self._alsa_container_adapter_format = ""
+        self._alsa_container_adapter_diag_sig = ""
         self.output_state = "switching"
         self.output_error = None
         if str(driver or "") == "PipeWire":
@@ -2083,6 +2289,18 @@ class RustAudioPlayerAdapter:
         target_buffer = int(getattr(self, "alsa_buffer_time", 100000) or 100000)
         target_latency = int(getattr(self, "alsa_latency_time", 10000) or 10000)
         exclusive = bool(getattr(self, "exclusive_lock_mode", False))
+
+        is_alsa_exclusive = exclusive and str(driver or "").upper() == "ALSA"
+        cur_res = getattr(self, "_alsa_reservation", None) if is_alsa_exclusive else None
+
+        if is_alsa_exclusive and cur_res is not None and not cur_res.acquired:
+            # Reservation is being acquired in background; retry will happen from
+            # the async callback once D-Bus ownership is established.
+            return True
+        if not is_alsa_exclusive:
+            # Leaving ALSA exclusive mode or switching drivers — release reservation.
+            self._release_alsa_reservation()
+
         rc = self._rust.set_output(
             driver,
             resolved_device_id,
@@ -2097,13 +2315,39 @@ class RustAudioPlayerAdapter:
             self.output_error = None
             return True
 
+        detail = ""
+        try:
+            detail = (self._rust.get_last_error() or "").strip()
+        except Exception:
+            detail = ""
+
+        if is_alsa_exclusive and cur_res is None:
+            from services.alsa_reserve import parse_alsa_card_num
+
+            card_num = parse_alsa_card_num(str(resolved_device_id or ""))
+            if card_num is not None:
+                logger.info(
+                    "ALSA exclusive direct open failed; acquiring D-Bus reservation and retrying once: "
+                    "driver=%s device=%s rc=%s detail=%s",
+                    driver,
+                    resolved_device_id or "default",
+                    rc,
+                    detail or "n/a",
+                )
+                self._start_alsa_reservation_async(driver, resolved_device_id, card_num)
+                return True
+
         self.output_state = "error"
-        self.output_error = f"Output switch failed (rc={rc}) for {driver}/{resolved_device_id or 'default'}"
+        self.output_error = (
+            f"Output switch failed (rc={rc}) for {driver}/{resolved_device_id or 'default'}"
+            + (f": {detail}" if detail else "")
+        )
         logger.error(
-            "Rust output switch failed: driver=%s device=%s rc=%s",
+            "Rust output switch failed: driver=%s device=%s rc=%s detail=%s",
             driver,
             resolved_device_id,
             rc,
+            detail or "n/a",
         )
         return False
 

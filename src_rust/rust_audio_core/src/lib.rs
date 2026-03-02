@@ -464,7 +464,22 @@ impl Engine {
     fn parse_tag_text_value(text: &str, key: &str) -> Option<String> {
         let lower = text.to_ascii_lowercase();
         let pat = format!("{key}=");
-        let pos = lower.find(&pat)?;
+        // GStreamer serialises a TagList as "taglist, k1=(type)v1, k2=(type)v2, ...".
+        // A bare find("bitrate=") would also hit "maximum-bitrate=" or
+        // "nominal-bitrate=" since they contain "bitrate=" as a substring.
+        // Anchor the search on the ", " field separator to match the exact key.
+        let boundary = format!(", {key}=");
+        let pos = lower
+            .find(&boundary)
+            .map(|p| p + 2) // skip leading ", "
+            .or_else(|| {
+                // Edge case: key is the very first field (no leading ", ").
+                // GStreamer always prepends "taglist, " so the byte before
+                // key= is a space; guard against substring matches anyway.
+                lower
+                    .find(&pat)
+                    .filter(|&p| p == 0 || lower.as_bytes().get(p.wrapping_sub(1)) == Some(&b' '))
+            })?;
         let rest = &text[(pos + pat.len())..];
         let mut out = String::new();
         for ch in rest.chars() {
@@ -1123,44 +1138,29 @@ impl Engine {
                 }
             }
         } else if driver_norm.contains("alsa") {
-            let s = gst::ElementFactory::make("alsasink")
-                .name("rust-alsa-sink")
-                .build()
-                .ok();
-            match s {
-                Some(ref elem) => {
-                    if let Some(dev) = device_norm {
-                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            elem.set_property("device", dev);
-                        }));
+            match build_alsa_sink_element(device_norm, buffer_us, latency_us, exclusive) {
+                Ok((elem, forced_caps_format)) => {
+                    if let Some(fmt) = forced_caps_format {
+                        self.emit_event(
+                            EVT_STATE,
+                            &format!(
+                                "alsa-exclusive container-adapter format={} device={}",
+                                fmt,
+                                device_norm.unwrap_or("default")
+                            ),
+                        );
                     }
-                    let target_buffer = if buffer_us > 0 { buffer_us } else { 100_000 };
-                    let target_latency = if latency_us > 0 { latency_us } else { 10_000 };
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        elem.set_property("buffer-time", i64::from(target_buffer));
-                    }));
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        elem.set_property("latency-time", i64::from(target_latency));
-                    }));
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        elem.set_property("provide-clock", true);
-                    }));
-                    if exclusive {
-                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            // `slave-method` is an enum property on GstAlsaSink.
-                            // Setting it as integer can panic in Rust bindings
-                            // (type mismatch). Use enum nick string instead.
-                            if elem.find_property("slave-method").is_some() {
-                                elem.set_property_from_str("slave-method", "none");
-                            }
-                        }));
-                    }
-                    s
+                    Some(elem)
                 }
-                None => {
+                Err(-13) => {
                     self.set_error("alsasink unavailable");
                     self.emit_event(EVT_ERROR, "alsasink unavailable");
                     return -13;
+                }
+                Err(_) => {
+                    self.set_error("failed to create ALSA sink bin");
+                    self.emit_event(EVT_ERROR, "failed to create ALSA sink bin");
+                    return -15;
                 }
             }
         } else {
@@ -1602,6 +1602,99 @@ fn parse_alsa_playback_pcm_index(entry_name: &str) -> Option<String> {
     Some(middle.to_string())
 }
 
+fn parse_alsa_hw_device_id(device_id: &str) -> Option<(String, Option<String>)> {
+    let trimmed = device_id.trim();
+    let rest = trimmed.strip_prefix("hw:")?;
+    let mut parts = rest.split(',');
+    let card_idx = parts.next()?.trim();
+    if card_idx.is_empty() || !card_idx.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let pcm_idx = parts
+        .next()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty() && v.chars().all(|c| c.is_ascii_digit()));
+    Some((card_idx.to_string(), pcm_idx))
+}
+
+fn parse_alsa_playback_formats_from_stream_text(content: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_playback = false;
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.eq_ignore_ascii_case("Playback:") {
+            in_playback = true;
+            continue;
+        }
+        if line.eq_ignore_ascii_case("Capture:") {
+            in_playback = false;
+            continue;
+        }
+        if !in_playback {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("Format:") {
+            let fmt = rest.trim().to_ascii_uppercase();
+            if !fmt.is_empty() {
+                out.push(fmt);
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn read_alsa_card_playback_formats_from_proc_root(proc_root: &Path, card_idx: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let card_path = proc_root.join(format!("card{card_idx}"));
+    let Ok(entries) = std::fs::read_dir(card_path) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !(name.starts_with("stream") && name[6..].chars().all(|c| c.is_ascii_digit())) {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        out.extend(parse_alsa_playback_formats_from_stream_text(&content));
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn normalize_alsa_caps_container_format(playback_format: &str) -> Option<&'static str> {
+    match playback_format.trim().to_ascii_uppercase().as_str() {
+        "S32_LE" => Some("S32LE"),
+        "S24_32_LE" => Some("S24_32LE"),
+        _ => None,
+    }
+}
+
+fn detect_alsa_exclusive_caps_format_from_proc_root(
+    proc_root: &Path,
+    device_id: &str,
+) -> Option<String> {
+    let (card_idx, _pcm_idx) = parse_alsa_hw_device_id(device_id)?;
+    let formats = read_alsa_card_playback_formats_from_proc_root(proc_root, &card_idx);
+    if formats.is_empty() {
+        return None;
+    }
+    let mut forced: Option<&'static str> = None;
+    for fmt in formats {
+        let normalized = normalize_alsa_caps_container_format(&fmt)?;
+        match forced {
+            Some(cur) if cur != normalized => return None,
+            Some(_) => {}
+            None => forced = Some(normalized),
+        }
+    }
+    forced.map(str::to_string)
+}
+
 fn read_alsa_pcm_label(info_path: &Path) -> Option<String> {
     let Ok(content) = std::fs::read_to_string(info_path) else {
         return None;
@@ -1702,6 +1795,91 @@ fn list_alsa_cards_from_proc_root(proc_root: &Path) -> Vec<(String, Option<Strin
 
 fn list_alsa_cards() -> Vec<(String, Option<String>)> {
     list_alsa_cards_from_proc_root(Path::new("/proc/asound"))
+}
+
+fn build_alsa_sink_element(
+    device: Option<&str>,
+    buffer_us: i32,
+    latency_us: i32,
+    exclusive: bool,
+) -> Result<(gst::Element, Option<String>), c_int> {
+    let alsa_sink = gst::ElementFactory::make("alsasink")
+        .name("rust-alsa-sink")
+        .build()
+        .map_err(|_| -13)?;
+
+    if let Some(dev) = device {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            alsa_sink.set_property("device", dev);
+        }));
+    }
+    let target_buffer = if buffer_us > 0 { buffer_us } else { 100_000 };
+    let target_latency = if latency_us > 0 { latency_us } else { 10_000 };
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        alsa_sink.set_property("buffer-time", i64::from(target_buffer));
+    }));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        alsa_sink.set_property("latency-time", i64::from(target_latency));
+    }));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        alsa_sink.set_property("provide-clock", true);
+    }));
+    if exclusive {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // `slave-method` is an enum property on GstAlsaSink.
+            // Setting it as integer can panic in Rust bindings
+            // (type mismatch). Use enum nick string instead.
+            if alsa_sink.find_property("slave-method").is_some() {
+                alsa_sink.set_property_from_str("slave-method", "none");
+            }
+        }));
+    }
+
+    let forced_caps_format = if exclusive {
+        device.and_then(|dev| {
+            detect_alsa_exclusive_caps_format_from_proc_root(Path::new("/proc/asound"), dev)
+        })
+    } else {
+        None
+    };
+
+    let Some(fmt) = forced_caps_format.as_deref() else {
+        return Ok((alsa_sink, None));
+    };
+
+    let convert = gst::ElementFactory::make("audioconvert")
+        .name("rust-alsa-convert")
+        .build()
+        .map_err(|_| -15)?;
+    let capsfilter = gst::ElementFactory::make("capsfilter")
+        .name("rust-alsa-caps")
+        .build()
+        .map_err(|_| -15)?;
+    let caps = gst::Caps::builder("audio/x-raw")
+        .field("format", fmt)
+        .field("layout", "interleaved")
+        .build();
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        capsfilter.set_property("caps", &caps);
+    }));
+
+    let bin = gst::Bin::new();
+    if bin.add(&convert).is_err()
+        || bin.add(&capsfilter).is_err()
+        || bin.add(&alsa_sink).is_err()
+    {
+        return Err(-15);
+    }
+    if convert.link(&capsfilter).is_err() || capsfilter.link(&alsa_sink).is_err() {
+        return Err(-15);
+    }
+    let sink_pad = convert.static_pad("sink").ok_or(-15)?;
+    let ghost_sink = gst::GhostPad::with_target(&sink_pad).map_err(|_| -15)?;
+    if bin.add_pad(&ghost_sink).is_err() {
+        return Err(-15);
+    }
+
+    Ok((bin.upcast::<gst::Element>(), Some(fmt.to_string())))
 }
 
 fn devices_for_driver(driver: &str) -> Vec<(String, Option<String>)> {
@@ -2571,5 +2749,73 @@ mod tests {
                 Some("hw:1,0".to_string()),
             )]
         );
+    }
+
+    #[test]
+    fn alsa_stream_parser_reads_playback_formats_only() {
+        let text = r#"MUSILAND Monitor 09 at usb-0000:00:14.0-2, high speed : USB Audio
+
+Playback:
+  Status: Stop
+  Interface 1
+    Altset 1
+    Format: S32_LE
+    Channels: 2
+
+Capture:
+  Status: Stop
+  Interface 2
+    Altset 1
+    Format: S16_LE
+"#;
+
+        let formats = parse_alsa_playback_formats_from_stream_text(text);
+
+        assert_eq!(formats, vec!["S32_LE".to_string()]);
+    }
+
+    #[test]
+    fn alsa_exclusive_caps_format_detects_s32_only_device() {
+        let proc_root = TempProcRoot::new("alsa_stream_caps_s32");
+        proc_root.write(
+            "card2/stream0",
+            r#"USB DAC at usb-1, high speed : USB Audio
+
+Playback:
+  Interface 1
+    Altset 1
+    Format: S32_LE
+    Channels: 2
+    Rates: 44100, 48000
+"#,
+        );
+
+        let fmt = detect_alsa_exclusive_caps_format_from_proc_root(proc_root.path(), "hw:2,0");
+
+        assert_eq!(fmt, Some("S32LE".to_string()));
+    }
+
+    #[test]
+    fn alsa_exclusive_caps_format_skips_mixed_format_device() {
+        let proc_root = TempProcRoot::new("alsa_stream_caps_mixed");
+        proc_root.write(
+            "card2/stream0",
+            r#"USB DAC at usb-1, high speed : USB Audio
+
+Playback:
+  Interface 1
+    Altset 1
+    Format: S16_LE
+    Channels: 2
+  Interface 1
+    Altset 2
+    Format: S32_LE
+    Channels: 2
+"#,
+        );
+
+        let fmt = detect_alsa_exclusive_caps_format_from_proc_root(proc_root.path(), "hw:2,0");
+
+        assert_eq!(fmt, None);
     }
 }

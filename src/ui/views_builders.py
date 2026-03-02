@@ -326,8 +326,29 @@ def build_settings_page(app):
 
     row_bp = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
     bp_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
-    bp_info.append(Gtk.Label(label="Bit-Perfect Mode", xalign=0, css_classes=["settings-label"]))
-    bp_info.append(Gtk.Label(label="Bypass software mixer & EQ", xalign=0, css_classes=["dim-label"]))
+    bp_title_box = Gtk.Box(spacing=6, orientation=Gtk.Orientation.HORIZONTAL)
+    bp_title_box.append(Gtk.Label(label="Bit-Perfect Mode", xalign=0, css_classes=["settings-label"]))
+    bp_help_btn = Gtk.Button(icon_name="dialog-question-symbolic", css_classes=["flat", "circular"])
+    bp_help_btn.set_tooltip_text("Click for details")
+    bp_help_pop = Gtk.Popover()
+    bp_help_pop.set_parent(bp_help_btn)
+    bp_help_pop.set_autohide(True)
+    bp_pop_content = Gtk.Label(wrap=True, max_width_chars=44, xalign=0)
+    bp_pop_content.set_markup(
+        "<b>Bit-Perfect Mode</b>\n\n"
+        "• <b>Always:</b> bypasses the app EQ and app volume processing.\n\n"
+        "• <b>PipeWire mode:</b> follows the music source sample rate when possible, "
+        "but audio still passes through the system mixer.\n\n"
+        "• <b>ALSA + Exclusive mode:</b> bypasses the system mixer and is treated as "
+        "true bit-perfect playback."
+    )
+    bp_pop_box = Gtk.Box(margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
+    bp_pop_box.append(bp_pop_content)
+    bp_help_pop.set_child(bp_pop_box)
+    bp_help_btn.connect("clicked", lambda x: bp_help_pop.popup())
+    bp_title_box.append(bp_help_btn)
+    bp_info.append(bp_title_box)
+    bp_info.append(Gtk.Label(label="Bypass app EQ/volume; follow source rate when possible", xalign=0, css_classes=["dim-label"]))
     row_bp.append(bp_info)
     row_bp.append(Gtk.Box(hexpand=True))
     app.bp_switch = Gtk.Switch(valign=Gtk.Align.CENTER)

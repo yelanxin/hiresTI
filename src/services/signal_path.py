@@ -11,13 +11,127 @@ import glob
 logger = logging.getLogger("signal_path")
 
 class AudioSignalPathWindow(Adw.Window):
+    _TERMINAL_CSS = """
+    .signal-terminal-window,
+    .signal-terminal-window:backdrop,
+    .signal-terminal-content,
+    .signal-terminal-scroll,
+    .signal-terminal-clamp,
+    .signal-terminal-root {
+        background: #000000;
+        color: #6eff81;
+    }
+    .signal-terminal-header {
+        background: #000000;
+        color: #8dff9d;
+        border-bottom: 2px solid alpha(#6eff81, 0.34);
+        box-shadow: none;
+        border-radius: 0;
+    }
+    .signal-terminal-root {
+        background-image:
+            linear-gradient(to bottom, alpha(#6eff81, 0.03), transparent 48px),
+            repeating-linear-gradient(to bottom, alpha(#6eff81, 0.018) 0 1px, transparent 1px 3px);
+        padding: 8px 0 20px 0;
+    }
+    .signal-terminal-card {
+        background: #010301;
+        border-radius: 0;
+        border: 1px solid alpha(#6eff81, 0.42);
+        box-shadow: none;
+        outline: 1px solid alpha(#6eff81, 0.10);
+        outline-offset: -1px;
+    }
+    .signal-terminal-title {
+        font-size: 20px;
+        font-weight: 900;
+        letter-spacing: 1px;
+        text-transform: uppercase;
+        color: #a5ffaf;
+    }
+    .signal-terminal-subtitle,
+    .signal-terminal-subtle,
+    .signal-terminal-window .dim-label {
+        color: alpha(#6eff81, 0.72);
+    }
+    .signal-terminal-heading {
+        font-weight: 900;
+        text-transform: uppercase;
+        color: #bcffc3;
+    }
+    .signal-terminal-icon {
+        color: #63ff79;
+        -gtk-icon-size: 20px;
+    }
+    .signal-terminal-row {
+        padding: 1px 0;
+    }
+    .signal-terminal-key {
+        color: alpha(#6eff81, 0.74);
+    }
+    .signal-terminal-value {
+        font-weight: 800;
+        color: #cbffd1;
+        text-shadow: none;
+    }
+    .signal-terminal-window .success-text {
+        color: #7dff8b;
+        text-shadow: none;
+    }
+    .signal-terminal-window .warning-text {
+        color: #ffe066;
+    }
+    .signal-terminal-button {
+        min-height: 30px;
+        padding: 0 10px;
+        border-radius: 0;
+        border: 1px solid alpha(#6eff81, 0.40);
+        background: #010301;
+        color: #a7ffb3;
+        font-weight: 800;
+        box-shadow: none;
+    }
+    .signal-terminal-button:hover {
+        background: alpha(#6eff81, 0.08);
+        border-color: alpha(#6eff81, 0.62);
+    }
+    .signal-terminal-button:active {
+        background: alpha(#6eff81, 0.14);
+    }
+    .signal-terminal-arrow {
+        font-size: 20px;
+        font-weight: 900;
+        color: alpha(#6eff81, 0.48);
+        margin: -2px 0;
+    }
+    """
+    _terminal_css_provider = None
+
+    @classmethod
+    def _ensure_terminal_css(cls):
+        if cls._terminal_css_provider is not None:
+            return
+        display = Gdk.Display.get_default()
+        if display is None:
+            return
+        provider = Gtk.CssProvider()
+        provider.load_from_data(cls._TERMINAL_CSS.encode("utf-8"))
+        Gtk.StyleContext.add_provider_for_display(
+            display,
+            provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+        )
+        cls._terminal_css_provider = provider
+
     def __init__(self, parent_app):
         super().__init__(transient_for=parent_app.win, modal=True)
+        self._ensure_terminal_css()
         # [修复 1] 先初始化变量，防止 AttributeError
         self.timer_id = None 
         
         self.set_default_size(550, 760)
         self.set_title("Audio Signal Path")
+        self.add_css_class("signal-terminal-window")
         self.app = parent_app
         self.player = parent_app.player
         self._pw_runtime_cache_ts = 0.0
@@ -25,46 +139,52 @@ class AudioSignalPathWindow(Adw.Window):
 
         # 主界面容器
         content = Adw.ToolbarView()
+        content.add_css_class("signal-terminal-content")
         self.set_content(content)
 
         # 顶部栏
         header = Adw.HeaderBar()
+        header.add_css_class("signal-terminal-header")
         content.add_top_bar(header)
 
         # 滚动区域
         scroll = Gtk.ScrolledWindow()
+        scroll.add_css_class("signal-terminal-scroll")
         content.set_content(scroll)
 
         # 居中布局
         clamp = Adw.Clamp(maximum_size=550, margin_top=24, margin_bottom=24, margin_start=12, margin_end=12)
+        clamp.add_css_class("signal-terminal-clamp")
         scroll.set_child(clamp)
 
         # 垂直主盒子
         main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         main_box.add_css_class("signal-path-root")
+        main_box.add_css_class("signal-terminal-root")
         clamp.set_child(main_box)
         self.root_box = main_box
-        self._sync_theme_from_app()
 
         # --- 标题区域 ---
         title_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, margin_bottom=12)
-        lbl_title = Gtk.Label(label="Signal Path", css_classes=["title-2"])
-        lbl_sub = Gtk.Label(label="Live Audio Processing Pipeline", css_classes=["dim-label"])
+        lbl_title = Gtk.Label(label="Signal Path", css_classes=["signal-terminal-title"])
+        lbl_sub = Gtk.Label(label="Live Audio Processing Pipeline", css_classes=["signal-terminal-subtitle"])
         title_box.append(lbl_title)
         title_box.append(lbl_sub)
         main_box.append(title_box)
 
         # --- 顶部状态摘要 ---
-        self.summary_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["signal-card"], margin_bottom=8)
+        self.summary_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["signal-card", "signal-terminal-card"], margin_bottom=8)
         summary_head = Gtk.Box(spacing=8, margin_bottom=8)
-        summary_head.append(Gtk.Image.new_from_icon_name("dialog-information-symbolic"))
-        summary_head.append(Gtk.Label(label="Output Summary", xalign=0, css_classes=["heading"], hexpand=True))
-        self.copy_diag_btn = Gtk.Button(label="Copy", css_classes=["flat"])
+        summary_icon = Gtk.Image.new_from_icon_name("dialog-information-symbolic")
+        summary_icon.add_css_class("signal-terminal-icon")
+        summary_head.append(summary_icon)
+        summary_head.append(Gtk.Label(label="Output Summary", xalign=0, css_classes=["signal-terminal-heading"], hexpand=True))
+        self.copy_diag_btn = Gtk.Button(label="Copy", css_classes=["flat", "signal-terminal-button"])
         self.copy_diag_btn.set_tooltip_text("Copy diagnostics summary")
         self.copy_diag_btn.connect("clicked", self.on_copy_diagnostics_clicked)
         summary_head.append(self.copy_diag_btn)
         self.summary_card.append(summary_head)
-        self.summary_rows = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.summary_rows = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         self.summary_card.append(self.summary_rows)
         main_box.append(self.summary_card)
 
@@ -125,16 +245,17 @@ class AudioSignalPathWindow(Adw.Window):
 
     def create_stage_card(self, icon_name, title, subtitle):
         """创建每一级的卡片"""
-        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["signal-card"])
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["signal-card", "signal-terminal-card"])
         
         # 头部：图标 + 标题
         header = Gtk.Box(spacing=12, margin_bottom=12)
         icon = Gtk.Image.new_from_icon_name(icon_name)
         icon.add_css_class("signal-icon")
+        icon.add_css_class("signal-terminal-icon")
         
         text_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        lbl_t = Gtk.Label(label=title, xalign=0, css_classes=["heading"])
-        lbl_s = Gtk.Label(label=subtitle, xalign=0, css_classes=["caption", "dim-label"])
+        lbl_t = Gtk.Label(label=title, xalign=0, css_classes=["signal-terminal-heading"])
+        lbl_s = Gtk.Label(label=subtitle, xalign=0, css_classes=["signal-terminal-subtle"])
         text_box.append(lbl_t); text_box.append(lbl_s)
         
         header.append(icon)
@@ -142,7 +263,7 @@ class AudioSignalPathWindow(Adw.Window):
         card.append(header)
         
         # 内容区域
-        content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         card.content_box = content_box 
         card.append(content_box)
         
@@ -150,7 +271,7 @@ class AudioSignalPathWindow(Adw.Window):
 
     def create_arrow(self):
         """创建连接箭头"""
-        lbl = Gtk.Label(label="↓", css_classes=["signal-connector"])
+        lbl = Gtk.Label(label="↓", css_classes=["signal-connector", "signal-terminal-arrow"])
         return lbl
 
     def set_card_rows(self, card, rows):
@@ -165,8 +286,9 @@ class AudioSignalPathWindow(Adw.Window):
                 orientation=Gtk.Orientation.VERTICAL if is_long else Gtk.Orientation.HORIZONTAL,
                 spacing=4 if is_long else 0,
             )
+            row.add_css_class("signal-terminal-row")
 
-            lbl_key = Gtk.Label(label=label, xalign=0, css_classes=["dim-label"])
+            lbl_key = Gtk.Label(label=label, xalign=0, css_classes=["signal-terminal-key"])
             lbl_key.set_wrap(True)
             lbl_key.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
 
@@ -174,7 +296,7 @@ class AudioSignalPathWindow(Adw.Window):
                 label=value_text,
                 xalign=0 if is_long else 1,
                 hexpand=True,
-                css_classes=["stat-value"],
+                css_classes=["stat-value", "signal-terminal-value"],
             )
             lbl_val.set_wrap(True)
             lbl_val.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
@@ -435,8 +557,9 @@ class AudioSignalPathWindow(Adw.Window):
 
         for key, value, style in rows:
             row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
-            lbl_key = Gtk.Label(label=key, xalign=0, css_classes=["dim-label"])
-            lbl_val = Gtk.Label(label=value, xalign=1, hexpand=True, css_classes=["stat-value"])
+            row.add_css_class("signal-terminal-row")
+            lbl_key = Gtk.Label(label=key, xalign=0, css_classes=["signal-terminal-key"])
+            lbl_val = Gtk.Label(label=value, xalign=1, hexpand=True, css_classes=["stat-value", "signal-terminal-value"])
             lbl_val.set_wrap(True)
             if style == "ok":
                 lbl_val.add_css_class("success-text")
@@ -459,15 +582,22 @@ class AudioSignalPathWindow(Adw.Window):
             reasons.append(f"Output state is {output_state}")
 
         rate_match = self._rate_only_match(sample_rate, output_rate)
-        depth_match = self._depth_only_match(bit_depth, output_depth)
+        if driver == "ALSA" and exclusive:
+            depth_match = self._depth_container_match(bit_depth, output_depth)
+        else:
+            depth_match = self._depth_only_match(bit_depth, output_depth)
         format_match = bool(rate_match and depth_match)
 
-        # ALSA path: requires exclusive for strict direct mode (rate+depth match).
+        # ALSA exclusive path is bit-perfect when it keeps the original rate,
+        # bypasses the system mixer, and widens only into a lossless container
+        # format such as 16-bit PCM -> 32-bit container PCM.
         if driver == "ALSA":
             if not exclusive:
                 reasons.append("Not in exclusive mode")
-            if not format_match:
-                reasons.append("Rate/depth mismatch")
+            if exclusive and not rate_match:
+                reasons.append("Sample-rate mismatch")
+            if exclusive and not depth_match:
+                reasons.append("Output bit depth narrower than source")
         # PipeWire path: strict mode here also requires both rate and depth match.
         elif driver == "PipeWire":
             if bool(getattr(self.player, "_pipewire_rate_blocked", False)):
@@ -544,7 +674,7 @@ class AudioSignalPathWindow(Adw.Window):
         if sample_rate == "Unknown" or bit_depth == "Unknown":
             return False
         if driver == "ALSA" and self.player.exclusive_lock_mode:
-            return self._rate_only_match(sample_rate, output_rate) and self._depth_only_match(bit_depth, output_depth)
+            return self._rate_only_match(sample_rate, output_rate) and self._depth_container_match(bit_depth, output_depth)
         if driver == "PipeWire":
             return self._rate_only_match(sample_rate, output_rate) and self._depth_only_match(bit_depth, output_depth)
         return False
@@ -568,7 +698,7 @@ class AudioSignalPathWindow(Adw.Window):
         return a > 0 and b > 0 and a == b
 
     @staticmethod
-    def _depth_only_match(src_depth, out_depth):
+    def _depth_bits(v):
         def _to_bits(v):
             s = str(v or "").strip().lower()
             if not s or s == "unknown":
@@ -583,9 +713,19 @@ class AudioSignalPathWindow(Adw.Window):
                 return int(s)
             except Exception:
                 return 0
-        a = _to_bits(src_depth)
-        b = _to_bits(out_depth)
+        return _to_bits(v)
+
+    @classmethod
+    def _depth_only_match(cls, src_depth, out_depth):
+        a = cls._depth_bits(src_depth)
+        b = cls._depth_bits(out_depth)
         return a > 0 and b > 0 and a == b
+
+    @classmethod
+    def _depth_container_match(cls, src_depth, out_depth):
+        a = cls._depth_bits(src_depth)
+        b = cls._depth_bits(out_depth)
+        return a > 0 and b > 0 and b >= a
 
     @staticmethod
     def _parse_pw_depth(fmt):

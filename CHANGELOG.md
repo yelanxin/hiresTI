@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.4.5 - 2026-03-02
+ALSA exclusive reliability + signal-path clarity release: one-shot D-Bus reservation retry, 32-bit container DAC support, and clearer bit-perfect diagnostics/UI.
+
+### Added
+- Added D-Bus `org.freedesktop.ReserveDevice1` ALSA reservation support via `src/services/alsa_reserve.py` so exclusive `hw:N,M` playback can politely ask PipeWire/WirePlumber to release the card only after a direct exclusive open fails.
+- Added ALSA exclusive runtime diagnostics that log the container adapter format, source bit depth, and active kernel `hw_params` when a 32-bit container-only DAC is in use.
+- Added regression coverage for:
+  - one-shot ALSA reservation retry behavior,
+  - active ALSA `hw_params` parsing and container-adapter diagnostic dedupe,
+  - ALSA bit-perfect verdict rules that now allow lossless container widening such as `16-bit -> 32-bit`.
+
+### Changed
+- ALSA exclusive output now tries direct hardware open first and only falls back to D-Bus reservation on failure, instead of reserving the device preemptively.
+- ALSA exclusive sink creation in the Rust audio core now detects `S32_LE` / `S24_32_LE`-only playback devices from `/proc/asound/cardN/stream*` and inserts `audioconvert + capsfilter` to widen source PCM into the required container format without resampling.
+- `Audio Signal Path` bit-perfect rules now treat ALSA exclusive playback as valid when the sample rate matches, the system mixer is bypassed, and output bit depth is greater than or equal to source bit depth.
+- `Bit-Perfect Mode` settings now include an explicit help popover explaining the difference between PipeWire source-rate following and true ALSA exclusive bit-perfect playback.
+- `Audio Signal Path` now uses a dedicated terminal-style black/green presentation with tighter row spacing.
+
+### Fixed
+- Fixed an ALSA exclusive retry loop caused by scheduling `set_output()` directly with `GLib.idle_add`, which repeatedly re-applied output switching after reservation success.
+- Fixed ALSA exclusive error classification so generic `rust-alsa-sink` messages no longer trigger false device-disconnect recovery loops.
+- Fixed transport/output switch error reporting to include the last Rust/GStreamer error detail when available.
+- Fixed GTK slider warnings in the Signal Path window by removing the custom scrollbar slider override that conflicted with GTK sizing.
+
+### Tests
+- Verified with:
+  - `pytest -q tests/test_rust_audio_reservation_retry.py tests/test_signal_path_bitperfect.py tests/test_audio_output_state_transition.py`
+  - `cargo test --lib`
+
+---
+
 ## 1.4.1 - 2026-02-28
 Remote control UI clarification release: clearer MCP/RPC endpoint presentation and better LAN endpoint display.
 
