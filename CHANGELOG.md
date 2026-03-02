@@ -23,6 +23,7 @@ ALSA exclusive reliability + signal-path clarity release: one-shot D-Bus reserva
 - Fixed ALSA exclusive error classification so generic `rust-alsa-sink` messages no longer trigger false device-disconnect recovery loops.
 - Fixed transport/output switch error reporting to include the last Rust/GStreamer error detail when available.
 - Fixed GTK slider warnings in the Signal Path window by removing the custom scrollbar slider override that conflicted with GTK sizing.
+- Fixed album favorite updates not appearing in time in the UI after toggling favorite state.
 
 ### Tests
 - Verified with:
