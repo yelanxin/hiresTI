@@ -23,7 +23,9 @@
 
 ## Screenshots
 ### Main Window
-![Main Window](screenshots/1.3.1-1.png)
+![Main Window](screenshots/1.4.5-1.png)
+![Main Window](screenshots/1.4.5-2.png)
+
 ### Mini Mode
 <img src="screenshots/1.0.4-5.png" width="400">
 
