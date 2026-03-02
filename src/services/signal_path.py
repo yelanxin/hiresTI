@@ -296,7 +296,7 @@ class AudioSignalPathWindow(Adw.Window):
                 label=value_text,
                 xalign=0 if is_long else 1,
                 hexpand=True,
-                css_classes=["stat-value", "signal-terminal-value"],
+                css_classes=["signal-terminal-value"],
             )
             lbl_val.set_wrap(True)
             lbl_val.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
@@ -559,7 +559,7 @@ class AudioSignalPathWindow(Adw.Window):
             row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
             row.add_css_class("signal-terminal-row")
             lbl_key = Gtk.Label(label=key, xalign=0, css_classes=["signal-terminal-key"])
-            lbl_val = Gtk.Label(label=value, xalign=1, hexpand=True, css_classes=["stat-value", "signal-terminal-value"])
+            lbl_val = Gtk.Label(label=value, xalign=1, hexpand=True, css_classes=["signal-terminal-value"])
             lbl_val.set_wrap(True)
             if style == "ok":
                 lbl_val.add_css_class("success-text")
