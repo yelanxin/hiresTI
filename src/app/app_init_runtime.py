@@ -133,6 +133,9 @@ def _init_runtime_state(self):
     self._playing_pulse_on = False
     self._home_sections_cache = None
     self.stream_prefetch_cache = {}
+    self.eq_band_values = [0.0] * 10
+    self._eq_ui_syncing = False
+    self._volume_ui_syncing = False
     self._init_ui_refs()
 
     # Mini mode state must be initialized at startup.

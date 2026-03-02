@@ -9,6 +9,7 @@ from app.wiring_ui import (
     bind_builders,
     bind_favorites,
     bind_lifecycle,
+    bind_now_playing,
     bind_search,
     bind_tray,
     bind_ui_loop,
@@ -40,6 +41,7 @@ def wire_tidal_app(TidalApp, force=False):
     bind_favorites(TidalApp, seen=seen)
     bind_ui_loop(TidalApp, seen=seen)
     bind_search(TidalApp, seen=seen)
+    bind_now_playing(TidalApp, seen=seen)
     bind_builders(TidalApp, seen=seen)
     bind_remote_control(TidalApp, seen=seen)
     bind_audio_settings_extras(TidalApp, seen=seen)

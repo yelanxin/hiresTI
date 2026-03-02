@@ -728,6 +728,9 @@ def update_tech_label(self, info):
         for cls in ("tech-state-ok", "tech-state-mixed", "tech-state-warn"):
             self.lbl_tech.remove_css_class(cls)
         self.lbl_tech.set_visible(True)
+        # Track changed — reset bitrate stability tracking state.
+        self._bitrate_pending = 0
+        self._bitrate_shown = 0
         return
 
     display_codec = codec if codec and codec not in ["-", "Loading..."] else "PCM"
@@ -771,9 +774,27 @@ def update_tech_label(self, info):
 
     bitrate = int(info.get("bitrate", 0) or 0)
     if bitrate > 0:
-        kbps = max(1, int(round(bitrate / 1000.0)))
-        bitrate_text = f" • {kbps}k"
+        # GStreamer's bitrate estimate for lossless streams (FLAC) starts very
+        # low and converges upward over several TAG events.  Only display the
+        # value once two consecutive TAG events agree within ±40%, which means
+        # the estimate has stabilised.  Until then keep the last stable value
+        # (or show nothing if this is the very first track).
+        pending = int(getattr(self, "_bitrate_pending", 0) or 0)
+        shown   = int(getattr(self, "_bitrate_shown",   0) or 0)
+        self._bitrate_pending = bitrate
+        if pending > 0 and 0.6 <= bitrate / pending <= 1.67:
+            # Two consecutive similar readings → stable; update display.
+            self._bitrate_shown = bitrate
+            shown = bitrate
+        # If not yet stable: keep the previously confirmed value (or nothing).
+        if shown > 0:
+            kbps = max(1, int(round(shown / 1000.0)))
+            bitrate_text = f" • {kbps}kbps"
+        else:
+            bitrate_text = ""
     else:
+        self._bitrate_pending = 0
+        self._bitrate_shown = 0
         bitrate_text = ""
 
     is_bp = bool(getattr(self.player, "bit_perfect_mode", False))
@@ -810,8 +831,10 @@ def on_bit_perfect_toggled(self, switch, state):
     if not state: self.ex_switch.set_active(False)
     is_ex = self.ex_switch.get_active()
     self.player.toggle_bit_perfect(state, exclusive_lock=is_ex)
-    self.eq_btn.set_sensitive(not state)
-    if state: self.eq_pop.popdown()
+    if getattr(self, "eq_btn", None) is not None:
+        self.eq_btn.set_sensitive(not state)
+    if state and getattr(self, "eq_pop", None) is not None:
+        self.eq_pop.popdown()
     if self.bp_label is not None: self.bp_label.set_visible(state)
     if is_ex:
         self._force_driver_selection("ALSA"); self.driver_dd.set_sensitive(False); self.on_driver_changed(self.driver_dd, None)

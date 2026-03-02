@@ -144,6 +144,8 @@ def _set_overlay_handles_visible(self, visible):
     if visible:
         return
 
+    if hasattr(self, "hide_now_playing_overlay"):
+        self.hide_now_playing_overlay()
     self.close_queue_drawer()
     revealer = getattr(self, "viz_revealer", None)
     if revealer is not None:

@@ -103,14 +103,19 @@ def do_shutdown(self):
 
 def _restore_runtime_state(self):
     saved_volume = self.settings.get("volume", 80)
-    if self.vol_scale is not None:
+    if hasattr(self, "_sync_volume_ui_state"):
+        self._sync_volume_ui_state(value=saved_volume)
+    elif self.vol_scale is not None:
         self.vol_scale.set_value(saved_volume)
     if self.player is not None:
         self.player.set_volume(saved_volume / 100.0)
 
-    if self.mode_btn is not None:
-        self.mode_btn.set_icon_name(self.MODE_ICONS.get(self.play_mode, "hiresti-mode-loop-symbolic"))
-        self.mode_btn.set_tooltip_text(self.MODE_TOOLTIPS.get(self.play_mode, "Loop All (Album/Playlist)"))
+    mode_icon = self.MODE_ICONS.get(self.play_mode, "hiresti-mode-loop-symbolic")
+    mode_tip = self.MODE_TOOLTIPS.get(self.play_mode, "Loop All (Album/Playlist)")
+    for btn in (getattr(self, "mode_btn", None), getattr(self, "now_playing_mode_btn", None)):
+        if btn is not None:
+            btn.set_icon_name(mode_icon)
+            btn.set_tooltip_text(mode_tip)
 
     if self.paned is not None and self.win is not None:
         sidebar_px = int(max(120, self.win.get_width() * float(ui_config.SIDEBAR_RATIO)))
@@ -176,12 +181,18 @@ def do_activate(self):
     self.content_window_handle.set_hexpand(True)
     self.content_window_handle.set_vexpand(True)
     self.main_vbox.append(self.content_window_handle)
+    self.content_overlay = Gtk.Overlay()
+    self.content_overlay.set_hexpand(True)
+    self.content_overlay.set_vexpand(True)
+    self.content_window_handle.set_child(self.content_overlay)
     self.content_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
     self.content_vbox.set_hexpand(True)
     self.content_vbox.set_vexpand(True)
-    self.content_window_handle.set_child(self.content_vbox)
+    self.content_overlay.set_child(self.content_vbox)
     self._build_body(self.content_vbox)
     self._build_player_bar(self.content_vbox)
+    if hasattr(self, "_build_now_playing_overlay"):
+        self._build_now_playing_overlay()
     self._setup_theme_watch()
     self._restore_runtime_state()
     self._set_login_view_pending()

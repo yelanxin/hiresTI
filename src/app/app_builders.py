@@ -10,6 +10,97 @@ from ui import config as ui_config
 
 logger = logging.getLogger(__name__)
 
+_EQ_FREQS = ["30", "60", "120", "240", "480", "1k", "2k", "4k", "8k", "16k"]
+
+
+def _volume_icon_name(percent):
+    value = float(percent or 0.0)
+    if value <= 0.0:
+        return "hiresti-volume-muted-symbolic"
+    if value < 30.0:
+        return "hiresti-volume-low-symbolic"
+    if value < 70.0:
+        return "hiresti-volume-medium-symbolic"
+    return "hiresti-volume-high-symbolic"
+
+
+def _sync_volume_ui_state(self, value=None, source_scale=None):
+    try:
+        volume = float(value if value is not None else self.settings.get("volume", 80))
+    except Exception:
+        volume = 80.0
+    volume = max(0.0, min(100.0, volume))
+
+    self._volume_ui_syncing = True
+    try:
+        for scale in (getattr(self, "vol_scale", None), getattr(self, "now_playing_vol_scale", None)):
+            if scale is None or scale is source_scale:
+                continue
+            try:
+                if abs(float(scale.get_value()) - volume) > 0.1:
+                    scale.set_value(volume)
+            except Exception:
+                continue
+    finally:
+        self._volume_ui_syncing = False
+
+    icon = _volume_icon_name(volume)
+    for btn in (getattr(self, "vol_btn", None), getattr(self, "now_playing_vol_btn", None)):
+        if btn is not None:
+            try:
+                btn.set_icon_name(icon)
+            except Exception:
+                pass
+
+
+def _sync_eq_slider_groups(self, source_scale=None):
+    values = list(getattr(self, "eq_band_values", [0.0] * len(_EQ_FREQS)) or [])
+    if len(values) < len(_EQ_FREQS):
+        values.extend([0.0] * (len(_EQ_FREQS) - len(values)))
+        self.eq_band_values = values
+
+    self._eq_ui_syncing = True
+    try:
+        for group in (
+            getattr(self, "sliders", None) or [],
+            getattr(self, "now_playing_eq_sliders", None) or [],
+        ):
+            for idx, scale in enumerate(group):
+                if scale is None or scale is source_scale or idx >= len(values):
+                    continue
+                try:
+                    if abs(float(scale.get_value()) - float(values[idx])) > 0.01:
+                        scale.set_value(float(values[idx]))
+                except Exception:
+                    continue
+    finally:
+        self._eq_ui_syncing = False
+
+
+def _on_eq_slider_changed(self, scale, idx):
+    if getattr(self, "_eq_ui_syncing", False):
+        return
+    values = list(getattr(self, "eq_band_values", [0.0] * len(_EQ_FREQS)) or [])
+    if len(values) < len(_EQ_FREQS):
+        values.extend([0.0] * (len(_EQ_FREQS) - len(values)))
+    value = float(scale.get_value())
+    values[idx] = value
+    self.eq_band_values = values
+    try:
+        self.player.set_eq_band(idx, value)
+    except Exception:
+        logger.debug("set_eq_band failed", exc_info=True)
+    _sync_eq_slider_groups(self, source_scale=scale)
+
+
+def _reset_eq_ui(self):
+    self.eq_band_values = [0.0] * len(_EQ_FREQS)
+    try:
+        self.player.reset_eq()
+    except Exception:
+        logger.debug("reset_eq failed", exc_info=True)
+    _sync_eq_slider_groups(self)
+
 
 def _reset_search_focus_after_layout_change(self, duration_ms=260):
     try:
@@ -40,17 +131,21 @@ def _reset_search_focus_after_layout_change(self, duration_ms=260):
     GLib.timeout_add(int(duration_ms), _clear)
 
 
-def _build_volume_popover(self):
+def _build_volume_popover(self, scale_attr="vol_scale"):
     pop = Gtk.Popover()
     vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
 
-    self.vol_scale = Gtk.Scale.new_with_range(Gtk.Orientation.VERTICAL, 0, 100, 5)
-    self.vol_scale.set_inverted(True)
-    self.vol_scale.set_size_request(-1, 150)
-    self.vol_scale.set_value(80)
-    self.vol_scale.connect("value-changed", self.on_volume_changed_ui)
+    scale = Gtk.Scale.new_with_range(Gtk.Orientation.VERTICAL, 0, 100, 5)
+    scale.set_inverted(True)
+    scale.set_size_request(-1, 150)
+    try:
+        scale.set_value(float(self.settings.get("volume", 80)))
+    except Exception:
+        scale.set_value(80)
+    scale.connect("value-changed", self.on_volume_changed_ui)
+    setattr(self, scale_attr, scale)
 
-    vbox.append(self.vol_scale)
+    vbox.append(scale)
     pop.set_child(vbox)
     return pop
 
@@ -82,8 +177,20 @@ def on_key_pressed(self, controller, keyval, keycode, state):
             self.toggle_queue_drawer()
             return True
 
-    if keyval == Gdk.KEY_Escape and getattr(self, "queue_revealer", None) is not None:
-        if self.queue_revealer.get_reveal_child():
+    if keyval == Gdk.KEY_w or keyval == Gdk.KEY_W:
+        now_playing_open = bool(
+            getattr(self, "now_playing_revealer", None) is not None
+            and self.now_playing_revealer.get_reveal_child()
+        )
+        if now_playing_open or not self.search_entry.has_focus():
+            self.toggle_now_playing_overlay()
+            return True
+
+    if keyval == Gdk.KEY_Escape:
+        if getattr(self, "now_playing_revealer", None) is not None and self.now_playing_revealer.get_reveal_child():
+            self.hide_now_playing_overlay()
+            return True
+        if getattr(self, "queue_revealer", None) is not None and self.queue_revealer.get_reveal_child():
             self.close_queue_drawer()
             return True
 
@@ -106,6 +213,8 @@ def toggle_mini_mode(self, btn):
         self._set_visualizer_expanded(False)
         self.settings["viz_expanded"] = False
         self.schedule_save_settings()
+    if hasattr(self, "hide_now_playing_overlay"):
+        self.hide_now_playing_overlay()
     self.close_queue_drawer()
     _reset_search_focus_after_layout_change(self)
 
@@ -181,57 +290,73 @@ def _build_user_popover(self):
     return pop
 
 
-def _build_eq_popover(self):
+def _build_eq_popover(self, sliders_attr="sliders"):
     pop = Gtk.Popover()
     vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
     hb = Gtk.Box(spacing=12)
     hb.append(Gtk.Label(label="10-Band Equalizer", css_classes=["title-4"]))
     reset = Gtk.Button(label="Reset", css_classes=["flat"])
-    reset.connect("clicked", lambda b: (self.player.reset_eq(), [s.set_value(0) for s in self.sliders]))
+    reset.connect("clicked", lambda _b: self._reset_eq_ui())
     hb.append(reset)
     vbox.append(hb)
     hbox = Gtk.Box(spacing=8)
-    freqs = ["30", "60", "120", "240", "480", "1k", "2k", "4k", "8k", "16k"]
-    self.sliders = []
-    for i, f in enumerate(freqs):
+    sliders = []
+    eq_values = list(getattr(self, "eq_band_values", [0.0] * len(_EQ_FREQS)) or [])
+    if len(eq_values) < len(_EQ_FREQS):
+        eq_values.extend([0.0] * (len(_EQ_FREQS) - len(eq_values)))
+        self.eq_band_values = eq_values
+    for i, f in enumerate(_EQ_FREQS):
         vb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         scale = Gtk.Scale.new_with_range(Gtk.Orientation.VERTICAL, -24, 12, 1)
         scale.set_inverted(True)
         scale.set_size_request(-1, 150)
-        scale.set_value(0)
+        scale.set_value(float(eq_values[i]))
         scale.add_mark(0, Gtk.PositionType.RIGHT, None)
-        scale.connect("value-changed", lambda s, idx=i: self.player.set_eq_band(idx, s.get_value()))
-        self.sliders.append(scale)
+        scale.connect("value-changed", lambda s, idx=i: self._on_eq_slider_changed(s, idx))
+        sliders.append(scale)
         vb.append(scale)
         vb.append(Gtk.Label(label=f, css_classes=["caption"]))
         hbox.append(vb)
+    setattr(self, sliders_attr, sliders)
     vbox.append(hbox)
     pop.set_child(vbox)
     return pop
 
 
 def _lock_volume_controls(self, locked):
-    if self.vol_scale is not None and self.vol_btn is not None:
-        if locked:
-            self.vol_scale.set_value(100)
-            self.vol_btn.set_sensitive(False)
-            self.vol_btn.set_tooltip_text("Volume locked in Bit-Perfect/Exclusive mode")
-            self.vol_btn.set_icon_name("hiresti-volume-high-symbolic")
-            if self.vol_pop is not None:
-                self.vol_pop.popdown()
-        else:
-            self.vol_btn.set_sensitive(True)
-            self.vol_scale.set_sensitive(True)
-            self.vol_btn.set_tooltip_text("Adjust Volume")
+    for scale in (getattr(self, "vol_scale", None), getattr(self, "now_playing_vol_scale", None)):
+        if scale is not None and locked:
+            scale.set_value(100)
+        if scale is not None:
+            scale.set_sensitive(not locked)
 
-    if self.eq_btn is not None:
-        self.eq_btn.set_sensitive(not locked)
+    for btn in (getattr(self, "vol_btn", None), getattr(self, "now_playing_vol_btn", None)):
+        if btn is None:
+            continue
         if locked:
-            self.eq_btn.set_tooltip_text("EQ disabled in Bit-Perfect mode (Bypassed)")
-            if self.eq_pop is not None:
-                self.eq_pop.popdown()
+            btn.set_sensitive(False)
+            btn.set_tooltip_text("Volume locked in Bit-Perfect/Exclusive mode")
+            btn.set_icon_name("hiresti-volume-high-symbolic")
         else:
-            self.eq_btn.set_tooltip_text("Equalizer")
+            btn.set_sensitive(True)
+            btn.set_tooltip_text("Adjust Volume")
+
+    for pop in (getattr(self, "vol_pop", None), getattr(self, "now_playing_vol_pop", None)):
+        if locked and pop is not None:
+            pop.popdown()
+
+    for btn in (getattr(self, "eq_btn", None), getattr(self, "now_playing_eq_btn", None)):
+        if btn is None:
+            continue
+        btn.set_sensitive(not locked)
+        if locked:
+            btn.set_tooltip_text("EQ disabled in Bit-Perfect mode (Bypassed)")
+        else:
+            btn.set_tooltip_text("Equalizer")
+
+    for pop in (getattr(self, "eq_pop", None), getattr(self, "now_playing_eq_pop", None)):
+        if locked and pop is not None:
+            pop.popdown()
 
 
 def _build_help_popover(self):
@@ -240,14 +365,14 @@ def _build_help_popover(self):
     pop.add_css_class("shortcuts-surface")
     vbox = Gtk.Box(
         orientation=Gtk.Orientation.VERTICAL,
-        spacing=12,
-        margin_top=18,
-        margin_bottom=18,
-        margin_start=18,
-        margin_end=18,
+        spacing=8,
+        margin_top=12,
+        margin_bottom=12,
+        margin_start=12,
+        margin_end=12,
         css_classes=["shortcuts-popover"],
     )
-    vbox.set_size_request(420, -1)
+    vbox.set_size_request(280, -1)
 
     title = Gtk.Label(label="Keyboard Shortcuts", css_classes=["shortcuts-title"], halign=Gtk.Align.START)
     vbox.append(title)
@@ -265,6 +390,7 @@ def _build_help_popover(self):
         ("Ctrl + ←", "Previous Track"),
         ("Ctrl + F", "Focus Search"),
         ("Q", "Toggle Queue Drawer"),
+        ("W", "Toggle Now Playing"),
         ("Tab", "Toggle Lyrics & Viz")
     ]
 

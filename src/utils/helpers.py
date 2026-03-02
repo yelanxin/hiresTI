@@ -220,12 +220,14 @@ def load_img(widget: Any, url_provider: Callable[[], str] | str, cache_dir: str,
                     def apply_pic():
                         if hasattr(widget, '_target_url') and widget._target_url == u:
                             widget.set_size_request(size, size)
+                            widget._loaded_pixbuf = scaled or pb
                             widget.set_paintable(texture)
                     GLib.idle_add(apply_pic)
                 else:
                     def apply_img():
                         if hasattr(widget, '_target_url') and widget._target_url == u:
                             widget.set_pixel_size(size)
+                            widget._loaded_pixbuf = scaled or pb
                             widget.set_from_pixbuf(scaled)
                     GLib.idle_add(apply_img)
             except Exception as e:

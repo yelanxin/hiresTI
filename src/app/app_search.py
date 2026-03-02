@@ -50,6 +50,9 @@ def on_track_selected(self, box, row):
 
 def on_player_art_clicked(self, gest, n, x, y):
     if self.playing_track:
+        if hasattr(self, "toggle_now_playing_overlay"):
+            self.toggle_now_playing_overlay()
+            return
         track = self.playing_track
         if hasattr(track, 'album') and track.album:
             self.show_album_details(track.album)

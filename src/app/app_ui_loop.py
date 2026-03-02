@@ -177,6 +177,10 @@ def update_layout_proportions(self, w, p):
             queue_anchor.set_margin_top(queue_gap)
         if int(queue_anchor.get_margin_bottom() or 0) != queue_gap:
             queue_anchor.set_margin_bottom(queue_gap)
+    if hasattr(self, "_schedule_now_playing_surface_resync"):
+        self._schedule_now_playing_surface_resync()
+    elif hasattr(self, "_sync_now_playing_surface_size"):
+        GLib.idle_add(lambda: (self._sync_now_playing_surface_size(), False)[1])
     GLib.idle_add(lambda: (self._schedule_viz_handle_realign(animate=False), False)[1])
 
 

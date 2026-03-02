@@ -11,6 +11,17 @@ from core.executor import submit_daemon
 logger = logging.getLogger(__name__)
 
 
+def _current_track_fav_buttons(self):
+    return [
+        btn
+        for btn in (
+            getattr(self, "track_fav_btn", None),
+            getattr(self, "now_playing_track_fav_btn", None),
+        )
+        if btn is not None
+    ]
+
+
 def _update_fav_icon(self, btn, is_active):
     if is_active:
         btn.set_icon_name("hiresti-favorite-symbolic")
@@ -21,24 +32,28 @@ def _update_fav_icon(self, btn, is_active):
 
 
 def refresh_current_track_favorite_state(self):
-    btn = getattr(self, "track_fav_btn", None)
+    buttons = _current_track_fav_buttons(self)
     track = getattr(self, "playing_track", None)
     user = getattr(self.backend, "user", None)
-    if btn is None:
+    if not buttons:
         return
     if not track or getattr(track, "id", None) is None:
-        self._update_fav_icon(btn, False)
-        btn.set_sensitive(False)
-        btn.set_visible(False)
+        for btn in buttons:
+            self._update_fav_icon(btn, False)
+            btn.set_sensitive(False)
+            btn.set_visible(False)
         return
-    btn.set_visible(True)
+    for btn in buttons:
+        btn.set_visible(True)
     if not user:
-        self._update_fav_icon(btn, False)
-        btn.set_sensitive(False)
+        for btn in buttons:
+            self._update_fav_icon(btn, False)
+            btn.set_sensitive(False)
         return
 
     track_id = str(track.id)
-    btn.set_sensitive(False)
+    for btn in buttons:
+        btn.set_sensitive(False)
 
     def do():
         is_fav = self.backend.is_track_favorite(track_id)
@@ -47,8 +62,9 @@ def refresh_current_track_favorite_state(self):
             current = getattr(getattr(self, "playing_track", None), "id", None)
             if str(current) != track_id:
                 return False
-            self._update_fav_icon(btn, is_fav)
-            btn.set_sensitive(True)
+            for btn in _current_track_fav_buttons(self):
+                self._update_fav_icon(btn, is_fav)
+                btn.set_sensitive(True)
             return False
 
         GLib.idle_add(apply)
@@ -142,7 +158,9 @@ def on_track_fav_clicked(self, btn):
     track_id = str(track.id)
     is_currently_active = "active" in btn.get_css_classes()
     is_add = not is_currently_active
-    btn.set_sensitive(False)
+    buttons = _current_track_fav_buttons(self)
+    for target in buttons:
+        target.set_sensitive(False)
 
     def do():
         ok = self.backend.toggle_track_favorite(track_id, is_add)
@@ -150,10 +168,16 @@ def on_track_fav_clicked(self, btn):
         def apply():
             current = getattr(getattr(self, "playing_track", None), "id", None)
             if str(current) != track_id:
+                for target in _current_track_fav_buttons(self):
+                    target.set_sensitive(True)
                 return False
             if ok:
-                self._update_fav_icon(btn, is_add)
-            btn.set_sensitive(True)
+                self.refresh_current_track_favorite_state()
+                self.refresh_visible_track_fav_buttons()
+                self.refresh_liked_songs_dashboard(force=True)
+            else:
+                for target in _current_track_fav_buttons(self):
+                    target.set_sensitive(True)
             return False
 
         GLib.idle_add(apply)

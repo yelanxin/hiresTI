@@ -93,21 +93,15 @@ def on_settings_clicked(self, btn):
 
 
 def on_volume_changed_ui(self, scale):
+    if getattr(self, "_volume_ui_syncing", False):
+        return
     val = scale.get_value()
     self.player.set_volume(val / 100.0)
     self.settings["volume"] = int(round(val))
     self.schedule_save_settings()
 
-    icon = "hiresti-volume-high-symbolic"
-    if val == 0:
-        icon = "hiresti-volume-muted-symbolic"
-    elif val < 30:
-        icon = "hiresti-volume-low-symbolic"
-    elif val < 70:
-        icon = "hiresti-volume-medium-symbolic"
-
-    if self.vol_btn is not None:
-        self.vol_btn.set_icon_name(icon)
+    if hasattr(self, "_sync_volume_ui_state"):
+        self._sync_volume_ui_state(value=val, source_scale=scale)
     if hasattr(self, "_mpris_sync_volume"):
         self._mpris_sync_volume()
 
@@ -125,9 +119,10 @@ def on_toggle_mode(self, btn):
     icon = self.MODE_ICONS.get(self.play_mode, "hiresti-mode-loop-symbolic")
     tooltip = self.MODE_TOOLTIPS.get(self.play_mode, "Loop")
 
-    if self.mode_btn is not None:
-        self.mode_btn.set_icon_name(icon)
-        self.mode_btn.set_tooltip_text(tooltip)
+    for btn in (getattr(self, "mode_btn", None), getattr(self, "now_playing_mode_btn", None)):
+        if btn is not None:
+            btn.set_icon_name(icon)
+            btn.set_tooltip_text(tooltip)
 
     if self.play_mode == self.MODE_SHUFFLE or self.play_mode == self.MODE_SMART:
         self._generate_shuffle_list()

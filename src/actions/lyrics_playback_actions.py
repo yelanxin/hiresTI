@@ -112,6 +112,12 @@ def render_lyrics_list(app, lyrics_obj=None, status_msg=None):
     if not hasattr(app, "lyrics_vbox"):
         return
 
+    if hasattr(app, "_render_now_playing_lyrics"):
+        try:
+            app._render_now_playing_lyrics(lyrics_obj, status_msg)
+        except Exception as e:
+            logger.debug("Now playing lyrics mirror render failed: %s", e)
+
     while child := app.lyrics_vbox.get_first_child():
         app.lyrics_vbox.remove(child)
     app.lyric_widgets = []
@@ -261,6 +267,8 @@ def play_track(app, index):
     GLib.idle_add(lambda: app._update_track_list_icon())
     if hasattr(app, "render_queue_drawer"):
         GLib.idle_add(app.render_queue_drawer)
+    if hasattr(app, "_refresh_now_playing_from_track"):
+        GLib.idle_add(lambda: (app._refresh_now_playing_from_track(), False)[1])
 
     cover_id = getattr(track, "cover", None) or getattr(track.album, "cover", None)
     cover_url = app._get_tidal_image_url(cover_id) if cover_id else None
@@ -604,5 +612,11 @@ def update_ui_loop(app):
 
     if hasattr(app, "_mpris_sync_position"):
         app._mpris_sync_position()
+
+    if hasattr(app, "_sync_now_playing_overlay_state"):
+        try:
+            app._sync_now_playing_overlay_state(p, d, playing_now)
+        except Exception as e:
+            logger.debug("Now playing overlay ui sync failed: %s", e)
 
     return True

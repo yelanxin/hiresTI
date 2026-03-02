@@ -173,13 +173,61 @@ def bind_search(TidalApp, seen=None):
     ], seen=seen)
 
 
+def bind_now_playing(TidalApp, seen=None):
+    from app.app_now_playing import (
+        build_now_playing_overlay,
+        hide_now_playing_overlay,
+        is_now_playing_overlay_open,
+        on_now_playing_open_album_clicked,
+        on_now_playing_track_selected,
+        show_now_playing_overlay,
+        toggle_now_playing_overlay,
+        _load_now_playing_album_tracks_async,
+        _prime_now_playing_cover_color,
+        _refresh_now_playing_from_track,
+        _render_now_playing_queue,
+        _render_now_playing_album_tracks,
+        _render_now_playing_lyrics,
+        _schedule_now_playing_surface_resync,
+        _scroll_now_playing_to_lyric,
+        _sync_now_playing_surface_size,
+        _sync_now_playing_lyrics,
+        _sync_now_playing_overlay_state,
+    )
+
+    bind_map(TidalApp, [
+        ("_build_now_playing_overlay", build_now_playing_overlay),
+        ("show_now_playing_overlay", show_now_playing_overlay),
+        ("hide_now_playing_overlay", hide_now_playing_overlay),
+        ("toggle_now_playing_overlay", toggle_now_playing_overlay),
+        ("is_now_playing_overlay_open", is_now_playing_overlay_open),
+        ("on_now_playing_open_album_clicked", on_now_playing_open_album_clicked),
+        ("on_now_playing_track_selected", on_now_playing_track_selected),
+        ("_prime_now_playing_cover_color", _prime_now_playing_cover_color),
+        ("_refresh_now_playing_from_track", _refresh_now_playing_from_track),
+        ("_load_now_playing_album_tracks_async", _load_now_playing_album_tracks_async),
+        ("_render_now_playing_queue", _render_now_playing_queue),
+        ("_render_now_playing_album_tracks", _render_now_playing_album_tracks),
+        ("_render_now_playing_lyrics", _render_now_playing_lyrics),
+        ("_schedule_now_playing_surface_resync", _schedule_now_playing_surface_resync),
+        ("_scroll_now_playing_to_lyric", _scroll_now_playing_to_lyric),
+        ("_sync_now_playing_surface_size", _sync_now_playing_surface_size),
+        ("_sync_now_playing_lyrics", _sync_now_playing_lyrics),
+        ("_sync_now_playing_overlay_state", _sync_now_playing_overlay_state),
+    ], seen=seen)
+
+
 def bind_builders(TidalApp, seen=None):
     from app.app_builders import (
         _build_volume_popover,
+        _sync_volume_ui_state,
         on_key_pressed,
         toggle_mini_mode,
         _build_user_popover,
         _build_eq_popover,
+        _sync_eq_slider_groups,
+        _on_eq_slider_changed,
+        _reset_eq_ui,
         _lock_volume_controls,
         _build_help_popover,
         _show_simple_dialog,
@@ -187,10 +235,14 @@ def bind_builders(TidalApp, seen=None):
 
     bind_map(TidalApp, [
         ("_build_volume_popover", _build_volume_popover),
+        ("_sync_volume_ui_state", _sync_volume_ui_state),
         ("on_key_pressed", on_key_pressed),
         ("toggle_mini_mode", toggle_mini_mode),
         ("_build_user_popover", _build_user_popover),
         ("_build_eq_popover", _build_eq_popover),
+        ("_sync_eq_slider_groups", _sync_eq_slider_groups),
+        ("_on_eq_slider_changed", _on_eq_slider_changed),
+        ("_reset_eq_ui", _reset_eq_ui),
         ("_lock_volume_controls", _lock_volume_controls),
         ("_build_help_popover", _build_help_popover),
         ("_show_simple_dialog", _show_simple_dialog),

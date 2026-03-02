@@ -132,6 +132,10 @@ def _update_track_list_icon(self, target_list=None):
             targets.append(self.queue_track_list)
         if getattr(self, "queue_drawer_list", None) is not None:
             targets.append(self.queue_drawer_list)
+        if getattr(self, "now_playing_queue_list", None) is not None:
+            targets.append(self.now_playing_queue_list)
+        if getattr(self, "now_playing_track_list", None) is not None:
+            targets.append(self.now_playing_track_list)
         if not targets:
             return
 
@@ -215,6 +219,8 @@ def _update_list_ui(self, index):
         getattr(self, "track_list", None),
         getattr(self, "liked_track_list", None),
         getattr(self, "playlist_track_list", None),
+        getattr(self, "now_playing_queue_list", None),
+        getattr(self, "now_playing_track_list", None),
     ]
     for track_list in candidates:
         if track_list is None:

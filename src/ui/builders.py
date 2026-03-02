@@ -1045,12 +1045,6 @@ def build_player_bar(app, container):
     app.mode_btn.connect("clicked", app.on_toggle_mode)
     app.vol_box.append(app.mode_btn)
 
-    app.eq_btn = Gtk.Button(icon_name="hiresti-eq-symbolic", css_classes=["flat", "eq-btn", "player-side-btn"])
-    app.eq_pop = app._build_eq_popover()
-    app.eq_pop.set_parent(app.eq_btn)
-    app.eq_btn.connect("clicked", lambda b: app.eq_pop.popup())
-    app.vol_box.append(app.eq_btn)
-
     app.vol_btn = Gtk.Button(icon_name="hiresti-volume-high-symbolic", css_classes=["flat", "player-side-btn"])
     app.vol_pop = app._build_volume_popover()
     app.vol_pop.set_parent(app.vol_btn)

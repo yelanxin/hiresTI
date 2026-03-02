@@ -598,6 +598,242 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
 .heart-btn:hover { color: alpha(currentColor, 0.6); background-color: alpha(currentColor, 0.05); transform: scale(1.1); }
 .heart-btn.active { color: #e91e63; opacity: 1; }
 
+.now-playing-shell {
+    background: none;
+    background-color: transparent;
+}
+.now-playing-surface {
+    border-radius: 24px 24px 0 0;
+    border: 1px solid alpha(currentColor, 0.08);
+    background-color: black;
+    background-image:
+        linear-gradient(145deg, alpha(@accent_bg_color, 0.14), transparent 32%);
+    box-shadow: 0 18px 42px alpha(black, 0.20);
+    padding: 0;
+}
+.now-playing-layout {
+    min-height: 0;
+}
+.now-playing-left {
+    min-width: 0;
+    border-radius: 24px 0 0 0;
+    border: none;
+    background-color: transparent;
+}
+.now-playing-right {
+    min-width: 0;
+    border-radius: 0 24px 0 0;
+    background: transparent;
+}
+.now-playing-cover {
+    background: transparent;
+}
+.now-playing-left-scrim {
+    border-radius: 24px 0 0 0;
+}
+.now-playing-left-top {
+    min-width: 0;
+}
+.now-playing-kicker {
+    font-size: 15px;
+    font-weight: 800;
+    color: alpha(white, 0.96);
+    text-shadow: 0 2px 12px alpha(black, 0.30);
+}
+.now-playing-meta-panel {
+    padding: 0 0 18px 0;
+    min-width: 0;
+}
+.now-playing-info-card {
+    background-color: rgba(0, 0, 0, 0.20);
+    background-image: none;
+    border: 1px solid alpha(white, 0.10);
+    border-radius: 16px;
+    box-shadow: none;
+    padding: 20px;
+}
+.now-playing-title {
+    font-size: 30px;
+    font-weight: 800;
+    line-height: 1.08;
+    margin-top: 0;
+    color: white;
+    text-shadow: 0 2px 14px alpha(black, 0.30);
+}
+.now-playing-artist {
+    font-size: 16px;
+    font-weight: 700;
+    color: #f1c76a;
+    text-shadow: 0 2px 12px alpha(black, 0.30);
+}
+.now-playing-album {
+    font-size: 13px;
+    color: alpha(white, 0.78);
+    text-shadow: 0 2px 12px alpha(black, 0.30);
+}
+.now-playing-tool-row {
+    margin-top: 0;
+    margin-bottom: 0;
+}
+.now-playing-tool-btn {
+    min-width: 34px;
+    min-height: 34px;
+    padding: 0;
+    border: 1px solid alpha(currentColor, 0.10);
+    border-radius: 999px;
+    background-image: none;
+    background-color: alpha(currentColor, 0.10);
+    box-shadow: none;
+}
+.now-playing-tool-btn:hover {
+    background-image: none;
+    background-color: alpha(currentColor, 0.14);
+}
+.now-playing-tool-btn:active {
+    background-image: none;
+    background-color: alpha(currentColor, 0.08);
+}
+.now-playing-tool-btn image {
+    -gtk-icon-size: 18px;
+}
+.now-playing-track-fav-btn.active {
+    color: #e91e63;
+    opacity: 1;
+}
+.now-playing-tool-btn.eq-btn image {
+    -gtk-icon-size: 20px;
+}
+.now-playing-progress-box {
+    margin-top: 0;
+}
+.now-playing-progress-box label {
+    color: alpha(white, 0.82);
+}
+.now-playing-progress trough {
+    min-height: 6px;
+    border-radius: 999px;
+    background-color: alpha(white, 0.18);
+}
+.now-playing-progress progress {
+    min-height: 6px;
+    border-radius: 999px;
+    background-color: #f1c76a;
+}
+.now-playing-controls {
+    margin-top: 0;
+}
+.now-playing-controls .transport-btn {
+    min-width: 42px;
+    min-height: 42px;
+    margin: 0;
+    padding: 0;
+}
+.now-playing-controls .transport-btn image {
+    -gtk-icon-size: 22px;
+}
+.now-playing-controls .transport-main-btn {
+    min-width: 56px;
+    min-height: 56px;
+    margin: 0;
+    padding: 0;
+    border-radius: 999px;
+    background-image: none;
+    background-color: alpha(currentColor, 0.10);
+    border: 1px solid alpha(currentColor, 0.10);
+    box-shadow: none;
+}
+.now-playing-controls .transport-main-btn image {
+    -gtk-icon-size: 26px;
+}
+.now-playing-collapse-btn {
+    color: alpha(white, 0.75);
+    min-width: 32px;
+    min-height: 32px;
+}
+.now-playing-collapse-btn:hover {
+    color: white;
+    background-color: alpha(white, 0.12);
+}
+.now-playing-switcher {
+    margin-top: -2px;
+}
+.now-playing-switcher,
+.now-playing-switcher > box {
+    background: none;
+    background-color: transparent;
+    box-shadow: none;
+    margin: 0;
+    padding: 0;
+}
+.now-playing-switcher button {
+    min-height: 32px;
+    margin: 0;
+    padding: 4px 16px;
+    border: 1px solid alpha(currentColor, 0.10);
+    border-radius: 0;
+    background-image: none;
+    background-color: alpha(currentColor, 0.10);
+    box-shadow: none;
+    text-shadow: none;
+}
+.now-playing-switcher button:first-child,
+.now-playing-switcher button:last-child {
+    border-radius: 0;
+}
+.now-playing-switcher button:first-child {
+    border-radius: 0 0 0 14px;
+}
+.now-playing-switcher button:last-child {
+    border-radius: 0 0 14px 0;
+}
+.now-playing-switcher button:checked {
+    background-image: none;
+    background-color: alpha(currentColor, 0.10);
+    box-shadow: inset 0 -2px 0 alpha(white, 0.24);
+}
+.now-playing-switcher button:hover {
+    background-image: none;
+    background-color: alpha(currentColor, 0.14);
+}
+.now-playing-stack,
+.now-playing-stack-page,
+.now-playing-track-scroll,
+.now-playing-track-scroll viewport {
+    background: transparent;
+    background-color: transparent;
+    background-image: none;
+    box-shadow: none;
+    border: none;
+}
+.now-playing-list-shell {
+    background: transparent;
+    background-color: transparent;
+    background-image: none;
+    border: none;
+    box-shadow: none;
+    padding: 0;
+}
+.now-playing-list-shell .now-playing-track-scroll,
+.now-playing-list-shell .now-playing-track-scroll viewport {
+    background: transparent;
+    background-color: transparent;
+    background-image: none;
+    border: none;
+    box-shadow: none;
+}
+.now-playing-lyrics-page {
+    border-radius: 18px;
+}
+.now-playing-track-list row {
+    border-radius: 14px;
+}
+.now-playing-track-row {
+    margin-bottom: 2px;
+}
+.now-playing-lyrics-box {
+    min-width: 0;
+}
+
 .track-heart-btn { background: transparent; box-shadow: none; border: none; padding: 2px; min-width: 18px; min-height: 18px; border-radius: 99px; color: alpha(currentColor, 0.36); transition: all 0.2s; }
 .track-heart-btn image { -gtk-icon-size: 18px; }
 .track-heart-btn:hover { color: alpha(currentColor, 0.7); background-color: alpha(currentColor, 0.05); transform: scale(1.06); }
@@ -678,12 +914,12 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
 .warning-text { color: #f6d32d; }
 
 /* Shortcut content style (keep system popover shell) */
-.shortcuts-popover { min-width: 380px; }
+.shortcuts-popover { min-width: 260px; }
 .shortcuts-title { font-size: 18px; font-weight: 800; margin-bottom: 2px; }
-.shortcuts-subtitle { font-size: 12px; color: alpha(currentColor, 0.72); margin-bottom: 10px; }
-.shortcuts-list { margin-top: 2px; }
+.shortcuts-subtitle { font-size: 12px; color: alpha(currentColor, 0.72); margin-bottom: 6px; }
+.shortcuts-list { margin-top: 0; }
 .shortcuts-row {
-    padding: 10px 12px;
+    padding: 7px 8px;
     border-radius: 10px;
     border: 1px solid alpha(currentColor, 0.14);
     background-color: alpha(currentColor, 0.04);
@@ -694,7 +930,7 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
 }
 .shortcuts-action { font-size: 13px; font-weight: 600; }
 .shortcuts-keycap {
-    padding: 4px 10px;
+    padding: 3px 7px;
     border-radius: 8px;
     border: 1px solid alpha(currentColor, 0.25);
     background-color: alpha(currentColor, 0.10);
@@ -793,6 +1029,15 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
     background-color: alpha(currentColor, 0.04);
     border: 1px solid alpha(currentColor, 0.10);
     border-radius: 12px;
+    padding: 6px;
+}
+
+.tracks-list.now-playing-track-list {
+    background-image: none;
+    background-color: rgba(24, 26, 34, 0.30);
+    border: 1px solid alpha(currentColor, 0.10);
+    border-radius: 18px;
+    box-shadow: none;
     padding: 6px;
 }
 

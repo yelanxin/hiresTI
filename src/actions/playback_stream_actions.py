@@ -43,5 +43,11 @@ def load_cover_art(app, cover_id_or_url):
     if not url:
         return
 
+    if hasattr(app, "_prime_now_playing_cover_color"):
+        try:
+            app._prime_now_playing_cover_color(url)
+        except Exception:
+            pass
+
     if hasattr(app, "art_img"):
         utils.load_img(app.art_img, url, app.cache_dir, 80)

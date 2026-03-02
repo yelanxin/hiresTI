@@ -96,16 +96,16 @@ def on_nav_selected(app, box, row):
             cached = list(getattr(app.backend, "_cached_albums", []) or [])
             now = time.time()
             last_ts = float(getattr(app.backend, "_cached_albums_ts", 0.0) or 0.0)
-            if hasattr(app.backend, "_album_cache_ttl_seconds"):
-                ttl = float(app.backend._album_cache_ttl_seconds())
-            else:
-                try:
-                    ttl = float(getattr(app.backend, "_albums_cache_ttl", 300.0))
-                except Exception:
-                    ttl = 300.0
+            # Only show cached data for instant first paint if it is very fresh
+            # (fetched within the last 15 s).  Older caches may not reflect
+            # changes made on other devices (e.g. unfavoriting on mobile), so
+            # we skip the stale first-render and show a loading indicator
+            # instead, then always fetch from the server.
+            INSTANT_RENDER_TTL = 15.0
+            cache_age = now - last_ts
+            show_cached = cached and cache_age < INSTANT_RENDER_TTL
 
-            # Instant first paint: render cached data immediately.
-            if cached:
+            if show_cached:
                 if hasattr(app, "grid_subtitle_label") and app.grid_subtitle_label is not None:
                     app.grid_subtitle_label.set_text(f"{len(cached)} saved albums")
                 app.render_collection_dashboard([], cached)
@@ -119,17 +119,26 @@ def on_nav_selected(app, box, row):
                 )
                 app.collection_content_box.append(loading)
 
-            # Background refresh only when TTL has expired.
-            if not cached or now - last_ts > ttl:
-                def task():
-                    albums = list(app.backend.get_recent_albums())
-                    album_count = len(albums)
-                    def update():
-                        if hasattr(app, "grid_subtitle_label") and app.grid_subtitle_label is not None:
-                            app.grid_subtitle_label.set_text(f"{album_count} saved albums")
-                        app.render_collection_dashboard([], albums)
-                    GLib.idle_add(update)
-                Thread(target=task, daemon=True).start()
+            # Always refresh from the server so external changes (e.g. a
+            # favourite removed on mobile) are picked up on every navigation.
+            # Pre-compute cached IDs in the main thread for later comparison.
+            cached_ids = [str(getattr(a, "id", "")) for a in cached] if show_cached else None
+
+            def task():
+                albums = list(app.backend.get_recent_albums())
+                album_count = len(albums)
+                fresh_ids = [str(getattr(a, "id", "")) for a in albums]
+                def update():
+                    # Skip re-render when the cached first-paint already shows
+                    # exactly the same albums — avoids a visible double-flash.
+                    if cached_ids is not None and fresh_ids == cached_ids:
+                        return False
+                    if hasattr(app, "grid_subtitle_label") and app.grid_subtitle_label is not None:
+                        app.grid_subtitle_label.set_text(f"{album_count} saved albums")
+                    app.render_collection_dashboard([], albums)
+                    return False
+                GLib.idle_add(update)
+            Thread(target=task, daemon=True).start()
         else:
             if hasattr(app, "grid_subtitle_label") and app.grid_subtitle_label is not None:
                 app.grid_subtitle_label.set_text("0 saved albums")

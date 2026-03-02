@@ -17,6 +17,8 @@ def _get_active_queue(self):
 def _set_play_queue(self, tracks):
     self.play_queue = list(tracks or [])
     self.shuffle_indices = []
+    if hasattr(self, "_render_now_playing_queue"):
+        GLib.idle_add(lambda: (self._render_now_playing_queue(self._get_active_queue()), False)[1])
     if hasattr(self, "_mpris_sync_metadata"):
         self._mpris_sync_metadata()
     if hasattr(self, "_remote_publish_queue_event"):
@@ -84,6 +86,8 @@ def _refresh_queue_views(self):
         self.render_queue_dashboard()
     if getattr(self, "queue_revealer", None) is not None and self.queue_revealer.get_reveal_child():
         self.render_queue_drawer()
+    if hasattr(self, "_render_now_playing_queue"):
+        self._render_now_playing_queue(self._get_active_queue())
 
 
 def on_queue_remove_track_clicked(self, track_index):
