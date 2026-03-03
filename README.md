@@ -70,39 +70,6 @@ python3 src/main.py
 
 `hiresTI` loads the Rust audio and visualizer cores from `src_rust/*/target/release`, so the `--release` build step is required before running from source.
 
-## Remote Control / MCP (OpenClaw)
-
-Starting from `v1.4.0`, hiresTI includes a built-in remote control service with:
-
-- HTTP JSON-RPC control endpoint
-- MCP endpoint for OpenClaw / `mcporter`
-- Bearer API key authentication
-- `Local only` and `LAN` access modes
-
-Typical OpenClaw setup:
-
-1. In hiresTI, open `Settings > Remote Control`.
-2. Enable Remote Control.
-3. Leave it on `Local only` for same-machine use, or switch to `LAN` for another device.
-4. Copy the MCP endpoint and API key shown in hiresTI.
-5. Register the MCP service in OpenClaw:
-
-```bash
-cd ~/.openclaw/workspace
-mcporter config add hires_ti http://127.0.0.1:18473/mcp \
-  --header "Authorization=Bearer <YOUR_REMOTE_TOKEN>"
-```
-
-Then verify it:
-
-```bash
-mcporter list
-mcporter list hires_ti --schema
-mcporter call hires_ti.player_get_state
-```
-
-For a dedicated OpenClaw setup guide, see [openclaw-mcp-guide-en.md](./openclaw-mcp-guide-en.md).
-
 ## Install Prebuilt Packages
 Please download prebuilt package from release page.
 
