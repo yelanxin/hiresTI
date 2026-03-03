@@ -102,6 +102,7 @@ def _make_switch_adapter(rc, last_error=""):
     adapter.current_device_id = None
     adapter.output_state = "idle"
     adapter.output_error = None
+    adapter._output_switch_restore = None
     adapter.alsa_buffer_time = 20000
     adapter.alsa_latency_time = 2000
     adapter.exclusive_lock_mode = True
@@ -161,6 +162,45 @@ def test_apply_output_switch_alsa_exclusive_failure_triggers_reservation_retry()
             "exclusive": True,
         }
     ]
+
+
+def test_apply_output_switch_alsa_exclusive_retry_failure_restores_previous_output():
+    adapter = _make_switch_adapter(-4, last_error="Device or resource busy")
+    adapter.current_driver = "ALSA"
+    adapter.current_device_id = "hw:1,0"
+    adapter.requested_driver = "ALSA"
+    adapter.requested_device_id = "hw:1,0"
+    adapter.output_state = "active"
+    adapter.output_error = None
+    reservation_calls = []
+    adapter._start_alsa_reservation_async = (
+        lambda driver, device_id, card_num: reservation_calls.append((driver, device_id, card_num))
+    )
+    adapter._release_alsa_reservation = lambda: None
+
+    first_ok = rust_audio.RustAudioPlayerAdapter._apply_output_switch_once(adapter, "ALSA", "hw:2,0")
+
+    assert first_ok is True
+    assert adapter.current_driver == "ALSA"
+    assert adapter.current_device_id == "hw:1,0"
+    assert adapter.requested_driver == "ALSA"
+    assert adapter.requested_device_id == "hw:2,0"
+    assert adapter.output_state == "switching"
+    assert adapter._output_switch_restore is not None
+    assert reservation_calls == [("ALSA", "hw:2,0", 2)]
+
+    adapter._alsa_reservation = SimpleNamespace(acquired=True)
+
+    second_ok = rust_audio.RustAudioPlayerAdapter._apply_output_switch_once(adapter, "ALSA", "hw:2,0")
+
+    assert second_ok is False
+    assert adapter.current_driver == "ALSA"
+    assert adapter.current_device_id == "hw:1,0"
+    assert adapter.requested_driver == "ALSA"
+    assert adapter.requested_device_id == "hw:1,0"
+    assert adapter.output_state == "active"
+    assert adapter.output_error is None
+    assert adapter._output_switch_restore is None
 
 
 def test_read_active_alsa_hw_details_prefers_running_substream(tmp_path):
@@ -234,3 +274,44 @@ def test_container_adapter_runtime_log_includes_hw_params_and_dedupes(tmp_path, 
     assert "source_depth=16" in diag_msgs[0]
     assert "hw_format=S32_LE" in diag_msgs[0]
     assert "hw_rate=44100" in diag_msgs[0]
+
+
+def test_runtime_snapshot_debug_log_dedupes_stable_state(caplog):
+    snaps = [
+        {
+            "pipewire": {"force_rate": 44100, "latency_ms": 21.333333333333332},
+            "output": {"session_rate": 44100, "session_depth": 16, "hardware_rate": 44100, "hardware_depth": 32},
+            "source": {"rate": 44100, "depth": 16, "bitrate": 569142, "codec": "FLAC"},
+        },
+        {
+            "pipewire": {"force_rate": 44100, "latency_ms": 21.333333333333332},
+            "output": {"session_rate": 44100, "session_depth": 16, "hardware_rate": 44100, "hardware_depth": 32},
+            "source": {"rate": 44100, "depth": 16, "bitrate": 571282, "codec": "FLAC"},
+        },
+        {
+            "pipewire": {"force_rate": 48000, "latency_ms": 21.333333333333332},
+            "output": {"session_rate": 48000, "session_depth": 16, "hardware_rate": 48000, "hardware_depth": 32},
+            "source": {"rate": 48000, "depth": 16, "bitrate": 571282, "codec": "FLAC"},
+        },
+    ]
+
+    adapter = object.__new__(rust_audio.RustAudioPlayerAdapter)
+    adapter._rust = SimpleNamespace(get_runtime_snapshot=lambda: snaps.pop(0))
+
+    with caplog.at_level(logging.DEBUG, logger=rust_audio.logger.name):
+        first = rust_audio.RustAudioPlayerAdapter._read_runtime_snapshot(adapter)
+        second = rust_audio.RustAudioPlayerAdapter._read_runtime_snapshot(adapter)
+        third = rust_audio.RustAudioPlayerAdapter._read_runtime_snapshot(adapter)
+
+    diag_msgs = [
+        record
+        for record in caplog.records
+        if "Rust runtime snapshot:" in record.message
+    ]
+
+    assert first["source"]["bitrate"] == 569142
+    assert second["source"]["bitrate"] == 571282
+    assert third["pipewire"]["force_rate"] == 48000
+    assert len(diag_msgs) == 2
+    assert all(record.levelno == logging.DEBUG for record in diag_msgs)
+    assert all("bitrate=" not in record.message for record in diag_msgs)

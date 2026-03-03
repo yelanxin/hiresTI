@@ -69,6 +69,56 @@ class AudioSignalPathWindow(Adw.Window):
     .signal-terminal-key {
         color: alpha(#6eff81, 0.74);
     }
+    .signal-terminal-help-button {
+        min-width: 22px;
+        min-height: 22px;
+        padding: 0;
+        border: none;
+        border-radius: 0;
+        background: transparent;
+        color: alpha(#6eff81, 0.72);
+        box-shadow: none;
+        -gtk-icon-size: 14px;
+    }
+    .signal-terminal-help-button:hover {
+        background: alpha(#6eff81, 0.08);
+        color: #bcffc3;
+    }
+    .signal-terminal-help-button:active {
+        background: alpha(#6eff81, 0.14);
+    }
+    .signal-terminal-popover,
+    .signal-terminal-popover.background {
+        background: transparent;
+        border: none;
+        border-radius: 0;
+        box-shadow: none;
+        padding: 0;
+        color: #6eff81;
+    }
+    .signal-terminal-popover > contents,
+    .signal-terminal-popover.background > contents {
+        background: transparent;
+        border: none;
+        border-radius: 0;
+        box-shadow: none;
+        padding: 0;
+    }
+    .signal-terminal-popover-card {
+        min-width: 360px;
+        padding: 12px 14px;
+        border-radius: 0;
+        background-image:
+            linear-gradient(to bottom, alpha(#6eff81, 0.03), transparent 48px),
+            repeating-linear-gradient(to bottom, alpha(#6eff81, 0.018) 0 1px, transparent 1px 3px);
+    }
+    .signal-terminal-popover-rule {
+        color: alpha(#6eff81, 0.22);
+    }
+    .signal-terminal-popover-body {
+        color: #cbffd1;
+        font-family: monospace;
+    }
     .signal-terminal-value {
         font-weight: 800;
         color: #cbffd1;
@@ -186,6 +236,7 @@ class AudioSignalPathWindow(Adw.Window):
         self.summary_card.append(summary_head)
         self.summary_rows = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         self.summary_card.append(self.summary_rows)
+        self._init_bitperfect_help_button()
         main_box.append(self.summary_card)
 
         # --- 1. Source Stage (源文件) ---
@@ -241,6 +292,12 @@ class AudioSignalPathWindow(Adw.Window):
         if self.timer_id:
             GLib.source_remove(self.timer_id)
             self.timer_id = None
+        pop = getattr(self, "bitperfect_verdict_help_pop", None)
+        if pop is not None:
+            try:
+                pop.popdown()
+            except Exception:
+                pass
         return False
 
     def create_stage_card(self, icon_name, title, subtitle):
@@ -307,6 +364,84 @@ class AudioSignalPathWindow(Adw.Window):
             row.append(lbl_key)
             row.append(lbl_val)
             card.content_box.append(row)
+
+    def _build_bitperfect_verdict_help_text(self):
+        driver = self._get_current_driver()
+        lines = [
+            "Bit-Perfect Verdict\n\n",
+            "A Yes verdict means these checks passed:\n",
+            "- Bit-Perfect mode is enabled\n",
+            "- Output state is Active\n",
+            "- Source and output sample rates match\n",
+            "- Output bit depth is not lower than the source\n",
+        ]
+        if driver == "ALSA":
+            lines.append("- ALSA also requires Exclusive mode\n")
+        lines.append("\n")
+        lines.append(
+            "PipeWire note: Even when playback follows the music sample rate, "
+            "shared PipeWire output still goes through the system mixer. System volume "
+            "changes or other mixer processing can break true end-to-end bit-perfect "
+            "playback.\n\n"
+        )
+        lines.append(
+            "Use ALSA + Exclusive if you need the system mixer and system volume "
+            "path fully bypassed."
+        )
+        return "".join(lines)
+
+    def _init_bitperfect_help_button(self):
+        btn = Gtk.MenuButton(icon_name="dialog-question-symbolic", css_classes=["flat"])
+        btn.add_css_class("signal-terminal-help-button")
+        btn.set_valign(Gtk.Align.CENTER)
+        btn.set_tooltip_text("Explain bit-perfect verdict")
+
+        pop = Gtk.Popover()
+        pop.add_css_class("signal-terminal-popover")
+        pop.set_autohide(True)
+        pop.set_has_arrow(False)
+        pop_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=10,
+            css_classes=["signal-terminal-card", "signal-terminal-popover-card"],
+        )
+
+        pop_head = Gtk.Box(spacing=8)
+        pop_icon = Gtk.Image.new_from_icon_name("dialog-information-symbolic")
+        pop_icon.add_css_class("signal-terminal-icon")
+        pop_head.append(pop_icon)
+
+        pop_head_text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        pop_head_text.append(Gtk.Label(label="Bit-Perfect Verdict", xalign=0, css_classes=["signal-terminal-heading"]))
+        pop_head_text.append(Gtk.Label(label="Diagnostic Rules", xalign=0, css_classes=["signal-terminal-subtle"]))
+        pop_head.append(pop_head_text)
+        pop_box.append(pop_head)
+
+        pop_rule = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        pop_rule.add_css_class("signal-terminal-popover-rule")
+        pop_box.append(pop_rule)
+
+        pop_label = Gtk.Label(
+            wrap=True,
+            max_width_chars=44,
+            xalign=0,
+            css_classes=["signal-terminal-popover-body"],
+        )
+        pop_label.set_selectable(False)
+        pop_label.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        pop_box.append(pop_label)
+        pop.set_child(pop_box)
+        btn.set_popover(pop)
+
+        self.bitperfect_verdict_help_btn = btn
+        self.bitperfect_verdict_help_pop = pop
+        self.bitperfect_verdict_help_label = pop_label
+        self._refresh_bitperfect_help_text()
+
+    def _refresh_bitperfect_help_text(self):
+        lbl = getattr(self, "bitperfect_verdict_help_label", None)
+        if lbl is not None:
+            lbl.set_text(self._build_bitperfect_verdict_help_text())
 
     def update_info(self):
         # 确保定时器安全
@@ -499,6 +634,10 @@ class AudioSignalPathWindow(Adw.Window):
         return True
 
     def _update_summary(self):
+        pop = getattr(self, "bitperfect_verdict_help_pop", None)
+        if pop is not None and pop.get_visible():
+            return
+
         while child := self.summary_rows.get_first_child():
             self.summary_rows.remove(child)
 
@@ -565,7 +704,20 @@ class AudioSignalPathWindow(Adw.Window):
                 lbl_val.add_css_class("success-text")
             elif style == "warn":
                 lbl_val.add_css_class("warning-text")
-            row.append(lbl_key)
+            if key == "Bit-Perfect Verdict":
+                self._refresh_bitperfect_help_text()
+                old_parent = self.bitperfect_verdict_help_btn.get_parent()
+                if old_parent is not None and old_parent is not row:
+                    try:
+                        old_parent.remove(self.bitperfect_verdict_help_btn)
+                    except Exception:
+                        pass
+                key_box = Gtk.Box(spacing=4, valign=Gtk.Align.CENTER)
+                key_box.append(lbl_key)
+                key_box.append(self.bitperfect_verdict_help_btn)
+                row.append(key_box)
+            else:
+                row.append(lbl_key)
             row.append(lbl_val)
             self.summary_rows.append(row)
 
@@ -582,15 +734,15 @@ class AudioSignalPathWindow(Adw.Window):
             reasons.append(f"Output state is {output_state}")
 
         rate_match = self._rate_only_match(sample_rate, output_rate)
-        if driver == "ALSA" and exclusive:
+        if self._uses_lossless_container_match(driver, exclusive):
             depth_match = self._depth_container_match(bit_depth, output_depth)
         else:
             depth_match = self._depth_only_match(bit_depth, output_depth)
         format_match = bool(rate_match and depth_match)
 
-        # ALSA exclusive path is bit-perfect when it keeps the original rate,
-        # bypasses the system mixer, and widens only into a lossless container
-        # format such as 16-bit PCM -> 32-bit container PCM.
+        # ALSA exclusive and PipeWire now share the same source-vs-output
+        # format rule here: keep the original sample rate and allow only
+        # lossless container widening such as 16-bit PCM -> 32-bit PCM.
         if driver == "ALSA":
             if not exclusive:
                 reasons.append("Not in exclusive mode")
@@ -598,12 +750,13 @@ class AudioSignalPathWindow(Adw.Window):
                 reasons.append("Sample-rate mismatch")
             if exclusive and not depth_match:
                 reasons.append("Output bit depth narrower than source")
-        # PipeWire path: strict mode here also requires both rate and depth match.
         elif driver == "PipeWire":
             if bool(getattr(self.player, "_pipewire_rate_blocked", False)):
                 reasons.append("PipeWire rate blocked")
-            if not format_match:
-                reasons.append("Rate/depth mismatch")
+            if not rate_match:
+                reasons.append("Sample-rate mismatch")
+            if not depth_match:
+                reasons.append("Output bit depth narrower than source")
         else:
             reasons.append(f"Driver is {driver}")
 
@@ -650,16 +803,20 @@ class AudioSignalPathWindow(Adw.Window):
                 return None
             v = float(pw.get("latency_ms", -1.0) or -1.0)
             try:
-                now = time.monotonic()
-                last = float(getattr(self, "_pw_latency_log_ts", 0.0) or 0.0)
-                if (now - last) >= 3.0:
-                    self._pw_latency_log_ts = now
-                    logger.info(
-                        "SignalPath latency source: latency_ms=%s force_rate=%s allowed=%s",
-                        pw.get("latency_ms", None),
+                if logger.isEnabledFor(logging.DEBUG):
+                    sig = (
+                        round(v, 3) if v >= 0.0 else None,
                         pw.get("force_rate", None),
                         pw.get("allowed_rates_raw", None),
                     )
+                    if sig != getattr(self, "_pw_latency_log_sig", None):
+                        self._pw_latency_log_sig = sig
+                        logger.debug(
+                            "SignalPath latency source: latency_ms=%s force_rate=%s allowed=%s",
+                            pw.get("latency_ms", None),
+                            pw.get("force_rate", None),
+                            pw.get("allowed_rates_raw", None),
+                        )
             except Exception:
                 pass
             if v >= 0.0:
@@ -673,11 +830,14 @@ class AudioSignalPathWindow(Adw.Window):
             return False
         if sample_rate == "Unknown" or bit_depth == "Unknown":
             return False
-        if driver == "ALSA" and self.player.exclusive_lock_mode:
+        if self._uses_lossless_container_match(driver, self.player.exclusive_lock_mode):
             return self._rate_only_match(sample_rate, output_rate) and self._depth_container_match(bit_depth, output_depth)
-        if driver == "PipeWire":
-            return self._rate_only_match(sample_rate, output_rate) and self._depth_only_match(bit_depth, output_depth)
         return False
+
+    @staticmethod
+    def _uses_lossless_container_match(driver, exclusive):
+        drv = str(driver or "")
+        return drv == "PipeWire" or (drv == "ALSA" and bool(exclusive))
 
     @staticmethod
     def _rate_only_match(src_rate, out_rate):

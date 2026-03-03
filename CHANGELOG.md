@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.4.6 - 2026-03-03
+Signal-path polish release: terminal-style bit-perfect help, clearer PipeWire verdict rules, and quieter runtime diagnostics.
+
+### Changed
+- `Audio Signal Path` now shows the `Bit-Perfect Verdict` help as a terminal-style black/green popover that matches the Signal Path page, with a straight-edge shell instead of the default rounded GNOME bubble.
+- The `Bit-Perfect Verdict` help copy now explains the exact pass criteria and makes the PipeWire system-mixer limitation explicit alongside the ALSA exclusive-mode requirement.
+- PipeWire bit-perfect checks now use the same lossless container-widening rule as ALSA exclusive mode, so `16-bit -> 32-bit` container output is treated as valid when the playback path is otherwise lossless.
+- PipeWire verdict failures now report narrower output-depth and sample-rate mismatches separately instead of collapsing them into a generic combined mismatch reason.
+- PipeWire pro-audio profile activation now ignores `pwcardprofile:` pseudo-device ids instead of trying to treat them as real output targets.
+
+### Fixed
+- Fixed noisy repeated `Rust runtime snapshot` and `SignalPath latency source` logs by downgrading them to deduped `DEBUG` diagnostics that only emit when the observed runtime state changes.
+- Fixed the Signal Path summary refresh loop so the `Bit-Perfect Verdict` help popover stays stable while it is open.
+- Fixed failed ALSA exclusive retry paths so the previous active output selection is restored if the post-reservation switch still cannot be completed.
+
+### Tests
+- Verified with:
+  - `pytest -q tests/test_signal_path_bitperfect.py`
+  - `pytest -q tests/test_rust_audio_reservation_retry.py`
+
+---
+
 ## 1.4.5 - 2026-03-02
 ALSA exclusive reliability + signal-path clarity release: one-shot D-Bus reservation retry, 32-bit container DAC support, and clearer bit-perfect diagnostics/UI.
 

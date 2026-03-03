@@ -661,6 +661,8 @@ class RustAudioPlayerAdapter:
             dev = str(device_id or "").strip()
             if not dev:
                 return False
+            if dev.startswith("pwcardprofile:"):
+                return False
             last_rc = -1
             for attempt in range(1, 4):
                 rc_rust = int(self._rust.set_pipewire_pro_audio(dev))
@@ -689,31 +691,54 @@ class RustAudioPlayerAdapter:
             return False
         return self._ensure_pipewire_pro_audio_profile(dev)
 
+    @staticmethod
+    def _runtime_snapshot_log_signature(snap):
+        pw = snap.get("pipewire", {}) if isinstance(snap, dict) else {}
+        out = snap.get("output", {}) if isinstance(snap, dict) else {}
+        src = snap.get("source", {}) if isinstance(snap, dict) else {}
+
+        def _rounded_ms(value):
+            try:
+                return round(float(value), 3)
+            except Exception:
+                return None
+
+        return (
+            (pw.get("force_rate") if isinstance(pw, dict) else None),
+            _rounded_ms(pw.get("latency_ms") if isinstance(pw, dict) else None),
+            (out.get("session_rate") if isinstance(out, dict) else None),
+            (out.get("session_depth") if isinstance(out, dict) else None),
+            (out.get("hardware_rate") if isinstance(out, dict) else None),
+            (out.get("hardware_depth") if isinstance(out, dict) else None),
+            (src.get("rate") if isinstance(src, dict) else None),
+            (src.get("depth") if isinstance(src, dict) else None),
+            (src.get("codec") if isinstance(src, dict) else None),
+        )
+
     def _read_runtime_snapshot(self):
         try:
             snap = self._rust.get_runtime_snapshot()
             if isinstance(snap, dict):
                 try:
-                    now = time.monotonic()
-                    last = float(getattr(self, "_runtime_snapshot_log_ts", 0.0) or 0.0)
-                    if (now - last) >= 3.0:
-                        setattr(self, "_runtime_snapshot_log_ts", now)
-                        pw = snap.get("pipewire", {}) if isinstance(snap, dict) else {}
-                        out = snap.get("output", {}) if isinstance(snap, dict) else {}
-                        src = snap.get("source", {}) if isinstance(snap, dict) else {}
-                        logger.info(
-                            "Rust runtime snapshot: pw(force=%s latency_ms=%s) out(session=%s/%s hw=%s/%s) src(rate=%s depth=%s bitrate=%s codec=%s)",
-                            (pw.get("force_rate") if isinstance(pw, dict) else None),
-                            (pw.get("latency_ms") if isinstance(pw, dict) else None),
-                            (out.get("session_rate") if isinstance(out, dict) else None),
-                            (out.get("session_depth") if isinstance(out, dict) else None),
-                            (out.get("hardware_rate") if isinstance(out, dict) else None),
-                            (out.get("hardware_depth") if isinstance(out, dict) else None),
-                            (src.get("rate") if isinstance(src, dict) else None),
-                            (src.get("depth") if isinstance(src, dict) else None),
-                            (src.get("bitrate") if isinstance(src, dict) else None),
-                            (src.get("codec") if isinstance(src, dict) else None),
-                        )
+                    if logger.isEnabledFor(logging.DEBUG):
+                        sig = self._runtime_snapshot_log_signature(snap)
+                        if sig != getattr(self, "_runtime_snapshot_log_sig", None):
+                            self._runtime_snapshot_log_sig = sig
+                            pw = snap.get("pipewire", {}) if isinstance(snap, dict) else {}
+                            out = snap.get("output", {}) if isinstance(snap, dict) else {}
+                            src = snap.get("source", {}) if isinstance(snap, dict) else {}
+                            logger.debug(
+                                "Rust runtime snapshot: pw(force=%s latency_ms=%s) out(session=%s/%s hw=%s/%s) src(rate=%s depth=%s codec=%s)",
+                                (pw.get("force_rate") if isinstance(pw, dict) else None),
+                                (pw.get("latency_ms") if isinstance(pw, dict) else None),
+                                (out.get("session_rate") if isinstance(out, dict) else None),
+                                (out.get("session_depth") if isinstance(out, dict) else None),
+                                (out.get("hardware_rate") if isinstance(out, dict) else None),
+                                (out.get("hardware_depth") if isinstance(out, dict) else None),
+                                (src.get("rate") if isinstance(src, dict) else None),
+                                (src.get("depth") if isinstance(src, dict) else None),
+                                (src.get("codec") if isinstance(src, dict) else None),
+                            )
                 except Exception:
                     pass
                 return snap
@@ -994,6 +1019,7 @@ class RustAudioPlayerAdapter:
         self._output_switch_pending = None
         self._last_output_switch_sig = None
         self._last_output_switch_ts = 0.0
+        self._output_switch_restore = None
         self._alsa_container_adapter_active = False
         self._alsa_container_adapter_format = ""
         self._alsa_container_adapter_diag_sig = ""
@@ -2254,10 +2280,19 @@ class RustAudioPlayerAdapter:
                     getattr(self, "current_device_id", None)
                     or getattr(self, "requested_device_id", None)
                 )
+        restore = getattr(self, "_output_switch_restore", None)
+        if restore is None:
+            restore = {
+                "requested_driver": getattr(self, "requested_driver", None),
+                "requested_device_id": getattr(self, "requested_device_id", None),
+                "current_driver": getattr(self, "current_driver", None),
+                "current_device_id": getattr(self, "current_device_id", None),
+                "output_state": getattr(self, "output_state", "idle"),
+                "output_error": getattr(self, "output_error", None),
+            }
+            self._output_switch_restore = restore
         self.requested_driver = driver
         self.requested_device_id = resolved_device_id
-        self.current_driver = driver
-        self.current_device_id = resolved_device_id
         self._alsa_container_adapter_active = False
         self._alsa_container_adapter_format = ""
         self._alsa_container_adapter_diag_sig = ""
@@ -2285,7 +2320,6 @@ class RustAudioPlayerAdapter:
                     )
                     resolved_device_id = new_target
                     self.requested_device_id = resolved_device_id
-                    self.current_device_id = resolved_device_id
         target_buffer = int(getattr(self, "alsa_buffer_time", 100000) or 100000)
         target_latency = int(getattr(self, "alsa_latency_time", 10000) or 10000)
         exclusive = bool(getattr(self, "exclusive_lock_mode", False))
@@ -2311,8 +2345,11 @@ class RustAudioPlayerAdapter:
         if rc == 0:
             if str(driver or "") == "PipeWire":
                 logger.info("PipeWire switch applied by Rust: target=%s", str(resolved_device_id or "default"))
+            self.current_driver = driver
+            self.current_device_id = resolved_device_id
             self.output_state = "active"
             self.output_error = None
+            self._output_switch_restore = None
             return True
 
         detail = ""
@@ -2337,11 +2374,22 @@ class RustAudioPlayerAdapter:
                 self._start_alsa_reservation_async(driver, resolved_device_id, card_num)
                 return True
 
-        self.output_state = "error"
-        self.output_error = (
+        msg = (
             f"Output switch failed (rc={rc}) for {driver}/{resolved_device_id or 'default'}"
             + (f": {detail}" if detail else "")
         )
+        restore = getattr(self, "_output_switch_restore", None)
+        if restore is not None:
+            self.requested_driver = restore.get("requested_driver")
+            self.requested_device_id = restore.get("requested_device_id")
+            self.current_driver = restore.get("current_driver")
+            self.current_device_id = restore.get("current_device_id")
+            self.output_state = restore.get("output_state", "idle")
+            self.output_error = restore.get("output_error")
+            self._output_switch_restore = None
+        else:
+            self.output_state = "error"
+            self.output_error = msg
         logger.error(
             "Rust output switch failed: driver=%s device=%s rc=%s detail=%s",
             driver,
