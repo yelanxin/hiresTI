@@ -65,11 +65,13 @@ def on_nav_selected(app, box, row):
                 if not getattr(app, "_top_sections_cache", None):
                     try:
                         app._top_sections_cache = list(app.backend.get_top_page() or [])
+                        app._top_sections_cache_time = time.monotonic()
                     except Exception:
                         pass
                 if not getattr(app, "_new_sections_cache", None):
                     try:
                         app._new_sections_cache = list(app.backend.get_new_page() or [])
+                        app._new_sections_cache_time = time.monotonic()
                     except Exception:
                         pass
 

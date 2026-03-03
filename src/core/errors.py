@@ -7,7 +7,11 @@ def classify_exception(exc: Exception) -> str:
         return "auth"
     if any(k in text for k in ("500", "502", "503", "504", "internal server error", "bad gateway", "service unavailable")):
         return "server"
-    if any(k in text for k in ("timeout", "timed out", "connection", "network", "dns", "unreachable")):
+    if any(k in text for k in (
+        "timeout", "timed out", "connection", "network", "dns", "unreachable",
+        "eof occurred", "ssl", "remote end closed", "connection reset",
+        "connection aborted", "broken pipe", "econnreset", "econnrefused",
+    )):
         return "network"
     if any(k in text for k in ("404", "not found", "no such")):
         return "not_found"

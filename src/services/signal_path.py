@@ -236,6 +236,7 @@ class AudioSignalPathWindow(Adw.Window):
         self.summary_card.append(summary_head)
         self.summary_rows = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         self.summary_card.append(self.summary_rows)
+        self._summary_last_signature = None
         self._init_bitperfect_help_button()
         main_box.append(self.summary_card)
 
@@ -443,6 +444,39 @@ class AudioSignalPathWindow(Adw.Window):
         if lbl is not None:
             lbl.set_text(self._build_bitperfect_verdict_help_text())
 
+    def _summary_rows_signature(self, rows):
+        return tuple((str(key), str(value), str(style)) for key, value, style in rows)
+
+    def _render_summary_rows(self, rows):
+        while child := self.summary_rows.get_first_child():
+            self.summary_rows.remove(child)
+
+        for key, value, style in rows:
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+            row.add_css_class("signal-terminal-row")
+            lbl_key = Gtk.Label(label=key, xalign=0, css_classes=["signal-terminal-key"])
+            lbl_val = Gtk.Label(label=value, xalign=1, hexpand=True, css_classes=["signal-terminal-value"])
+            lbl_val.set_wrap(True)
+            if style == "ok":
+                lbl_val.add_css_class("success-text")
+            elif style == "warn":
+                lbl_val.add_css_class("warning-text")
+            if key == "Bit-Perfect Verdict":
+                old_parent = self.bitperfect_verdict_help_btn.get_parent()
+                if old_parent is not None:
+                    try:
+                        old_parent.remove(self.bitperfect_verdict_help_btn)
+                    except Exception:
+                        pass
+                key_box = Gtk.Box(spacing=4, valign=Gtk.Align.CENTER)
+                key_box.append(lbl_key)
+                key_box.append(self.bitperfect_verdict_help_btn)
+                row.append(key_box)
+            else:
+                row.append(lbl_key)
+            row.append(lbl_val)
+            self.summary_rows.append(row)
+
     def update_info(self):
         # 确保定时器安全
         # if not self.timer_id: return True # (已由 on_close 处理，这里可省略)
@@ -638,9 +672,6 @@ class AudioSignalPathWindow(Adw.Window):
         if pop is not None and pop.get_visible():
             return
 
-        while child := self.summary_rows.get_first_child():
-            self.summary_rows.remove(child)
-
         state = getattr(self.player, "output_state", "idle")
         err = getattr(self.player, "output_error", None)
         req_driver = getattr(self.player, "requested_driver", None)
@@ -693,33 +724,12 @@ class AudioSignalPathWindow(Adw.Window):
         if not verdict_ok and reasons:
             rows.append(("Reasons", " | ".join(reasons), False))
         # Keep summary concise: hide actionable suggestion row in UI.
-
-        for key, value, style in rows:
-            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
-            row.add_css_class("signal-terminal-row")
-            lbl_key = Gtk.Label(label=key, xalign=0, css_classes=["signal-terminal-key"])
-            lbl_val = Gtk.Label(label=value, xalign=1, hexpand=True, css_classes=["signal-terminal-value"])
-            lbl_val.set_wrap(True)
-            if style == "ok":
-                lbl_val.add_css_class("success-text")
-            elif style == "warn":
-                lbl_val.add_css_class("warning-text")
-            if key == "Bit-Perfect Verdict":
-                self._refresh_bitperfect_help_text()
-                old_parent = self.bitperfect_verdict_help_btn.get_parent()
-                if old_parent is not None and old_parent is not row:
-                    try:
-                        old_parent.remove(self.bitperfect_verdict_help_btn)
-                    except Exception:
-                        pass
-                key_box = Gtk.Box(spacing=4, valign=Gtk.Align.CENTER)
-                key_box.append(lbl_key)
-                key_box.append(self.bitperfect_verdict_help_btn)
-                row.append(key_box)
-            else:
-                row.append(lbl_key)
-            row.append(lbl_val)
-            self.summary_rows.append(row)
+        self._refresh_bitperfect_help_text()
+        sig = self._summary_rows_signature(rows)
+        if sig == getattr(self, "_summary_last_signature", None):
+            return
+        self._render_summary_rows(rows)
+        self._summary_last_signature = sig
 
     def _compute_bitperfect_verdict(self, output_state, sample_rate="Unknown", bit_depth="Unknown", output_rate="Unknown", output_depth="Unknown"):
         reasons = []

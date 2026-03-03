@@ -11,6 +11,22 @@ logger = logging.getLogger(__name__)
 _global_session = None
 
 
+def reset_global_session() -> None:
+    """
+    Close and discard the global HTTP session, forcing a fresh one on next use.
+    Call this after system sleep/resume or when connections are known to be stale.
+    """
+    global _global_session
+    old = _global_session
+    _global_session = None
+    if old is not None:
+        try:
+            old.close()
+        except Exception:
+            pass
+    logger.info("Global HTTP session reset (stale connections discarded)")
+
+
 def get_global_session() -> requests.Session:
     """
     Get or create a global requests Session with larger connection pool.

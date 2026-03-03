@@ -116,3 +116,28 @@ def test_pipewire_latency_debug_log_dedupes_stable_state(caplog):
     assert third == 42.0
     assert len(diag_msgs) == 2
     assert all(record.levelno == logging.DEBUG for record in diag_msgs)
+
+
+def test_summary_update_skips_rebuild_when_rows_are_unchanged():
+    win = _make_window("ALSA", exclusive=True)
+    win.bitperfect_verdict_help_pop = SimpleNamespace(get_visible=lambda: False)
+    win._summary_last_signature = None
+
+    render_calls = []
+    refresh_calls = []
+
+    win._refresh_bitperfect_help_text = lambda: refresh_calls.append(True)
+    win._render_summary_rows = lambda rows: render_calls.append(tuple(rows))
+    win._get_pipewire_clock_state = lambda: (0, [])
+    win._read_runtime_snapshot_safe = lambda: {
+        "source": {"rate": 44100, "depth": 16},
+        "output": {"hardware_rate": 44100, "hardware_depth": 16},
+    }
+    win._compute_format_match = lambda *args: True
+    win._compute_bitperfect_verdict = lambda *args: (True, "ok", [])
+
+    win._update_summary()
+    win._update_summary()
+
+    assert len(render_calls) == 1
+    assert len(refresh_calls) == 2

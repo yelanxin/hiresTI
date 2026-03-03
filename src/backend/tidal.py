@@ -406,6 +406,13 @@ class TidalBackend:
 
     def recover_session(self, reason="api"):
         with self._session_recovery_lock:
+            # Discard stale connections (e.g. after system sleep/resume) so that
+            # check_login() and subsequent requests use fresh TCP/SSL connections.
+            try:
+                from core.http_session import reset_global_session
+                reset_global_session()
+            except Exception as e:
+                logger.debug("HTTP session reset skipped: %s", e)
             try:
                 data = self._read_saved_session_data()
             except Exception as e:

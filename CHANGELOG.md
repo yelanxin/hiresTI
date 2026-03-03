@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.4.8 - 2026-03-03
+Navigation and session-recovery stability release: smoother first-open `New` page rendering, better post-sleep page recovery, and a more reliable Signal Path help popover.
+
+### Fixed
+- Fixed the `New` page occasionally flashing on first entry because prefetched sections were rendered and then immediately refreshed again instead of being treated as fresh cache data.
+- Fixed cases where parts of the app could fail to display after system sleep/resume by resetting stale global HTTP connections before TIDAL session recovery and classifying broken SSL/TCP disconnects as recoverable network failures.
+- Fixed the `Audio Signal Path` `Bit-Perfect Verdict` help button occasionally failing to open because the summary area was rebuilding the button every second even when the diagnostics had not changed.
+
+### Tests
+- Verified with:
+  - `pytest -q tests/test_signal_path_bitperfect.py`
+  - `pytest -q tests/test_tidal_session_recovery.py`
+
+---
+
 ## 1.4.7 - 2026-03-03
 Now Playing album-navigation follow-up release: easier album return flow, correct artist drill-down from overlay-opened albums, and reduced GTK label sizing warnings.
 
