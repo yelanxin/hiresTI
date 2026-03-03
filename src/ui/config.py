@@ -554,6 +554,15 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
 .album-title-large { font-size: 28px; font-weight: 800; margin-bottom: 4px; }
 .album-artist-medium { font-size: 16px; font-weight: 600; color: @accent_color; margin-bottom: 8px; }
 .album-meta { font-size: 13px; opacity: 0.7; }
+.home-subtitle,
+.album-artist-medium,
+.album-meta,
+.home-card-title,
+.home-card-subtitle,
+.home-section-subtitle {
+    padding-top: 1px;
+    padding-bottom: 1px;
+}
 .history-rank-badge {
     min-width: 20px;
     padding: 2px 8px;
@@ -823,6 +832,9 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
     background-image: none;
     border: none;
     box-shadow: none;
+}
+.now-playing-open-album-btn image {
+    -gtk-icon-size: 18px;
 }
 .now-playing-lyrics-page {
     border-radius: 18px;

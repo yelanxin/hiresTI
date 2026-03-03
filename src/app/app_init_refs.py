@@ -163,6 +163,8 @@ def _init_runtime_refs(self):
     self.liked_tracks_last_fetch_ts = 0.0
     self.liked_tracks_cache_ttl_sec = LikedTracksCache.TTL_SEC
     self.current_album = None
+    self.current_album_artist_id = None
+    self.current_album_artist_name = ""
     self.current_remote_playlist = None
     self.current_playlist_folder = None
     self.current_playlist_folder_stack = []

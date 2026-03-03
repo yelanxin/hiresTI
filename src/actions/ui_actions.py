@@ -1085,6 +1085,47 @@ def _ensure_play_shuffle_btns(app):
         app._album_shuffle_btn.set_visible(True)
 
 
+def _artist_context_values(candidate):
+    if candidate is None:
+        return None, ""
+    if isinstance(candidate, dict):
+        artist_id = candidate.get("id")
+        artist_name = str(candidate.get("name", "") or "").strip()
+        return artist_id, artist_name
+    if isinstance(candidate, str):
+        return None, candidate.strip()
+    artist_id = getattr(candidate, "id", None)
+    artist_name = str(getattr(candidate, "name", "") or "").strip()
+    return artist_id, artist_name
+
+
+def _resolve_album_artist_context(app, alb):
+    candidates = []
+
+    if alb is not None:
+        candidates.append(getattr(alb, "artist", None))
+        artists = getattr(alb, "artists", None)
+        if artists:
+            try:
+                candidates.extend(list(artists)[:1])
+            except Exception:
+                pass
+
+    track = getattr(app, "playing_track", None)
+    track_album = getattr(track, "album", None) if track is not None else None
+    album_id = str(getattr(alb, "id", "") or "")
+    track_album_id = str(getattr(track_album, "id", "") or "")
+    if track is not None and (not album_id or (track_album_id and album_id == track_album_id)):
+        candidates.append(getattr(track, "artist", None))
+
+    for candidate in candidates:
+        artist_id, artist_name = _artist_context_values(candidate)
+        if artist_id or artist_name:
+            return artist_id, artist_name
+
+    return None, "Various Artists"
+
+
 def show_album_details(app, alb):
     current_view = app.right_stack.get_visible_child_name()
     if current_view and current_view != "tracks":
@@ -1100,9 +1141,9 @@ def show_album_details(app, alb):
     app.header_title.set_text(title)
     app.header_title.set_tooltip_text(title)
 
-    artist_name = "Various Artists"
-    if hasattr(alb, "artist") and alb.artist:
-        artist_name = alb.artist.name if hasattr(alb.artist, "name") else str(alb.artist)
+    artist_id, artist_name = _resolve_album_artist_context(app, alb)
+    app.current_album_artist_id = artist_id
+    app.current_album_artist_name = artist_name
     app.header_artist.set_text(artist_name)
     app.header_artist.set_tooltip_text(artist_name)
 

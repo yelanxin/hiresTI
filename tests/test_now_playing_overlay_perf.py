@@ -28,11 +28,15 @@ class _Progress:
 class _Label:
     def __init__(self):
         self.text = None
+        self.tooltip = None
         self.set_text_calls = 0
 
     def set_text(self, value):
         self.text = str(value)
         self.set_text_calls += 1
+
+    def set_tooltip_text(self, value):
+        self.tooltip = None if value is None else str(value)
 
 
 class _Button:
@@ -43,6 +47,39 @@ class _Button:
     def set_icon_name(self, value):
         self.icon_name = str(value)
         self.set_icon_calls += 1
+
+
+class _SensitiveButton:
+    def __init__(self):
+        self.sensitive = None
+        self.set_sensitive_calls = 0
+
+    def set_sensitive(self, value):
+        self.sensitive = bool(value)
+        self.set_sensitive_calls += 1
+
+
+class _NavRow:
+    def __init__(self, nav_id):
+        self.nav_id = str(nav_id)
+        self._next = None
+
+    def get_next_sibling(self):
+        return self._next
+
+
+class _NavList:
+    def __init__(self, nav_ids):
+        self._rows = [_NavRow(nav_id) for nav_id in nav_ids]
+        for left, right in zip(self._rows, self._rows[1:]):
+            left._next = right
+        self.selected = None
+
+    def get_first_child(self):
+        return self._rows[0] if self._rows else None
+
+    def select_row(self, row):
+        self.selected = row
 
 
 class _Stack:
@@ -434,6 +471,62 @@ def test_now_playing_track_album_name_reads_album_name():
     track = SimpleNamespace(album=SimpleNamespace(name="Fearless"))
 
     assert app_now_playing._now_playing_track_album_name(track) == "Fearless"
+
+
+def test_open_album_click_hides_overlay_and_opens_album(monkeypatch):
+    album = SimpleNamespace(id="42", name="Fearless")
+    opened = []
+    hidden = []
+    remembered = []
+    nav_list = _NavList(["home", "collection", "artists"])
+    app = SimpleNamespace(
+        playing_track=SimpleNamespace(album=album),
+        show_album_details=lambda alb: opened.append(alb),
+        nav_list=nav_list,
+        _remember_last_nav=lambda nav_id: remembered.append(nav_id),
+    )
+
+    monkeypatch.setattr(app_now_playing, "hide_now_playing_overlay", lambda _app: hidden.append(True))
+
+    app_now_playing.on_now_playing_open_album_clicked(app)
+
+    assert hidden == [True]
+    assert opened == [album]
+    assert nav_list.selected is not None
+    assert nav_list.selected.nav_id == "collection"
+    assert remembered == ["collection"]
+
+
+def test_refresh_now_playing_disables_open_album_button_without_album(monkeypatch):
+    app = SimpleNamespace(
+        playing_track=SimpleNamespace(
+            name="Track",
+            artist=SimpleNamespace(name="Artist"),
+            album=None,
+        ),
+        now_playing_title_label=_Label(),
+        now_playing_artist_label=_Label(),
+        now_playing_album_label=_Label(),
+        now_playing_open_album_btn=_SensitiveButton(),
+        _render_now_playing_queue=lambda _tracks: None,
+        _get_active_queue=lambda: [],
+        _load_now_playing_album_tracks_async=lambda _album: None,
+        _render_now_playing_album_tracks=lambda _tracks: None,
+        _render_now_playing_lyrics=lambda _lyrics, _status: None,
+        backend=SimpleNamespace(get_artwork_url=lambda _track, _size: None),
+        lyrics_mgr=None,
+        now_playing_album_tracks=[],
+        now_playing_album_id="",
+        player=SimpleNamespace(get_position=lambda: (12.0, 180.0), is_playing=lambda: True),
+        _sync_now_playing_overlay_state=lambda _pos, _dur, _playing: None,
+    )
+
+    monkeypatch.setattr(app_now_playing, "_load_now_playing_cover", lambda _app, _cover_ref: None)
+
+    app_now_playing._refresh_now_playing_from_track(app)
+
+    assert app.now_playing_open_album_btn.sensitive is False
+    assert app.now_playing_open_album_btn.set_sensitive_calls == 1
 
 
 def test_scrim_css_is_disabled():

@@ -174,15 +174,20 @@ def _tick_playing_row_pulse(self):
 
 def on_header_artist_clicked(self, gest, n, x, y):
     if self.current_album:
-        artist_obj = None
-        if hasattr(self.current_album, "artist") and self.current_album.artist:
-            artist_obj = self.current_album.artist
+        artist_id = getattr(self, "current_album_artist_id", None)
+        artist_name = str(getattr(self, "current_album_artist_name", "") or "").strip()
 
-        if not artist_obj or isinstance(artist_obj, str):
-            return
+        if not artist_id and not artist_name:
+            artist_obj = None
+            if hasattr(self.current_album, "artist") and self.current_album.artist:
+                artist_obj = self.current_album.artist
+            if artist_obj is not None:
+                if isinstance(artist_obj, str):
+                    artist_name = artist_obj.strip()
+                else:
+                    artist_id = getattr(artist_obj, "id", None)
+                    artist_name = getattr(artist_obj, "name", "").strip()
 
-        artist_id = getattr(artist_obj, "id", None)
-        artist_name = getattr(artist_obj, "name", "").strip()
         if not artist_id and not artist_name:
             return
 

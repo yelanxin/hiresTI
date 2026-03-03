@@ -1251,9 +1251,7 @@ def _build_now_playing_right_panel(self, layout):
     self.now_playing_queue_scroll = queue_scroll
     queue_page.append(queue_shell)
 
-    album_page = Gtk.Box(
-        orientation=Gtk.Orientation.VERTICAL,
-        spacing=10,
+    album_page = Gtk.Overlay(
         hexpand=True,
         vexpand=True,
         css_classes=["now-playing-stack-page"],
@@ -1274,7 +1272,21 @@ def _build_now_playing_right_panel(self, layout):
     album_scroll.set_child(self.now_playing_track_list)
     album_shell.append(album_scroll)
     self.now_playing_album_scroll = album_scroll
-    album_page.append(album_shell)
+    album_page.set_child(album_shell)
+
+    # Floating action: jump from the album tab back into the main album page.
+    self.now_playing_open_album_btn = Gtk.Button(
+        css_classes=["flat", "circular", "now-playing-collapse-btn", "now-playing-open-album-btn"],
+        halign=Gtk.Align.END,
+        valign=Gtk.Align.END,
+        sensitive=False,
+    )
+    self.now_playing_open_album_btn.set_child(Gtk.Image.new_from_icon_name("go-next-symbolic"))
+    self.now_playing_open_album_btn.set_tooltip_text("Open Album in Main View")
+    self.now_playing_open_album_btn.set_margin_end(58)
+    self.now_playing_open_album_btn.set_margin_bottom(18)
+    self.now_playing_open_album_btn.connect("clicked", self.on_now_playing_open_album_clicked)
+    album_page.add_overlay(self.now_playing_open_album_btn)
 
     lyrics_page = Gtk.Box(
         orientation=Gtk.Orientation.VERTICAL,
@@ -1530,11 +1542,31 @@ def toggle_now_playing_overlay(self, _btn=None):
         show_now_playing_overlay(self)
 
 
+def _select_sidebar_nav_row(self, nav_id):
+    nav_list = getattr(self, "nav_list", None)
+    if nav_list is None:
+        return False
+    child = nav_list.get_first_child()
+    while child:
+        if getattr(child, "nav_id", None) == nav_id:
+            try:
+                nav_list.select_row(child)
+            except Exception:
+                return False
+            remember = getattr(self, "_remember_last_nav", None)
+            if callable(remember):
+                remember(nav_id)
+            return True
+        child = child.get_next_sibling()
+    return False
+
+
 def on_now_playing_open_album_clicked(self, _btn=None):
     track = getattr(self, "playing_track", None)
     album = getattr(track, "album", None) if track is not None else None
     if album is None:
         return
+    _select_sidebar_nav_row(self, "collection")
     hide_now_playing_overlay(self)
     self.show_album_details(album)
 

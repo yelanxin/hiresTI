@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.4.7 - 2026-03-03
+Now Playing album-navigation follow-up release: easier album return flow, correct artist drill-down from overlay-opened albums, and reduced GTK label sizing warnings.
+
+### Added
+- The `Now Playing` album tab now includes a floating quick-open action that jumps straight to the current album in the main library view.
+
+### Changed
+- Returning from `Now Playing` to an album now synchronizes the left sidebar selection to `My Albums`, so the main shell context matches the page being shown.
+
+### Fixed
+- Fixed album header artist navigation for albums opened from `Now Playing` by carrying forward artist context even when the playback track's album object has incomplete artist metadata.
+- Reduced repeated GTK `GtkLabel ... natural size must be >= min size` warnings by relaxing vertical sizing for the compact secondary/card label styles used in album and home grids.
+
+### Tests
+- Verified with:
+  - `pytest -q tests/test_album_artist_navigation.py tests/test_now_playing_overlay_perf.py`
+  - `pytest -q tests/test_home_section_header.py tests/test_tidal_home_page.py`
+
+---
+
 ## 1.4.6 - 2026-03-03
 Signal-path + home-page polish release: terminal-style bit-perfect help, clearer PipeWire verdict rules, quieter runtime diagnostics, and better TIDAL home context headers.
 
