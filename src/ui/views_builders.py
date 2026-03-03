@@ -432,6 +432,25 @@ def build_settings_page(app):
     row_drv.append(app.driver_dd)
     group_out.append(row_drv)
 
+    row_depth = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
+    depth_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
+    depth_info.append(Gtk.Label(label="Output Bit Depth", xalign=0, css_classes=["settings-label"]))
+    depth_info.append(
+        Gtk.Label(
+            label="ALSA only. PipeWire final hardware depth is controlled by the system graph",
+            xalign=0,
+            css_classes=["dim-label"],
+        )
+    )
+    row_depth.append(depth_info)
+    row_depth.append(Gtk.Box(hexpand=True))
+    app.bit_depth_dd = Gtk.DropDown(model=Gtk.StringList.new(["Auto"]))
+    app.bit_depth_dd.set_valign(Gtk.Align.CENTER)
+    app.bit_depth_dd.set_sensitive(False)
+    app.bit_depth_dd.connect("notify::selected-item", app.on_output_bit_depth_changed)
+    row_depth.append(app.bit_depth_dd)
+    group_out.append(row_depth)
+
     row_dev = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
     row_dev.append(Gtk.Label(label="Output Device", hexpand=True, xalign=0))
     app.device_dd = Gtk.DropDown(model=Gtk.StringList.new(["Default"]))

@@ -120,6 +120,7 @@ def _init_runtime_state(self):
     self.is_programmatic_update = False
     self.current_device_list = []
     self.current_device_name = self.settings.get("device", "Default Output")
+    self.ignore_output_bit_depth_change = False
     self.search_track_data = []
     self.search_history = list(self.settings.get("search_history", []))
     self.nav_history = []

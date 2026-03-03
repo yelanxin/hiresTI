@@ -97,6 +97,7 @@ pub struct Engine {
     last_depth: i32,
     source_rate: i32,
     source_depth: i32,
+    preferred_output_format: String,
     spectrum_enabled: bool,
 }
 
@@ -930,6 +931,7 @@ impl Engine {
             last_depth: 0,
             source_rate: 0,
             source_depth: 0,
+            preferred_output_format: String::new(),
             spectrum_enabled: true,
         })
     }
@@ -1094,11 +1096,14 @@ impl Engine {
         }
         let device_norm = resolved_device.as_deref();
 
-        let sink = if driver_norm.is_empty() || driver_norm.starts_with("auto") {
-            gst::ElementFactory::make("autoaudiosink")
+        let (sink, auto_caps_format) = if driver_norm.is_empty() || driver_norm.starts_with("auto") {
+            (
+                gst::ElementFactory::make("autoaudiosink")
                 .name("rust-auto-sink")
                 .build()
-                .ok()
+                .ok(),
+                None,
+            )
         } else if driver_norm.contains("pipewire") {
             let s = gst::ElementFactory::make("pipewiresink")
                 .name("rust-pw-sink")
@@ -1146,7 +1151,7 @@ impl Engine {
                             latency_node
                         ),
                     );
-                    s
+                    (s, None)
                 }
                 None => {
                     self.set_error("pipewiresink unavailable");
@@ -1177,7 +1182,7 @@ impl Engine {
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         elem.set_property("provide-clock", true);
                     }));
-                    s
+                    (s, None)
                 }
                 None => {
                     self.set_error("pulsesink unavailable");
@@ -1187,19 +1192,7 @@ impl Engine {
             }
         } else if driver_norm.contains("alsa") {
             match build_alsa_sink_element(device_norm, buffer_us, latency_us, exclusive) {
-                Ok((elem, forced_caps_format)) => {
-                    if let Some(fmt) = forced_caps_format {
-                        self.emit_event(
-                            EVT_STATE,
-                            &format!(
-                                "alsa-exclusive container-adapter format={} device={}",
-                                fmt,
-                                device_norm.unwrap_or("default")
-                            ),
-                        );
-                    }
-                    Some(elem)
-                }
+                Ok((elem, forced_caps_format)) => (Some(elem), forced_caps_format),
                 Err(-13) => {
                     self.set_error("alsasink unavailable");
                     self.emit_event(EVT_ERROR, "alsasink unavailable");
@@ -1223,7 +1216,51 @@ impl Engine {
             return -15;
         };
 
-        self.playbin.set_property("audio-sink", &sink_elem);
+        let preferred_caps_format = self
+            .preferred_output_format
+            .trim()
+            .to_string();
+        let selected_caps_format = if !preferred_caps_format.is_empty() {
+            Some(preferred_caps_format.as_str())
+        } else {
+            auto_caps_format.as_deref()
+        };
+        let final_sink = if let Some(fmt) = selected_caps_format {
+            match wrap_sink_with_caps(sink_elem, fmt, "rust-output-convert", "rust-output-caps") {
+                Ok(wrapped) => {
+                    if preferred_caps_format.is_empty() {
+                        self.emit_event(
+                            EVT_STATE,
+                            &format!(
+                                "alsa-exclusive container-adapter format={} device={}",
+                                fmt,
+                                device_norm.unwrap_or("default")
+                            ),
+                        );
+                    } else {
+                        self.emit_event(
+                            EVT_STATE,
+                            &format!(
+                                "output-format preference={} driver={} device={}",
+                                fmt,
+                                driver,
+                                device_norm.unwrap_or("default")
+                            ),
+                        );
+                    }
+                    wrapped
+                }
+                Err(_) => {
+                    self.set_error(format!("failed to apply output format {fmt}"));
+                    self.emit_event(EVT_ERROR, &format!("failed to apply output format {fmt}"));
+                    return -15;
+                }
+            }
+        } else {
+            sink_elem
+        };
+
+        self.playbin.set_property("audio-sink", &final_sink);
         self.emit_event(
             EVT_STATE,
             &format!(
@@ -1496,6 +1533,96 @@ fn list_pulseaudio_sinks() -> Vec<(String, Option<String>)> {
         .into_iter()
         .map(|(name, dev_id, _card)| (name, dev_id))
         .collect()
+}
+
+fn pulseaudio_alsa_card_index_from_sink_name(sink_name: &str) -> Option<String> {
+    fn str_opt_to_string(v: Option<std::borrow::Cow<'_, str>>) -> String {
+        v.map(|x| x.into_owned()).unwrap_or_default()
+    }
+
+    let Ok((mut mainloop, context)) = pa_connect() else {
+        return None;
+    };
+    let target = sink_name.trim().to_string();
+    if target.is_empty() {
+        return None;
+    }
+
+    let found = Rc::new(RefCell::new(String::new()));
+    let done = Rc::new(Cell::new(false));
+
+    let found_cb = Rc::clone(&found);
+    let done_cb = Rc::clone(&done);
+    let mut op = context
+        .introspect()
+        .get_sink_info_list(move |res| match res {
+            ListResult::Item(info) => {
+                let name = str_opt_to_string(info.name.as_ref().cloned());
+                if name != target {
+                    return;
+                }
+                let alsa_card = info.proplist.get_str("alsa.card").unwrap_or_default();
+                let alsa_card = alsa_card.trim();
+                if !alsa_card.is_empty() {
+                    *found_cb.borrow_mut() = alsa_card.to_string();
+                }
+            }
+            ListResult::End | ListResult::Error => {
+                done_cb.set(true);
+            }
+        });
+    pa_wait_for_list(&mut mainloop, &context, &done, &mut op);
+    let out = found.borrow().clone();
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+fn pulseaudio_alsa_card_index_from_card_name(card: &str) -> Option<String> {
+    fn str_opt_to_string(v: Option<std::borrow::Cow<'_, str>>) -> String {
+        v.map(|x| x.into_owned()).unwrap_or_default()
+    }
+
+    let Ok((mut mainloop, context)) = pa_connect() else {
+        return None;
+    };
+    let target = card.trim().to_string();
+    if target.is_empty() {
+        return None;
+    }
+
+    let found = Rc::new(RefCell::new(String::new()));
+    let done = Rc::new(Cell::new(false));
+
+    let found_cb = Rc::clone(&found);
+    let done_cb = Rc::clone(&done);
+    let mut op = context
+        .introspect()
+        .get_card_info_list(move |res| match res {
+            ListResult::Item(info) => {
+                let name = str_opt_to_string(info.name.as_ref().cloned());
+                if name != target {
+                    return;
+                }
+                let alsa_card = info.proplist.get_str("alsa.card").unwrap_or_default();
+                let alsa_card = alsa_card.trim();
+                if !alsa_card.is_empty() {
+                    *found_cb.borrow_mut() = alsa_card.to_string();
+                }
+            }
+            ListResult::End | ListResult::Error => {
+                done_cb.set(true);
+            }
+        });
+    pa_wait_for_list(&mut mainloop, &context, &done, &mut op);
+    let out = found.borrow().clone();
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 fn pa_connect() -> Result<(PaMainloop, PaContext), String> {
@@ -2065,6 +2192,80 @@ fn detect_alsa_exclusive_caps_format_from_proc_root(
     forced.map(str::to_string)
 }
 
+fn gst_output_format_from_playback_format(playback_format: &str) -> Option<&'static str> {
+    match playback_format.trim().to_ascii_uppercase().as_str() {
+        "S16_LE" | "S16LE" => Some("S16LE"),
+        "S24_LE" | "S24LE" | "S24_3LE" => Some("S24LE"),
+        "S24_32_LE" | "S24_32LE" => Some("S24_32LE"),
+        "S32_LE" | "S32LE" => Some("S32LE"),
+        _ => None,
+    }
+}
+
+fn supported_output_formats_from_playback_formats(formats: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for fmt in formats {
+        let Some(mapped) = gst_output_format_from_playback_format(fmt) else {
+            continue;
+        };
+        if !out.iter().any(|v| v == mapped) {
+            out.push(mapped.to_string());
+        }
+    }
+    out
+}
+
+fn supported_output_depths_from_formats(formats: &[String]) -> Vec<i32> {
+    let mut out: Vec<i32> = Vec::new();
+    for fmt in formats {
+        let Some(depth) = Engine::parse_depth_from_format(fmt) else {
+            continue;
+        };
+        if !out.iter().any(|v| *v == depth) {
+            out.push(depth);
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
+fn wrap_sink_with_caps(
+    sink_elem: gst::Element,
+    format_name: &str,
+    convert_name: &str,
+    caps_name: &str,
+) -> Result<gst::Element, c_int> {
+    let convert = gst::ElementFactory::make("audioconvert")
+        .name(convert_name)
+        .build()
+        .map_err(|_| -15)?;
+    let capsfilter = gst::ElementFactory::make("capsfilter")
+        .name(caps_name)
+        .build()
+        .map_err(|_| -15)?;
+    let caps = gst::Caps::builder("audio/x-raw")
+        .field("format", format_name)
+        .field("layout", "interleaved")
+        .build();
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        capsfilter.set_property("caps", &caps);
+    }));
+
+    let bin = gst::Bin::new();
+    if bin.add(&convert).is_err() || bin.add(&capsfilter).is_err() || bin.add(&sink_elem).is_err() {
+        return Err(-15);
+    }
+    if convert.link(&capsfilter).is_err() || capsfilter.link(&sink_elem).is_err() {
+        return Err(-15);
+    }
+    let sink_pad = convert.static_pad("sink").ok_or(-15)?;
+    let ghost_sink = gst::GhostPad::with_target(&sink_pad).map_err(|_| -15)?;
+    if bin.add_pad(&ghost_sink).is_err() {
+        return Err(-15);
+    }
+    Ok(bin.upcast::<gst::Element>())
+}
+
 fn read_alsa_pcm_label(info_path: &Path) -> Option<String> {
     let Ok(content) = std::fs::read_to_string(info_path) else {
         return None;
@@ -2212,44 +2413,7 @@ fn build_alsa_sink_element(
     } else {
         None
     };
-
-    let Some(fmt) = forced_caps_format.as_deref() else {
-        return Ok((alsa_sink, None));
-    };
-
-    let convert = gst::ElementFactory::make("audioconvert")
-        .name("rust-alsa-convert")
-        .build()
-        .map_err(|_| -15)?;
-    let capsfilter = gst::ElementFactory::make("capsfilter")
-        .name("rust-alsa-caps")
-        .build()
-        .map_err(|_| -15)?;
-    let caps = gst::Caps::builder("audio/x-raw")
-        .field("format", fmt)
-        .field("layout", "interleaved")
-        .build();
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        capsfilter.set_property("caps", &caps);
-    }));
-
-    let bin = gst::Bin::new();
-    if bin.add(&convert).is_err()
-        || bin.add(&capsfilter).is_err()
-        || bin.add(&alsa_sink).is_err()
-    {
-        return Err(-15);
-    }
-    if convert.link(&capsfilter).is_err() || capsfilter.link(&alsa_sink).is_err() {
-        return Err(-15);
-    }
-    let sink_pad = convert.static_pad("sink").ok_or(-15)?;
-    let ghost_sink = gst::GhostPad::with_target(&sink_pad).map_err(|_| -15)?;
-    if bin.add_pad(&ghost_sink).is_err() {
-        return Err(-15);
-    }
-
-    Ok((bin.upcast::<gst::Element>(), Some(fmt.to_string())))
+    Ok((alsa_sink, forced_caps_format))
 }
 
 fn devices_for_driver(driver: &str) -> Vec<(String, Option<String>)> {
@@ -2306,6 +2470,34 @@ fn card_from_pipewire_output_node(device_id: &str) -> Option<String> {
         return None;
     }
     Some(format!("alsa_card.{core}"))
+}
+
+fn supported_output_formats_for_driver_device(driver: &str, device_id: Option<&str>) -> Vec<String> {
+    let drv = driver.trim();
+    let dev = device_id.unwrap_or("").trim();
+    if dev.is_empty() {
+        return Vec::new();
+    }
+
+    let alsa_card_idx = if drv == "ALSA" {
+        parse_alsa_hw_device_id(dev).map(|(card_idx, _)| card_idx)
+    } else if drv == "PipeWire" {
+        parse_pipewire_card_profile_target(dev)
+            .and_then(|(card, _)| pulseaudio_alsa_card_index_from_card_name(&card))
+            .or_else(|| card_from_pipewire_output_node(dev).and_then(|card| pulseaudio_alsa_card_index_from_card_name(&card)))
+            .or_else(|| pulseaudio_alsa_card_index_from_sink_name(dev))
+    } else if drv == "PulseAudio" {
+        pulseaudio_alsa_card_index_from_sink_name(dev)
+    } else {
+        None
+    };
+
+    let Some(card_idx) = alsa_card_idx else {
+        return Vec::new();
+    };
+    let playback_formats =
+        read_alsa_card_playback_formats_from_proc_root(Path::new("/proc/asound"), &card_idx);
+    supported_output_formats_from_playback_formats(&playback_formats)
 }
 
 fn pulseaudio_card_active_profile(card: &str) -> Option<String> {
@@ -2809,6 +3001,32 @@ pub extern "C" fn rac_set_output_tuned(
 }
 
 #[no_mangle]
+pub extern "C" fn rac_set_preferred_output_format(
+    ptr: *mut Engine,
+    format_name: *const c_char,
+) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    if format_name.is_null() {
+        engine.preferred_output_format.clear();
+        return 0;
+    }
+    let fmt = unsafe { CStr::from_ptr(format_name) };
+    match fmt.to_str() {
+        Ok(s) => {
+            engine.preferred_output_format = s.trim().to_ascii_uppercase();
+            0
+        }
+        Err(_) => {
+            engine.set_error("rac_set_preferred_output_format: invalid utf-8");
+            engine.emit_event(EVT_ERROR, "rac_set_preferred_output_format: invalid utf-8");
+            -2
+        }
+    }
+}
+
+#[no_mangle]
 pub extern "C" fn rac_set_speed(ptr: *mut Engine, speed: c_double) -> c_int {
     let Some(engine) = as_mut_engine(ptr) else {
         return -1;
@@ -2940,6 +3158,8 @@ pub extern "C" fn rac_list_devices(ptr: *mut Engine, driver: *const c_char) -> *
         if i > 0 {
             s.push(',');
         }
+        let supported_formats = supported_output_formats_for_driver_device(drv_str, dev_id.as_deref());
+        let supported_bit_depths = supported_output_depths_from_formats(&supported_formats);
         s.push_str("{\"name\":\"");
         s.push_str(&json_escape(&name));
         s.push_str("\",\"device_id\":");
@@ -2951,6 +3171,24 @@ pub extern "C" fn rac_list_devices(ptr: *mut Engine, driver: *const c_char) -> *
             }
             None => s.push_str("null"),
         }
+        s.push_str(",\"supported_formats\":[");
+        for (fmt_idx, fmt) in supported_formats.iter().enumerate() {
+            if fmt_idx > 0 {
+                s.push(',');
+            }
+            s.push('"');
+            s.push_str(&json_escape(fmt));
+            s.push('"');
+        }
+        s.push(']');
+        s.push_str(",\"supported_bit_depths\":[");
+        for (depth_idx, depth) in supported_bit_depths.iter().enumerate() {
+            if depth_idx > 0 {
+                s.push(',');
+            }
+            s.push_str(&depth.to_string());
+        }
+        s.push(']');
         s.push('}');
     }
     s.push(']');
@@ -3188,6 +3426,38 @@ Playback:
         let fmt = detect_alsa_exclusive_caps_format_from_proc_root(proc_root.path(), "hw:2,0");
 
         assert_eq!(fmt, None);
+    }
+
+    #[test]
+    fn supported_output_formats_map_known_alsa_formats() {
+        let formats = supported_output_formats_from_playback_formats(&vec![
+            "S16_LE".to_string(),
+            "S24_3LE".to_string(),
+            "S24_32_LE".to_string(),
+            "S32_LE".to_string(),
+        ]);
+
+        assert_eq!(
+            formats,
+            vec![
+                "S16LE".to_string(),
+                "S24LE".to_string(),
+                "S24_32LE".to_string(),
+                "S32LE".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn supported_output_depths_dedupe_container_formats() {
+        let depths = supported_output_depths_from_formats(&vec![
+            "S24LE".to_string(),
+            "S24_32LE".to_string(),
+            "S16LE".to_string(),
+            "S32LE".to_string(),
+        ]);
+
+        assert_eq!(depths, vec![16, 24, 32]);
     }
 
     #[test]

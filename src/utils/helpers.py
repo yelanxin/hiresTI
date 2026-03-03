@@ -20,7 +20,25 @@ logger = logging.getLogger(__name__)
 _IMG_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="img-load")
 
 # Unified cover/artwork display size (px) — change here to resize all non-track/non-artist covers.
+# This value is updated at startup by set_ui_scale() based on the display scale factor.
 COVER_SIZE = 170
+
+
+def set_ui_scale(scale_factor: int) -> None:
+    """Adjust UI element sizes for the display's scale factor.
+
+    At HiDPI (scale ≥ 2) GTK doubles all logical pixels automatically, so the
+    base sizes are correct.  At 1x the same logical sizes render physically
+    smaller; we compensate by scaling up.
+
+    Call once from app startup before any UI is built.
+    """
+    global COVER_SIZE
+    # Target: match the physical appearance of a 2x HiDPI display.
+    # Cap at 1.4× to avoid overflowing the default window width.
+    ui_scale = max(1.0, min(1.4, 2.0 / max(1, scale_factor)))
+    COVER_SIZE = int(170 * ui_scale)
+    logger.debug("Display scale=%d → ui_scale=%.2f, COVER_SIZE=%d", scale_factor, ui_scale, COVER_SIZE)
 
 _TIDAL_IMAGE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",

@@ -1109,3 +1109,38 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
 }
 
 """
+
+
+def get_scale_css_overrides(font_scale: float) -> str:
+    """Return additional CSS that enlarges text for low-DPI (1x) displays.
+
+    At scale ≥ 2 GTK's HiDPI path already doubles every logical pixel, so the
+    base sizes in CSS_DATA are correct.  At 1x we inject overrides so the same
+    physical-size feel is preserved.
+
+    font_scale is typically 1.4 at scale=1 and 1.0 at scale≥2.
+    Returns an empty string when no override is needed (font_scale ≤ 1.05).
+    """
+    if font_scale <= 1.05:
+        return ""
+
+    def fs(px: int) -> str:
+        return f"{round(px * font_scale)}px"
+
+    return f"""
+/* DPI-adaptive font overrides (font_scale={font_scale:.2f}) */
+.sidebar-header {{ font-size: {fs(13)}; }}
+.section-title {{ font-size: {fs(20)}; }}
+.album-title-large {{ font-size: {fs(28)}; }}
+.album-artist-medium {{ font-size: {fs(16)}; }}
+.album-meta {{ font-size: {fs(13)}; }}
+.player-title {{ font-size: {fs(14)}; }}
+.player-artist {{ font-size: {fs(12)}; }}
+.player-album {{ font-size: {fs(12)}; }}
+.now-playing-kicker {{ font-size: {fs(15)}; }}
+.shortcuts-title {{ font-size: {fs(18)}; }}
+.shortcuts-subtitle {{ font-size: {fs(12)}; }}
+.shortcuts-action {{ font-size: {fs(13)}; }}
+.login-hero-title {{ font-size: {fs(20)}; }}
+.login-hero-subtitle {{ font-size: {fs(13)}; }}
+"""

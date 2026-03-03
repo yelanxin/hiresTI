@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.4.9 - 2026-03-03
+Display-scaling and output-format control release: better 1x readability, device-aware ALSA bit-depth selection, and clearer PipeWire behavior.
+
+### Added
+- Added an `Output Bit Depth` selector in Audio settings that reads the selected device's advertised PCM formats and only shows supported ALSA bit depths instead of a fixed `16/24/32-bit` list.
+
+### Changed
+- `Output Bit Depth` now appears above `Output Device` in Audio settings for a tighter output-configuration flow.
+- `Output Bit Depth` is now ALSA-only. In `PipeWire` mode it stays on disabled `Auto`, because the final hardware bit depth is controlled by the PipeWire graph rather than directly by the player.
+- Home-page card sizing now follows a DPI-adaptive shared cover size so album and track tiles keep a more consistent physical size across 1x and HiDPI displays.
+
+### Fixed
+- Fixed low-DPI layouts rendering text and artwork too small by detecting the primary display scale at startup and applying matching font/cover-size overrides.
+- Fixed output-format control UI showing unsupported bit depths for the selected device and passing misleading format requests through PipeWire.
+
+### Tests
+- Verified with:
+  - `pytest -q tests/test_audio_settings_actions.py`
+  - `CCACHE_DISABLE=1 cargo test --manifest-path src_rust/rust_audio_core/Cargo.toml --lib`
+
+---
+
 ## 1.4.8 - 2026-03-03
 Navigation and session-recovery stability release: smoother first-open `New` page rendering, better post-sleep page recovery, and a more reliable Signal Path help popover.
 

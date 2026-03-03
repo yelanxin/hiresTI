@@ -1381,12 +1381,12 @@ def batch_load_home(app, sections):
 
     def _build_home_item_button(item_data):
         v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, css_classes=["card", "home-card"])
-        card_width = 180
+        card_width = utils.COVER_SIZE + 10
         img_size = utils.COVER_SIZE
         img_cls = "album-cover-img"
         if item_data["type"] == "Track":
-            card_width = 100
-            img_size = 90
+            card_width = max(90, utils.COVER_SIZE // 2)
+            img_size = card_width - 10
             v.add_css_class("home-track-card")
         elif item_data["type"] == "Artist" or "Radio" in item_data["name"]:
             img_size = 150

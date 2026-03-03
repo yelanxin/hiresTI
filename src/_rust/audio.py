@@ -109,6 +109,9 @@ class _RustAudioCore:
                     ctypes.c_int,
                     ctypes.c_int,
                 ]
+            if hasattr(lib, "rac_set_preferred_output_format"):
+                lib.rac_set_preferred_output_format.restype = ctypes.c_int
+                lib.rac_set_preferred_output_format.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
 
             lib.rac_set_speed.restype = ctypes.c_int
             lib.rac_set_speed.argtypes = [ctypes.c_void_p, ctypes.c_double]
@@ -292,6 +295,15 @@ class _RustAudioCore:
         else:
             logger.warning("Rust output route failed rc=%s driver=%s device=%s", rc, drv, dev or "default")
         return rc
+
+    def set_preferred_output_format(self, format_name=None):
+        if (not self.available) or self._closed:
+            return -1
+        if not hasattr(self.lib, "rac_set_preferred_output_format"):
+            return -3
+        fmt = str(format_name or "").strip()
+        fmt_b = fmt.encode("utf-8", "ignore") if fmt else None
+        return self._call_int("rac_set_preferred_output_format", fmt_b, default_rc=-2)
 
     def set_speed(self, speed):
         rc = self._call_int("rac_set_speed", ctypes.c_double(float(speed or 1.0)), default_rc=-2)
@@ -477,7 +489,27 @@ class _RustAudioCore:
                 dev_id = item.get("device_id", None)
                 if dev_id is not None:
                     dev_id = str(dev_id)
-                out.append({"name": name, "device_id": dev_id})
+                supported_formats = []
+                for raw_fmt in list(item.get("supported_formats") or []):
+                    fmt = str(raw_fmt or "").strip()
+                    if fmt:
+                        supported_formats.append(fmt)
+                supported_bit_depths = []
+                for raw_depth in list(item.get("supported_bit_depths") or []):
+                    try:
+                        depth = int(raw_depth or 0)
+                    except Exception:
+                        depth = 0
+                    if depth > 0:
+                        supported_bit_depths.append(depth)
+                out.append(
+                    {
+                        "name": name,
+                        "device_id": dev_id,
+                        "supported_formats": supported_formats,
+                        "supported_bit_depths": supported_bit_depths,
+                    }
+                )
             return out
         except Exception:
             logger.exception("Rust audio core list_devices failed")
@@ -961,6 +993,7 @@ class RustAudioPlayerAdapter:
         self.alsa_latency_time = 10000
         self.output_state = "idle"
         self.output_error = None
+        self.preferred_output_format = ""
         self.requested_driver = None
         self.requested_device_id = None
         self.current_driver = "Auto (Default)"
@@ -2335,6 +2368,12 @@ class RustAudioPlayerAdapter:
             # Leaving ALSA exclusive mode or switching drivers — release reservation.
             self._release_alsa_reservation()
 
+        preferred_format = str(getattr(self, "preferred_output_format", "") or "").strip()
+        try:
+            self._rust.set_preferred_output_format(preferred_format or None)
+        except Exception:
+            logger.debug("Rust preferred output format update skipped", exc_info=True)
+
         rc = self._rust.set_output(
             driver,
             resolved_device_id,
@@ -2462,6 +2501,21 @@ class RustAudioPlayerAdapter:
             return devices
         logger.error("Rust device enumeration unavailable for driver=%s", driver)
         return []
+
+    def set_output_format_preference(self, format_name=None):
+        fmt = str(format_name or "").strip().upper()
+        self.preferred_output_format = fmt
+        rc = -1
+        try:
+            rc = int(self._rust.set_preferred_output_format(fmt or None))
+        except Exception:
+            logger.debug("Rust preferred output format setter failed", exc_info=True)
+            rc = -1
+        if fmt:
+            logger.info("Preferred output format set: %s", fmt)
+        else:
+            logger.info("Preferred output format cleared")
+        return rc == 0 or rc == -3
 
 
 def create_audio_engine(on_eos_callback=None, on_tag_callback=None, on_spectrum_callback=None, on_viz_sync_offset_update=None):

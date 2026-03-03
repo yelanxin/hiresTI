@@ -1,5 +1,6 @@
 from threading import Thread
 import logging
+import re
 import time
 
 import gi
@@ -9,6 +10,195 @@ from gi.repository import Gtk, GLib
 from core.executor import submit_daemon
 
 logger = logging.getLogger(__name__)
+
+_OUTPUT_BIT_DEPTH_GUESS_FORMATS = {
+    16: "S16LE",
+    24: "S24LE",
+    32: "S32LE",
+}
+
+
+def _canonical_output_format_name(fmt):
+    up = str(fmt or "").strip().upper()
+    mapping = {
+        "S16_LE": "S16LE",
+        "S16LE": "S16LE",
+        "S24_LE": "S24LE",
+        "S24LE": "S24LE",
+        "S24_3LE": "S24LE",
+        "S24_32_LE": "S24_32LE",
+        "S24_32LE": "S24_32LE",
+        "S32_LE": "S32LE",
+        "S32LE": "S32LE",
+    }
+    return mapping.get(up, up)
+
+
+def _output_format_bit_depth(fmt):
+    up = _canonical_output_format_name(fmt)
+    if not up:
+        return 0
+    if "S24_32" in up:
+        return 24
+    match = re.search(r"(\d+)", up)
+    if not match:
+        return 0
+    try:
+        return int(match.group(1))
+    except Exception:
+        return 0
+
+
+def _device_supported_output_formats(device_info):
+    if not isinstance(device_info, dict):
+        return []
+    out = []
+    seen = set()
+    for raw in list(device_info.get("supported_formats") or []):
+        fmt = _canonical_output_format_name(raw)
+        depth = _output_format_bit_depth(fmt)
+        if depth not in (16, 24, 32):
+            continue
+        if fmt in seen:
+            continue
+        seen.add(fmt)
+        out.append(fmt)
+    return out
+
+
+def _device_supported_bit_depths(device_info):
+    seen = set()
+    out = []
+    for fmt in _device_supported_output_formats(device_info):
+        depth = _output_format_bit_depth(fmt)
+        if depth in (16, 24, 32) and depth not in seen:
+            seen.add(depth)
+            out.append(depth)
+    if out:
+        return out
+    if isinstance(device_info, dict):
+        for raw in list(device_info.get("supported_bit_depths") or []):
+            try:
+                depth = int(raw or 0)
+            except Exception:
+                depth = 0
+            if depth in (16, 24, 32) and depth not in seen:
+                seen.add(depth)
+                out.append(depth)
+    out.sort()
+    return out
+
+
+def _bit_depth_labels_for_device(device_info):
+    return ["Auto"] + [f"{depth}-bit" for depth in _device_supported_bit_depths(device_info)]
+
+
+def _parse_output_bit_depth_label(label):
+    text = str(label or "").strip()
+    if not text or text.lower() == "auto":
+        return 0
+    match = re.search(r"(\d+)", text)
+    if not match:
+        return 0
+    try:
+        depth = int(match.group(1))
+    except Exception:
+        return 0
+    return depth if depth in (16, 24, 32) else 0
+
+
+def _current_selected_device_info(app):
+    dd = getattr(app, "device_dd", None)
+    devices = list(getattr(app, "current_device_list", []) or [])
+    if dd is None or not devices:
+        return None
+    try:
+        idx = int(dd.get_selected())
+    except Exception:
+        idx = 0
+    if 0 <= idx < len(devices):
+        return devices[idx]
+    return None
+
+
+def _preferred_output_format_for_device(device_info, label):
+    depth = _parse_output_bit_depth_label(label)
+    if depth <= 0:
+        return None
+    for fmt in _device_supported_output_formats(device_info):
+        if _output_format_bit_depth(fmt) == depth:
+            return fmt
+    if depth in _device_supported_bit_depths(device_info):
+        return _OUTPUT_BIT_DEPTH_GUESS_FORMATS.get(depth)
+    return None
+
+
+def _selected_driver_name(app):
+    dd = getattr(app, "driver_dd", None)
+    item = dd.get_selected_item() if dd is not None else None
+    return item.get_string() if item is not None else ""
+
+
+def _driver_supports_explicit_output_bit_depth(app):
+    return str(_selected_driver_name(app) or "").strip().upper() == "ALSA"
+
+
+def _apply_output_bit_depth_preference(app, device_info=None):
+    player = getattr(app, "player", None)
+    if player is None:
+        return None
+    fmt = None
+    if _driver_supports_explicit_output_bit_depth(app):
+        label = str(getattr(app, "settings", {}).get("output_bit_depth", "Auto") or "Auto")
+        fmt = _preferred_output_format_for_device(device_info, label)
+    if hasattr(player, "set_output_format_preference"):
+        player.set_output_format_preference(fmt)
+    else:
+        setattr(player, "preferred_output_format", str(fmt or ""))
+    return fmt
+
+
+def _sync_output_bit_depth_dropdown(app, device_info=None):
+    dd = getattr(app, "bit_depth_dd", None)
+    if dd is None:
+        _apply_output_bit_depth_preference(app, device_info)
+        return
+    if _driver_supports_explicit_output_bit_depth(app):
+        labels = _bit_depth_labels_for_device(device_info)
+        saved = str(getattr(app, "settings", {}).get("output_bit_depth", "Auto") or "Auto")
+        selected_label = saved if saved in labels else "Auto"
+        if selected_label != saved:
+            app.settings["output_bit_depth"] = selected_label
+            if hasattr(app, "save_settings"):
+                app.save_settings()
+        sensitive = len(labels) > 1
+        selected_idx = labels.index(selected_label)
+    else:
+        labels = ["Auto"]
+        sensitive = False
+        selected_idx = 0
+    app.ignore_output_bit_depth_change = True
+    dd.set_model(Gtk.StringList.new(labels))
+    dd.set_sensitive(sensitive)
+    dd.set_selected(selected_idx)
+    app.ignore_output_bit_depth_change = False
+    _apply_output_bit_depth_preference(app, device_info)
+
+
+def _device_enum_signature(devices):
+    sig = []
+    for info in list(devices or []):
+        if not isinstance(info, dict):
+            continue
+        sig.append(
+            (
+                str(info.get("name") or ""),
+                str(info.get("device_id") or ""),
+                tuple(str(v or "") for v in list(info.get("supported_formats") or [])),
+                tuple(int(v or 0) for v in list(info.get("supported_bit_depths") or [])),
+            )
+        )
+    return tuple(sig)
 
 
 def _stop_output_hotplug_watch(app):
@@ -62,10 +252,12 @@ def _refresh_devices_for_current_driver_ui_only(app, reason="hotplug-watch"):
         devices = app.player.get_devices_for_driver(driver_name)
 
         def apply_devices():
-            old_names = [d.get("name") for d in getattr(app, "current_device_list", [])]
+            old_sig = _device_enum_signature(getattr(app, "current_device_list", []))
+            new_sig = _device_enum_signature(devices)
             new_names = [d.get("name") for d in devices]
-            if new_names == old_names:
+            if new_sig == old_sig:
                 return False
+            old_names = [d.get("name") for d in getattr(app, "current_device_list", [])]
             old_set = set([n for n in old_names if n])
             new_set = set([n for n in new_names if n])
             added = [n for n in new_names if n in (new_set - old_set)]
@@ -84,6 +276,8 @@ def _refresh_devices_for_current_driver_ui_only(app, reason="hotplug-watch"):
             if devices and sel_idx < len(devices):
                 app.device_dd.set_selected(sel_idx)
                 app.current_device_name = devices[sel_idx].get("name") or app.current_device_name
+            device_info = devices[sel_idx] if devices and sel_idx < len(devices) else None
+            _sync_output_bit_depth_dropdown(app, device_info)
             app.ignore_device_change = False
             app.update_tech_label(app.player.stream_info)
             logger.info("Output device list refreshed (%s): %d devices", reason, len(devices))
@@ -235,6 +429,7 @@ def refresh_devices_keep_driver_select_first(app, reason="device-refresh"):
 
             if not devices:
                 app.current_device_name = "Unavailable"
+                _sync_output_bit_depth_dropdown(app, None)
                 app.ignore_device_change = False
                 try:
                     app.player.output_state = "error"
@@ -256,6 +451,7 @@ def refresh_devices_keep_driver_select_first(app, reason="device-refresh"):
             app.current_device_name = target["name"]
             app.settings["device"] = target["name"]
             app.save_settings()
+            _sync_output_bit_depth_dropdown(app, target)
             app.ignore_device_change = False
             app.update_tech_label(app.player.stream_info)
 
@@ -381,18 +577,18 @@ def _passive_sync_device_list(app):
 
         selected_item = app.device_dd.get_selected_item() if hasattr(app, "device_dd") else None
         prefer_name = selected_item.get_string() if selected_item else getattr(app, "current_device_name", None)
-        old_names = [d.get("name") for d in getattr(app, "current_device_list", [])]
+        old_sig = _device_enum_signature(getattr(app, "current_device_list", []))
 
         app._device_list_sync_running = True
 
         def worker():
             try:
                 devices = app.player.get_devices_for_driver(driver_name)
-                new_names = [d.get("name") for d in devices]
+                new_sig = _device_enum_signature(devices)
 
                 def apply_result():
                     app._device_list_sync_running = False
-                    if new_names == old_names:
+                    if new_sig == old_sig:
                         return False
 
                     app.ignore_device_change = True
@@ -409,6 +605,8 @@ def _passive_sync_device_list(app):
                     if devices and sel_idx < len(devices):
                         app.device_dd.set_selected(sel_idx)
                         app.current_device_name = devices[sel_idx].get("name") or app.current_device_name
+                    device_info = devices[sel_idx] if devices and sel_idx < len(devices) else None
+                    _sync_output_bit_depth_dropdown(app, device_info)
                     app.ignore_device_change = False
                     app.update_tech_label(app.player.stream_info)
                     logger.info("Output device list synced (passive): driver=%s count=%d", driver_name, len(devices))
@@ -546,6 +744,8 @@ def on_driver_changed(app, dd, p):
             if sel_idx < len(devices):
                 app.device_dd.set_selected(sel_idx)
 
+            device_info = devices[sel_idx] if sel_idx < len(devices) else None
+            _sync_output_bit_depth_dropdown(app, device_info)
             app.ignore_device_change = False
 
             target_id = None
@@ -597,6 +797,7 @@ def on_device_changed(app, dd, p):
         remembered_name = str(getattr(app, "_last_disconnected_device_name", "") or "")
         target_name = device_info["name"]
         driver_label = app.driver_dd.get_selected_item().get_string()
+        _sync_output_bit_depth_dropdown(app, device_info)
         ok = app.player.set_output(driver_label, device_info["device_id"])
         if not ok:
             if previous_idx is not None and previous_idx != idx:
@@ -627,6 +828,39 @@ def on_device_changed(app, dd, p):
         if hasattr(app, "_apply_viz_sync_offset_for_device"):
             app._apply_viz_sync_offset_for_device(driver_label, device_id=device_info["device_id"], device_name=target_name)
         update_output_status_ui(app)
+
+
+def on_output_bit_depth_changed(app, dd, p):
+    if getattr(app, "ignore_output_bit_depth_change", False):
+        return
+    selected = dd.get_selected_item()
+    label = selected.get_string() if selected is not None else "Auto"
+    app.settings["output_bit_depth"] = str(label or "Auto")
+    app.save_settings()
+    device_info = _current_selected_device_info(app)
+    _apply_output_bit_depth_preference(app, device_info)
+    app.update_tech_label(app.player.stream_info)
+
+    drv_item = app.driver_dd.get_selected_item() if getattr(app, "driver_dd", None) is not None else None
+    if drv_item is None:
+        update_output_status_ui(app)
+        return
+    driver_label = drv_item.get_string()
+    device_id = device_info.get("device_id") if isinstance(device_info, dict) else None
+    ok = app.player.set_output(driver_label, device_id)
+    if not ok and hasattr(app, "show_output_notice"):
+        app.show_output_notice(
+            f"Failed to apply {label or 'Auto'} output depth",
+            "error",
+            3600,
+        )
+    elif ok and hasattr(app, "_apply_viz_sync_offset_for_device"):
+        app._apply_viz_sync_offset_for_device(
+            driver_label,
+            device_id=device_id,
+            device_name=(device_info or {}).get("name"),
+        )
+    update_output_status_ui(app)
 
 
 def on_output_state_transition(self, prev_state, state, detail=None):

@@ -14,6 +14,17 @@ from ui import config as ui_config
 logger = logging.getLogger(__name__)
 
 
+def _detect_display_scale(display) -> int:
+    """Return the primary monitor's integer scale factor (1 or 2 on most systems)."""
+    try:
+        monitors = display.get_monitors()
+        if monitors.get_n_items() > 0:
+            return max(1, monitors.get_item(0).get_scale_factor())
+    except Exception as e:
+        logger.debug("Could not read monitor scale factor: %s", e)
+    return 1
+
+
 def detect_app_version(self):
     env_ver = str(os.environ.get("HIRESTI_VERSION", "")).strip()
     if env_ver:
@@ -163,6 +174,21 @@ def do_activate(self):
     css_data = ui_config.CSS_DATA.replace("__HIRESTI_LOGO_SVG__", logo_svg.replace("\\", "/"))
     provider.load_from_data(css_data.encode())
     Gtk.StyleContext.add_provider_for_display(display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    # Detect display scale factor and apply DPI-adaptive sizes before building UI.
+    _display_scale = _detect_display_scale(display)
+    import utils.helpers as _helpers
+    _helpers.set_ui_scale(_display_scale)
+    _font_scale = max(1.0, min(1.4, 2.0 / max(1, _display_scale)))
+    _override_css = ui_config.get_scale_css_overrides(_font_scale)
+    if _override_css:
+        _scale_provider = Gtk.CssProvider()
+        _scale_provider.load_from_data(_override_css.encode())
+        Gtk.StyleContext.add_provider_for_display(
+            display, _scale_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1
+        )
+    logger.info("Display scale=%d → font_scale=%.2f, COVER_SIZE=%d",
+                _display_scale, _font_scale, _helpers.COVER_SIZE)
 
     self.win = Adw.ApplicationWindow(
         application=self,

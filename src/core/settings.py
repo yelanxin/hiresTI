@@ -19,6 +19,7 @@ class SettingsSchema:
     bit_perfect: bool = False
     exclusive_lock: bool = False
     latency_profile: str = "Standard (100ms)"
+    output_bit_depth: str = "Auto"
     volume: int = 80
     play_mode: int = 0
     last_nav: str = "home"
@@ -53,6 +54,7 @@ DEFAULT_SETTINGS = {
     "bit_perfect": False,
     "exclusive_lock": False,
     "latency_profile": "Standard (100ms)",
+    "output_bit_depth": "Auto",
     "volume": 80,
     "play_mode": 0,
     "last_nav": "home",
@@ -89,6 +91,7 @@ _VALIDATION_RULES = {
     "bit_perfect": (bool, None, None, False),
     "exclusive_lock": (bool, None, None, False),
     "latency_profile": (str, None, None, "Standard (100ms)"),
+    "output_bit_depth": (str, None, None, "Auto"),
     "volume": (int, 0, 100, 80),
     "play_mode": (int, 0, 3, 0),
     "last_nav": (str, None, None, "home"),
@@ -181,6 +184,7 @@ def normalize_settings(raw: Optional[dict[str, Any]]) -> dict[str, Any]:
     normalized["bit_perfect"] = _as_bool(raw.get("bit_perfect"), DEFAULT_SETTINGS["bit_perfect"])
     normalized["exclusive_lock"] = _as_bool(raw.get("exclusive_lock"), DEFAULT_SETTINGS["exclusive_lock"])
     normalized["latency_profile"] = _as_str(raw.get("latency_profile"), DEFAULT_SETTINGS["latency_profile"])
+    normalized["output_bit_depth"] = _as_str(raw.get("output_bit_depth"), DEFAULT_SETTINGS["output_bit_depth"])
     normalized["volume"] = _as_int(raw.get("volume"), DEFAULT_SETTINGS["volume"], minimum=0, maximum=100)
     normalized["play_mode"] = _as_int(raw.get("play_mode"), DEFAULT_SETTINGS["play_mode"], minimum=0, maximum=3)
     normalized["last_nav"] = _as_str(raw.get("last_nav"), DEFAULT_SETTINGS["last_nav"])
