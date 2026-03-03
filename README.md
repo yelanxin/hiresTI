@@ -9,7 +9,7 @@
 
 ## Highlights
 
-- From `v1.2.0`, hiresTI uses a Rust audio engine core by default
+- A high performance Rust audio engine core
 - Native Linux UI with GTK4 + Libadwaita
 - TIDAL OAuth login and account-scoped library access
 - Bit-perfect playback flow with optional exclusive output controls
