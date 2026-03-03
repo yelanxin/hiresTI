@@ -2,6 +2,7 @@ use gst::prelude::*;
 use gstreamer as gst;
 use libpulse_binding as pulse;
 use pipewire as pw;
+use pulse::proplist::properties as pa_props;
 use pulse::callbacks::ListResult;
 use pulse::context::{Context as PaContext, FlagSet as PaContextFlagSet, State as PaContextState};
 use pulse::mainloop::standard::Mainloop as PaMainloop;
@@ -11,7 +12,7 @@ use pw::{
     metadata::Metadata as PwMetadata, registry::GlobalObject, types::ObjectType,
 };
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_double, c_int, c_void};
@@ -26,6 +27,7 @@ static GST_INIT: Once = Once::new();
 static PW_INIT: Once = Once::new();
 const SPECTRUM_BANDS_MAX: usize = 128;
 const SPECTRUM_RING_CAP: usize = 512;
+const PIPEWIRE_CARD_PROFILE_TARGET_PREFIX: &str = "pwcardprofile:";
 
 type EventCallback = extern "C" fn(c_int, *const c_char, *mut c_void);
 const EVT_STATE: c_int = 1;
@@ -47,6 +49,22 @@ fn json_escape(v: &str) -> String {
         }
     }
     out
+}
+
+fn build_pipewire_card_profile_target(card: &str, profile: &str) -> String {
+    format!("{PIPEWIRE_CARD_PROFILE_TARGET_PREFIX}{}|{}", card.trim(), profile.trim())
+}
+
+fn parse_pipewire_card_profile_target(device_id: &str) -> Option<(String, String)> {
+    let raw = device_id.trim();
+    let tail = raw.strip_prefix(PIPEWIRE_CARD_PROFILE_TARGET_PREFIX)?;
+    let (card, profile) = tail.split_once('|')?;
+    let card = card.trim();
+    let profile = profile.trim();
+    if card.is_empty() || profile.is_empty() {
+        return None;
+    }
+    Some((card.to_string(), profile.to_string()))
 }
 
 #[derive(Debug)]
@@ -1044,7 +1062,37 @@ impl Engine {
         let _ = self.playbin.set_state(gst::State::Null);
 
         let driver_norm = driver.trim().to_lowercase();
-        let device_norm = device.map(|d| d.trim()).filter(|d| !d.is_empty());
+        let original_device = device
+            .map(|d| d.trim().to_string())
+            .filter(|d| !d.is_empty());
+        let mut resolved_device = original_device.clone();
+        if driver_norm.contains("pipewire") {
+            if let Some(device_id) = original_device.as_deref() {
+                if let Some((card, profile)) = parse_pipewire_card_profile_target(device_id) {
+                    match activate_pipewire_card_profile_target(&card, &profile) {
+                        Ok(target_sink) => {
+                            self.emit_event(
+                                EVT_STATE,
+                                &format!(
+                                    "pipewire-card-profile resolved card={} profile={} sink={}",
+                                    card, profile, target_sink
+                                ),
+                            );
+                            resolved_device = Some(target_sink);
+                        }
+                        Err(e) => {
+                            self.set_error(format!("pipewire profile activation failed: {e}"));
+                            self.emit_event(
+                                EVT_ERROR,
+                                &format!("pipewire profile activation failed: {e}"),
+                            );
+                            return -16;
+                        }
+                    }
+                }
+            }
+        }
+        let device_norm = resolved_device.as_deref();
 
         let sink = if driver_norm.is_empty() || driver_norm.starts_with("auto") {
             gst::ElementFactory::make("autoaudiosink")
@@ -1089,11 +1137,11 @@ impl Engine {
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         elem.set_property("stream-properties", &props);
                     }));
-                    self.emit_event(
-                        EVT_STATE,
-                        &format!(
-                            "pipewire-sink configured target={} autoconnect={} latency={}",
-                            device_norm.unwrap_or("default"),
+                        self.emit_event(
+                            EVT_STATE,
+                            &format!(
+                                "pipewire-sink configured target={} autoconnect={} latency={}",
+                                device_norm.unwrap_or("default"),
                             auto_connect,
                             latency_node
                         ),
@@ -1403,7 +1451,7 @@ pub extern "C" fn rac_set_spectrum_enabled(ptr: *mut Engine, enabled: c_int) -> 
     0
 }
 
-fn list_pulseaudio_sinks() -> Vec<(String, Option<String>)> {
+fn list_pulseaudio_sinks_detailed() -> Vec<(String, Option<String>, Option<u32>)> {
     fn str_opt_to_string(v: Option<std::borrow::Cow<'_, str>>) -> String {
         v.map(|x| x.into_owned()).unwrap_or_default()
     }
@@ -1412,8 +1460,9 @@ fn list_pulseaudio_sinks() -> Vec<(String, Option<String>)> {
         return Vec::new();
     };
 
-    let mut out: Vec<(String, Option<String>)> = Vec::new();
-    let shared: Rc<RefCell<Vec<(String, Option<String>)>>> = Rc::new(RefCell::new(Vec::new()));
+    let mut out: Vec<(String, Option<String>, Option<u32>)> = Vec::new();
+    let shared: Rc<RefCell<Vec<(String, Option<String>, Option<u32>)>>> =
+        Rc::new(RefCell::new(Vec::new()));
     let done = Rc::new(Cell::new(false));
 
     let shared_cb = Rc::clone(&shared);
@@ -1428,7 +1477,9 @@ fn list_pulseaudio_sinks() -> Vec<(String, Option<String>)> {
                 }
                 let desc = str_opt_to_string(info.description.as_ref().cloned());
                 let name = if desc.is_empty() { dev.clone() } else { desc };
-                shared_cb.borrow_mut().push((name, Some(dev)));
+                shared_cb
+                    .borrow_mut()
+                    .push((name, Some(dev), info.card));
             }
             ListResult::End | ListResult::Error => {
                 done_cb.set(true);
@@ -1438,6 +1489,13 @@ fn list_pulseaudio_sinks() -> Vec<(String, Option<String>)> {
     pa_wait_for_list(&mut mainloop, &context, &done, &mut op);
     out.extend(shared.borrow().iter().cloned());
     out
+}
+
+fn list_pulseaudio_sinks() -> Vec<(String, Option<String>)> {
+    list_pulseaudio_sinks_detailed()
+        .into_iter()
+        .map(|(name, dev_id, _card)| (name, dev_id))
+        .collect()
 }
 
 fn pa_connect() -> Result<(PaMainloop, PaContext), String> {
@@ -1517,17 +1575,25 @@ fn list_pipewire_sinks() -> Vec<(String, Option<String>)> {
                 }
                 let node_name = props.get("node.name").unwrap_or("");
                 // Skip monitor endpoints from sink list.
-                if node_name.is_empty() || node_name.contains(".monitor") {
+                if !node_name.is_empty() && node_name.contains(".monitor") {
                     return;
                 }
-                let name = props
-                    .get("node.description")
-                    .or_else(|| props.get("device.description"))
-                    .or_else(|| props.get("node.nick"))
-                    .or_else(|| props.get("node.name"))
-                    .unwrap_or("Audio Sink")
-                    .to_string();
-                let dev_id = Some(node_name.to_string());
+                let object_serial = props.get("object.serial").unwrap_or("");
+                let Some(target_id) = pipewire_target_id_from_props(node_name, object_serial) else {
+                    return;
+                };
+                let name = pipewire_display_name_from_strings(
+                    props
+                        .get("node.description")
+                        .or_else(|| props.get("device.description"))
+                        .unwrap_or(""),
+                    props.get("node.nick").unwrap_or(""),
+                    props
+                        .get("node.name")
+                        .or_else(|| props.get("object.serial"))
+                        .unwrap_or("Audio Sink"),
+                );
+                let dev_id = Some(target_id);
                 sinks_clone.borrow_mut().push((name, dev_id));
             })
             .register();
@@ -1564,6 +1630,310 @@ fn list_pipewire_sinks() -> Vec<(String, Option<String>)> {
         Ok(out)
     })();
     result.unwrap_or_default()
+}
+
+fn pipewire_target_id_from_props(node_name: &str, object_serial: &str) -> Option<String> {
+    let node = node_name.trim();
+    if !node.is_empty() {
+        if node.contains(".monitor") {
+            return None;
+        }
+        return Some(node.to_string());
+    }
+    let serial = object_serial.trim();
+    if serial.is_empty() {
+        return None;
+    }
+    Some(serial.to_string())
+}
+
+fn merge_output_device_lists(
+    primary: Vec<(String, Option<String>)>,
+    extras: Vec<(String, Option<String>)>,
+) -> Vec<(String, Option<String>)> {
+    let mut out: Vec<(String, Option<String>)> = Vec::new();
+    let mut seen_ids: HashSet<String> = HashSet::new();
+    let mut seen_names_without_id: HashSet<String> = HashSet::new();
+
+    for (name, dev_id) in primary.into_iter().chain(extras.into_iter()) {
+        let clean_name = name.trim().to_string();
+        if clean_name.is_empty() {
+            continue;
+        }
+        let clean_id = dev_id.and_then(|v| {
+            let s = v.trim().to_string();
+            if s.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
+        });
+        if let Some(ref id) = clean_id {
+            if !seen_ids.insert(id.clone()) {
+                continue;
+            }
+        } else {
+            let key = clean_name.to_ascii_uppercase();
+            if !seen_names_without_id.insert(key) {
+                continue;
+            }
+        }
+        out.push((clean_name, clean_id));
+    }
+
+    out
+}
+
+fn pulseaudio_sink_card_indices() -> HashSet<u32> {
+    list_pulseaudio_sinks_detailed()
+        .into_iter()
+        .filter_map(|(_name, _dev_id, card)| card)
+        .collect()
+}
+
+fn pipewire_display_name_from_strings(description: &str, nick: &str, fallback: &str) -> String {
+    let desc = description.trim();
+    let nick = nick.trim();
+    if !desc.is_empty() && !nick.is_empty() {
+        if desc.eq_ignore_ascii_case(nick) {
+            return desc.to_string();
+        }
+        return format!("{desc}/{nick}");
+    }
+    if !desc.is_empty() {
+        return desc.to_string();
+    }
+    if !nick.is_empty() {
+        return nick.to_string();
+    }
+    fallback.trim().to_string()
+}
+
+fn choose_pipewire_output_profile_from_entries(
+    active_profile: Option<&str>,
+    profiles: &[(String, u32, u32, bool)],
+) -> Option<String> {
+    if let Some(active) = active_profile {
+        let active_trim = active.trim();
+        if !active_trim.is_empty()
+            && profiles
+                .iter()
+                .any(|(name, sinks, _priority, _available)| *sinks > 0 && name == active_trim)
+        {
+            return Some(active_trim.to_string());
+        }
+    }
+
+    let mut best_available: Option<(String, u32)> = None;
+    let mut best_any: Option<(String, u32)> = None;
+    for (name, sinks, priority, available) in profiles {
+        let profile_name = name.trim();
+        if *sinks == 0 || profile_name.is_empty() {
+            continue;
+        }
+        if *available {
+            let replace = best_available
+                .as_ref()
+                .map(|(_, prio)| *prio < *priority)
+                .unwrap_or(true);
+            if replace {
+                best_available = Some((profile_name.to_string(), *priority));
+            }
+        }
+        let replace_any = best_any
+            .as_ref()
+            .map(|(_, prio)| *prio < *priority)
+            .unwrap_or(true);
+        if replace_any {
+            best_any = Some((profile_name.to_string(), *priority));
+        }
+    }
+
+    best_available.or(best_any).map(|(name, _)| name)
+}
+
+fn list_pipewire_card_fallbacks() -> Vec<(String, Option<String>)> {
+    let active_cards = pulseaudio_sink_card_indices();
+    let Ok((mut mainloop, context)) = pa_connect() else {
+        return Vec::new();
+    };
+
+    let shared: Rc<RefCell<Vec<(String, Option<String>)>>> = Rc::new(RefCell::new(Vec::new()));
+    let done = Rc::new(Cell::new(false));
+
+    let shared_cb = Rc::clone(&shared);
+    let done_cb = Rc::clone(&done);
+    let mut op = context
+        .introspect()
+        .get_card_info_list(move |res| match res {
+            ListResult::Item(info) => {
+                if active_cards.contains(&info.index) {
+                    return;
+                }
+                let card_name = info
+                    .name
+                    .as_ref()
+                    .map(|v| v.to_string())
+                    .unwrap_or_default();
+                if card_name.trim().is_empty() {
+                    return;
+                }
+                let active_profile = info
+                    .active_profile
+                    .as_ref()
+                    .and_then(|p| p.name.as_ref().map(|v| v.to_string()));
+                let profiles: Vec<(String, u32, u32, bool)> = info
+                    .profiles
+                    .iter()
+                    .filter_map(|p| {
+                        let name = p.name.as_ref()?.to_string();
+                        Some((name, p.n_sinks, p.priority, p.available))
+                    })
+                    .collect();
+                let Some(profile_name) =
+                    choose_pipewire_output_profile_from_entries(active_profile.as_deref(), &profiles)
+                else {
+                    return;
+                };
+                let label = pipewire_display_name_from_strings(
+                    &info.proplist.get_str(pa_props::DEVICE_DESCRIPTION).unwrap_or_default(),
+                    &info.proplist.get_str("device.nick").unwrap_or_default(),
+                    &card_name,
+                );
+                if label.trim().is_empty() {
+                    return;
+                }
+                shared_cb.borrow_mut().push((
+                    label,
+                    Some(build_pipewire_card_profile_target(&card_name, &profile_name)),
+                ));
+            }
+            ListResult::End | ListResult::Error => {
+                done_cb.set(true);
+            }
+        });
+
+    pa_wait_for_list(&mut mainloop, &context, &done, &mut op);
+    let mut out = shared.borrow().clone();
+    out.sort_by_key(|(name, dev)| {
+        let hay = format!(
+            "{} {}",
+            name.to_ascii_uppercase(),
+            dev.clone().unwrap_or_default().to_ascii_uppercase()
+        );
+        (
+            if hay.contains("USB") { 0 } else { 1 },
+            name.to_ascii_uppercase(),
+            dev.clone().unwrap_or_default(),
+        )
+    });
+    out.dedup_by(|a, b| a.1 == b.1);
+    out
+}
+
+fn pulseaudio_card_index(card: &str) -> Option<u32> {
+    let Ok((mut mainloop, context)) = pa_connect() else {
+        return None;
+    };
+    let target = card.trim().to_string();
+    if target.is_empty() {
+        return None;
+    }
+
+    let found = Rc::new(Cell::new(u32::MAX));
+    let done = Rc::new(Cell::new(false));
+
+    let found_cb = Rc::clone(&found);
+    let done_cb = Rc::clone(&done);
+    let mut op = context
+        .introspect()
+        .get_card_info_list(move |res| match res {
+            ListResult::Item(info) => {
+                let name = info.name.as_ref().map(|v| v.to_string()).unwrap_or_default();
+                if name == target {
+                    found_cb.set(info.index);
+                }
+            }
+            ListResult::End | ListResult::Error => {
+                done_cb.set(true);
+            }
+        });
+    pa_wait_for_list(&mut mainloop, &context, &done, &mut op);
+    match found.get() {
+        u32::MAX => None,
+        idx => Some(idx),
+    }
+}
+
+fn pulseaudio_resolve_sink_name_for_card(card: &str, prefer_profile: Option<&str>) -> Option<String> {
+    let card_index = pulseaudio_card_index(card)?;
+    let Ok((mut mainloop, context)) = pa_connect() else {
+        return None;
+    };
+    let preferred = prefer_profile.unwrap_or("").trim().to_string();
+    let matches: Rc<RefCell<Vec<(u8, String)>>> = Rc::new(RefCell::new(Vec::new()));
+    let done = Rc::new(Cell::new(false));
+
+    let matches_cb = Rc::clone(&matches);
+    let done_cb = Rc::clone(&done);
+    let mut op = context
+        .introspect()
+        .get_sink_info_list(move |res| match res {
+            ListResult::Item(info) => {
+                if info.card != Some(card_index) {
+                    return;
+                }
+                let sink_name = info.name.as_ref().map(|v| v.to_string()).unwrap_or_default();
+                if sink_name.trim().is_empty() || sink_name.ends_with(".monitor") {
+                    return;
+                }
+                let sink_profile = info
+                    .proplist
+                    .get_str(pa_props::DEVICE_PROFILE_NAME)
+                    .unwrap_or_default();
+                let score = if !preferred.is_empty() && sink_profile == preferred {
+                    2
+                } else if preferred.is_empty() || sink_profile.is_empty() {
+                    1
+                } else {
+                    0
+                };
+                matches_cb.borrow_mut().push((score, sink_name));
+            }
+            ListResult::End | ListResult::Error => {
+                done_cb.set(true);
+            }
+        });
+    pa_wait_for_list(&mut mainloop, &context, &done, &mut op);
+    let mut found = matches.borrow().clone();
+    found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    found.into_iter().next().map(|(_, sink_name)| sink_name)
+}
+
+fn activate_pipewire_card_profile_target(card: &str, profile: &str) -> Result<String, String> {
+    let card_name = card.trim();
+    let profile_name = profile.trim();
+    if card_name.is_empty() || profile_name.is_empty() {
+        return Err("invalid PipeWire card/profile target".to_string());
+    }
+
+    let active = pulseaudio_card_active_profile(card_name).unwrap_or_default();
+    if active != profile_name {
+        pulseaudio_set_card_profile(card_name, profile_name)?;
+        thread::sleep(Duration::from_millis(120));
+    }
+
+    for _attempt in 0..8 {
+        if let Some(sink_name) = pulseaudio_resolve_sink_name_for_card(card_name, Some(profile_name)) {
+            return Ok(sink_name);
+        }
+        thread::sleep(Duration::from_millis(80));
+    }
+
+    Err(format!(
+        "no sink node became available for card={} profile={}",
+        card_name, profile_name
+    ))
 }
 
 fn parse_alsa_card_labels(content: &str) -> HashMap<String, String> {
@@ -1889,13 +2259,14 @@ fn devices_for_driver(driver: &str) -> Vec<(String, Option<String>)> {
     }
     if d == "PipeWire" {
         let mut out = vec![("Default System Output".to_string(), None)];
-        // For PipeWire driver, prefer pure PipeWire-discovered targets so target-object is always valid.
-        let mut pw_only = list_pipewire_sinks();
-        if pw_only.is_empty() {
-            // Safety fallback only when PipeWire enumeration is fully unavailable.
-            pw_only = list_pulseaudio_sinks();
-        }
-        out.extend(pw_only);
+        // Merge raw PipeWire sink nodes with the PulseAudio-compat compatibility
+        // view. Some WirePlumber/PipeWire setups expose a fuller sink list via the
+        // pulse server even though the selectable target remains the same node name.
+        let merged = merge_output_device_lists(
+            merge_output_device_lists(list_pipewire_sinks(), list_pulseaudio_sinks()),
+            list_pipewire_card_fallbacks(),
+        );
+        out.extend(merged);
         return out;
     }
     if d == "PulseAudio" {
@@ -2817,5 +3188,105 @@ Playback:
         let fmt = detect_alsa_exclusive_caps_format_from_proc_root(proc_root.path(), "hw:2,0");
 
         assert_eq!(fmt, None);
+    }
+
+    #[test]
+    fn pipewire_target_id_prefers_node_name_and_falls_back_to_serial() {
+        assert_eq!(
+            pipewire_target_id_from_props("alsa_output.usb-DAC.pro-output-0", "701"),
+            Some("alsa_output.usb-DAC.pro-output-0".to_string())
+        );
+        assert_eq!(
+            pipewire_target_id_from_props("", "701"),
+            Some("701".to_string())
+        );
+        assert_eq!(pipewire_target_id_from_props("", ""), None);
+        assert_eq!(
+            pipewire_target_id_from_props("alsa_output.usb-DAC.monitor", "701"),
+            None
+        );
+    }
+
+    #[test]
+    fn merge_output_device_lists_prefers_primary_and_adds_missing_entries() {
+        let merged = merge_output_device_lists(
+            vec![
+                ("USB DAC".to_string(), Some("alsa_output.usb-DAC.pro-output-0".to_string())),
+                ("Serial Only Sink".to_string(), Some("701".to_string())),
+            ],
+            vec![
+                ("USB DAC via Pulse".to_string(), Some("alsa_output.usb-DAC.pro-output-0".to_string())),
+                ("HDMI Sink".to_string(), Some("alsa_output.pci-HDMI.iec958-stereo".to_string())),
+                ("Serial Only Duplicate".to_string(), Some("701".to_string())),
+                ("Fallback Sink".to_string(), None),
+                ("Fallback Sink".to_string(), None),
+            ],
+        );
+
+        assert_eq!(
+            merged,
+            vec![
+                ("USB DAC".to_string(), Some("alsa_output.usb-DAC.pro-output-0".to_string())),
+                ("Serial Only Sink".to_string(), Some("701".to_string())),
+                ("HDMI Sink".to_string(), Some("alsa_output.pci-HDMI.iec958-stereo".to_string())),
+                ("Fallback Sink".to_string(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn pipewire_card_profile_target_round_trips() {
+        let built = build_pipewire_card_profile_target(
+            "alsa_card.pci-0000_00_03.0",
+            "pro-audio",
+        );
+        assert_eq!(
+            built,
+            "pwcardprofile:alsa_card.pci-0000_00_03.0|pro-audio".to_string()
+        );
+        assert_eq!(
+            parse_pipewire_card_profile_target(&built),
+            Some((
+                "alsa_card.pci-0000_00_03.0".to_string(),
+                "pro-audio".to_string()
+            ))
+        );
+        assert_eq!(parse_pipewire_card_profile_target("pwcardprofile:bad"), None);
+    }
+
+    #[test]
+    fn pipewire_display_name_combines_description_and_nick() {
+        assert_eq!(
+            pipewire_display_name_from_strings(
+                "Built-in Audio Pro 1",
+                "CS4208 Digital",
+                "alsa_output.pci-0000_00_1b.0.pro-output-1",
+            ),
+            "Built-in Audio Pro 1/CS4208 Digital".to_string()
+        );
+        assert_eq!(
+            pipewire_display_name_from_strings("Built-in Audio Pro", "Built-in Audio Pro", "fallback"),
+            "Built-in Audio Pro".to_string()
+        );
+        assert_eq!(
+            pipewire_display_name_from_strings("", "CS4208 Digital", "fallback"),
+            "CS4208 Digital".to_string()
+        );
+    }
+
+    #[test]
+    fn choose_pipewire_output_profile_prefers_active_then_available() {
+        let profiles = vec![
+            ("output:hdmi-stereo".to_string(), 1, 5900, false),
+            ("pro-audio".to_string(), 3, 1, true),
+        ];
+        assert_eq!(
+            choose_pipewire_output_profile_from_entries(Some("output:hdmi-stereo"), &profiles),
+            Some("output:hdmi-stereo".to_string())
+        );
+        assert_eq!(
+            choose_pipewire_output_profile_from_entries(Some("off"), &profiles),
+            Some("pro-audio".to_string())
+        );
     }
 }

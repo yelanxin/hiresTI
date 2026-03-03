@@ -47,6 +47,31 @@ def _build_rank(values):
     return rank
 
 
+def _is_home_context_kicker(text):
+    low = str(text or "").strip().lower()
+    return low in {
+        "because you liked",
+        "because you listened to",
+    }
+
+
+def _home_section_header_lines(section):
+    title = str((section or {}).get("title", "") or "").strip()
+    subtitle = str((section or {}).get("subtitle", "") or (section or {}).get("sub_title", "") or "").strip()
+    section_type = str((section or {}).get("section_type", "") or "").strip().upper()
+    context_header = (section or {}).get("context_header") or {}
+    context_title = str((context_header or {}).get("name", "") or "").strip()
+    if section_type == "HORIZONTAL_LIST_WITH_CONTEXT" and title and context_title:
+        return {"title": context_title, "kicker": title, "secondary": ""}
+    if section_type == "HORIZONTAL_LIST_WITH_CONTEXT" and title and subtitle:
+        return {"title": subtitle, "kicker": title, "secondary": ""}
+    if title and subtitle and _is_home_context_kicker(title):
+        return {"title": subtitle, "kicker": title, "secondary": ""}
+    if title and subtitle and _is_home_context_kicker(subtitle):
+        return {"title": title, "kicker": subtitle, "secondary": ""}
+    return {"title": title, "kicker": "", "secondary": subtitle}
+
+
 def sort_objects_by_name_fast(items, context="items"):
     objs = list(items or [])
     n = len(objs)
@@ -1363,8 +1388,39 @@ def batch_load_home(app, sections):
     for sec in sections:
         section_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, css_classes=["home-section"])
         section_head = Gtk.Box(spacing=8, css_classes=["home-section-head"])
-        section_title = Gtk.Label(label=sec["title"], xalign=0, hexpand=True, css_classes=["home-section-title"])
-        section_head.append(section_title)
+        context_header = sec.get("context_header") or {}
+        context_image_url = str(context_header.get("image_url", "") or "").strip()
+        if context_image_url:
+            context_img = Gtk.Image(pixel_size=48, css_classes=["album-cover-img"])
+            context_img.set_size_request(48, 48)
+            utils.load_img(context_img, context_image_url, app.cache_dir, 48)
+            section_head.append(context_img)
+        heading_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
+        header_lines = _home_section_header_lines(sec)
+        if header_lines["kicker"]:
+            heading_box.append(
+                Gtk.Label(
+                    label=header_lines["kicker"],
+                    xalign=0,
+                    hexpand=True,
+                    wrap=True,
+                    css_classes=["dim-label", "home-card-subtitle", "home-section-subtitle"],
+                )
+            )
+        section_title = Gtk.Label(label=header_lines["title"], xalign=0, hexpand=True, css_classes=["home-section-title"])
+        heading_box.append(section_title)
+        section_subtitle = header_lines["secondary"]
+        if section_subtitle:
+            heading_box.append(
+                Gtk.Label(
+                    label=section_subtitle,
+                    xalign=0,
+                    hexpand=True,
+                    wrap=True,
+                    css_classes=["dim-label", "home-card-subtitle", "home-section-subtitle"],
+                )
+            )
+        section_head.append(heading_box)
         section_box.append(section_head)
 
         flow = Gtk.FlowBox(

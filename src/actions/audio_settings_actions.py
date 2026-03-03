@@ -587,27 +587,45 @@ def on_device_changed(app, dd, p):
     idx = dd.get_selected()
     if hasattr(app, "current_device_list") and idx < len(app.current_device_list):
         device_info = app.current_device_list[idx]
+        previous_name = str(getattr(app, "current_device_name", "") or "")
+        previous_saved = str(app.settings.get("device", "") or "")
+        previous_idx = None
+        for i, info in enumerate(list(getattr(app, "current_device_list", []) or [])):
+            if str(info.get("name", "") or "") == previous_name:
+                previous_idx = i
+                break
         remembered_name = str(getattr(app, "_last_disconnected_device_name", "") or "")
-        if remembered_name and device_info.get("name") == remembered_name:
-            app._last_disconnected_device_name = ""
-            app._last_disconnected_driver = ""
-        app.current_device_name = device_info["name"]
-        app.update_tech_label(app.player.stream_info)
-        app.settings["device"] = device_info["name"]
-        app.save_settings()
+        target_name = device_info["name"]
         driver_label = app.driver_dd.get_selected_item().get_string()
         ok = app.player.set_output(driver_label, device_info["device_id"])
         if not ok:
+            if previous_idx is not None and previous_idx != idx:
+                app.ignore_device_change = True
+                try:
+                    dd.set_selected(previous_idx)
+                finally:
+                    app.ignore_device_change = False
+            if previous_saved:
+                app.settings["device"] = previous_saved
+            app.current_device_name = previous_name or getattr(app, "current_device_name", "Default")
+            app.update_tech_label(app.player.stream_info)
             if hasattr(app, "show_output_notice"):
                 app.show_output_notice(
-                    f"Output device unavailable: {device_info['name']}",
+                    f"Output device unavailable: {target_name}",
                     "error",
                     4200,
                 )
             update_output_status_ui(app)
             return
+        if remembered_name and target_name == remembered_name:
+            app._last_disconnected_device_name = ""
+            app._last_disconnected_driver = ""
+        app.current_device_name = target_name
+        app.update_tech_label(app.player.stream_info)
+        app.settings["device"] = target_name
+        app.save_settings()
         if hasattr(app, "_apply_viz_sync_offset_for_device"):
-            app._apply_viz_sync_offset_for_device(driver_label, device_id=device_info["device_id"], device_name=device_info["name"])
+            app._apply_viz_sync_offset_for_device(driver_label, device_id=device_info["device_id"], device_name=target_name)
         update_output_status_ui(app)
 
 

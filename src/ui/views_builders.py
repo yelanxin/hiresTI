@@ -2,7 +2,7 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Gtk, Adw
+from gi.repository import Gtk, Adw, Pango
 
 from app.app_remote_control import REMOTE_ACCESS_MODES
 import utils
@@ -337,8 +337,9 @@ def build_settings_page(app):
     bp_pop_content.set_markup(
         "<b>Bit-Perfect Mode</b>\n\n"
         "• <b>Always:</b> bypasses the app EQ and app volume processing.\n\n"
-        "• <b>PipeWire mode:</b> follows the music source sample rate when possible, "
-        "but audio still passes through the system mixer.\n\n"
+        "• <b>PipeWire mode:</b> follows the music source sample rate when possible "
+        "and uses the same rate/depth verdict rules as ALSA Exclusive, but audio "
+        "still passes through the system mixer.\n\n"
         "• <b>ALSA + Exclusive mode:</b> bypasses the system mixer and is treated as "
         "true bit-perfect playback."
     )
@@ -440,10 +441,15 @@ def build_settings_page(app):
     group_out.append(row_dev)
 
     row_state = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
-    row_state.append(Gtk.Label(label="Output Status", hexpand=True, xalign=0))
-    app.output_status_label = Gtk.Label(label="Idle", xalign=1, css_classes=["dim-label"])
-    row_state.append(app.output_status_label)
-    app.output_recover_btn = Gtk.Button(label="Recover", css_classes=["flat"])
+    row_state.append(Gtk.Label(label="Output Status", xalign=0, valign=Gtk.Align.START))
+    status_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, hexpand=True, halign=Gtk.Align.FILL)
+    app.output_status_label = Gtk.Label(label="Idle", xalign=0, hexpand=True, css_classes=["dim-label"])
+    app.output_status_label.set_wrap(True)
+    app.output_status_label.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+    app.output_status_label.set_max_width_chars(72)
+    status_box.append(app.output_status_label)
+    row_state.append(status_box)
+    app.output_recover_btn = Gtk.Button(label="Recover", css_classes=["flat"], valign=Gtk.Align.START)
     app.output_recover_btn.connect("clicked", app.on_recover_output_clicked)
     app.output_recover_btn.set_sensitive(False)
     row_state.append(app.output_recover_btn)

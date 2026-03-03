@@ -3,6 +3,7 @@ import logging
 import os
 import json
 import time
+import threading
 import requests
 import requests.adapters
 from datetime import datetime
@@ -49,6 +50,7 @@ class TidalBackend:
         self._last_login_error = ""
         # Circuit breaker for unstable mix endpoint.
         self._mix_fail_until = {}
+        self._session_recovery_lock = threading.Lock()
 
     def _default_ca_bundle_candidates(self):
         candidates = [
@@ -123,7 +125,7 @@ class TidalBackend:
         msg = str(exc or "").strip() or "(no message)"
         return f"[{kind}/{etype}] {msg}"
 
-    def _tune_http_pool(self):
+    def _tune_http_pool(self, session_obj=None):
         """
         Raise requests/urllib3 pool size for high-volume library fetches.
         This avoids noisy 'Connection pool is full, discarding connection' warnings
@@ -137,7 +139,8 @@ class TidalBackend:
 
         try:
             # Get session from different possible locations (tidalapi may create it lazily)
-            req_obj = getattr(self.session, "request", None)
+            target_session = self.session if session_obj is None else session_obj
+            req_obj = getattr(target_session, "request", None)
             if req_obj is None:
                 logger.debug("HTTP pool tuning skipped: no request object yet")
                 return
@@ -203,21 +206,23 @@ class TidalBackend:
             fallback="LOSSLESS",
         )
 
-    def _apply_global_config(self):
+    def _apply_global_config(self, session_obj=None):
         try:
-            if hasattr(self.session, 'config'):
-                self.session.config.quality = self.quality
-                if hasattr(self.session.config, 'set_quality'):
-                    self.session.config.set_quality(self.quality)
+            target_session = self.session if session_obj is None else session_obj
+            if hasattr(target_session, 'config'):
+                target_session.config.quality = self.quality
+                if hasattr(target_session.config, 'set_quality'):
+                    target_session.config.set_quality(self.quality)
         except Exception as e:
             logger.warning("Config sync warning: %s", e)
 
-    def _apply_session_quality(self, quality):
+    def _apply_session_quality(self, quality, session_obj=None):
         try:
-            if hasattr(self.session, "config"):
-                self.session.config.quality = quality
-                if hasattr(self.session.config, "set_quality"):
-                    self.session.config.set_quality(quality)
+            target_session = self.session if session_obj is None else session_obj
+            if hasattr(target_session, "config"):
+                target_session.config.quality = quality
+                if hasattr(target_session.config, "set_quality"):
+                    target_session.config.set_quality(quality)
         except Exception as e:
             logger.debug("Failed to apply session quality %s: %s", quality, e)
 
@@ -354,35 +359,84 @@ class TidalBackend:
         os.chmod(self.token_file, 0o600)
         logger.debug("Session saved to %s", self.token_file)
 
-    def try_load_session(self):
+    def _read_saved_session_data(self):
         if os.path.exists(self.legacy_token_file) and not os.path.exists(self.token_file):
             logger.warning("Legacy token file detected (.pkl). Please login again to migrate.")
+            return None
+
+        if not os.path.exists(self.token_file):
+            return None
+
+        with open(self.token_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        required = ('token_type', 'access_token', 'refresh_token', 'expiry_time')
+        if not all(k in data for k in required):
+            logger.warning("Session file invalid: missing required fields.")
+            return None
+        return data
+
+    def _restore_session_from_saved_data(self, data, reason="restore"):
+        try:
+            new_session = tidalapi.Session()
+            self._apply_global_config(session_obj=new_session)
+            new_session.load_oauth_session(
+                data['token_type'],
+                data['access_token'],
+                data['refresh_token'],
+                self._deserialize_expiry(data['expiry_time']),
+            )
+            if not new_session.check_login():
+                logger.warning("Session %s failed: check_login returned false.", reason)
+                return False
+
+            self.session = new_session
+            self.user = new_session.user
+            self._tune_http_pool()
+            self._apply_global_config()
+            self._set_last_login_error("")
+            try:
+                self.save_session()
+            except Exception as e:
+                logger.debug("Session save after %s skipped: %s", reason, e)
+            return True
+        except Exception as e:
+            logger.warning("Session %s error [%s]: %s", reason, classify_exception(e), e)
             return False
 
-        if os.path.exists(self.token_file):
+    def recover_session(self, reason="api"):
+        with self._session_recovery_lock:
             try:
-                with open(self.token_file, 'r', encoding='utf-8') as f:
-                    d = json.load(f)
-
-                required = ('token_type', 'access_token', 'refresh_token', 'expiry_time')
-                if not all(k in d for k in required):
-                    logger.warning("Session file invalid: missing required fields.")
-                    return False
-
-                self.session.load_oauth_session(
-                    d['token_type'],
-                    d['access_token'],
-                    d['refresh_token'],
-                    self._deserialize_expiry(d['expiry_time']),
-                )
-                if self.session.check_login():
-                    self.user = self.session.user
-                    self._tune_http_pool()  # Ensure pool is tuned after session is ready
-                    self.refresh_favorite_ids()
-                    self._apply_global_config()
-                    return True
+                data = self._read_saved_session_data()
             except Exception as e:
-                logger.warning("Session load error [%s]: %s", classify_exception(e), e)
+                logger.warning("Session recovery read failed [%s]: %s", classify_exception(e), e)
+                return False
+            if not data:
+                return False
+            return self._restore_session_from_saved_data(data, reason=f"recovery:{reason}")
+
+    def _call_with_session_recovery(self, fn, context="api"):
+        try:
+            return fn()
+        except Exception as e:
+            kind = classify_exception(e)
+            if kind not in ("auth", "network", "server"):
+                raise
+            logger.warning("%s failed [%s]; attempting session recovery: %s", context, kind, e)
+            if not self.recover_session(reason=context):
+                raise
+            return fn()
+
+    def try_load_session(self):
+        try:
+            data = self._read_saved_session_data()
+            if not data:
+                return False
+            if self._restore_session_from_saved_data(data, reason="startup"):
+                self.refresh_favorite_ids()
+                return True
+        except Exception as e:
+            logger.warning("Session load error [%s]: %s", classify_exception(e), e)
         return False
 
     def refresh_favorite_ids(self):
@@ -600,22 +654,28 @@ class TidalBackend:
 
     def get_favorites(self, limit=20000):
         try: 
-            if not self.user:
-                return []
-            fav = getattr(self.user, "favorites", None)
-            artists_api = getattr(fav, "artists", None)
-            return self._paginate_favorites_api(artists_api, limit=limit, page_size=100)
+            def _fetch():
+                if not self.user:
+                    return []
+                fav = getattr(self.user, "favorites", None)
+                artists_api = getattr(fav, "artists", None)
+                return self._paginate_favorites_api(artists_api, limit=limit, page_size=100)
+
+            return self._call_with_session_recovery(_fetch, context="favorite artists")
         except Exception as e:
             logger.warning("Failed to fetch favorite artists: %s", e)
             return []
 
     def get_recent_albums(self, limit=20000):
         try:
-            if not self.user:
-                return []
-            fav = getattr(self.user, "favorites", None)
-            albums_api = getattr(fav, "albums", None)
-            result = self._paginate_favorites_api(albums_api, limit=limit, page_size=1000)
+            def _fetch():
+                if not self.user:
+                    return []
+                fav = getattr(self.user, "favorites", None)
+                albums_api = getattr(fav, "albums", None)
+                return self._paginate_favorites_api(albums_api, limit=limit, page_size=1000)
+
+            result = self._call_with_session_recovery(_fetch, context="recent albums")
             # Populate cache and fav_album_ids so callers can avoid re-fetching.
             self._cached_albums = list(result)
             self._cached_albums_ts = time.time()
@@ -627,15 +687,23 @@ class TidalBackend:
             return result
         except Exception as e:
             logger.warning("Failed to fetch recent albums: %s", e)
+            if classify_exception(e) in ("auth", "network", "server"):
+                cached = list(getattr(self, "_cached_albums", []) or [])
+                if cached:
+                    logger.info("Using cached recent albums after transient failure: count=%s", len(cached))
+                    return cached
             return []
 
     def get_favorite_tracks(self, limit=50):
         try:
-            if not self.user:
-                return []
-            fav = getattr(self.user, "favorites", None)
-            tracks_api = getattr(fav, "tracks", None)
-            return self._paginate_favorites_api(tracks_api, limit=limit, page_size=1000)
+            def _fetch():
+                if not self.user:
+                    return []
+                fav = getattr(self.user, "favorites", None)
+                tracks_api = getattr(fav, "tracks", None)
+                return self._paginate_favorites_api(tracks_api, limit=limit, page_size=1000)
+
+            return self._call_with_session_recovery(_fetch, context="favorite tracks")
         except Exception as e:
             logger.warning("Failed to fetch favorite tracks: %s", e)
             return []
@@ -1258,6 +1326,85 @@ class TidalBackend:
     # ==========================================
     # [核心修改] 带过滤功能的 get_home_page
     # ==========================================
+    def _home_source_value(self, source, key):
+        if isinstance(source, dict):
+            return source.get(key)
+        return getattr(source, key, None)
+
+    def _get_home_section_subtitle(self, category):
+        title = str(self._home_source_value(category, "title") or "").strip()
+        candidates = [
+            self._home_source_value(category, "subtitle"),
+            self._home_source_value(category, "description"),
+        ]
+        seen = set()
+        for raw in candidates:
+            text = str(raw or "").strip()
+            low = text.lower()
+            if not text or low == title.lower() or low in seen:
+                continue
+            seen.add(low)
+            return text
+        return ""
+
+    def _parse_home_feed_item(self, item):
+        if not isinstance(item, dict):
+            return None
+        item_type = str(item.get("type", "") or "").strip().upper()
+        data = item.get("data")
+        if not item_type or not isinstance(data, dict):
+            return None
+
+        try:
+            obj = None
+            if item_type == "ALBUM" and hasattr(self.session, "parse_album"):
+                obj = self.session.parse_album(data)
+            elif item_type == "ARTIST" and hasattr(self.session, "parse_artist"):
+                obj = self.session.parse_artist(data)
+            elif item_type == "TRACK" and hasattr(self.session, "parse_track"):
+                obj = self.session.parse_track(data)
+            elif item_type == "PLAYLIST" and hasattr(self.session, "parse_playlist"):
+                obj = self.session.parse_playlist(data)
+            elif item_type == "VIDEO" and hasattr(self.session, "parse_video"):
+                obj = self.session.parse_video(data)
+            elif item_type == "MIX":
+                mix_parser = getattr(self.session, "parse_v2_mix", None) or getattr(self.session, "parse_mix", None)
+                if callable(mix_parser):
+                    obj = mix_parser(data)
+            if obj is None:
+                return None
+            processed = self._process_generic_item(obj)
+            if not processed:
+                return None
+            processed["obj"] = obj
+            processed["type"] = processed.get("type") or item_type.title()
+            return processed
+        except Exception as e:
+            logger.debug("Failed to parse home feed item type=%s: %s", item_type, e)
+            return None
+
+    def _fetch_home_page_raw(self):
+        if not getattr(self, "session", None):
+            return {}
+        request_obj = getattr(self.session, "request", None)
+        config_obj = getattr(self.session, "config", None)
+        if request_obj is None or config_obj is None or not hasattr(request_obj, "request"):
+            return {}
+
+        def _fetch():
+            return request_obj.request(
+                "GET",
+                "home/feed/static",
+                base_url=config_obj.api_v2_location,
+                params={
+                    "deviceType": "BROWSER",
+                    "locale": getattr(self.session, "locale", None),
+                    "platform": "WEB",
+                },
+            ).json()
+
+        return self._call_with_session_recovery(_fetch, context="home page")
+
     def get_home_page(self):
         """
         获取 Tidal 首页，并根据用户需求过滤栏目。
@@ -1275,20 +1422,64 @@ class TidalBackend:
 
         home_sections = []
         try:
-            if hasattr(self.session, 'home'):
+            raw_home = self._fetch_home_page_raw()
+            raw_items = list((raw_home or {}).get("items") or [])
+            if raw_items:
+                logger.debug("Fetching home page from raw home/feed/static payload...")
+                for category in raw_items:
+                    if not isinstance(category, dict):
+                        continue
+                    title = str(category.get("title", "") or "").strip()
+                    subtitle = self._get_home_section_subtitle(category)
+                    description = str(category.get("description", "") or "").strip()
+                    filter_text = " ".join(
+                        part for part in (title, subtitle, description)
+                        if str(part or "").strip()
+                    ).lower()
+
+                    is_allowed = any(k in filter_text for k in ALLOWED_KEYWORDS)
+                    if not is_allowed:
+                        continue
+
+                    items = []
+                    for item in list(category.get("items") or []):
+                        processed_item = self._parse_home_feed_item(item)
+                        if processed_item:
+                            items.append(processed_item)
+                    if not items:
+                        continue
+
+                    section = {
+                        "title": title,
+                        "subtitle": subtitle,
+                        "section_type": str(category.get("type", "") or ""),
+                        "items": items,
+                    }
+                    context_header = self._parse_home_feed_item(category.get("header"))
+                    if context_header:
+                        section["context_header"] = context_header
+                    home_sections.append(section)
+            elif hasattr(self.session, 'home'):
                 logger.debug("Fetching session.home()...")
                 home = self.session.home()
                 if hasattr(home, 'categories'):
                     for category in home.categories:
-                        title = category.title
-                        title_lower = title.lower()
+                        title = str(getattr(category, "title", "") or "").strip()
+                        subtitle = self._get_home_section_subtitle(category)
+                        description = str(getattr(category, "description", "") or "").strip()
+                        filter_text = " ".join(
+                            part for part in (title, subtitle, description)
+                            if str(part or "").strip()
+                        ).lower()
                         
                         # [过滤逻辑] 检查标题是否包含任一关键词
-                        is_allowed = any(k in title_lower for k in ALLOWED_KEYWORDS)
+                        is_allowed = any(k in filter_text for k in ALLOWED_KEYWORDS)
                         
                         if is_allowed:
                             section = {
                                 'title': title,
+                                'subtitle': subtitle,
+                                'section_type': str(getattr(category, "type", "") or ""),
                                 'items': []
                             }
                             if hasattr(category, 'items'):
@@ -1674,62 +1865,64 @@ class TidalBackend:
 
     def get_tracks(self, item):
         try:
-            # 1. 解包
-            if isinstance(item, dict) and 'obj' in item:
-                item = item['obj']
+            def _fetch():
+                # 1. 解包
+                resolved = item
+                if isinstance(resolved, dict) and 'obj' in resolved:
+                    resolved = resolved['obj']
 
-            # 2. 优先尝试直接调用方法
-            if hasattr(item, 'tracks') and callable(item.tracks):
-                return item.tracks()
-            if hasattr(item, 'items') and callable(item.items):
-                return self._extract_tracks_from_items(item.items())
+                item_type = type(resolved).__name__
+                item_id = getattr(resolved, 'id', None)
 
-            # 3. 重新抓取
-            item_type = type(item).__name__
-            item_id = getattr(item, 'id', None)
-            
-            if not item_id: return []
+                # 2. 优先通过当前 session 重新解析远端对象，避免使用挂在旧 session
+                # 上的 album/playlist object（挂起后更容易失效）。
+                if item_id:
+                    logger.debug("Reloading %s with ID %s", item_type, item_id)
 
-            logger.debug("Reloading %s with ID %s", item_type, item_id)
+                    if 'Mix' in item_type:
+                        now = time.time()
+                        fail_until = self._mix_fail_until.get(str(item_id), 0)
+                        if now < fail_until:
+                            logger.info(
+                                "Skipping mix %s fetch for %ss due to recent server failures.",
+                                item_id,
+                                int(fail_until - now),
+                            )
+                            return []
 
-            if 'Mix' in item_type:
-                now = time.time()
-                fail_until = self._mix_fail_until.get(str(item_id), 0)
-                if now < fail_until:
-                    logger.info(
-                        "Skipping mix %s fetch for %ss due to recent server failures.",
-                        item_id,
-                        int(fail_until - now),
-                    )
-                    return []
+                        def fetch_mix_items():
+                            mix = self.session.mix(item_id)
+                            return self._extract_tracks_from_items(mix.items())
 
-                def fetch_mix_items():
-                    mix = self.session.mix(item_id)
-                    return self._extract_tracks_from_items(mix.items())
+                        try:
+                            tracks = self._retry_api_call(fetch_mix_items, attempts=3, base_delay=0.4)
+                            # Clear circuit breaker after successful fetch.
+                            self._mix_fail_until.pop(str(item_id), None)
+                            return tracks
+                        except Exception as e:
+                            # Temporary circuit breaker to avoid spamming unstable endpoint.
+                            if self._is_server_error(e):
+                                self._mix_fail_until[str(item_id)] = time.time() + 60
+                            raise
 
-                try:
-                    tracks = self._retry_api_call(fetch_mix_items, attempts=3, base_delay=0.4)
-                    # Clear circuit breaker after successful fetch.
-                    self._mix_fail_until.pop(str(item_id), None)
-                    return tracks
-                except Exception as e:
-                    # Temporary circuit breaker to avoid spamming unstable endpoint.
-                    if self._is_server_error(e):
-                        self._mix_fail_until[str(item_id)] = time.time() + 60
-                    raise
-            
-            elif 'Playlist' in item_type:
-                pl = self.session.playlist(item_id)
-                return self._extract_tracks_from_items(pl.items())
-            
-            elif 'Album' in item_type:
-                alb = self.session.album(item_id)
-                return alb.tracks()
+                    if 'Playlist' in item_type:
+                        pl = self.session.playlist(item_id)
+                        return self._extract_tracks_from_items(pl.items())
 
-            if hasattr(item, 'id'):
-                return self.session.album(item.id).tracks()
-            
-            return []
+                    if 'Album' in item_type:
+                        alb = self.session.album(item_id)
+                        return alb.tracks()
+
+                # 3. 回退到对象自带方法（适配部分本地/轻量对象）。
+                if hasattr(resolved, 'tracks') and callable(resolved.tracks):
+                    return resolved.tracks()
+                if hasattr(resolved, 'items') and callable(resolved.items):
+                    return self._extract_tracks_from_items(resolved.items())
+                if hasattr(resolved, 'id'):
+                    return self.session.album(resolved.id).tracks()
+                return []
+
+            return self._call_with_session_recovery(_fetch, context="album tracks")
         except Exception as e:
             logger.warning("Get tracks error [%s]: %s", classify_exception(e), e)
             return []

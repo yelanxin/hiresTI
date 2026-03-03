@@ -755,9 +755,12 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
     background-color: alpha(white, 0.12);
 }
 .now-playing-switcher {
-    margin-top: -2px;
+    background: none;
+    background-color: transparent;
+    box-shadow: none;
+    margin: -2px 0 0 0;
+    padding: 0;
 }
-.now-playing-switcher,
 .now-playing-switcher > box {
     background: none;
     background-color: transparent;

@@ -59,6 +59,42 @@ fi
 echo "$VERSION" > version.txt
 echo "🧾 Version file updated: version.txt -> $VERSION"
 
+sync_flatpak_metainfo_release() {
+    local meta_file="flatpak/com.hiresti.player.metainfo.xml"
+    if [ ! -f "$meta_file" ]; then
+        return 0
+    fi
+
+    local release_date
+    release_date="$(
+        sed -n "s/^##[[:space:]]\\+${VERSION//./\\.}[[:space:]]*-[[:space:]]*\\([0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}\\).*$/\\1/p" CHANGELOG.md | head -n 1
+    )"
+    if [ -z "$release_date" ]; then
+        release_date="$(date -u +%F)"
+    fi
+
+    local tmp_file
+    tmp_file="$(mktemp)"
+    awk -v version="$VERSION" -v date="$release_date" '
+        /<releases>/ && !inserted {
+            print
+            print "    <release version=\"" version "\" date=\"" date "\"/>"
+            inserted = 1
+            next
+        }
+        {
+            if (index($0, "<release version=\"" version "\"") > 0) {
+                next
+            }
+            print
+        }
+    ' "$meta_file" > "$tmp_file"
+    mv "$tmp_file" "$meta_file"
+    echo "🧾 Flatpak metainfo synced: $VERSION ($release_date)"
+}
+
+sync_flatpak_metainfo_release
+
 # Preflight checks
 for required in src/main.py src/ui src/actions src/viz icons/hicolor; do
     if [ ! -e "$required" ]; then

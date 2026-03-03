@@ -33,12 +33,37 @@ class _DriverDropdown:
         return None
 
 
+class _DriverItem:
+    def __init__(self, text):
+        self._text = str(text)
+
+    def get_string(self):
+        return self._text
+
+
+class _SelectableDropdown:
+    def __init__(self, selected=0):
+        self._selected = int(selected)
+        self.selected_calls = []
+
+    def get_selected(self):
+        return self._selected
+
+    def set_selected(self, value):
+        self._selected = int(value)
+        self.selected_calls.append(int(value))
+
+
 class _Player:
     def __init__(self):
         self.toggle_calls = []
+        self.stream_info = {}
 
     def toggle_bit_perfect(self, enabled, exclusive_lock=False):
         self.toggle_calls.append((bool(enabled), bool(exclusive_lock)))
+
+    def set_output(self, driver, device_id):
+        raise NotImplementedError
 
 
 class _Visible:
@@ -79,3 +104,54 @@ def test_on_bit_perfect_toggled_allows_missing_eq_controls():
     assert ex_switch.sensitive_calls == [True]
     assert driver_dd.sensitive_calls == [True]
     assert bp_label.visible_calls == [True]
+
+
+def test_on_device_changed_rolls_back_selection_when_output_switch_fails(monkeypatch):
+    notices = []
+    saved = []
+    tech_updates = []
+
+    class _BusyPlayer(_Player):
+        def __init__(self):
+            super().__init__()
+            self.set_output_calls = []
+
+        def set_output(self, driver, device_id):
+            self.set_output_calls.append((driver, device_id))
+            return False
+
+    driver_dd = SimpleNamespace(get_selected_item=lambda: _DriverItem("ALSA"))
+    device_dd = _SelectableDropdown(selected=1)
+    player = _BusyPlayer()
+    app = SimpleNamespace(
+        ignore_device_change=False,
+        current_device_list=[
+            {"name": "DAC One", "device_id": "hw:1,0"},
+            {"name": "DAC Two", "device_id": "hw:2,0"},
+        ],
+        current_device_name="DAC One",
+        settings={"device": "DAC One"},
+        player=player,
+        driver_dd=driver_dd,
+        device_dd=device_dd,
+        save_settings=lambda: saved.append(True),
+        update_tech_label=lambda stream: tech_updates.append(stream),
+        show_output_notice=lambda text, state, timeout: notices.append((text, state, timeout)),
+        _last_disconnected_device_name="",
+        _last_disconnected_driver="",
+    )
+
+    monkeypatch.setattr(audio_settings_actions, "_stop_output_hotplug_watch", lambda _app: None)
+    monkeypatch.setattr(audio_settings_actions, "_touch_output_probe_burst", lambda _app, seconds=0: None)
+    monkeypatch.setattr(audio_settings_actions, "update_output_status_ui", lambda _app: None)
+
+    audio_settings_actions.on_device_changed(app, device_dd, None)
+
+    assert player.set_output_calls == [("ALSA", "hw:2,0")]
+    assert device_dd.get_selected() == 0
+    assert device_dd.selected_calls == [0]
+    assert app.current_device_name == "DAC One"
+    assert app.settings["device"] == "DAC One"
+    assert saved == []
+    assert tech_updates == [{}]
+    assert notices == [("Output device unavailable: DAC Two", "error", 4200)]
