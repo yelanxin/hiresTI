@@ -1,7 +1,7 @@
 # Changelog
 
 ## 1.4.6 - 2026-03-03
-Signal-path polish release: terminal-style bit-perfect help, clearer PipeWire verdict rules, and quieter runtime diagnostics.
+Signal-path + home-page polish release: terminal-style bit-perfect help, clearer PipeWire verdict rules, quieter runtime diagnostics, and better TIDAL home context headers.
 
 ### Changed
 - `Audio Signal Path` now shows the `Bit-Perfect Verdict` help as a terminal-style black/green popover that matches the Signal Path page, with a straight-edge shell instead of the default rounded GNOME bubble.
@@ -9,6 +9,8 @@ Signal-path polish release: terminal-style bit-perfect help, clearer PipeWire ve
 - PipeWire bit-perfect checks now use the same lossless container-widening rule as ALSA exclusive mode, so `16-bit -> 32-bit` container output is treated as valid when the playback path is otherwise lossless.
 - PipeWire verdict failures now report narrower output-depth and sample-rate mismatches separately instead of collapsing them into a generic combined mismatch reason.
 - PipeWire pro-audio profile activation now ignores `pwcardprofile:` pseudo-device ids instead of trying to treat them as real output targets.
+- TIDAL home-page section headers now preserve official recommendation context more accurately by promoting the feed context title to the main line, rendering the recommendation reason as a smaller kicker, and showing context artwork when the feed provides it.
+- TIDAL home-page subtitle handling now keeps upstream `subtitle` text when present and falls back to `description` only when needed, so shelves with contextual recommendations do not lose their intended wording.
 
 ### Fixed
 - Fixed noisy repeated `Rust runtime snapshot` and `SignalPath latency source` logs by downgrading them to deduped `DEBUG` diagnostics that only emit when the observed runtime state changes.
@@ -19,6 +21,7 @@ Signal-path polish release: terminal-style bit-perfect help, clearer PipeWire ve
 - Verified with:
   - `pytest -q tests/test_signal_path_bitperfect.py`
   - `pytest -q tests/test_rust_audio_reservation_retry.py`
+  - `pytest -q tests/test_home_section_header.py tests/test_tidal_home_page.py`
 
 ---
 
