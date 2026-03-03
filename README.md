@@ -4,10 +4,8 @@
 ![Rust](https://img.shields.io/badge/Rust-1.70%2B-orange?logo=rust)
 ![GTK4](https://img.shields.io/badge/UI-GTK4%20%2B%20Libadwaita-green)
 ![License](https://img.shields.io/badge/License-GPL--3.0-purple)
-[![OpenClaw Integrated](https://img.shields.io/badge/OpenClaw-Integrated-1F6FEB)](./openclaw-mcp-guide-en.md)
 
-
-`hiresTI` is an AI-ready native Linux desktop client for TIDAL, focused on stable playback, high-quality output paths, a responsive GTK4/Libadwaita user experience, and OpenClaw/MCP integration for AI-driven control.
+`hiresTI` is a native Linux desktop client for TIDAL, focused on stable playback, high-quality output paths, a responsive GTK4/Libadwaita user experience.
 
 ## Highlights
 
@@ -19,7 +17,7 @@
 - Cloud playlist management with folder support and cover collage previews
 - Built-in queue drawer, lyrics support, and visualizer modules
 - MPRIS support (`org.mpris.MediaPlayer2.hiresti`) for desktop media controls
-- Built-in remote control with HTTP JSON-RPC, MCP endpoint, and OpenClaw integration support
+- Built-in remote control with HTTP JSON-RPC, MCP endpoint.
 
 ## Screenshots
 ### Main Window
