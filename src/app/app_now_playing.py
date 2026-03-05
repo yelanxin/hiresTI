@@ -1042,10 +1042,36 @@ def _sync_now_playing_surface_size(self):
     if overlay_w <= 0:
         overlay_w = int(ui_config.WINDOW_WIDTH)
 
+    # Keep Now Playing width exactly aligned with the main bottom player bar.
+    # Use the real rendered bar width and center-align the surface.
+    bottom_bar = getattr(self, "bottom_bar", None)
+    target_surface_w = max(420, int(overlay_w) - (2 * int(_NOW_PLAYING_PANEL_SIDE_MARGIN)))
+    if overlay is not None and bottom_bar is not None:
+        try:
+            ok, rect = bottom_bar.compute_bounds(overlay)
+        except Exception:
+            ok, rect = False, None
+        if ok and rect is not None:
+            bar_w = int(round(float(rect.get_width() or 0.0)))
+            if bar_w > 0:
+                target_surface_w = max(420, bar_w)
+    try:
+        surface.set_halign(Gtk.Align.CENTER)
+    except Exception:
+        pass
+    try:
+        if int(surface.get_margin_start() or 0) != 0:
+            surface.set_margin_start(0)
+    except Exception:
+        surface.set_margin_start(0)
+    try:
+        if int(surface.get_margin_end() or 0) != 0:
+            surface.set_margin_end(0)
+    except Exception:
+        surface.set_margin_end(0)
+
     margin_top = 0
     margin_bottom = 0
-    margin_start = 0
-    margin_end = 0
     try:
         margin_top = int(surface.get_margin_top() or 0)
     except Exception:
@@ -1054,17 +1080,9 @@ def _sync_now_playing_surface_size(self):
         margin_bottom = int(surface.get_margin_bottom() or 0)
     except Exception:
         margin_bottom = 0
-    try:
-        margin_start = int(surface.get_margin_start() or 0)
-    except Exception:
-        margin_start = 0
-    try:
-        margin_end = int(surface.get_margin_end() or 0)
-    except Exception:
-        margin_end = 0
     target_h = max(320, int(overlay_h) - margin_top - margin_bottom)
-    _set_size_request_if_changed(surface, -1, target_h)
-    surface_w = max(420, int(overlay_w) - margin_start - margin_end)
+    _set_size_request_if_changed(surface, target_surface_w, target_h)
+    surface_w = int(target_surface_w)
     left_target_w, right_panel_w = _now_playing_split_widths(surface_w)
     if right_panel is not None:
         _set_size_request_if_changed(right_panel, right_panel_w, -1)

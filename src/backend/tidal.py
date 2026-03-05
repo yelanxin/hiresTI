@@ -144,7 +144,11 @@ class TidalBackend:
             if req_obj is None:
                 logger.debug("HTTP pool tuning skipped: no request object yet")
                 return
-            sess = getattr(req_obj, "session", None)
+            # tidalapi.Session.request_session is the underlying requests.Session
+            sess = getattr(target_session, "request_session", None)
+            if sess is None:
+                # Fallback: older tidalapi may embed it under request.session
+                sess = getattr(req_obj, "session", None)
             if sess is None:
                 logger.debug("HTTP pool tuning skipped: no session in request object yet")
                 return
@@ -1293,18 +1297,37 @@ class TidalBackend:
         }
 
     def get_albums(self, art):
-        try:
+        def _fetch():
+            a = art
             # History/Local objects may only contain artist id/name and
             # do not expose get_albums(). Resolve to a real artist first.
-            if isinstance(art, (int, str)):
-                art = self.session.artist(art)
-            elif hasattr(art, "id") and not hasattr(art, "get_albums"):
-                art = self.session.artist(getattr(art, "id"))
-
-            res = art.get_albums()
-            return res() if callable(res) else res
+            if isinstance(a, (int, str)):
+                a = self.session.artist(a)
+            elif hasattr(a, "id") and not hasattr(a, "get_albums"):
+                a = self.session.artist(getattr(a, "id"))
+            res = a.get_albums()
+            return list((res() if callable(res) else res) or [])
+        try:
+            return self._call_with_session_recovery(_fetch, context="artist albums")
         except Exception as e:
             logger.warning("Failed to fetch albums for artist %s: %s", getattr(art, "id", "unknown"), e)
+            return []
+
+    def get_albums_page(self, art, limit=50, offset=0):
+        """Fetch one page of artist albums. Uses session recovery on transient errors."""
+        def _fetch():
+            a = art
+            if isinstance(a, (int, str)):
+                a = self.session.artist(a)
+            elif hasattr(a, "id") and not hasattr(a, "get_albums"):
+                a = self.session.artist(getattr(a, "id"))
+            res = a.get_albums(limit=limit, offset=offset)
+            return list((res() if callable(res) else res) or [])
+        try:
+            return self._call_with_session_recovery(_fetch, context="artist albums page")
+        except Exception as e:
+            logger.warning("Failed to fetch albums page artist=%s offset=%s: %s",
+                           getattr(art, "id", "?"), offset, e)
             return []
 
     def resolve_artist(self, artist_id=None, artist_name=None):

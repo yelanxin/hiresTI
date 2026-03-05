@@ -248,14 +248,79 @@ def on_artist_clicked(app, artist):
     while c := app.collection_content_box.get_first_child():
         app.collection_content_box.remove(c)
 
-    app.create_album_flow()
-    def task():
-        albums = list(app.backend.get_albums(artist) or [])
-        albums = ui_actions.sort_objects_by_name_fast(albums, context="artist_albums")
-        logger.info("Artist albums prepared: artist=%s total=%s", getattr(artist, "name", "Unknown"), len(albums))
-        GLib.idle_add(app.batch_load_albums, albums)
+    # Disconnect previous artist scroll hook
+    try:
+        old_vadj = getattr(app, "_artist_albums_vadj", None)
+        old_hid  = int(getattr(app, "_artist_albums_vadj_handler_id", 0) or 0)
+        if old_vadj is not None and old_hid:
+            old_vadj.disconnect(old_hid)
+    except Exception:
+        pass
+    app._artist_albums_vadj = None
+    app._artist_albums_vadj_handler_id = 0
 
-    Thread(target=task, daemon=True).start()
+    render_token = int(getattr(app, "_artist_albums_render_token", 0) or 0) + 1
+    app._artist_albums_render_token = render_token
+
+    app.create_album_flow()
+
+    PAGE_SIZE = 50
+    state = {"offset": 0, "loading": False, "has_more": True}
+
+    def _ensure_scroll_hook():
+        if getattr(app, "_artist_albums_vadj_handler_id", 0):
+            return
+        vadj = app.alb_scroll.get_vadjustment() if getattr(app, "alb_scroll", None) else None
+        if vadj is None:
+            return
+        app._artist_albums_vadj = vadj
+        app._artist_albums_vadj_handler_id = vadj.connect("value-changed", _maybe_load_more)
+
+    def _maybe_load_more(_adj=None):
+        if int(getattr(app, "_artist_albums_render_token", 0) or 0) != render_token:
+            return
+        if state["loading"] or not state["has_more"]:
+            return
+        vadj = getattr(app, "_artist_albums_vadj", None)
+        if vadj is None:
+            return
+        remain = float(vadj.get_upper()) - (float(vadj.get_value()) + float(vadj.get_page_size()))
+        if remain <= 320:
+            _load_next_page()
+
+    def _load_next_page():
+        if state["loading"] or not state["has_more"]:
+            return
+        if int(getattr(app, "_artist_albums_render_token", 0) or 0) != render_token:
+            return
+        state["loading"] = True
+        offset = state["offset"]
+
+        def task():
+            page = list(app.backend.get_albums_page(artist, limit=PAGE_SIZE, offset=offset) or [])
+
+            def apply():
+                if int(getattr(app, "_artist_albums_render_token", 0) or 0) != render_token:
+                    return False
+                state["loading"] = False
+                if not page:
+                    state["has_more"] = False
+                    return False
+                state["offset"] += len(page)
+                if len(page) < PAGE_SIZE:
+                    state["has_more"] = False
+                logger.info("Artist albums page loaded: artist=%s offset=%s count=%s",
+                            getattr(artist, "name", "Unknown"), offset, len(page))
+                app.batch_load_albums(page)
+                if state["has_more"]:
+                    _ensure_scroll_hook()
+                return False
+
+            GLib.idle_add(apply)
+
+        Thread(target=task, daemon=True).start()
+
+    _load_next_page()  # load first page immediately
 
 
 def on_back_clicked(app, btn):
