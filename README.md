@@ -25,7 +25,7 @@ Audio Optimization Guide: [audio-optimization-guide.md](audio-optimization-guide
 ### Main Window
 ![Main Window](screenshots/1.4.5-1.png)
 ![Main Window](screenshots/1.4.5-2.png)
-![Main Window](screenshots/1.5.0-1.png)
+![Main Window](screenshots/1.5.0-2.png)
 
 
 ### Mini Mode
