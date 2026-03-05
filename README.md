@@ -19,6 +19,8 @@
 - MPRIS support (`org.mpris.MediaPlayer2.hiresti`) for desktop media controls
 - Built-in remote control with HTTP JSON-RPC, MCP endpoint.
 
+Audio Optimization Guide: [audio-optimization-guide.md](audio-optimization-guide.md)
+
 ## Screenshots
 ### Main Window
 ![Main Window](screenshots/1.4.5-1.png)

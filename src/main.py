@@ -13,7 +13,7 @@ gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
 from gi.repository import Adw
 from core.logging import setup_logging
-from core.constants import PlayMode, LyricsSettings, AudioLatency, VisualizerSettings
+from core.constants import PlayMode, LyricsSettings, AudioLatency, AlsaMmapRealtimePriority, VisualizerSettings
 from app import app_bootstrap
 from app import app_diagnostics
 from app import app_init_refs
@@ -35,6 +35,9 @@ class TidalApp(Adw.Application):
     LYRICS_FONT_PRESETS = LyricsSettings.FONT_PRESETS
     LATENCY_OPTIONS = AudioLatency.OPTIONS
     LATENCY_MAP = AudioLatency.MAP
+    ALSA_MMAP_REALTIME_PRIORITY_OPTIONS = AlsaMmapRealtimePriority.OPTIONS
+    ALSA_MMAP_REALTIME_PRIORITY_MAP = AlsaMmapRealtimePriority.MAP
+    ALSA_MMAP_REALTIME_PRIORITY_DEFAULT = AlsaMmapRealtimePriority.DEFAULT_LABEL
     VIZ_BAR_OPTIONS = VisualizerSettings.BAR_OPTIONS
 
     def _init_ui_refs(self):

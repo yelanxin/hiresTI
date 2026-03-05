@@ -24,12 +24,22 @@ class _Switch:
 
 class _DriverDropdown:
     def __init__(self):
+        self.model = []
+        self._selected = 0
         self.sensitive_calls = []
+
+    def set_model(self, model):
+        self.model = list(model)
+
+    def set_selected(self, value):
+        self._selected = int(value)
 
     def set_sensitive(self, value):
         self.sensitive_calls.append(bool(value))
 
     def get_selected_item(self):
+        if 0 <= self._selected < len(self.model):
+            return _DriverItem(self.model[self._selected])
         return None
 
 
@@ -78,6 +88,7 @@ class _Player:
         self.stream_info = {}
         self.set_output_calls = []
         self.output_format_pref_calls = []
+        self.realtime_priority_calls = []
 
     def toggle_bit_perfect(self, enabled, exclusive_lock=False):
         self.toggle_calls.append((bool(enabled), bool(exclusive_lock)))
@@ -89,6 +100,13 @@ class _Player:
     def set_output_format_preference(self, format_name=None):
         self.output_format_pref_calls.append(format_name)
         return True
+
+    def set_alsa_mmap_realtime_priority(self, priority):
+        self.realtime_priority_calls.append(int(priority))
+        return True
+
+    def get_drivers(self):
+        return ["Auto (Default)", "PipeWire", "ALSA（auto）", "ALSA（mmap）"]
 
 
 class _Visible:
@@ -280,3 +298,32 @@ def test_on_output_bit_depth_changed_applies_supported_format(monkeypatch):
     assert player.output_format_pref_calls == ["S24_32LE"]
     assert player.set_output_calls == [("ALSA", "hw:1,0")]
     assert notices == []
+
+
+def test_on_mmap_realtime_priority_changed_applies_and_restarts_for_mmap():
+    saved = []
+    restarts = []
+    dd = _ModelDropdown(selected=3)
+    dd.model = ["Off", "Low (40)", "Recommended (60)", "High (70)"]
+    player = _Player()
+    app = SimpleNamespace(
+        settings={},
+        save_settings=lambda: saved.append(True),
+        player=player,
+        ALSA_MMAP_REALTIME_PRIORITY_MAP={
+            "Off": 0,
+            "Low (40)": 40,
+            "Recommended (60)": 60,
+            "High (70)": 70,
+        },
+        ALSA_MMAP_REALTIME_PRIORITY_DEFAULT="Recommended (60)",
+        driver_dd=SimpleNamespace(get_selected_item=lambda: _DriverItem("ALSA（mmap）")),
+        on_driver_changed=lambda *_args: restarts.append(True),
+    )
+
+    audio_settings_actions.on_mmap_realtime_priority_changed(app, dd, None)
+
+    assert app.settings["alsa_mmap_realtime_priority"] == "High (70)"
+    assert saved == [True]
+    assert player.realtime_priority_calls == [70]
+    assert restarts == [True]

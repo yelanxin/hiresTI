@@ -376,7 +376,7 @@ class AudioSignalPathWindow(Adw.Window):
             "- Source and output sample rates match\n",
             "- Output bit depth is not lower than the source\n",
         ]
-        if driver == "ALSA":
+        if driver in ("ALSA", "ALSA（auto）", "ALSA (mmap)", "ALSA（mmap）"):
             lines.append("- ALSA also requires Exclusive mode\n")
         lines.append("\n")
         lines.append(
@@ -386,7 +386,7 @@ class AudioSignalPathWindow(Adw.Window):
             "playback.\n\n"
         )
         lines.append(
-            "Use ALSA + Exclusive if you need the system mixer and system volume "
+            "Use ALSA（auto）/ALSA（mmap） + Exclusive if you need the system mixer and system volume "
             "path fully bypassed."
         )
         return "".join(lines)
@@ -753,7 +753,7 @@ class AudioSignalPathWindow(Adw.Window):
         # ALSA exclusive and PipeWire now share the same source-vs-output
         # format rule here: keep the original sample rate and allow only
         # lossless container widening such as 16-bit PCM -> 32-bit PCM.
-        if driver == "ALSA":
+        if driver in ("ALSA", "ALSA（auto）", "ALSA (mmap)", "ALSA（mmap）"):
             if not exclusive:
                 reasons.append("Not in exclusive mode")
             if exclusive and not rate_match:
@@ -770,7 +770,12 @@ class AudioSignalPathWindow(Adw.Window):
         else:
             reasons.append(f"Driver is {driver}")
 
-        verdict_ok = bool(bit_perfect and output_state == "active" and format_match and (driver != "ALSA" or exclusive))
+        verdict_ok = bool(
+            bit_perfect
+            and output_state == "active"
+            and format_match
+            and (driver not in ("ALSA", "ALSA（auto）", "ALSA (mmap)", "ALSA（mmap）") or exclusive)
+        )
         return (verdict_ok, "ok" if verdict_ok else "warn", reasons)
 
     def _get_current_driver(self):
@@ -847,7 +852,9 @@ class AudioSignalPathWindow(Adw.Window):
     @staticmethod
     def _uses_lossless_container_match(driver, exclusive):
         drv = str(driver or "")
-        return drv == "PipeWire" or (drv == "ALSA" and bool(exclusive))
+        return drv == "PipeWire" or (
+            drv in ("ALSA", "ALSA（auto）", "ALSA (mmap)", "ALSA（mmap）") and bool(exclusive)
+        )
 
     @staticmethod
     def _rate_only_match(src_rate, out_rate):
@@ -1153,7 +1160,7 @@ class AudioSignalPathWindow(Adw.Window):
         driver = self._get_current_driver()
         if not self.player.bit_perfect_mode:
             suggestions.append("Enable Bit-Perfect mode")
-        if driver == "ALSA" and not self.player.exclusive_lock_mode:
+        if driver in ("ALSA", "ALSA（auto）", "ALSA (mmap)", "ALSA（mmap）") and not self.player.exclusive_lock_mode:
             suggestions.append("Enable Exclusive mode")
         if driver == "PipeWire":
             force_rate, _allowed = self._get_pipewire_clock_state()

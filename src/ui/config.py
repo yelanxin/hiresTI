@@ -486,8 +486,37 @@ window.undecorated { background-color: transparent; }
 .pill { margin: 10px; padding: 10px; min-width: 28px; min-height: 28px; border-radius: 99px; }
 flowboxchild { background-color: transparent; padding: 0; margin: 0; }
 .card { background-color: transparent; border: none; box-shadow: none; padding: 8px; min-width: 130px; transition: background-color 0.2s; }
+.home-feed-card { padding: 6px 0; min-width: 0; border-radius: 12px; transition: background-color 0.2s; }
+.home-feed-btn { padding: 0; min-width: 0; min-height: 0; background: transparent; box-shadow: none; }
+.home-feed-media { transition: filter 0.2s; }
+.home-feed-tint { background-color: transparent; transition: background-color 0.2s; }
+.playlist-folder-shape { border-radius: 16px; }
+.home-feed-btn:hover,
+.home-feed-btn:active,
+.home-feed-btn:checked {
+    background: transparent;
+    background-color: transparent;
+    box-shadow: none;
+}
+.home-feed-btn:hover .home-feed-card,
+.home-feed-btn:active .home-feed-card,
+.home-feed-btn:checked .home-feed-card {
+    background-color: alpha(currentColor, 0.06);
+}
+.home-feed-btn:hover .home-feed-tint,
+.home-feed-btn:active .home-feed-tint,
+.home-feed-btn:checked .home-feed-tint,
+.card:hover .home-feed-tint {
+    background-color: alpha(@accent_bg_color, 0.16);
+}
+.home-feed-btn:hover label,
+.home-feed-btn:active label,
+.home-feed-btn:checked label {
+    color: @accent_color;
+}
 .card:hover { background-color: alpha(currentColor, 0.06); }
 .card:hover label { color: @accent_color; }
+.artist-feed-card:hover { background-color: transparent; }
 .history-card-btn .card:hover { background-color: transparent; }
 .playlist-folder-cover {
     min-width: 130px;
@@ -528,6 +557,31 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
 .history-card-btn {
     min-height: 28px;
     padding: 0;
+}
+.dashboard-track-row-btn {
+    background: transparent;
+    background-color: transparent;
+    box-shadow: none;
+}
+.dashboard-track-row-btn:hover,
+.dashboard-track-row-btn:active,
+.dashboard-track-row-btn:checked {
+    background: transparent;
+    background-color: transparent;
+    box-shadow: none;
+}
+.dashboard-track-row-btn:hover .home-feed-tint,
+.dashboard-track-row-btn:active .home-feed-tint,
+.dashboard-track-row-btn:checked .home-feed-tint {
+    background-color: alpha(@accent_bg_color, 0.16);
+}
+.dashboard-track-row-btn:hover .home-card-title,
+.dashboard-track-row-btn:active .home-card-title,
+.dashboard-track-row-btn:checked .home-card-title,
+.dashboard-track-row-btn:hover .home-card-subtitle,
+.dashboard-track-row-btn:active .home-card-subtitle,
+.dashboard-track-row-btn:checked .home-card-subtitle {
+    color: @accent_color;
 }
 .history-card-btn.track-row-playing {
     border-radius: 10px;
@@ -650,7 +704,7 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
     text-shadow: 0 2px 12px alpha(black, 0.30);
 }
 .now-playing-meta-panel {
-    padding: 0 0 18px 0;
+    padding: 0 0 12px 0;
     min-width: 0;
 }
 .now-playing-info-card {

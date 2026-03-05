@@ -55,9 +55,13 @@ def test_init_audio_and_data_services_sets_up_player_and_cache(tmp_path, monkeyp
         def __init__(self):
             self.visual_sync_offset_ms = None
             self.latency_calls = []
+            self.realtime_priority_calls = []
 
         def set_alsa_latency(self, buf_ms, lat_ms):
             self.latency_calls.append((buf_ms, lat_ms))
+
+        def set_alsa_mmap_realtime_priority(self, priority):
+            self.realtime_priority_calls.append(int(priority))
 
     class _Mgr:
         def __init__(self, base_dir, scope_key):
@@ -78,10 +82,17 @@ def test_init_audio_and_data_services_sets_up_player_and_cache(tmp_path, monkeyp
     app.settings = {
         "viz_sync_device_offsets": {"dev_a": 10},
         "viz_sync_offset_ms": 40,
+        "alsa_mmap_realtime_priority": "High (70)",
         "latency_profile": "Low Latency (40ms)",
         "audio_cache_tracks": 7,
     }
     app.LATENCY_MAP = {"Low Latency (40ms)": (40, 40), "Standard (100ms)": (100, 100)}
+    app.ALSA_MMAP_REALTIME_PRIORITY_MAP = {
+        "Off": 0,
+        "Recommended (60)": 60,
+        "High (70)": 70,
+    }
+    app.ALSA_MMAP_REALTIME_PRIORITY_DEFAULT = "Recommended (60)"
     app.on_next_track = lambda *a, **k: None
     app.update_tech_label = lambda *a, **k: None
     app.on_spectrum_data = lambda *a, **k: None
@@ -95,6 +106,7 @@ def test_init_audio_and_data_services_sets_up_player_and_cache(tmp_path, monkeyp
     assert app._viz_sync_device_key is None
     assert app._viz_sync_offsets == {"dev_a": 10}
     assert app._viz_sync_last_saved_ms == 40
+    assert app.player.realtime_priority_calls == [70]
     assert app.player.latency_calls == [(40, 40)]
     assert app.player.visual_sync_offset_ms == 40
     assert app.settings["viz_sync_offset_ms"] == 40

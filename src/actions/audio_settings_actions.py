@@ -17,6 +17,9 @@ _OUTPUT_BIT_DEPTH_GUESS_FORMATS = {
     32: "S32LE",
 }
 
+DRIVER_ALSA_AUTO = "ALSA（auto）"
+DRIVER_ALSA_MMAP = "ALSA（mmap）"
+
 
 def _canonical_output_format_name(fmt):
     up = str(fmt or "").strip().upper()
@@ -139,8 +142,71 @@ def _selected_driver_name(app):
     return item.get_string() if item is not None else ""
 
 
+def _driver_key(driver_name):
+    text = str(driver_name or "").strip().lower()
+    text = text.replace("（", "(").replace("）", ")")
+    compact = text.replace(" ", "")
+    if compact in ("alsa_mmap", "alsa(mmap)"):
+        return "alsa_mmap"
+    if compact in ("alsa", "alsa(auto)"):
+        return "alsa_auto"
+    if compact in ("pipewire",):
+        return "pipewire"
+    if compact in ("auto", "auto(default)"):
+        return "auto"
+    return compact
+
+
+def _driver_is_alsa_family(driver_name):
+    return _driver_key(driver_name) in ("alsa_auto", "alsa_mmap")
+
+
+def _driver_choices_for_mode(app, exclusive_enabled=None):
+    player = getattr(app, "player", None)
+    drivers = list(player.get_drivers() or []) if player is not None else []
+    if exclusive_enabled is None:
+        ex_switch = getattr(app, "ex_switch", None)
+        if ex_switch is not None:
+            exclusive_enabled = bool(ex_switch.get_active())
+        else:
+            exclusive_enabled = bool(getattr(app, "settings", {}).get("exclusive_lock", False))
+    if exclusive_enabled:
+        drivers = [drv for drv in drivers if _driver_is_alsa_family(drv)]
+    return drivers
+
+
+def _refresh_driver_dropdown_options(app, preferred_driver=None, exclusive_enabled=None):
+    dd = getattr(app, "driver_dd", None)
+    if dd is None:
+        return ""
+    drivers = _driver_choices_for_mode(app, exclusive_enabled=exclusive_enabled)
+    if not drivers:
+        return ""
+    target = str(
+        preferred_driver
+        or _selected_driver_name(app)
+        or getattr(app, "settings", {}).get("driver", "")
+        or ""
+    ).strip()
+    target_key = _driver_key(target)
+    if target not in drivers:
+        for candidate in drivers:
+            if _driver_key(candidate) == target_key:
+                target = candidate
+                break
+        else:
+            target = DRIVER_ALSA_AUTO if DRIVER_ALSA_AUTO in drivers else drivers[0]
+    app.ignore_driver_change = True
+    try:
+        dd.set_model(Gtk.StringList.new(drivers))
+        dd.set_selected(drivers.index(target))
+    finally:
+        app.ignore_driver_change = False
+    return target
+
+
 def _driver_supports_explicit_output_bit_depth(app):
-    return str(_selected_driver_name(app) or "").strip().upper() == "ALSA"
+    return _driver_is_alsa_family(_selected_driver_name(app))
 
 
 def _apply_output_bit_depth_preference(app, device_info=None):
@@ -510,7 +576,7 @@ def _monitor_selected_device_presence(app):
         device_name = dev_item.get_string()
         if not driver_name or not device_name:
             return
-        if driver_name not in ("ALSA", "PipeWire"):
+        if _driver_key(driver_name) not in ("alsa_auto", "alsa_mmap", "pipewire"):
             return
         if device_name in ("Default Output", "Default System Output", "Unavailable", "Default"):
             return
@@ -572,7 +638,7 @@ def _passive_sync_device_list(app):
         if not drv_item:
             return
         driver_name = drv_item.get_string()
-        if driver_name not in ("ALSA", "PipeWire"):
+        if _driver_key(driver_name) not in ("alsa_auto", "alsa_mmap", "pipewire"):
             return
 
         selected_item = app.device_dd.get_selected_item() if hasattr(app, "device_dd") else None
@@ -706,7 +772,34 @@ def on_latency_changed(app, dd, p):
             app.on_driver_changed(app.driver_dd, None)
 
 
+def on_mmap_realtime_priority_changed(app, dd, p):
+    selected = dd.get_selected_item()
+    if not selected:
+        return
+    profile_name = selected.get_string()
+
+    app.settings["alsa_mmap_realtime_priority"] = profile_name
+    app.save_settings()
+
+    priority = app.ALSA_MMAP_REALTIME_PRIORITY_MAP.get(
+        profile_name,
+        app.ALSA_MMAP_REALTIME_PRIORITY_MAP[app.ALSA_MMAP_REALTIME_PRIORITY_DEFAULT],
+    )
+    app.player.set_alsa_mmap_realtime_priority(priority)
+    logger.info(
+        "ALSA mmap realtime priority applied: priority=%d (priority-change, profile=%s)",
+        int(priority),
+        profile_name,
+    )
+
+    if _driver_key(_selected_driver_name(app)) == "alsa_mmap":
+        logger.info("Realtime priority changed, restarting ALSA mmap output")
+        app.on_driver_changed(app.driver_dd, None)
+
+
 def on_driver_changed(app, dd, p):
+    if getattr(app, "ignore_driver_change", False):
+        return
     _stop_output_hotplug_watch(app)
     _touch_output_probe_burst(app, seconds=30)
     selected = dd.get_selected_item()
@@ -714,7 +807,17 @@ def on_driver_changed(app, dd, p):
         return
     driver_name = selected.get_string()
 
-    if not app.ex_switch.get_active() or driver_name == "ALSA":
+    if app.ex_switch.get_active() and not _driver_is_alsa_family(driver_name):
+        app._force_driver_selection(DRIVER_ALSA_AUTO)
+        if hasattr(app, "show_output_notice"):
+            app.show_output_notice(
+                f"Exclusive mode requires {DRIVER_ALSA_AUTO} or {DRIVER_ALSA_MMAP}.",
+                "warn",
+                3200,
+            )
+        return
+
+    if not app.ex_switch.get_active() or _driver_is_alsa_family(driver_name):
         app.settings["driver"] = driver_name
         app.save_settings()
 
@@ -1089,8 +1192,19 @@ def on_bit_perfect_toggled(self, switch, state):
         self.eq_pop.popdown()
     if self.bp_label is not None: self.bp_label.set_visible(state)
     if is_ex:
-        self._force_driver_selection("ALSA"); self.driver_dd.set_sensitive(False); self.on_driver_changed(self.driver_dd, None)
+        prev_driver = _selected_driver_name(self)
+        _refresh_driver_dropdown_options(
+            self,
+            preferred_driver=prev_driver,
+            exclusive_enabled=True,
+        )
+        self.on_driver_changed(self.driver_dd, None)
     else:
+        _refresh_driver_dropdown_options(
+            self,
+            preferred_driver=_selected_driver_name(self),
+            exclusive_enabled=False,
+        )
         self.driver_dd.set_sensitive(True)
         drv_item = self.driver_dd.get_selected_item() if self.driver_dd is not None else None
         drv_name = drv_item.get_string() if drv_item is not None else ""
@@ -1133,12 +1247,21 @@ def on_exclusive_toggled(self, switch, state):
     self.latency_dd.set_sensitive(state)
 
     if state:
-        # 开启独占：强制 ALSA，禁用驱动选择
-        self._force_driver_selection("ALSA")
-        self.driver_dd.set_sensitive(False)
+        # 开启独占：允许在 ALSA（auto） / ALSA（mmap）之间切换。
+        prev_driver = _selected_driver_name(self)
+        _refresh_driver_dropdown_options(
+            self,
+            preferred_driver=prev_driver,
+            exclusive_enabled=True,
+        )
         self.on_driver_changed(self.driver_dd, None)
     else:
         # 关闭独占：恢复驱动选择
+        _refresh_driver_dropdown_options(
+            self,
+            preferred_driver=_selected_driver_name(self),
+            exclusive_enabled=False,
+        )
         self.driver_dd.set_sensitive(True)
         # 刷新一下非独占状态下的设备列表
         self.on_device_changed(self.device_dd, None)

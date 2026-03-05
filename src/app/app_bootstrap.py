@@ -61,17 +61,29 @@ def _configure_icon_theme(display):
         os.path.join(app_root, "icons"),
         os.path.join(project_root, "icons"),
     ]
-    added = []
+    existing_paths = []
+    try:
+        existing_paths = list(icon_theme.get_search_path() or [])
+    except Exception as e:
+        logger.debug("Could not read GTK icon theme search path: %s", e)
+    preferred = []
+    final_paths = []
     seen = set()
-    for path in search_paths:
+    for path in search_paths + existing_paths:
         norm = os.path.abspath(path)
-        if norm in seen or not os.path.isdir(norm):
+        if norm in seen:
             continue
-        icon_theme.add_search_path(norm)
-        added.append(norm)
+        if not os.path.isdir(norm):
+            continue
+        final_paths.append(norm)
         seen.add(norm)
-    if added:
-        logger.info("Added GTK icon theme search paths: %s", ", ".join(added))
+        if path in search_paths:
+            preferred.append(norm)
+    if preferred:
+        # Prefer bundled icons over distro theme variants so app-specific
+        # symbolic artwork stays consistent across environments.
+        icon_theme.set_search_path(final_paths)
+        logger.info("Preferring bundled GTK icon theme search paths: %s", ", ".join(preferred))
     else:
         logger.warning("No bundled GTK icon theme search path found.")
     return icon_theme
@@ -235,14 +247,33 @@ def do_activate(self):
         self._lock_volume_controls(True)
 
     # 2. 应用 Latency
+    saved_rt_profile = self.settings.get(
+        "alsa_mmap_realtime_priority",
+        self.ALSA_MMAP_REALTIME_PRIORITY_DEFAULT,
+    )
+    if saved_rt_profile not in self.ALSA_MMAP_REALTIME_PRIORITY_MAP:
+        saved_rt_profile = self.ALSA_MMAP_REALTIME_PRIORITY_DEFAULT
+    self.player.set_alsa_mmap_realtime_priority(
+        self.ALSA_MMAP_REALTIME_PRIORITY_MAP[saved_rt_profile]
+    )
+
+    # 3. 应用 Latency
     saved_profile = self.settings.get("latency_profile", "Standard (100ms)")
     if saved_profile in self.LATENCY_MAP:
         buf_ms, lat_ms = self.LATENCY_MAP[saved_profile]
         self.player.set_alsa_latency(buf_ms, lat_ms)
 
-    # 3. 恢复驱动选择
+    # 4. 恢复驱动选择
     drivers = self.player.get_drivers()
     saved_drv = self.settings.get("driver", "Auto (Default)")
+    if saved_drv == "ALSA":
+        saved_drv = "ALSA（auto）"
+    elif saved_drv == "ALSA (auto)":
+        saved_drv = "ALSA（auto）"
+    elif saved_drv == "ALSA (mmap)":
+        saved_drv = "ALSA（mmap）"
+    if is_ex:
+        drivers = [drv for drv in drivers if drv in ("ALSA（auto）", "ALSA（mmap）")]
 
     # 如果保存的是 ALSA 或其他驱动，先尝试选中
     if saved_drv in drivers:
@@ -256,8 +287,7 @@ def do_activate(self):
     GLib.idle_add(lambda: (self.on_driver_changed(self.driver_dd, None), False)[1])
 
     if is_ex:
-        self.driver_dd.set_sensitive(False)
-        self._force_driver_selection("ALSA")
+        self._refresh_driver_dropdown_options(saved_drv, exclusive_enabled=True)
 
     key_controller = Gtk.EventControllerKey()
     key_controller.connect("key-pressed", self.on_key_pressed)

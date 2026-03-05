@@ -450,6 +450,36 @@ def test_now_playing_split_widths_use_60_40_layout():
     assert left_w + right_w + app_now_playing._NOW_PLAYING_CONTENT_INSET == 1000
 
 
+def test_now_playing_cover_rect_cover_mode_always_fills_bounds():
+    rect = app_now_playing._now_playing_cover_rect(1000, 1000, 720, 900, mode="cover")
+
+    assert rect == (-90.0, 0.0, 900.0, 900.0)
+
+
+def test_now_playing_cover_rect_contain_mode_keeps_full_image_visible_across_resizes():
+    wide_rect = app_now_playing._now_playing_cover_rect(1000, 1000, 720, 900, mode="contain", align_y="start")
+    narrow_rect = app_now_playing._now_playing_cover_rect(1000, 1000, 520, 900, mode="contain", align_y="start")
+
+    assert wide_rect == (0.0, 0.0, 720.0, 720.0)
+    assert narrow_rect == (0.0, 0.0, 520.0, 520.0)
+
+
+def test_build_now_playing_cover_surface_renders_pixbuf_backdrop():
+    pixbuf = app_now_playing.GdkPixbuf.Pixbuf.new(
+        app_now_playing.GdkPixbuf.Colorspace.RGB,
+        True,
+        8,
+        16,
+        16,
+    )
+    pixbuf.fill(0x7F5AFFff)
+
+    surface = app_now_playing._build_now_playing_cover_surface(pixbuf, 320, 480, (0.10, 0.11, 0.14))
+
+    assert surface.get_width() == 320
+    assert surface.get_height() == 480
+
+
 def test_dynamic_color_tints_now_playing_track_list():
     provider = _CssProvider()
     app = SimpleNamespace(now_playing_dynamic_provider=provider)

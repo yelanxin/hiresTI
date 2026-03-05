@@ -4,6 +4,8 @@ import os
 from dataclasses import dataclass, field, fields
 from typing import Any, Optional
 
+from core.constants import AlsaMmapRealtimePriority
+
 logger = logging.getLogger(__name__)
 
 CURRENT_SETTINGS_VERSION = 2
@@ -19,6 +21,7 @@ class SettingsSchema:
     bit_perfect: bool = False
     exclusive_lock: bool = False
     latency_profile: str = "Standard (100ms)"
+    alsa_mmap_realtime_priority: str = AlsaMmapRealtimePriority.DEFAULT_LABEL
     output_bit_depth: str = "Auto"
     volume: int = 80
     play_mode: int = 0
@@ -54,6 +57,7 @@ DEFAULT_SETTINGS = {
     "bit_perfect": False,
     "exclusive_lock": False,
     "latency_profile": "Standard (100ms)",
+    "alsa_mmap_realtime_priority": AlsaMmapRealtimePriority.DEFAULT_LABEL,
     "output_bit_depth": "Auto",
     "volume": 80,
     "play_mode": 0,
@@ -91,6 +95,7 @@ _VALIDATION_RULES = {
     "bit_perfect": (bool, None, None, False),
     "exclusive_lock": (bool, None, None, False),
     "latency_profile": (str, None, None, "Standard (100ms)"),
+    "alsa_mmap_realtime_priority": (str, None, None, AlsaMmapRealtimePriority.DEFAULT_LABEL),
     "output_bit_depth": (str, None, None, "Auto"),
     "volume": (int, 0, 100, 80),
     "play_mode": (int, 0, 3, 0),
@@ -184,6 +189,15 @@ def normalize_settings(raw: Optional[dict[str, Any]]) -> dict[str, Any]:
     normalized["bit_perfect"] = _as_bool(raw.get("bit_perfect"), DEFAULT_SETTINGS["bit_perfect"])
     normalized["exclusive_lock"] = _as_bool(raw.get("exclusive_lock"), DEFAULT_SETTINGS["exclusive_lock"])
     normalized["latency_profile"] = _as_str(raw.get("latency_profile"), DEFAULT_SETTINGS["latency_profile"])
+    realtime_profile = _as_str(
+        raw.get("alsa_mmap_realtime_priority"),
+        DEFAULT_SETTINGS["alsa_mmap_realtime_priority"],
+    )
+    normalized["alsa_mmap_realtime_priority"] = (
+        realtime_profile
+        if realtime_profile in AlsaMmapRealtimePriority.MAP
+        else DEFAULT_SETTINGS["alsa_mmap_realtime_priority"]
+    )
     normalized["output_bit_depth"] = _as_str(raw.get("output_bit_depth"), DEFAULT_SETTINGS["output_bit_depth"])
     normalized["volume"] = _as_int(raw.get("volume"), DEFAULT_SETTINGS["volume"], minimum=0, maximum=100)
     normalized["play_mode"] = _as_int(raw.get("play_mode"), DEFAULT_SETTINGS["play_mode"], minimum=0, maximum=3)

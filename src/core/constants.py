@@ -35,6 +35,19 @@ class AudioLatency:
     }
 
 
+class AlsaMmapRealtimePriority:
+    DEFAULT_LABEL = "Recommended (60)"
+    DEFAULT_VALUE = 60
+    OPTIONS = ["Off", "Low (40)", "Recommended (60)", "High (70)", "Very High (80)"]
+    MAP = {
+        "Off": 0,
+        "Low (40)": 40,
+        "Recommended (60)": 60,
+        "High (70)": 70,
+        "Very High (80)": 80,
+    }
+
+
 class VisualizerSettings:
     BAR_OPTIONS = [4, 8, 16, 32, 48, 64, 96, 128]
     BACKEND_POLICIES = ["Quality"]

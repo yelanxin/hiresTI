@@ -16,6 +16,24 @@ from gi.repository import Gst, GstPbutils
 
 logger = logging.getLogger(__name__)
 
+DRIVER_ALSA_AUTO = "ALSA（auto）"
+DRIVER_ALSA_MMAP = "ALSA（mmap）"
+
+
+def _driver_key(driver_name):
+    text = str(driver_name or "").strip().lower()
+    text = text.replace("（", "(").replace("）", ")")
+    compact = text.replace(" ", "")
+    if compact in ("alsa_mmap", "alsa(mmap)"):
+        return "alsa_mmap"
+    if compact in ("alsa", "alsa(auto)"):
+        return "alsa_auto"
+    if compact in ("pipewire",):
+        return "pipewire"
+    if compact in ("auto", "auto(default)"):
+        return "auto"
+    return compact
+
 
 class _RustAudioCore:
     EVENT_STATE = 1
@@ -109,6 +127,9 @@ class _RustAudioCore:
                     ctypes.c_int,
                     ctypes.c_int,
                 ]
+            if hasattr(lib, "rac_set_mmap_realtime_priority"):
+                lib.rac_set_mmap_realtime_priority.restype = ctypes.c_int
+                lib.rac_set_mmap_realtime_priority.argtypes = [ctypes.c_void_p, ctypes.c_int]
             if hasattr(lib, "rac_set_preferred_output_format"):
                 lib.rac_set_preferred_output_format.restype = ctypes.c_int
                 lib.rac_set_preferred_output_format.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
@@ -295,6 +316,17 @@ class _RustAudioCore:
         else:
             logger.warning("Rust output route failed rc=%s driver=%s device=%s", rc, drv, dev or "default")
         return rc
+
+    def set_mmap_realtime_priority(self, priority):
+        if not self.available:
+            return -1
+        if not hasattr(self.lib, "rac_set_mmap_realtime_priority"):
+            return -2
+        return self._call_int(
+            "rac_set_mmap_realtime_priority",
+            ctypes.c_int(int(priority or 0)),
+            default_rc=-3,
+        )
 
     def set_preferred_output_format(self, format_name=None):
         if (not self.available) or self._closed:
@@ -727,6 +759,7 @@ class RustAudioPlayerAdapter:
     def _runtime_snapshot_log_signature(snap):
         pw = snap.get("pipewire", {}) if isinstance(snap, dict) else {}
         out = snap.get("output", {}) if isinstance(snap, dict) else {}
+        mmap = snap.get("mmap_thread", {}) if isinstance(snap, dict) else {}
         src = snap.get("source", {}) if isinstance(snap, dict) else {}
 
         def _rounded_ms(value):
@@ -742,6 +775,12 @@ class RustAudioPlayerAdapter:
             (out.get("session_depth") if isinstance(out, dict) else None),
             (out.get("hardware_rate") if isinstance(out, dict) else None),
             (out.get("hardware_depth") if isinstance(out, dict) else None),
+            (mmap.get("running") if isinstance(mmap, dict) else None),
+            (mmap.get("realtime_enabled") if isinstance(mmap, dict) else None),
+            (mmap.get("realtime_priority") if isinstance(mmap, dict) else None),
+            (mmap.get("memlock_enabled") if isinstance(mmap, dict) else None),
+            (mmap.get("memlock_mode") if isinstance(mmap, dict) else None),
+            (mmap.get("device_resets") if isinstance(mmap, dict) else None),
             (src.get("rate") if isinstance(src, dict) else None),
             (src.get("depth") if isinstance(src, dict) else None),
             (src.get("codec") if isinstance(src, dict) else None),
@@ -758,15 +797,21 @@ class RustAudioPlayerAdapter:
                             self._runtime_snapshot_log_sig = sig
                             pw = snap.get("pipewire", {}) if isinstance(snap, dict) else {}
                             out = snap.get("output", {}) if isinstance(snap, dict) else {}
+                            mmap = snap.get("mmap_thread", {}) if isinstance(snap, dict) else {}
                             src = snap.get("source", {}) if isinstance(snap, dict) else {}
                             logger.debug(
-                                "Rust runtime snapshot: pw(force=%s latency_ms=%s) out(session=%s/%s hw=%s/%s) src(rate=%s depth=%s codec=%s)",
+                                "Rust runtime snapshot: pw(force=%s latency_ms=%s) out(session=%s/%s hw=%s/%s) mmap(rt=%s/%s memlock=%s/%s resets=%s) src(rate=%s depth=%s codec=%s)",
                                 (pw.get("force_rate") if isinstance(pw, dict) else None),
                                 (pw.get("latency_ms") if isinstance(pw, dict) else None),
                                 (out.get("session_rate") if isinstance(out, dict) else None),
                                 (out.get("session_depth") if isinstance(out, dict) else None),
                                 (out.get("hardware_rate") if isinstance(out, dict) else None),
                                 (out.get("hardware_depth") if isinstance(out, dict) else None),
+                                (mmap.get("realtime_enabled") if isinstance(mmap, dict) else None),
+                                (mmap.get("realtime_priority") if isinstance(mmap, dict) else None),
+                                (mmap.get("memlock_enabled") if isinstance(mmap, dict) else None),
+                                (mmap.get("memlock_mode") if isinstance(mmap, dict) else None),
+                                (mmap.get("device_resets") if isinstance(mmap, dict) else None),
                                 (src.get("rate") if isinstance(src, dict) else None),
                                 (src.get("depth") if isinstance(src, dict) else None),
                                 (src.get("codec") if isinstance(src, dict) else None),
@@ -991,6 +1036,7 @@ class RustAudioPlayerAdapter:
         self._alsa_reservation = None  # AlsaDeviceReservation when held
         self.alsa_buffer_time = 100000
         self.alsa_latency_time = 10000
+        self.alsa_mmap_realtime_priority = 60
         self.output_state = "idle"
         self.output_error = None
         self.preferred_output_format = ""
@@ -1023,6 +1069,8 @@ class RustAudioPlayerAdapter:
         self._rust_last_play_ts = 0.0
         self._rust_last_spectrum_seen_ts = 0.0
         self._rust_last_spectrum_recover_ts = 0.0
+        self._rust_spectrum_requested = False
+        self._rust_spectrum_forced_off = False
         self._rust_spectrum_enabled = False
         self._viz_latency_cached_ms = 0.0
         self._viz_latency_smooth_ms = 0.0
@@ -1046,7 +1094,7 @@ class RustAudioPlayerAdapter:
         self._rust_pump_idle_interval_paused_s = 0.25
         # Extra lookback to ensure interpolation has both neighbors even when
         # spectrum frames arrive in coarse bursts.
-        self._viz_interp_lookback_s = 0.12
+        self._viz_interp_lookback_s = 0.06
         self._output_switch_lock = threading.RLock()
         self._output_switch_inflight = False
         self._output_switch_pending = None
@@ -1253,7 +1301,7 @@ class RustAudioPlayerAdapter:
     def _maybe_log_alsa_container_adapter_runtime(self):
         if not bool(getattr(self, "_alsa_container_adapter_active", False)):
             return
-        if str(getattr(self, "current_driver", "") or "").upper() != "ALSA":
+        if _driver_key(getattr(self, "current_driver", "")) != "alsa_auto":
             return
         if not bool(getattr(self, "exclusive_lock_mode", False)):
             return
@@ -1482,8 +1530,10 @@ class RustAudioPlayerAdapter:
             return True
 
     def set_spectrum_enabled(self, enabled):
+        self._rust_spectrum_requested = bool(enabled)
+        effective_enabled = bool(enabled)
         prev_enabled = bool(getattr(self, "_rust_spectrum_enabled", False))
-        self._rust_spectrum_enabled = bool(enabled)
+        self._rust_spectrum_enabled = effective_enabled
         if self._rust.available:
             try:
                 self._rust.set_spectrum_enabled(self._rust_spectrum_enabled)
@@ -1504,6 +1554,12 @@ class RustAudioPlayerAdapter:
             False,
         )
         return True
+
+    def _apply_driver_spectrum_policy(self, driver):
+        if bool(getattr(self, "_rust_spectrum_forced_off", False)):
+            self._rust_spectrum_forced_off = False
+            logger.info("Rust spectrum driver policy: restored")
+        self.set_spectrum_enabled(bool(getattr(self, "_rust_spectrum_requested", False)))
 
     def _classify_rust_error(self, text):
         t = str(text or "").lower()
@@ -1527,7 +1583,7 @@ class RustAudioPlayerAdapter:
             # loop — that would call set_output repeatedly, creating an infinite cycle.
             # Release the reservation and show the error; user can recover manually.
             if bool(getattr(self, "exclusive_lock_mode", False)) and \
-                    str(getattr(self, "current_driver", "") or "").upper() == "ALSA":
+                    _driver_key(getattr(self, "current_driver", "")) == "alsa_auto":
                 self._release_alsa_reservation()
                 self.output_state = "error"
                 self.output_error = str(err_text or "ALSA exclusive mode error")
@@ -1573,6 +1629,33 @@ class RustAudioPlayerAdapter:
     def set_alsa_latency(self, buffer_ms, latency_ms):
         self.alsa_buffer_time = int(float(buffer_ms or 0.0) * 1000.0)
         self.alsa_latency_time = int(float(latency_ms or 0.0) * 1000.0)
+        return True
+
+    def set_alsa_mmap_realtime_priority(self, priority):
+        try:
+            target_priority = int(priority or 0)
+        except Exception:
+            target_priority = 0
+        target_priority = max(0, target_priority)
+        self.alsa_mmap_realtime_priority = target_priority
+        rc = -2
+        try:
+            rc = int(self._rust.set_mmap_realtime_priority(target_priority))
+        except Exception:
+            logger.debug("Rust ALSA mmap realtime priority setter failed", exc_info=True)
+        if rc == 0:
+            logger.info(
+                "ALSA mmap realtime priority set: %s",
+                target_priority if target_priority > 0 else "off",
+            )
+        elif rc == -2:
+            logger.debug("Rust ALSA mmap realtime priority setter unavailable")
+        elif rc < 0:
+            logger.warning(
+                "Rust ALSA mmap realtime priority apply failed rc=%s priority=%s",
+                rc,
+                target_priority,
+            )
         return True
 
     def toggle_bit_perfect(self, enabled, exclusive_lock=False):
@@ -1629,7 +1712,7 @@ class RustAudioPlayerAdapter:
         return False
 
     def get_drivers(self):
-        return ["Auto (Default)", "PipeWire", "ALSA"]
+        return ["Auto (Default)", "PipeWire", DRIVER_ALSA_AUTO, DRIVER_ALSA_MMAP]
 
     def _on_rust_event(self, evt, msg):
         if evt == _RustAudioCore.EVENT_EOS:
@@ -1682,6 +1765,7 @@ class RustAudioPlayerAdapter:
                 if (
                     ("output-switched" in lmsg)
                     or ("pipewire-sink" in lmsg)
+                    or ("alsa-mmap thread-config" in lmsg)
                     or ("container-adapter" in lmsg)
                     or ("playing" in lmsg)
                     or ("paused" in lmsg)
@@ -2357,7 +2441,8 @@ class RustAudioPlayerAdapter:
         target_latency = int(getattr(self, "alsa_latency_time", 10000) or 10000)
         exclusive = bool(getattr(self, "exclusive_lock_mode", False))
 
-        is_alsa_exclusive = exclusive and str(driver or "").upper() == "ALSA"
+        driver_norm = _driver_key(driver)
+        is_alsa_exclusive = exclusive and driver_norm in ("alsa_auto", "alsa_mmap")
         cur_res = getattr(self, "_alsa_reservation", None) if is_alsa_exclusive else None
 
         if is_alsa_exclusive and cur_res is not None and not cur_res.acquired:
@@ -2386,6 +2471,7 @@ class RustAudioPlayerAdapter:
                 logger.info("PipeWire switch applied by Rust: target=%s", str(resolved_device_id or "default"))
             self.current_driver = driver
             self.current_device_id = resolved_device_id
+            self._apply_driver_spectrum_policy(driver)
             self.output_state = "active"
             self.output_error = None
             self._output_switch_restore = None
@@ -2423,6 +2509,7 @@ class RustAudioPlayerAdapter:
             self.requested_device_id = restore.get("requested_device_id")
             self.current_driver = restore.get("current_driver")
             self.current_device_id = restore.get("current_device_id")
+            self._apply_driver_spectrum_policy(self.current_driver)
             self.output_state = restore.get("output_state", "idle")
             self.output_error = restore.get("output_error")
             self._output_switch_restore = None

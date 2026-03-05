@@ -75,6 +75,21 @@ def _init_audio_and_data_services(self):
     self.lyrics_mgr = LyricsManager()
     logger.info("LyricsManager initialized")
 
+    saved_rt_profile = self.settings.get(
+        "alsa_mmap_realtime_priority",
+        self.ALSA_MMAP_REALTIME_PRIORITY_DEFAULT,
+    )
+    if saved_rt_profile not in self.ALSA_MMAP_REALTIME_PRIORITY_MAP:
+        saved_rt_profile = self.ALSA_MMAP_REALTIME_PRIORITY_DEFAULT
+    self.player.set_alsa_mmap_realtime_priority(
+        self.ALSA_MMAP_REALTIME_PRIORITY_MAP[saved_rt_profile]
+    )
+    logger.info(
+        "ALSA mmap realtime priority applied: priority=%d (startup, profile=%s)",
+        int(self.ALSA_MMAP_REALTIME_PRIORITY_MAP[saved_rt_profile]),
+        saved_rt_profile,
+    )
+
     saved_profile = self.settings.get("latency_profile", "Standard (100ms)")
     if saved_profile not in self.LATENCY_MAP:
         saved_profile = "Standard (100ms)"

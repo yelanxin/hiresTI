@@ -340,7 +340,7 @@ def build_settings_page(app):
         "• <b>PipeWire mode:</b> follows the music source sample rate when possible "
         "and uses the same rate/depth verdict rules as ALSA Exclusive, but audio "
         "still passes through the system mixer.\n\n"
-        "• <b>ALSA + Exclusive mode:</b> bypasses the system mixer and is treated as "
+        "• <b>ALSA（auto）/ALSA（mmap） + Exclusive mode:</b> bypasses the system mixer and is treated as "
         "true bit-perfect playback."
     )
     bp_pop_box = Gtk.Box(margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
@@ -396,6 +396,42 @@ def build_settings_page(app):
     row_ex.append(app.ex_switch)
     group_out.append(row_ex)
 
+    row_rt = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
+    rt_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
+    rt_info.append(Gtk.Label(label="Realtime Audio Priority", xalign=0, css_classes=["settings-label"]))
+    rt_info.append(
+        Gtk.Label(
+            label="ALSA（mmap） writer thread only. Off disables SCHED_FIFO",
+            xalign=0,
+            css_classes=["dim-label"],
+        )
+    )
+    row_rt.append(rt_info)
+    row_rt.append(Gtk.Box(hexpand=True))
+    app.mmap_realtime_priority_dd = Gtk.DropDown(
+        model=Gtk.StringList.new(app.ALSA_MMAP_REALTIME_PRIORITY_OPTIONS)
+    )
+    app.mmap_realtime_priority_dd.set_valign(Gtk.Align.CENTER)
+    saved_rt_profile = app.settings.get(
+        "alsa_mmap_realtime_priority",
+        app.ALSA_MMAP_REALTIME_PRIORITY_DEFAULT,
+    )
+    if saved_rt_profile not in app.ALSA_MMAP_REALTIME_PRIORITY_OPTIONS:
+        saved_rt_profile = app.ALSA_MMAP_REALTIME_PRIORITY_DEFAULT
+    try:
+        target_idx = app.ALSA_MMAP_REALTIME_PRIORITY_OPTIONS.index(saved_rt_profile)
+        app.mmap_realtime_priority_dd.set_selected(target_idx)
+    except ValueError:
+        app.mmap_realtime_priority_dd.set_selected(
+            app.ALSA_MMAP_REALTIME_PRIORITY_OPTIONS.index(app.ALSA_MMAP_REALTIME_PRIORITY_DEFAULT)
+        )
+    app.mmap_realtime_priority_dd.connect(
+        "notify::selected-item",
+        app.on_mmap_realtime_priority_changed,
+    )
+    row_rt.append(app.mmap_realtime_priority_dd)
+    group_out.append(row_rt)
+
     row_lat = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
     lat_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
     lat_info.append(Gtk.Label(label="Output Latency", xalign=0, css_classes=["settings-label"]))
@@ -425,8 +461,42 @@ def build_settings_page(app):
     group_out.append(row_lat)
 
     row_drv = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
-    row_drv.append(Gtk.Label(label="Audio Driver", hexpand=True, xalign=0))
+    drv_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
+    drv_title_box = Gtk.Box(spacing=6, orientation=Gtk.Orientation.HORIZONTAL)
+    drv_title_box.append(Gtk.Label(label="Audio Driver", xalign=0, css_classes=["settings-label"]))
+    drv_help_btn = Gtk.Button(icon_name="dialog-question-symbolic", css_classes=["flat", "circular"])
+    drv_help_btn.set_tooltip_text("Click for details")
+    drv_help_pop = Gtk.Popover()
+    drv_help_pop.set_parent(drv_help_btn)
+    drv_help_pop.set_autohide(True)
+    drv_pop_content = Gtk.Label(wrap=True, max_width_chars=44, xalign=0)
+    drv_pop_content.set_markup(
+        "<b>ALSA Driver Modes</b>\n\n"
+        "• <b>ALSA（auto）:</b> lets the audio path choose <b>RW</b> or <b>MMAP</b> automatically.\n\n"
+        "• <b>ALSA（mmap）:</b> forces <b>MMAP</b> mode.\n\n"
+        "• <b>Why use MMAP:</b> It can reduce host-side jitter and data-copy overhead.\n\n"
+        "• <b>Tradeoff:</b> Some devices are more stable with auto selection."
+    )
+    drv_pop_box = Gtk.Box(margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
+    drv_pop_box.append(drv_pop_content)
+    drv_help_pop.set_child(drv_pop_box)
+    drv_help_btn.connect("clicked", lambda x: drv_help_pop.popup())
+    drv_title_box.append(drv_help_btn)
+    drv_info.append(drv_title_box)
+    drv_desc = Gtk.Label(
+        label="ALSA（auto） auto-selects RW/MMAP. ALSA（mmap） forces MMAP.",
+        xalign=0,
+        css_classes=["dim-label"],
+    )
+    drv_desc.set_wrap(True)
+    drv_desc.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+    drv_desc.set_max_width_chars(56)
+    drv_info.append(drv_desc)
+    row_drv.append(drv_info)
+    row_drv.append(Gtk.Box(hexpand=True))
     drivers = app.player.get_drivers()
+    if app.settings.get("exclusive_lock", False):
+        drivers = [drv for drv in drivers if drv in ("ALSA（auto）", "ALSA（mmap）")]
     app.driver_dd = Gtk.DropDown(model=Gtk.StringList.new(drivers))
     app.driver_dd.connect("notify::selected-item", app.on_driver_changed)
     row_drv.append(app.driver_dd)
@@ -437,7 +507,7 @@ def build_settings_page(app):
     depth_info.append(Gtk.Label(label="Output Bit Depth", xalign=0, css_classes=["settings-label"]))
     depth_info.append(
         Gtk.Label(
-            label="ALSA only. PipeWire final hardware depth is controlled by the system graph",
+            label="ALSA（auto） / ALSA（mmap）. PipeWire final hardware depth is controlled by the system graph",
             xalign=0,
             css_classes=["dim-label"],
         )

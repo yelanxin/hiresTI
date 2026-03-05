@@ -45,6 +45,7 @@ def _init_widget_refs(self):
     self.viz_handle_box = None
     self.list_box = None
     self.output_status_label = None
+    self.mmap_realtime_priority_dd = None
     self.output_recover_btn = None
     self.output_notice_revealer = None
     self.output_notice_icon = None

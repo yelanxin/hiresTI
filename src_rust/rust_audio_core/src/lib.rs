@@ -2,24 +2,26 @@ use gst::prelude::*;
 use gstreamer as gst;
 use libpulse_binding as pulse;
 use pipewire as pw;
-use pulse::proplist::properties as pa_props;
 use pulse::callbacks::ListResult;
 use pulse::context::{Context as PaContext, FlagSet as PaContextFlagSet, State as PaContextState};
 use pulse::mainloop::standard::Mainloop as PaMainloop;
 use pulse::operation::State as PaOperationState;
+use pulse::proplist::properties as pa_props;
 use pw::{
     context::Context as PwContext, keys, main_loop::MainLoop as PwMainLoop,
     metadata::Metadata as PwMetadata, registry::GlobalObject, types::ObjectType,
 };
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::ffi::{CStr, CString};
+use std::io;
 use std::os::raw::{c_char, c_double, c_int, c_void};
 use std::path::Path;
 use std::ptr;
 use std::rc::Rc;
-use std::sync::Once;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Once};
 use std::thread;
 use std::time::Duration;
 
@@ -28,6 +30,989 @@ static PW_INIT: Once = Once::new();
 const SPECTRUM_BANDS_MAX: usize = 128;
 const SPECTRUM_RING_CAP: usize = 512;
 const PIPEWIRE_CARD_PROFILE_TARGET_PREFIX: &str = "pwcardprofile:";
+
+// ---------------------------------------------------------------------------
+// ALSA mmap support
+// ---------------------------------------------------------------------------
+
+/// Raw ALSA FFI declarations.  We link libasound via build.rs.
+#[allow(non_camel_case_types, dead_code)]
+mod alsa_ffi {
+    use std::os::raw::{c_char, c_int, c_uint, c_void};
+
+    pub type SndPcmUframes = std::os::raw::c_ulong;
+    pub type SndPcmSframes = std::os::raw::c_long;
+
+    // snd_pcm_stream_t
+    pub const SND_PCM_STREAM_PLAYBACK: c_int = 0;
+    // snd_pcm_access_t
+    pub const SND_PCM_ACCESS_MMAP_INTERLEAVED: c_int = 0;
+    // snd_pcm_format_t
+    pub const SND_PCM_FORMAT_S16_LE: c_int = 2;
+    pub const SND_PCM_FORMAT_S24_LE: c_int = 6;
+    pub const SND_PCM_FORMAT_S32_LE: c_int = 10;
+
+    #[repr(C)]
+    pub struct SndPcmChannelArea {
+        pub addr: *mut c_void,
+        pub first: c_uint, // bit offset of first sample
+        pub step: c_uint,  // distance between samples in bits
+    }
+
+    extern "C" {
+        pub fn snd_pcm_open(
+            pcm: *mut *mut c_void,
+            name: *const c_char,
+            stream: c_int,
+            mode: c_int,
+        ) -> c_int;
+        pub fn snd_pcm_close(pcm: *mut c_void) -> c_int;
+        pub fn snd_pcm_drop(pcm: *mut c_void) -> c_int;
+        pub fn snd_pcm_start(pcm: *mut c_void) -> c_int;
+        pub fn snd_pcm_recover(pcm: *mut c_void, err: c_int, silent: c_int) -> c_int;
+        pub fn snd_pcm_wait(pcm: *mut c_void, timeout: c_int) -> c_int;
+
+        pub fn snd_pcm_hw_params_malloc(params: *mut *mut c_void) -> c_int;
+        pub fn snd_pcm_hw_params_free(params: *mut c_void);
+        pub fn snd_pcm_hw_params_any(pcm: *mut c_void, params: *mut c_void) -> c_int;
+        pub fn snd_pcm_hw_params_set_access(
+            pcm: *mut c_void,
+            params: *mut c_void,
+            access: c_int,
+        ) -> c_int;
+        pub fn snd_pcm_hw_params_set_format(
+            pcm: *mut c_void,
+            params: *mut c_void,
+            format: c_int,
+        ) -> c_int;
+        pub fn snd_pcm_hw_params_set_channels(
+            pcm: *mut c_void,
+            params: *mut c_void,
+            val: c_uint,
+        ) -> c_int;
+        pub fn snd_pcm_hw_params_set_rate_near(
+            pcm: *mut c_void,
+            params: *mut c_void,
+            val: *mut c_uint,
+            dir: *mut c_int,
+        ) -> c_int;
+        pub fn snd_pcm_hw_params_set_period_size_near(
+            pcm: *mut c_void,
+            params: *mut c_void,
+            val: *mut SndPcmUframes,
+            dir: *mut c_int,
+        ) -> c_int;
+        pub fn snd_pcm_hw_params_set_buffer_size_near(
+            pcm: *mut c_void,
+            params: *mut c_void,
+            val: *mut SndPcmUframes,
+        ) -> c_int;
+        pub fn snd_pcm_hw_params(pcm: *mut c_void, params: *mut c_void) -> c_int;
+
+        pub fn snd_pcm_sw_params_malloc(params: *mut *mut c_void) -> c_int;
+        pub fn snd_pcm_sw_params_free(params: *mut c_void);
+        pub fn snd_pcm_sw_params_current(pcm: *mut c_void, params: *mut c_void) -> c_int;
+        pub fn snd_pcm_sw_params_set_start_threshold(
+            pcm: *mut c_void,
+            params: *mut c_void,
+            val: SndPcmUframes,
+        ) -> c_int;
+        pub fn snd_pcm_sw_params_set_avail_min(
+            pcm: *mut c_void,
+            params: *mut c_void,
+            val: SndPcmUframes,
+        ) -> c_int;
+        pub fn snd_pcm_sw_params(pcm: *mut c_void, params: *mut c_void) -> c_int;
+
+        pub fn snd_pcm_mmap_begin(
+            pcm: *mut c_void,
+            areas: *mut *const SndPcmChannelArea,
+            offset: *mut SndPcmUframes,
+            frames: *mut SndPcmUframes,
+        ) -> c_int;
+        pub fn snd_pcm_mmap_commit(
+            pcm: *mut c_void,
+            offset: SndPcmUframes,
+            frames: SndPcmUframes,
+        ) -> SndPcmSframes;
+    }
+}
+
+/// Newtype so that a raw ALSA PCM pointer can cross thread boundaries.
+struct AlsaHandle(*mut std::os::raw::c_void);
+unsafe impl Send for AlsaHandle {}
+
+type ThreadEventQueue = Arc<Mutex<VecDeque<(c_int, String)>>>;
+type MmapThreadDiagnosticsHandle = Arc<Mutex<MmapThreadDiagnostics>>;
+
+const ALSA_MMAP_RT_PRIORITY_DEFAULT: i32 = 60;
+const ALSA_MMAP_MEMLOCK_MODE: &str = "current";
+const ALSA_MMAP_ACCUM_RATE_BUDGET_HZ: u32 = 192_000;
+
+#[derive(Debug, Clone, Default)]
+struct MmapThreadDiagnostics {
+    running: bool,
+    realtime_attempted: bool,
+    realtime_enabled: bool,
+    realtime_policy: String,
+    realtime_priority: i32,
+    realtime_error: String,
+    memlock_attempted: bool,
+    memlock_enabled: bool,
+    memlock_mode: String,
+    memlock_error: String,
+    negotiated_rate: u32,
+    period_frames: usize,
+    buffer_frames: usize,
+    open_failures: u32,
+    device_resets: u32,
+}
+
+fn push_thread_event(queue: &ThreadEventQueue, evt: c_int, msg: impl Into<String>) {
+    if let Ok(mut pending) = queue.lock() {
+        if pending.len() >= 32 {
+            pending.pop_front();
+        }
+        pending.push_back((evt, msg.into()));
+    }
+}
+
+fn update_mmap_thread_diagnostics(
+    diagnostics: &MmapThreadDiagnosticsHandle,
+    update: impl FnOnce(&mut MmapThreadDiagnostics),
+) {
+    if let Ok(mut state) = diagnostics.lock() {
+        update(&mut state);
+    }
+}
+
+fn format_errno(code: i32) -> String {
+    format!("{code}: {}", io::Error::from_raw_os_error(code))
+}
+
+#[cfg(target_os = "linux")]
+fn configure_mmap_thread_memlock(diagnostics: &MmapThreadDiagnosticsHandle) {
+    update_mmap_thread_diagnostics(diagnostics, |state| {
+        state.memlock_attempted = true;
+        state.memlock_mode = ALSA_MMAP_MEMLOCK_MODE.to_string();
+        state.memlock_enabled = false;
+        state.memlock_error.clear();
+    });
+
+    let rc = unsafe { libc::mlockall(libc::MCL_CURRENT) };
+    if rc == 0 {
+        update_mmap_thread_diagnostics(diagnostics, |state| {
+            state.memlock_enabled = true;
+        });
+        return;
+    }
+
+    let err = io::Error::last_os_error();
+    let err_msg = err
+        .raw_os_error()
+        .map(format_errno)
+        .unwrap_or_else(|| err.to_string());
+    update_mmap_thread_diagnostics(diagnostics, |state| {
+        state.memlock_error = err_msg;
+    });
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure_mmap_thread_memlock(diagnostics: &MmapThreadDiagnosticsHandle) {
+    update_mmap_thread_diagnostics(diagnostics, |state| {
+        state.memlock_attempted = false;
+        state.memlock_enabled = false;
+        state.memlock_mode = "unsupported".to_string();
+        state.memlock_error = "unsupported-platform".to_string();
+    });
+}
+
+#[cfg(target_os = "linux")]
+fn clamp_mmap_thread_realtime_priority(requested_priority: i32) -> i32 {
+    if requested_priority <= 0 {
+        return 0;
+    }
+    unsafe {
+        let min = libc::sched_get_priority_min(libc::SCHED_FIFO);
+        let max = libc::sched_get_priority_max(libc::SCHED_FIFO);
+        if min >= 0 && max >= 0 && min <= max {
+            requested_priority.clamp(min, max)
+        } else {
+            requested_priority
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn configure_mmap_thread_realtime(
+    diagnostics: &MmapThreadDiagnosticsHandle,
+    requested_priority: i32,
+) {
+    let priority = clamp_mmap_thread_realtime_priority(requested_priority);
+    if priority <= 0 {
+        update_mmap_thread_diagnostics(diagnostics, |state| {
+            state.realtime_attempted = false;
+            state.realtime_enabled = false;
+            state.realtime_policy = "SCHED_FIFO".to_string();
+            state.realtime_priority = 0;
+            state.realtime_error = "config".to_string();
+        });
+        return;
+    }
+
+    update_mmap_thread_diagnostics(diagnostics, |state| {
+        state.realtime_attempted = true;
+        state.realtime_enabled = false;
+        state.realtime_policy = "SCHED_FIFO".to_string();
+        state.realtime_priority = priority;
+        state.realtime_error.clear();
+    });
+
+    let param = libc::sched_param {
+        sched_priority: priority,
+    };
+    let rc = unsafe { libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &param) };
+    if rc == 0 {
+        update_mmap_thread_diagnostics(diagnostics, |state| {
+            state.realtime_enabled = true;
+        });
+        return;
+    }
+
+    update_mmap_thread_diagnostics(diagnostics, |state| {
+        state.realtime_error = format_errno(rc);
+    });
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure_mmap_thread_realtime(
+    diagnostics: &MmapThreadDiagnosticsHandle,
+    requested_priority: i32,
+) {
+    if requested_priority <= 0 {
+        update_mmap_thread_diagnostics(diagnostics, |state| {
+            state.realtime_attempted = false;
+            state.realtime_enabled = false;
+            state.realtime_policy = "SCHED_FIFO".to_string();
+            state.realtime_priority = 0;
+            state.realtime_error = "config".to_string();
+        });
+        return;
+    }
+    update_mmap_thread_diagnostics(diagnostics, |state| {
+        state.realtime_attempted = false;
+        state.realtime_enabled = false;
+        state.realtime_policy = "unsupported".to_string();
+        state.realtime_priority = 0;
+        state.realtime_error = "unsupported-platform".to_string();
+    });
+}
+
+fn format_mmap_thread_config_state(diagnostics: &MmapThreadDiagnosticsHandle) -> String {
+    let state = diagnostics
+        .lock()
+        .map(|state| state.clone())
+        .unwrap_or_default();
+
+    let realtime = if state.realtime_enabled {
+        format!("fifo:{}", state.realtime_priority)
+    } else if state.realtime_attempted {
+        format!(
+            "off({})",
+            if state.realtime_error.is_empty() {
+                "unavailable"
+            } else {
+                state.realtime_error.as_str()
+            }
+        )
+    } else if !state.realtime_error.is_empty() {
+        format!("off({})", state.realtime_error)
+    } else {
+        "off".to_string()
+    };
+
+    let memlock = if state.memlock_enabled {
+        state.memlock_mode.clone()
+    } else if state.memlock_attempted {
+        format!(
+            "off({})",
+            if state.memlock_error.is_empty() {
+                "unavailable"
+            } else {
+                state.memlock_error.as_str()
+            }
+        )
+    } else {
+        "off".to_string()
+    };
+
+    format!("alsa-mmap thread-config realtime={realtime} memlock={memlock}")
+}
+
+fn configure_mmap_thread_runtime(
+    diagnostics: &MmapThreadDiagnosticsHandle,
+    events: &ThreadEventQueue,
+    realtime_priority: i32,
+) {
+    configure_mmap_thread_memlock(diagnostics);
+    configure_mmap_thread_realtime(diagnostics, realtime_priority);
+    push_thread_event(
+        events,
+        EVT_STATE,
+        format_mmap_thread_config_state(diagnostics),
+    );
+}
+
+fn frames_for_duration_us(
+    duration_us: i32,
+    sample_rate: u32,
+    min_frames: usize,
+    max_frames: usize,
+) -> usize {
+    let duration_us = duration_us.max(0) as u64;
+    let sample_rate = sample_rate.max(1) as u64;
+    let frames = duration_us.saturating_mul(sample_rate) / 1_000_000;
+    (frames as usize).clamp(min_frames, max_frames)
+}
+
+fn normalized_driver_label(driver: &str) -> String {
+    driver
+        .trim()
+        .replace('（', "(")
+        .replace('）', ")")
+        .to_ascii_lowercase()
+        .replace(' ', "")
+}
+
+fn driver_is_alsa_auto(driver: &str) -> bool {
+    matches!(
+        normalized_driver_label(driver).as_str(),
+        "alsa" | "alsa(auto)"
+    )
+}
+
+fn driver_is_alsa_mmap(driver: &str) -> bool {
+    matches!(
+        normalized_driver_label(driver).as_str(),
+        "alsa_mmap" | "alsa(mmap)"
+    )
+}
+
+fn driver_is_alsa_family(driver: &str) -> bool {
+    driver_is_alsa_auto(driver) || driver_is_alsa_mmap(driver)
+}
+
+#[derive(Clone, Copy)]
+struct MmapAudioFormat {
+    gst_format: &'static str,
+    alsa_format: c_int,
+    frame_bytes: usize,
+    log_label: &'static str,
+}
+
+fn mmap_audio_format_from_preference(preferred: &str) -> MmapAudioFormat {
+    let norm = preferred.trim().to_ascii_uppercase();
+    match norm.as_str() {
+        "S16LE" | "S16_LE" => MmapAudioFormat {
+            gst_format: "S16LE",
+            alsa_format: alsa_ffi::SND_PCM_FORMAT_S16_LE,
+            frame_bytes: 4,
+            log_label: "S16_LE",
+        },
+        "S24LE" | "S24_LE" | "S24_32LE" | "S24_32_LE" => MmapAudioFormat {
+            // ALSA mmap uses the 24-in-32 container layout here.
+            gst_format: "S24_32LE",
+            alsa_format: alsa_ffi::SND_PCM_FORMAT_S24_LE,
+            frame_bytes: 8,
+            log_label: "S24_LE",
+        },
+        _ => MmapAudioFormat {
+            gst_format: "S32LE",
+            alsa_format: alsa_ffi::SND_PCM_FORMAT_S32_LE,
+            frame_bytes: 8,
+            log_label: "S32_LE",
+        },
+    }
+}
+
+/// Open ALSA device state for mmap playback.
+struct AlsaMmapCtx {
+    pcm: AlsaHandle,
+    period_frames: usize,
+    buffer_frames: usize,
+    frame_bytes: usize,
+    /// Negotiated sample rate (may differ from requested)
+    rate: u32,
+    primed_frames: usize,
+    started: bool,
+    /// Consecutive snd_pcm_start failures since last successful start.
+    /// Prevents the RT thread from retrying start indefinitely if the
+    /// device is in a persistent error state.
+    start_fail_count: u32,
+    format_label: &'static str,
+}
+
+impl AlsaMmapCtx {
+    /// Open `device` (e.g. `"hw:0,0"`) in MMAP_INTERLEAVED mode.
+    /// `want_rate`, `want_period_frames`, and `want_buffer_frames` are hints;
+    /// ALSA picks the nearest supported values.
+    fn open(
+        device: &str,
+        want_rate: u32,
+        want_period_frames: u32,
+        want_buffer_frames: u32,
+        sample_format: c_int,
+        frame_bytes: usize,
+        format_label: &'static str,
+    ) -> Result<Self, String> {
+        use alsa_ffi::*;
+        use std::ffi::CString;
+        use std::os::raw::{c_int, c_uint, c_void};
+
+        let dev_c = CString::new(device).map_err(|e| format!("bad device name: {e}"))?;
+        let mut pcm: *mut c_void = std::ptr::null_mut();
+
+        // --- open ---
+        let rc = unsafe { snd_pcm_open(&mut pcm, dev_c.as_ptr(), SND_PCM_STREAM_PLAYBACK, 0) };
+        if rc < 0 {
+            return Err(format!("snd_pcm_open({device}) rc={rc}"));
+        }
+
+        // --- hw params ---
+        let mut hw: *mut c_void = std::ptr::null_mut();
+        let result: Result<(usize, usize, u32), String> = unsafe {
+            if snd_pcm_hw_params_malloc(&mut hw) < 0 {
+                snd_pcm_close(pcm);
+                return Err("hw_params_malloc failed".into());
+            }
+            snd_pcm_hw_params_any(pcm, hw);
+
+            macro_rules! hw_check {
+                ($call:expr, $msg:literal) => {{
+                    let rc: c_int = $call;
+                    if rc < 0 {
+                        snd_pcm_hw_params_free(hw);
+                        snd_pcm_close(pcm);
+                        return Err(format!("{}: rc={}", $msg, rc));
+                    }
+                }};
+            }
+
+            hw_check!(
+                snd_pcm_hw_params_set_access(pcm, hw, SND_PCM_ACCESS_MMAP_INTERLEAVED),
+                "set_access MMAP_INTERLEAVED"
+            );
+            hw_check!(
+                snd_pcm_hw_params_set_format(pcm, hw, sample_format),
+                "set_format"
+            );
+            hw_check!(snd_pcm_hw_params_set_channels(pcm, hw, 2), "set_channels 2");
+
+            let mut rate: c_uint = want_rate;
+            let mut dir: c_int = 0;
+            hw_check!(
+                snd_pcm_hw_params_set_rate_near(pcm, hw, &mut rate, &mut dir),
+                "set_rate_near"
+            );
+
+            let mut period: SndPcmUframes = want_period_frames as SndPcmUframes;
+            hw_check!(
+                snd_pcm_hw_params_set_period_size_near(pcm, hw, &mut period, &mut dir),
+                "set_period_size_near"
+            );
+
+            let min_buffer = period.saturating_mul(2);
+            let want_buffer = (want_buffer_frames as SndPcmUframes).max(min_buffer);
+            let mut bufsize: SndPcmUframes = want_buffer;
+            hw_check!(
+                snd_pcm_hw_params_set_buffer_size_near(pcm, hw, &mut bufsize),
+                "set_buffer_size_near"
+            );
+
+            let rc = snd_pcm_hw_params(pcm, hw);
+            snd_pcm_hw_params_free(hw);
+            if rc < 0 {
+                snd_pcm_close(pcm);
+                return Err(format!("hw_params apply: rc={rc}"));
+            }
+
+            Ok((period as usize, bufsize as usize, rate))
+        };
+
+        let (period_frames, buffer_frames, rate) = result?;
+
+        // --- sw params ---
+        unsafe {
+            let mut sw: *mut c_void = std::ptr::null_mut();
+            if snd_pcm_sw_params_malloc(&mut sw) < 0 {
+                snd_pcm_close(pcm);
+                return Err("sw_params_malloc failed".into());
+            }
+            snd_pcm_sw_params_current(pcm, sw);
+            // Disable auto-start and start explicitly after we have primed a
+            // small amount of audio. This avoids deadlock on devices that do
+            // not begin consuming frames until `snd_pcm_start()` is called.
+            let start_threshold = (buffer_frames + 1) as SndPcmUframes;
+            snd_pcm_sw_params_set_start_threshold(pcm, sw, start_threshold);
+            // Wake the write thread when half a period of DMA space opens up,
+            // rather than waiting for a full period.  This gives the thread a
+            // head-start on the next write, reducing the chance of missing the
+            // hardware deadline at the cost of one extra poll wakeup per period.
+            let avail_min = (period_frames / 2).max(1);
+            snd_pcm_sw_params_set_avail_min(pcm, sw, avail_min as SndPcmUframes);
+            let rc = snd_pcm_sw_params(pcm, sw);
+            snd_pcm_sw_params_free(sw);
+            if rc < 0 {
+                snd_pcm_close(pcm);
+                return Err(format!("sw_params apply: rc={rc}"));
+            }
+        }
+
+        Ok(AlsaMmapCtx {
+            pcm: AlsaHandle(pcm),
+            period_frames,
+            buffer_frames,
+            frame_bytes,
+            rate,
+            primed_frames: 0,
+            started: false,
+            start_fail_count: 0,
+            format_label,
+        })
+    }
+
+    /// Write exactly `frames` frames from `src` (interleaved S32_LE) via mmap.
+    /// Blocks internally via snd_pcm_wait until hardware accepts each chunk.
+    fn mmap_write(&mut self, src: &[u8], frames: usize, stop: &AtomicBool) -> Result<(), i32> {
+        use alsa_ffi::*;
+        let pcm = self.pcm.0;
+        let frame_bytes = self.frame_bytes;
+        let mut remaining = frames;
+        let mut src_offset = 0usize;
+
+        while remaining > 0 {
+            if stop.load(Ordering::Relaxed) {
+                return Err(-125);
+            }
+            let mut to_write = remaining as SndPcmUframes;
+
+            // Obtain pointer into the DMA ring buffer.
+            let mut areas: *const SndPcmChannelArea = std::ptr::null();
+            let mut offset: SndPcmUframes = 0;
+            let rc = unsafe { snd_pcm_mmap_begin(pcm, &mut areas, &mut offset, &mut to_write) };
+            if rc < 0 {
+                let rec = unsafe { snd_pcm_recover(pcm, rc, 1) };
+                if rec < 0 {
+                    return Err(rec);
+                }
+                if stop.load(Ordering::Relaxed) {
+                    return Err(-125);
+                }
+                let wait_rc = unsafe { snd_pcm_wait(pcm, 100) };
+                if wait_rc < 0 {
+                    let wait_rec = unsafe { snd_pcm_recover(pcm, wait_rc, 1) };
+                    if wait_rec < 0 {
+                        return Err(wait_rec);
+                    }
+                }
+                continue;
+            }
+            if to_write == 0 {
+                if stop.load(Ordering::Relaxed) {
+                    return Err(-125);
+                }
+                let wait_rc = unsafe { snd_pcm_wait(pcm, 100) };
+                if wait_rc < 0 {
+                    let wait_rec = unsafe { snd_pcm_recover(pcm, wait_rc, 1) };
+                    if wait_rec < 0 {
+                        return Err(wait_rec);
+                    }
+                }
+                continue;
+            }
+
+            // Write directly into DMA memory.
+            // snd_pcm_mmap_begin guarantees the returned chunk is contiguous
+            // (to_write <= buffer_frames - offset), so no ring-wrap needed here.
+            // area.first is the bit-offset of the first sample within area.addr;
+            // divide by 8 to get the byte offset (always 0 on standard hardware,
+            // but handle it correctly for non-standard layouts).
+            unsafe {
+                let area = &*areas;
+                let first_byte = area.first as usize / 8;
+                let dst = (area.addr as *mut u8).add(first_byte + offset as usize * frame_bytes);
+                let src_ptr = src.as_ptr().add(src_offset);
+                std::ptr::copy_nonoverlapping(src_ptr, dst, to_write as usize * frame_bytes);
+            }
+
+            // Advance the application pointer; this signals new data to the USB driver.
+            let committed = unsafe { snd_pcm_mmap_commit(pcm, offset, to_write) };
+            if committed < 0 {
+                let rec = unsafe { snd_pcm_recover(pcm, committed as i32, 1) };
+                if rec < 0 {
+                    return Err(rec);
+                }
+                continue;
+            }
+
+            let committed = committed as usize;
+            src_offset += committed * frame_bytes;
+            remaining -= committed;
+            if !self.started {
+                self.primed_frames = self.primed_frames.saturating_add(committed);
+                // Pre-fill 3 periods before starting.  The extra period absorbs
+                // occasional decode or network jitter spikes without causing an
+                // underrun; the cost is ~1 period of additional start-up latency.
+                let prime_target = self.period_frames.saturating_mul(3).min(self.buffer_frames);
+                if self.primed_frames >= prime_target.max(1) {
+                    let start_rc = unsafe { snd_pcm_start(pcm) };
+                    if start_rc < 0 {
+                        let rec = unsafe { snd_pcm_recover(pcm, start_rc, 1) };
+                        if rec < 0 {
+                            return Err(rec);
+                        }
+                        // recover succeeded but start failed — count consecutive
+                        // failures so the RT thread does not retry forever.
+                        self.start_fail_count = self.start_fail_count.saturating_add(1);
+                        if self.start_fail_count >= 5 {
+                            return Err(start_rc);
+                        }
+                    } else {
+                        self.started = true;
+                        self.start_fail_count = 0;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for AlsaMmapCtx {
+    fn drop(&mut self) {
+        if !self.pcm.0.is_null() {
+            unsafe {
+                // Teardown happens on track switches and app shutdown. Discard
+                // pending frames immediately instead of waiting for drain.
+                let _ = alsa_ffi::snd_pcm_drop(self.pcm.0);
+                alsa_ffi::snd_pcm_close(self.pcm.0);
+            }
+            self.pcm.0 = std::ptr::null_mut();
+        }
+    }
+}
+
+/// Handle held by Engine to manage the mmap writer thread.
+struct MmapSink {
+    stop: Arc<AtomicBool>,
+    events: ThreadEventQueue,
+    diagnostics: MmapThreadDiagnosticsHandle,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl std::fmt::Debug for MmapSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MmapSink(running={})", self.thread.is_some())
+    }
+}
+
+/// Preallocated byte window for decoded PCM.
+///
+/// Unlike `Vec::drain(..period_bytes)`, this keeps a read offset and only
+/// compacts when the stale prefix grows large enough to matter, removing the
+/// per-period memmove from the mmap writer hot path.
+#[derive(Debug)]
+struct AudioByteWindow {
+    buf: Vec<u8>,
+    start: usize,
+}
+
+impl AudioByteWindow {
+    fn with_capacity(capacity: usize) -> Self {
+        let cap = capacity.max(1);
+        let mut buf = Vec::with_capacity(cap);
+        // Pre-fault all pages so that a subsequent mlockall(MCL_CURRENT) can
+        // pin them.  Vec::with_capacity only reserves virtual address space;
+        // the OS does not back the pages with physical memory until they are
+        // first written.
+        buf.resize(cap, 0u8);
+        buf.clear(); // reset len to 0, capacity is preserved
+        Self { buf, start: 0 }
+    }
+
+    fn clear(&mut self) {
+        self.buf.clear();
+        self.start = 0;
+    }
+
+    fn len(&self) -> usize {
+        self.buf.len().saturating_sub(self.start)
+    }
+
+    fn append(&mut self, src: &[u8]) {
+        if src.is_empty() {
+            return;
+        }
+        self.make_room(src.len());
+        self.buf.extend_from_slice(src);
+    }
+
+    fn peek_prefix(&self, len: usize) -> Option<&[u8]> {
+        if self.len() < len {
+            return None;
+        }
+        Some(&self.buf[self.start..self.start + len])
+    }
+
+    fn consume(&mut self, len: usize) {
+        if len == 0 {
+            return;
+        }
+        self.start = self.start.saturating_add(len).min(self.buf.len());
+        if self.start >= self.buf.len() {
+            self.clear();
+            return;
+        }
+
+        // Compact only when the stale prefix is at least as large as the live
+        // tail, or it has grown to a sizeable chunk.
+        let live_len = self.buf.len() - self.start;
+        if self.start >= live_len || self.start >= 65_536 {
+            self.compact();
+        }
+    }
+
+    fn make_room(&mut self, incoming_len: usize) {
+        let free_tail = self.buf.capacity().saturating_sub(self.buf.len());
+        if free_tail >= incoming_len {
+            return;
+        }
+
+        self.compact();
+        let free_tail = self.buf.capacity().saturating_sub(self.buf.len());
+        if free_tail < incoming_len {
+            self.buf.reserve(incoming_len - free_tail);
+        }
+    }
+
+    fn compact(&mut self) {
+        if self.start == 0 {
+            return;
+        }
+        if self.start >= self.buf.len() {
+            self.clear();
+            return;
+        }
+
+        self.buf.copy_within(self.start.., 0);
+        let live_len = self.buf.len() - self.start;
+        self.buf.truncate(live_len);
+        self.start = 0;
+    }
+}
+
+/// Background thread: pulls decoded PCM from appsink, writes to ALSA via mmap.
+///
+/// Design notes:
+/// - `appsink` has caps `audio/x-raw,format=S32LE,layout=interleaved` so GStreamer
+///   converts the format upstream.  Rate is left unconstrained; we derive ALSA
+///   period/buffer frame counts from the actual sample rate and reopen only if
+///   it changes.
+/// - `snd_pcm_wait()` inside mmap_write() provides natural back-pressure: the thread
+///   blocks until the hardware consumes one period, pacing the GStreamer pull rate.
+/// - `try-pull-sample` keeps the thread responsive to stop/flush transitions.
+///   Pipeline set_state(NULL) is treated as a transient reset unless `stop` is
+///   set, so URI changes can reuse the same sink.
+/// - Decoded PCM accumulates in a preallocated sliding window so appends stay
+///   cheap without `Vec::drain(..)` memmoves on every period commit.
+fn alsa_mmap_writer_thread(
+    appsink: gst::Element,
+    device: String,
+    period_us: i32,
+    target_buffer_us: i32,
+    mut accum: AudioByteWindow,
+    audio_format: MmapAudioFormat,
+    stop: Arc<AtomicBool>,
+    events: ThreadEventQueue,
+    diagnostics: MmapThreadDiagnosticsHandle,
+) {
+    // Prevent the CPU from entering deep C-states (C2+) during playback.
+    // Deep C-states have wakeup latencies of 100–300 µs; keeping the CPU in
+    // C0/C1 ensures snd_pcm_wait() wake-ups are serviced promptly.
+    // Writing 0 (latency budget = 0 µs) to /dev/cpu_dma_latency is the
+    // standard mechanism used by PipeWire, JACK, and rtkit.
+    // The file descriptor is held until this thread exits (drop closes it).
+    let _cpu_dma_latency_guard: Option<std::fs::File> = {
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/cpu_dma_latency")
+            .ok()
+            .and_then(|mut f| f.write_all(&0i32.to_ne_bytes()).ok().map(|_| f))
+    };
+
+    let mut ctx: Option<AlsaMmapCtx> = None;
+    let mut last_rate: u32 = 0;
+    let mut open_fail_count: u32 = 0;
+    let mut dma_locked = false;
+
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // Use a timed pull so track switches and app shutdown do not strand the
+        // writer thread inside an uninterruptible appsink wait.
+        let sample =
+            appsink.emit_by_name::<Option<gst::Sample>>("try-pull-sample", &[&100_000_000u64]);
+        let sample = match sample {
+            None => {
+                ctx = None;
+                accum.clear();
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                // In NULL/READY or during short route rebuild gaps, appsink can
+                // return immediately without blocking. Back off a little here so
+                // the realtime thread does not busy-spin while no PCM is flowing.
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Some(s) => s,
+        };
+
+        // Detect sample rate; (re)open ALSA when it changes.
+        let rate = sample
+            .caps()
+            .and_then(|c| c.structure(0))
+            .and_then(|s| s.get::<i32>("rate").ok())
+            .unwrap_or(44100) as u32;
+
+        if ctx.is_none() || rate != last_rate {
+            ctx = None; // Drop old ctx → closes ALSA via Drop
+            accum.clear();
+            let period_frames = frames_for_duration_us(period_us, rate, 64, 4096);
+            let buffer_frames = frames_for_duration_us(
+                target_buffer_us,
+                rate,
+                period_frames.saturating_mul(2),
+                16_384,
+            );
+            match AlsaMmapCtx::open(
+                &device,
+                rate,
+                period_frames as u32,
+                buffer_frames as u32,
+                audio_format.alsa_format,
+                audio_format.frame_bytes,
+                audio_format.log_label,
+            ) {
+                Ok(c) => {
+                    eprintln!(
+                        "[alsa-mmap] opened {} format={} rate={} period={} buffer={} frames",
+                        device, c.format_label, c.rate, c.period_frames, c.buffer_frames
+                    );
+                    update_mmap_thread_diagnostics(&diagnostics, |state| {
+                        state.negotiated_rate = c.rate;
+                        state.period_frames = c.period_frames;
+                        state.buffer_frames = c.buffer_frames;
+                    });
+                    last_rate = rate;
+                    open_fail_count = 0;
+                    if !dma_locked {
+                        // Re-lock now that ALSA DMA pages are mapped.
+                        unsafe { libc::mlockall(libc::MCL_CURRENT) };
+                        dma_locked = true;
+                    }
+                    ctx = Some(c);
+                }
+                Err(e) => {
+                    update_mmap_thread_diagnostics(&diagnostics, |state| {
+                        state.open_failures = state.open_failures.saturating_add(1);
+                    });
+                    open_fail_count += 1;
+                    eprintln!(
+                        "[alsa-mmap] open failed (attempt {}): {}  \
+                         — is the device busy (PipeWire/PulseAudio)?  \
+                         Try: systemctl --user stop pipewire pipewire-pulse",
+                        open_fail_count, e
+                    );
+                    // Notify the UI on the first threshold so the user sees an
+                    // error promptly, but keep retrying — the device may become
+                    // available within a few seconds (e.g. PipeWire releasing it).
+                    if open_fail_count == 3 {
+                        push_thread_event(
+                            &events,
+                            EVT_ERROR,
+                            format!(
+                                "alsa-mmap open failed after {} attempts: {}",
+                                open_fail_count, e
+                            ),
+                        );
+                    }
+                    // Give up only after a sustained run of failures (~20 × 100 ms
+                    // pull-timeout ≈ 2 s of retries after the initial error event).
+                    if open_fail_count >= 20 {
+                        eprintln!(
+                            "[alsa-mmap] giving up after {} failures, stopping mmap thread",
+                            open_fail_count
+                        );
+                        break;
+                    }
+                    // Keep pulling samples so the appsink does not stall the pipeline.
+                    continue;
+                }
+            }
+        }
+
+        let period_bytes = {
+            let ctx = ctx.as_ref().unwrap();
+            ctx.period_frames * ctx.frame_bytes
+        };
+
+        // Accumulate incoming PCM bytes.
+        if let Some(buf) = sample.buffer() {
+            if let Ok(map) = buf.map_readable() {
+                accum.append(map.as_slice());
+            }
+        }
+
+        // Write complete periods to ALSA.
+        let mut write_failed = None;
+        while accum.len() >= period_bytes {
+            let frames = ctx.as_ref().map(|c| c.period_frames).unwrap_or(0);
+            let rc = {
+                let ctx = ctx.as_mut().unwrap();
+                let src = accum.peek_prefix(period_bytes).unwrap_or(&[]);
+                ctx.mmap_write(src, frames, &stop)
+            };
+            if let Err(rc) = rc {
+                write_failed = Some(rc);
+                break;
+            }
+            accum.consume(period_bytes);
+        }
+        if let Some(rc) = write_failed {
+            if stop.load(Ordering::Relaxed) || rc == -125 {
+                break;
+            }
+            update_mmap_thread_diagnostics(&diagnostics, |state| {
+                state.device_resets = state.device_resets.saturating_add(1);
+            });
+            push_thread_event(
+                &events,
+                EVT_ERROR,
+                format!("alsa-mmap write failed rc={rc}; resetting device"),
+            );
+            ctx = None;
+            last_rate = 0;
+            accum.clear();
+        }
+    }
+    // ctx drops here → snd_pcm_drop + snd_pcm_close via AlsaMmapCtx::drop
+}
+
+// ---------------------------------------------------------------------------
 
 type EventCallback = extern "C" fn(c_int, *const c_char, *mut c_void);
 const EVT_STATE: c_int = 1;
@@ -52,7 +1037,11 @@ fn json_escape(v: &str) -> String {
 }
 
 fn build_pipewire_card_profile_target(card: &str, profile: &str) -> String {
-    format!("{PIPEWIRE_CARD_PROFILE_TARGET_PREFIX}{}|{}", card.trim(), profile.trim())
+    format!(
+        "{PIPEWIRE_CARD_PROFILE_TARGET_PREFIX}{}|{}",
+        card.trim(),
+        profile.trim()
+    )
 }
 
 fn parse_pipewire_card_profile_target(device_id: &str) -> Option<(String, String)> {
@@ -99,6 +1088,13 @@ pub struct Engine {
     source_depth: i32,
     preferred_output_format: String,
     spectrum_enabled: bool,
+    mmap_sink: Option<MmapSink>,
+    output_mmap_realtime_priority: i32,
+    output_driver: String,
+    output_device: Option<String>,
+    output_buffer_us: i32,
+    output_latency_us: i32,
+    output_exclusive: bool,
 }
 
 impl Engine {
@@ -698,6 +1694,31 @@ impl Engine {
         }
     }
 
+    fn reset_spectrum_timeline(&mut self) {
+        self.spectrum_pos_s = 0.0;
+        self.spectrum_len = 0;
+        self.spectrum_ring_write = 0;
+        self.spectrum_ring_count = 0;
+        self.spectrum_vals = [0.0; SPECTRUM_BANDS_MAX];
+        self.spectrum_ring_vals = [[0.0; SPECTRUM_BANDS_MAX]; SPECTRUM_RING_CAP];
+        self.spectrum_ring_len = [0; SPECTRUM_RING_CAP];
+        self.spectrum_ring_pos_s = [0.0; SPECTRUM_RING_CAP];
+        self.spectrum_ring_seq = [0; SPECTRUM_RING_CAP];
+    }
+
+    fn set_spectrum_filter_enabled(&mut self, enabled: bool) {
+        if enabled {
+            if let Some(ref bin) = self._audio_filter_bin {
+                let elem: gst::Element = bin.clone().upcast();
+                self.playbin.set_property("audio-filter", &elem);
+            }
+        } else {
+            self.playbin
+                .set_property("audio-filter", Option::<gst::Element>::None);
+            self.reset_spectrum_timeline();
+        }
+    }
+
     fn setup_spectrum_filter(playbin: &gst::Element) -> Option<gst::Bin> {
         let spectrum = gst::ElementFactory::make("spectrum")
             .name("rust-spectrum")
@@ -833,6 +1854,16 @@ impl Engine {
             frame_pos_s = (pos.nseconds() as f64) / 1_000_000_000.0;
             ts_src = "query-pos";
         }
+        // New track / backward seek can leave a few stale spectrum messages in the
+        // bus after the caller has already reset its local cursor. Drop the old
+        // ring immediately so `get_spectrum_frames_since(0)` does not replay the
+        // previous timeline on every recovery tick.
+        if self.spectrum_len > 0 && frame_pos_s.is_finite() && frame_pos_s >= 0.0 {
+            let prev_pos_s = self.spectrum_pos_s;
+            if prev_pos_s.is_finite() && frame_pos_s < (prev_pos_s - 0.25) {
+                self.reset_spectrum_timeline();
+            }
+        }
         self.spectrum_pos_s = frame_pos_s;
 
         self.spectrum_vals[..n].copy_from_slice(&tmp[..n]);
@@ -900,6 +1931,25 @@ impl Engine {
             }
         }
 
+        // Elevate GStreamer streaming thread (decode/demux) priority.
+        //
+        // GStreamer posts GST_MESSAGE_STREAM_STATUS with type Enter from within
+        // the streaming thread just before it starts running.  A sync handler
+        // is invoked in the posting thread's context, so `nice(-5)` applies to
+        // the streaming thread that called gst_bus_post().  This does not
+        // require elevated privileges (nice range [-20,19]; -5 is reachable by
+        // any process within its default nice range of [0,19]).
+        if let Some(bus) = playbin.bus() {
+            bus.set_sync_handler(|_bus, msg| {
+                if let gst::MessageView::StreamStatus(ss) = msg.view() {
+                    if ss.get().0 == gst::StreamStatusType::Enter {
+                        unsafe { libc::nice(-5) };
+                    }
+                }
+                gst::BusSyncReply::Pass
+            });
+        }
+
         let filter_bin = Self::setup_spectrum_filter(&playbin);
 
         Ok(Self {
@@ -933,11 +1983,22 @@ impl Engine {
             source_depth: 0,
             preferred_output_format: String::new(),
             spectrum_enabled: true,
+            mmap_sink: None,
+            output_mmap_realtime_priority: ALSA_MMAP_RT_PRIORITY_DEFAULT,
+            output_driver: String::new(),
+            output_device: None,
+            output_buffer_us: 100_000,
+            output_latency_us: 10_000,
+            output_exclusive: false,
         })
     }
 
     fn set_error(&mut self, msg: impl Into<String>) {
         self.last_error = Some(msg.into());
+    }
+
+    fn output_driver_is_mmap(&self) -> bool {
+        driver_is_alsa_mmap(&self.output_driver)
     }
 
     fn set_state(&mut self, state: gst::State) -> c_int {
@@ -964,7 +2025,24 @@ impl Engine {
         }
     }
 
+    fn drain_mmap_events(&mut self) {
+        let Some(events) = self.mmap_sink.as_ref().map(|ms| ms.events.clone()) else {
+            return;
+        };
+        let drained: Vec<(c_int, String)> = match events.lock() {
+            Ok(mut pending) => pending.drain(..).collect(),
+            Err(_) => return,
+        };
+        for (evt, msg) in drained {
+            if evt == EVT_ERROR {
+                self.set_error(msg.clone());
+            }
+            self.emit_event(evt, &msg);
+        }
+    }
+
     fn pump_events(&mut self) -> c_int {
+        self.drain_mmap_events();
         let Some(bus) = self.playbin.bus() else {
             return 0;
         };
@@ -1052,6 +2130,163 @@ impl Engine {
         count
     }
 
+    /// Stop the mmap writer thread (if running) and wait for it to exit.
+    /// Must be called after playbin is set to NULL so the appsink sees EOS
+    /// and the thread can unblock from pull-sample.
+    fn stop_mmap_sink(&mut self) {
+        if let Some(mut ms) = self.mmap_sink.take() {
+            ms.stop.store(true, Ordering::Relaxed);
+            if let Some(t) = ms.thread.take() {
+                let _ = t.join();
+            }
+        }
+    }
+
+    /// Build an `appsink` element whose output is consumed by a background
+    /// thread that writes to ALSA via mmap (zero kernel-copy path).
+    ///
+    /// Caps are fixed to `audio/x-raw, format=S32LE, layout=interleaved`
+    /// (rate unconstrained — the thread opens ALSA with the actual source rate).
+    /// GStreamer's internal `audioconvert` will handle format conversion upstream.
+    ///
+    /// Returns `(appsink_element, MmapSink)` on success.
+    fn build_appsink_mmap(
+        &self,
+        device: Option<&str>,
+        buffer_us: i32,
+        latency_us: i32,
+        preferred_output_format: &str,
+        realtime_priority: i32,
+    ) -> Result<(gst::Element, MmapSink), String> {
+        let dev = device.unwrap_or("hw:0,0").to_string();
+        let audio_format = mmap_audio_format_from_preference(preferred_output_format);
+
+        let period_us = if latency_us > 0 { latency_us } else { 10_000 };
+        let target_buffer_us = if buffer_us > 0 { buffer_us } else { 100_000 };
+        let queue_buffers = if target_buffer_us <= 20_000 {
+            4u32
+        } else {
+            8u32
+        };
+        let queue_time_ns =
+            (u64::try_from(target_buffer_us.max(period_us * 2)).unwrap_or(20_000)) * 1_000;
+        let accum_capacity_bytes = frames_for_duration_us(
+            target_buffer_us.max(period_us * 2),
+            ALSA_MMAP_ACCUM_RATE_BUDGET_HZ,
+            64,
+            192_000,
+        )
+        .saturating_mul(audio_format.frame_bytes)
+        .saturating_mul((queue_buffers as usize).max(4))
+        .saturating_mul(2)
+        .clamp(256 * 1024, 2 * 1024 * 1024);
+
+        // Build appsink — format is pinned so the mmap writer can copy frames
+        // directly into the ALSA ring without an extra repack step.
+        let appsink = gst::ElementFactory::make("appsink")
+            .name("rust-mmap-appsink")
+            .build()
+            .map_err(|e| format!("appsink unavailable: {e}"))?;
+
+        let caps = gst::Caps::builder("audio/x-raw")
+            .field("format", audio_format.gst_format)
+            .field("layout", "interleaved")
+            .field("channels", 2i32)
+            .build();
+        appsink.set_property("caps", &caps);
+        // The mmap writer thread already blocks on ALSA hardware pacing, so do
+        // not add a second clock gate at appsink.
+        appsink.set_property("sync", false);
+        // Timed pull mode: the writer thread polls appsink directly so it can
+        // react promptly to URI changes and shutdown.
+        appsink.set_property("emit-signals", false);
+        // Keep bounded headroom so short ALSA hiccups do not stall upstream
+        // spectrum/filter production immediately.
+        appsink.set_property("max-buffers", queue_buffers);
+        appsink.set_property("max-time", queue_time_ns);
+        appsink.set_property("drop", false);
+        appsink.set_property("wait-on-eos", false);
+
+        // Wrap appsink with audiobuffersplit so that large decoder buffers (e.g.
+        // FLAC default block size of 4096 samples ≈ 93 ms at 44100 Hz) are split
+        // into uniform ~16 ms chunks matching the spectrum element's interval.
+        // Without this, spectrum messages arrive in batches separated by long gaps,
+        // causing the waveform visualisation to appear over-smoothed.
+        // Falls back to bare appsink when the plugin is not available.
+        let sink_element: gst::Element = 'build_sink: {
+            let Ok(splitter) = gst::ElementFactory::make("audiobuffersplit")
+                .name("rust-mmap-bufsplit")
+                .build()
+            else {
+                eprintln!("[alsa-mmap] audiobuffersplit unavailable; spectrum detail may be reduced");
+                break 'build_sink appsink.clone();
+            };
+            // 16 ms matches the spectrum element's interval property.
+            let _ = splitter.set_property_from_str("output-buffer-duration", "16/1000");
+            let bin = gst::Bin::new();
+            // add_many only fails if elements are already in another bin — safe to
+            // fall back to bare appsink if so.
+            if bin.add_many([&splitter, &appsink]).is_err() {
+                eprintln!("[alsa-mmap] audiobuffersplit: bin.add_many failed");
+                break 'build_sink appsink.clone();
+            }
+            // After add_many succeeds, appsink belongs to the bin; always return
+            // the bin from this point to avoid orphaning the element.
+            let _ = splitter.link(&appsink);
+            if let Some(pad) = splitter.static_pad("sink") {
+                if let Ok(ghost) = gst::GhostPad::with_target(&pad) {
+                    let _ = bin.add_pad(&ghost);
+                }
+            }
+            eprintln!("[alsa-mmap] using audiobuffersplit for uniform 16 ms buffers");
+            bin.upcast::<gst::Element>()
+        };
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop.clone();
+        let events: ThreadEventQueue = Arc::new(Mutex::new(VecDeque::new()));
+        let events_clone = events.clone();
+        let diagnostics: MmapThreadDiagnosticsHandle =
+            Arc::new(Mutex::new(MmapThreadDiagnostics::default()));
+        let diagnostics_clone = diagnostics.clone();
+        let appsink_clone = appsink.clone();
+        let dev_clone = dev.clone();
+
+        let t = thread::spawn(move || {
+            // Allocate the decoded PCM window before `mlockall(MCL_CURRENT)` so
+            // the hot audio buffer is part of the pages we try to pin.
+            let accum = AudioByteWindow::with_capacity(accum_capacity_bytes);
+            update_mmap_thread_diagnostics(&diagnostics_clone, |state| {
+                state.running = true;
+            });
+            configure_mmap_thread_runtime(&diagnostics_clone, &events_clone, realtime_priority);
+            alsa_mmap_writer_thread(
+                appsink_clone,
+                dev_clone,
+                period_us,
+                target_buffer_us,
+                accum,
+                audio_format,
+                stop_clone,
+                events_clone,
+                diagnostics_clone.clone(),
+            );
+            update_mmap_thread_diagnostics(&diagnostics_clone, |state| {
+                state.running = false;
+            });
+        });
+
+        Ok((
+            sink_element,
+            MmapSink {
+                stop,
+                events,
+                diagnostics,
+                thread: Some(t),
+            },
+        ))
+    }
+
     fn set_output_tuned(
         &mut self,
         driver: &str,
@@ -1062,8 +2297,13 @@ impl Engine {
     ) -> c_int {
         let cur_state = self.playbin.state(gst::ClockTime::from_mseconds(50)).1;
         let _ = self.playbin.set_state(gst::State::Null);
+        // Stop any running mmap writer thread *after* set_state(Null) so the
+        // appsink sees EOS and pull-sample unblocks cleanly.
+        self.stop_mmap_sink();
 
-        let driver_norm = driver.trim().to_lowercase();
+        let driver_norm = normalized_driver_label(driver);
+        self.set_spectrum_filter_enabled(true);
+        self.emit_event(EVT_STATE, "spectrum-path=enabled");
         let original_device = device
             .map(|d| d.trim().to_string())
             .filter(|d| !d.is_empty());
@@ -1096,12 +2336,13 @@ impl Engine {
         }
         let device_norm = resolved_device.as_deref();
 
-        let (sink, auto_caps_format) = if driver_norm.is_empty() || driver_norm.starts_with("auto") {
+        let (sink, auto_caps_format) = if driver_norm.is_empty() || driver_norm.starts_with("auto")
+        {
             (
                 gst::ElementFactory::make("autoaudiosink")
-                .name("rust-auto-sink")
-                .build()
-                .ok(),
+                    .name("rust-auto-sink")
+                    .build()
+                    .ok(),
                 None,
             )
         } else if driver_norm.contains("pipewire") {
@@ -1142,11 +2383,11 @@ impl Engine {
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         elem.set_property("stream-properties", &props);
                     }));
-                        self.emit_event(
-                            EVT_STATE,
-                            &format!(
-                                "pipewire-sink configured target={} autoconnect={} latency={}",
-                                device_norm.unwrap_or("default"),
+                    self.emit_event(
+                        EVT_STATE,
+                        &format!(
+                            "pipewire-sink configured target={} autoconnect={} latency={}",
+                            device_norm.unwrap_or("default"),
                             auto_connect,
                             latency_node
                         ),
@@ -1190,6 +2431,39 @@ impl Engine {
                     return -12;
                 }
             }
+        } else if driver_is_alsa_mmap(driver) {
+            // Zero-copy mmap path: appsink + background writer thread.
+            // Caps wrapping is handled by setting caps on the appsink directly.
+            match self.build_appsink_mmap(
+                device_norm,
+                buffer_us,
+                latency_us,
+                &self.preferred_output_format,
+                self.output_mmap_realtime_priority,
+            ) {
+                Ok((elem, mmap)) => {
+                    self.mmap_sink = Some(mmap);
+                    let audio_format =
+                        mmap_audio_format_from_preference(&self.preferred_output_format);
+                    self.emit_event(
+                        EVT_STATE,
+                        &format!(
+                            "alsa-mmap configured device={} format={}",
+                            device_norm.unwrap_or("hw:0,0"),
+                            audio_format.gst_format
+                        ),
+                    );
+                    // Return None for auto_caps_format: caps are already set on
+                    // the appsink element itself, so wrap_sink_with_caps must not
+                    // be called (it would conflict with the element-level caps).
+                    (Some(elem), None::<String>)
+                }
+                Err(e) => {
+                    self.set_error(format!("alsa-mmap setup failed: {e}"));
+                    self.emit_event(EVT_ERROR, &format!("alsa-mmap setup failed: {e}"));
+                    return -17;
+                }
+            }
         } else if driver_norm.contains("alsa") {
             match build_alsa_sink_element(device_norm, buffer_us, latency_us, exclusive) {
                 Ok((elem, forced_caps_format)) => (Some(elem), forced_caps_format),
@@ -1216,11 +2490,13 @@ impl Engine {
             return -15;
         };
 
-        let preferred_caps_format = self
-            .preferred_output_format
-            .trim()
-            .to_string();
-        let selected_caps_format = if !preferred_caps_format.is_empty() {
+        let preferred_caps_format = self.preferred_output_format.trim().to_string();
+        // For alsa_mmap the appsink already has caps set on the element itself;
+        // wrapping it inside an audioconvert+capsfilter bin would conflict.
+        let is_mmap = driver_is_alsa_mmap(driver);
+        let selected_caps_format = if is_mmap {
+            None
+        } else if !preferred_caps_format.is_empty() {
             Some(preferred_caps_format.as_str())
         } else {
             auto_caps_format.as_deref()
@@ -1260,6 +2536,12 @@ impl Engine {
             sink_elem
         };
 
+        self.output_driver = driver.to_string();
+        self.output_device = resolved_device.clone();
+        self.output_buffer_us = buffer_us;
+        self.output_latency_us = latency_us;
+        self.output_exclusive = exclusive;
+
         self.playbin.set_property("audio-sink", &final_sink);
         self.emit_event(
             EVT_STATE,
@@ -1282,6 +2564,11 @@ impl Engine {
 
     fn set_output(&mut self, driver: &str, device: Option<&str>) -> c_int {
         self.set_output_tuned(driver, device, 100_000, 10_000, false)
+    }
+
+    fn set_mmap_realtime_priority(&mut self, priority: i32) -> c_int {
+        self.output_mmap_realtime_priority = priority.max(0);
+        0
     }
 
     fn apply_playback_rate(&mut self) -> c_int {
@@ -1514,9 +2801,7 @@ fn list_pulseaudio_sinks_detailed() -> Vec<(String, Option<String>, Option<u32>)
                 }
                 let desc = str_opt_to_string(info.description.as_ref().cloned());
                 let name = if desc.is_empty() { dev.clone() } else { desc };
-                shared_cb
-                    .borrow_mut()
-                    .push((name, Some(dev), info.card));
+                shared_cb.borrow_mut().push((name, Some(dev), info.card));
             }
             ListResult::End | ListResult::Error => {
                 done_cb.set(true);
@@ -1706,7 +2991,8 @@ fn list_pipewire_sinks() -> Vec<(String, Option<String>)> {
                     return;
                 }
                 let object_serial = props.get("object.serial").unwrap_or("");
-                let Some(target_id) = pipewire_target_id_from_props(node_name, object_serial) else {
+                let Some(target_id) = pipewire_target_id_from_props(node_name, object_serial)
+                else {
                     return;
                 };
                 let name = pipewire_display_name_from_strings(
@@ -1917,13 +3203,17 @@ fn list_pipewire_card_fallbacks() -> Vec<(String, Option<String>)> {
                         Some((name, p.n_sinks, p.priority, p.available))
                     })
                     .collect();
-                let Some(profile_name) =
-                    choose_pipewire_output_profile_from_entries(active_profile.as_deref(), &profiles)
-                else {
+                let Some(profile_name) = choose_pipewire_output_profile_from_entries(
+                    active_profile.as_deref(),
+                    &profiles,
+                ) else {
                     return;
                 };
                 let label = pipewire_display_name_from_strings(
-                    &info.proplist.get_str(pa_props::DEVICE_DESCRIPTION).unwrap_or_default(),
+                    &info
+                        .proplist
+                        .get_str(pa_props::DEVICE_DESCRIPTION)
+                        .unwrap_or_default(),
                     &info.proplist.get_str("device.nick").unwrap_or_default(),
                     &card_name,
                 );
@@ -1932,7 +3222,10 @@ fn list_pipewire_card_fallbacks() -> Vec<(String, Option<String>)> {
                 }
                 shared_cb.borrow_mut().push((
                     label,
-                    Some(build_pipewire_card_profile_target(&card_name, &profile_name)),
+                    Some(build_pipewire_card_profile_target(
+                        &card_name,
+                        &profile_name,
+                    )),
                 ));
             }
             ListResult::End | ListResult::Error => {
@@ -1976,7 +3269,11 @@ fn pulseaudio_card_index(card: &str) -> Option<u32> {
         .introspect()
         .get_card_info_list(move |res| match res {
             ListResult::Item(info) => {
-                let name = info.name.as_ref().map(|v| v.to_string()).unwrap_or_default();
+                let name = info
+                    .name
+                    .as_ref()
+                    .map(|v| v.to_string())
+                    .unwrap_or_default();
                 if name == target {
                     found_cb.set(info.index);
                 }
@@ -1992,7 +3289,10 @@ fn pulseaudio_card_index(card: &str) -> Option<u32> {
     }
 }
 
-fn pulseaudio_resolve_sink_name_for_card(card: &str, prefer_profile: Option<&str>) -> Option<String> {
+fn pulseaudio_resolve_sink_name_for_card(
+    card: &str,
+    prefer_profile: Option<&str>,
+) -> Option<String> {
     let card_index = pulseaudio_card_index(card)?;
     let Ok((mut mainloop, context)) = pa_connect() else {
         return None;
@@ -2010,7 +3310,11 @@ fn pulseaudio_resolve_sink_name_for_card(card: &str, prefer_profile: Option<&str
                 if info.card != Some(card_index) {
                     return;
                 }
-                let sink_name = info.name.as_ref().map(|v| v.to_string()).unwrap_or_default();
+                let sink_name = info
+                    .name
+                    .as_ref()
+                    .map(|v| v.to_string())
+                    .unwrap_or_default();
                 if sink_name.trim().is_empty() || sink_name.ends_with(".monitor") {
                     return;
                 }
@@ -2051,7 +3355,9 @@ fn activate_pipewire_card_profile_target(card: &str, profile: &str) -> Result<St
     }
 
     for _attempt in 0..8 {
-        if let Some(sink_name) = pulseaudio_resolve_sink_name_for_card(card_name, Some(profile_name)) {
+        if let Some(sink_name) =
+            pulseaudio_resolve_sink_name_for_card(card_name, Some(profile_name))
+        {
             return Ok(sink_name);
         }
         thread::sleep(Duration::from_millis(80));
@@ -2417,11 +3723,11 @@ fn build_alsa_sink_element(
 }
 
 fn devices_for_driver(driver: &str) -> Vec<(String, Option<String>)> {
-    let d = driver.trim();
-    if d == "Auto (Default)" || d.eq_ignore_ascii_case("auto") {
+    let d = normalized_driver_label(driver);
+    if d == "auto(default)" || d == "auto" {
         return vec![("Default Output".to_string(), None)];
     }
-    if d == "PipeWire" {
+    if d == "pipewire" {
         let mut out = vec![("Default System Output".to_string(), None)];
         // Merge raw PipeWire sink nodes with the PulseAudio-compat compatibility
         // view. Some WirePlumber/PipeWire setups expose a fuller sink list via the
@@ -2433,12 +3739,12 @@ fn devices_for_driver(driver: &str) -> Vec<(String, Option<String>)> {
         out.extend(merged);
         return out;
     }
-    if d == "PulseAudio" {
+    if d == "pulseaudio" {
         let mut out = vec![("Default System Output".to_string(), None)];
         out.extend(list_pulseaudio_sinks());
         return out;
     }
-    if d == "ALSA" {
+    if driver_is_alsa_family(driver) {
         return list_alsa_cards();
     }
     Vec::new()
@@ -2472,21 +3778,27 @@ fn card_from_pipewire_output_node(device_id: &str) -> Option<String> {
     Some(format!("alsa_card.{core}"))
 }
 
-fn supported_output_formats_for_driver_device(driver: &str, device_id: Option<&str>) -> Vec<String> {
-    let drv = driver.trim();
+fn supported_output_formats_for_driver_device(
+    driver: &str,
+    device_id: Option<&str>,
+) -> Vec<String> {
+    let drv = normalized_driver_label(driver);
     let dev = device_id.unwrap_or("").trim();
     if dev.is_empty() {
         return Vec::new();
     }
 
-    let alsa_card_idx = if drv == "ALSA" {
+    let alsa_card_idx = if driver_is_alsa_family(driver) {
         parse_alsa_hw_device_id(dev).map(|(card_idx, _)| card_idx)
-    } else if drv == "PipeWire" {
+    } else if drv == "pipewire" {
         parse_pipewire_card_profile_target(dev)
             .and_then(|(card, _)| pulseaudio_alsa_card_index_from_card_name(&card))
-            .or_else(|| card_from_pipewire_output_node(dev).and_then(|card| pulseaudio_alsa_card_index_from_card_name(&card)))
+            .or_else(|| {
+                card_from_pipewire_output_node(dev)
+                    .and_then(|card| pulseaudio_alsa_card_index_from_card_name(&card))
+            })
             .or_else(|| pulseaudio_alsa_card_index_from_sink_name(dev))
-    } else if drv == "PulseAudio" {
+    } else if drv == "pulseaudio" {
         pulseaudio_alsa_card_index_from_sink_name(dev)
     } else {
         None
@@ -2637,8 +3949,9 @@ pub extern "C" fn rac_free(ptr: *mut Engine) {
     }
     // SAFETY: Pointer was allocated by Box::into_raw in rac_new.
     unsafe {
-        let boxed = Box::from_raw(ptr);
+        let mut boxed = Box::from_raw(ptr);
         let _ = boxed.playbin.set_state(gst::State::Null);
+        boxed.stop_mmap_sink();
     }
 }
 
@@ -2663,7 +3976,28 @@ pub extern "C" fn rac_set_uri(ptr: *mut Engine, uri: *const c_char) -> c_int {
         }
     };
 
-    let _ = engine.playbin.set_state(gst::State::Null);
+    if engine.output_driver_is_mmap() {
+        let driver = engine.output_driver.clone();
+        let device = engine.output_device.clone();
+        let buffer_us = engine.output_buffer_us;
+        let latency_us = engine.output_latency_us;
+        let exclusive = engine.output_exclusive;
+        engine.emit_event(EVT_STATE, "alsa-mmap set_uri: rebuilding output");
+        let rc =
+            engine.set_output_tuned(&driver, device.as_deref(), buffer_us, latency_us, exclusive);
+        if rc != 0 {
+            engine.set_error(format!("alsa-mmap set_uri rebind failed rc={rc}"));
+            engine.emit_event(
+                EVT_ERROR,
+                &format!("alsa-mmap set_uri rebind failed rc={rc}"),
+            );
+            return rc;
+        }
+        let _ = engine.playbin.set_state(gst::State::Null);
+    } else {
+        let _ = engine.playbin.set_state(gst::State::Null);
+    }
+    engine.reset_spectrum_timeline();
     engine.playbin.set_property("uri", s);
     engine.uri = s.to_string();
     engine.last_codec.clear();
@@ -2705,6 +4039,7 @@ pub extern "C" fn rac_stop(ptr: *mut Engine) -> c_int {
     let Some(engine) = as_mut_engine(ptr) else {
         return -1;
     };
+    engine.reset_spectrum_timeline();
     engine.set_state(gst::State::Null)
 }
 
@@ -2725,6 +4060,7 @@ pub extern "C" fn rac_seek(ptr: *mut Engine, pos_s: c_double) -> c_int {
         gst::ClockTime::from_nseconds((clamped * 1_000_000_000.0) as u64),
     );
     if rc.is_ok() {
+        engine.reset_spectrum_timeline();
         0
     } else {
         engine.set_error("seek failed");
@@ -3001,6 +4337,14 @@ pub extern "C" fn rac_set_output_tuned(
 }
 
 #[no_mangle]
+pub extern "C" fn rac_set_mmap_realtime_priority(ptr: *mut Engine, priority: c_int) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    engine.set_mmap_realtime_priority(priority)
+}
+
+#[no_mangle]
 pub extern "C" fn rac_set_preferred_output_format(
     ptr: *mut Engine,
     format_name: *const c_char,
@@ -3158,7 +4502,8 @@ pub extern "C" fn rac_list_devices(ptr: *mut Engine, driver: *const c_char) -> *
         if i > 0 {
             s.push(',');
         }
-        let supported_formats = supported_output_formats_for_driver_device(drv_str, dev_id.as_deref());
+        let supported_formats =
+            supported_output_formats_for_driver_device(drv_str, dev_id.as_deref());
         let supported_bit_depths = supported_output_depths_from_formats(&supported_formats);
         s.push_str("{\"name\":\"");
         s.push_str(&json_escape(&name));
@@ -3212,6 +4557,10 @@ pub extern "C" fn rac_get_runtime_snapshot(ptr: *const Engine) -> *mut c_char {
     if pw_latency_ms < 0.0 && pw_quantum > 0 && pw_rate > 0 {
         pw_latency_ms = (pw_quantum as f64 / pw_rate as f64) * 1000.0;
     }
+    let mmap_diag = engine
+        .mmap_sink
+        .as_ref()
+        .and_then(|sink| sink.diagnostics.lock().ok().map(|state| state.clone()));
 
     let mut s = String::from("{");
     s.push_str("\"pipewire\":{");
@@ -3242,6 +4591,35 @@ pub extern "C" fn rac_get_runtime_snapshot(ptr: *const Engine) -> *mut c_char {
         hw_depth.unwrap_or(0),
     ));
     s.push_str("},");
+    s.push_str("\"mmap_thread\":");
+    match mmap_diag {
+        Some(diag) => {
+            s.push('{');
+            s.push_str(&format!(
+                "\"running\":{},\"realtime_attempted\":{},\"realtime_enabled\":{},\"realtime_policy\":\"{}\",\"realtime_priority\":{},\"realtime_error\":\"{}\",\
+                 \"memlock_attempted\":{},\"memlock_enabled\":{},\"memlock_mode\":\"{}\",\"memlock_error\":\"{}\",\
+                 \"negotiated_rate\":{},\"period_frames\":{},\"buffer_frames\":{},\"open_failures\":{},\"device_resets\":{}",
+                diag.running,
+                diag.realtime_attempted,
+                diag.realtime_enabled,
+                json_escape(&diag.realtime_policy),
+                diag.realtime_priority,
+                json_escape(&diag.realtime_error),
+                diag.memlock_attempted,
+                diag.memlock_enabled,
+                json_escape(&diag.memlock_mode),
+                json_escape(&diag.memlock_error),
+                diag.negotiated_rate,
+                diag.period_frames,
+                diag.buffer_frames,
+                diag.open_failures,
+                diag.device_resets,
+            ));
+            s.push('}');
+        }
+        None => s.push_str("null"),
+    }
+    s.push(',');
     s.push_str("\"source\":{");
     let source_rate = if engine.source_rate > 0 {
         engine.source_rate
@@ -3321,6 +4699,49 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    #[test]
+    fn audio_byte_window_reuses_stale_prefix_before_growing() {
+        let mut window = AudioByteWindow::with_capacity(16);
+        window.append(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+        window.consume(8);
+
+        let cap_before = window.buf.capacity();
+        window.append(&[13, 14, 15, 16, 17, 18]);
+
+        assert_eq!(window.buf.capacity(), cap_before);
+        assert_eq!(window.len(), 10);
+        assert_eq!(
+            window.peek_prefix(10),
+            Some(&[9, 10, 11, 12, 13, 14, 15, 16, 17, 18][..])
+        );
+    }
+
+    #[test]
+    fn audio_byte_window_resets_offsets_when_fully_consumed() {
+        let mut window = AudioByteWindow::with_capacity(8);
+        window.append(&[1, 2, 3, 4]);
+        window.consume(4);
+
+        assert_eq!(window.start, 0);
+        assert_eq!(window.len(), 0);
+
+        window.append(&[5, 6, 7]);
+        assert_eq!(window.peek_prefix(3), Some(&[5, 6, 7][..]));
+    }
+
+    #[test]
+    fn frames_for_duration_us_tracks_stream_rate() {
+        assert_eq!(frames_for_duration_us(10_000, 44_100, 64, 4096), 441);
+        assert_eq!(frames_for_duration_us(10_000, 48_000, 64, 4096), 480);
+        assert_eq!(frames_for_duration_us(10_000, 96_000, 64, 4096), 960);
+    }
+
+    #[test]
+    fn frames_for_duration_us_respects_clamps() {
+        assert_eq!(frames_for_duration_us(2_000, 44_100, 128, 4096), 128);
+        assert_eq!(frames_for_duration_us(500_000, 192_000, 64, 4096), 4096);
     }
 
     #[test]
@@ -3481,12 +4902,21 @@ Playback:
     fn merge_output_device_lists_prefers_primary_and_adds_missing_entries() {
         let merged = merge_output_device_lists(
             vec![
-                ("USB DAC".to_string(), Some("alsa_output.usb-DAC.pro-output-0".to_string())),
+                (
+                    "USB DAC".to_string(),
+                    Some("alsa_output.usb-DAC.pro-output-0".to_string()),
+                ),
                 ("Serial Only Sink".to_string(), Some("701".to_string())),
             ],
             vec![
-                ("USB DAC via Pulse".to_string(), Some("alsa_output.usb-DAC.pro-output-0".to_string())),
-                ("HDMI Sink".to_string(), Some("alsa_output.pci-HDMI.iec958-stereo".to_string())),
+                (
+                    "USB DAC via Pulse".to_string(),
+                    Some("alsa_output.usb-DAC.pro-output-0".to_string()),
+                ),
+                (
+                    "HDMI Sink".to_string(),
+                    Some("alsa_output.pci-HDMI.iec958-stereo".to_string()),
+                ),
                 ("Serial Only Duplicate".to_string(), Some("701".to_string())),
                 ("Fallback Sink".to_string(), None),
                 ("Fallback Sink".to_string(), None),
@@ -3496,9 +4926,15 @@ Playback:
         assert_eq!(
             merged,
             vec![
-                ("USB DAC".to_string(), Some("alsa_output.usb-DAC.pro-output-0".to_string())),
+                (
+                    "USB DAC".to_string(),
+                    Some("alsa_output.usb-DAC.pro-output-0".to_string())
+                ),
                 ("Serial Only Sink".to_string(), Some("701".to_string())),
-                ("HDMI Sink".to_string(), Some("alsa_output.pci-HDMI.iec958-stereo".to_string())),
+                (
+                    "HDMI Sink".to_string(),
+                    Some("alsa_output.pci-HDMI.iec958-stereo".to_string())
+                ),
                 ("Fallback Sink".to_string(), None),
             ]
         );
@@ -3506,10 +4942,7 @@ Playback:
 
     #[test]
     fn pipewire_card_profile_target_round_trips() {
-        let built = build_pipewire_card_profile_target(
-            "alsa_card.pci-0000_00_03.0",
-            "pro-audio",
-        );
+        let built = build_pipewire_card_profile_target("alsa_card.pci-0000_00_03.0", "pro-audio");
         assert_eq!(
             built,
             "pwcardprofile:alsa_card.pci-0000_00_03.0|pro-audio".to_string()
@@ -3521,7 +4954,10 @@ Playback:
                 "pro-audio".to_string()
             ))
         );
-        assert_eq!(parse_pipewire_card_profile_target("pwcardprofile:bad"), None);
+        assert_eq!(
+            parse_pipewire_card_profile_target("pwcardprofile:bad"),
+            None
+        );
     }
 
     #[test]
@@ -3535,7 +4971,11 @@ Playback:
             "Built-in Audio Pro 1/CS4208 Digital".to_string()
         );
         assert_eq!(
-            pipewire_display_name_from_strings("Built-in Audio Pro", "Built-in Audio Pro", "fallback"),
+            pipewire_display_name_from_strings(
+                "Built-in Audio Pro",
+                "Built-in Audio Pro",
+                "fallback"
+            ),
             "Built-in Audio Pro".to_string()
         );
         assert_eq!(

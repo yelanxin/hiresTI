@@ -8,6 +8,7 @@ def bind_action_delegates(TidalApp, seen=None):
         on_device_changed,
         on_driver_changed,
         on_latency_changed,
+        on_mmap_realtime_priority_changed,
         update_output_status_ui,
     )
     from actions.lyrics_playback_actions import (
@@ -80,6 +81,7 @@ def bind_action_delegates(TidalApp, seen=None):
         ("on_back_clicked", on_back_clicked),
         ("_load_cover_art", load_cover_art),
         ("on_latency_changed", on_latency_changed),
+        ("on_mmap_realtime_priority_changed", on_mmap_realtime_priority_changed),
         ("on_driver_changed", on_driver_changed),
         ("on_device_changed", on_device_changed),
         ("_refresh_output_status_loop", update_output_status_ui),
@@ -110,6 +112,7 @@ def bind_audio_settings_extras(TidalApp, seen=None):
         on_auto_rebind_once_toggled,
         on_output_bit_depth_changed,
         _get_output_status_interval_ms,
+        _refresh_driver_dropdown_options,
         _schedule_output_status_loop,
         _force_driver_selection,
         update_tech_label,
@@ -121,6 +124,7 @@ def bind_audio_settings_extras(TidalApp, seen=None):
         ("on_auto_rebind_once_toggled", on_auto_rebind_once_toggled),
         ("on_output_bit_depth_changed", on_output_bit_depth_changed),
         ("_get_output_status_interval_ms", _get_output_status_interval_ms),
+        ("_refresh_driver_dropdown_options", _refresh_driver_dropdown_options),
         ("_schedule_output_status_loop", _schedule_output_status_loop),
         ("_force_driver_selection", _force_driver_selection),
         ("update_tech_label", update_tech_label),

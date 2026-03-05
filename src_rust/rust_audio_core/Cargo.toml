@@ -16,3 +16,4 @@ codegen-units = 1
 gstreamer = "0.23"
 pipewire = "0.8"
 libpulse-binding = "2"
+libc = "0.2"

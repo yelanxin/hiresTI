@@ -108,17 +108,23 @@ def _build_now_playing_track_row(track, idx):
     info.set_size_request(_NOW_PLAYING_TRACK_INFO_WIDTH, -1)
     title = str(getattr(track, "name", "") or "Unknown Track")
     title_lbl = Gtk.Label(label=title, xalign=0, ellipsize=3, css_classes=["track-title"])
+    title_lbl.set_single_line_mode(True)
+    title_lbl.set_width_chars(22)
+    title_lbl.set_max_width_chars(22)
     title_lbl.set_tooltip_text(title)
     info.append(title_lbl)
     artist_name = str(getattr(getattr(track, "artist", None), "name", "") or "")
     if artist_name:
         artist_lbl = Gtk.Label(label=artist_name, xalign=0, ellipsize=3, css_classes=["dim-label", "track-artist"])
+        artist_lbl.set_single_line_mode(True)
+        artist_lbl.set_width_chars(22)
+        artist_lbl.set_max_width_chars(22)
         artist_lbl.set_tooltip_text(artist_name)
         info.append(artist_lbl)
     box.append(info)
 
-    box.append(_build_now_playing_track_album_label(track))
     box.append(Gtk.Box(hexpand=True))
+    box.append(_build_now_playing_track_album_label(track))
 
     dur = int(getattr(track, "duration", 0) or 0)
     dur_lbl = Gtk.Label(label=_format_time(dur), xalign=1, css_classes=["dim-label", "track-duration"])
@@ -434,24 +440,152 @@ def _rounded_rect_path(cr, x, y, width, height, top_left, top_right, bottom_righ
     cr.close_path()
 
 
-def _draw_cover_fill(cr, pixbuf, width, height):
+def _now_playing_cover_rect(src_w, src_h, dst_w, dst_h, mode="cover", frame_scale=1.0, align_x="center", align_y="center"):
+    src_w = int(src_w or 0)
+    src_h = int(src_h or 0)
+    dst_w = int(dst_w or 0)
+    dst_h = int(dst_h or 0)
+    if src_w <= 0 or src_h <= 0 or dst_w <= 0 or dst_h <= 0:
+        return None
+
+    scale_bias = max(0.50, float(frame_scale or 1.0))
+    target_w = float(dst_w) * scale_bias
+    target_h = float(dst_h) * scale_bias
+    if str(mode or "cover").lower() == "contain":
+        scale = min(target_w / float(src_w), target_h / float(src_h))
+    else:
+        scale = max(target_w / float(src_w), target_h / float(src_h))
+    draw_w = float(src_w) * scale
+    draw_h = float(src_h) * scale
+    if str(align_x or "center").lower() == "start":
+        x = 0.0
+    elif str(align_x or "center").lower() == "end":
+        x = float(dst_w) - draw_w
+    else:
+        x = (float(dst_w) - draw_w) / 2.0
+    if str(align_y or "center").lower() == "start":
+        y = 0.0
+    elif str(align_y or "center").lower() == "end":
+        y = float(dst_h) - draw_h
+    else:
+        y = (float(dst_h) - draw_h) / 2.0
+    return (
+        x,
+        y,
+        draw_w,
+        draw_h,
+    )
+
+
+def _draw_pixbuf_to_rect(cr, pixbuf, rect, alpha=1.0):
+    if rect is None:
+        return
     src_w = int(pixbuf.get_width() or 0)
     src_h = int(pixbuf.get_height() or 0)
-    if src_w <= 0 or src_h <= 0 or width <= 0 or height <= 0:
+    if src_w <= 0 or src_h <= 0:
         return
-    frame_scale = max(0.50, min(1.0, float(_NOW_PLAYING_COVER_FRAME_SCALE)))
-    target_w = float(width) * frame_scale
-    target_h = float(height) * frame_scale
-    scale = max(target_w / float(src_w), target_h / float(src_h))
+    x, y, draw_w, draw_h = rect
     cr.save()
-    cr.translate((float(width) - (float(src_w) * scale)) / 2.0, (float(height) - (float(src_h) * scale)) / 2.0)
-    cr.scale(scale, scale)
+    cr.translate(float(x), float(y))
+    cr.scale(float(draw_w) / float(src_w), float(draw_h) / float(src_h))
     Gdk.cairo_set_source_pixbuf(cr, pixbuf, 0, 0)
-    cr.paint()
+    if float(alpha) < 1.0:
+        cr.paint_with_alpha(max(0.0, min(1.0, float(alpha))))
+    else:
+        cr.paint()
     cr.restore()
 
 
-def _build_now_playing_cover_surface(pixbuf, width, height):
+def _draw_cover_fill(cr, pixbuf, width, height, alpha=1.0):
+    src_w = int(pixbuf.get_width() or 0)
+    src_h = int(pixbuf.get_height() or 0)
+    rect = _now_playing_cover_rect(src_w, src_h, width, height, mode="cover")
+    if rect is None:
+        return
+    _draw_pixbuf_to_rect(cr, pixbuf, rect, alpha=alpha)
+
+
+def _sample_cover_background_pixbuf(pixbuf, width, height):
+    if pixbuf is None:
+        return None
+    try:
+        sample_w = max(24, min(128, int(width // 6) or 24))
+        sample_h = max(24, min(128, int(height // 6) or 24))
+        return pixbuf.scale_simple(sample_w, sample_h, GdkPixbuf.InterpType.BILINEAR) or pixbuf
+    except Exception:
+        return pixbuf
+
+
+def _mix_rgb(rgb, target, factor):
+    factor = _clamp01(factor)
+    return tuple(_clamp01((float(src) * (1.0 - factor)) + (float(dst) * factor)) for src, dst in zip(rgb, target))
+
+
+def _draw_now_playing_cover_background(cr, pixbuf, width, height, dark_rgb=None):
+    base_rgb = tuple(dark_rgb or _NOW_PLAYING_LIST_BG_FALLBACK)
+    cr.rectangle(0.0, 0.0, float(width), float(height))
+    cr.set_source_rgb(*_mix_rgb(base_rgb, (0.0, 0.0, 0.0), 0.10))
+    cr.fill()
+
+    if pixbuf is not None:
+        blurred = _sample_cover_background_pixbuf(pixbuf, width, height)
+        _draw_cover_fill(cr, blurred or pixbuf, width, height, alpha=0.98)
+
+        image_wash = cairo.LinearGradient(0.0, 0.0, 0.0, float(height))
+        image_wash.add_color_stop_rgba(0.00, base_rgb[0], base_rgb[1], base_rgb[2], 0.18)
+        image_wash.add_color_stop_rgba(1.00, base_rgb[0], base_rgb[1], base_rgb[2], 0.30)
+        cr.rectangle(0.0, 0.0, float(width), float(height))
+        cr.set_source(image_wash)
+        cr.fill()
+
+    top_rgb = _mix_rgb(base_rgb, (1.0, 1.0, 1.0), 0.10)
+    bottom_rgb = _mix_rgb(base_rgb, (0.0, 0.0, 0.0), 0.24)
+
+    linear = cairo.LinearGradient(0.0, 0.0, 0.0, float(height))
+    if pixbuf is not None:
+        linear.add_color_stop_rgba(0.00, top_rgb[0], top_rgb[1], top_rgb[2], 0.16)
+        linear.add_color_stop_rgba(1.00, bottom_rgb[0], bottom_rgb[1], bottom_rgb[2], 0.42)
+    else:
+        linear.add_color_stop_rgba(0.00, top_rgb[0], top_rgb[1], top_rgb[2], 0.82)
+        linear.add_color_stop_rgba(1.00, bottom_rgb[0], bottom_rgb[1], bottom_rgb[2], 1.00)
+    cr.rectangle(0.0, 0.0, float(width), float(height))
+    cr.set_source(linear)
+    cr.fill()
+
+    glow_rgb = _mix_rgb(base_rgb, (1.0, 1.0, 1.0), 0.22)
+    glow = cairo.RadialGradient(
+        float(width) * 0.50,
+        float(height) * 0.35,
+        0.0,
+        float(width) * 0.50,
+        float(height) * 0.35,
+        max(float(width), float(height)) * 0.85,
+    )
+    glow.add_color_stop_rgba(0.00, glow_rgb[0], glow_rgb[1], glow_rgb[2], 0.12 if pixbuf is not None else 0.18)
+    glow.add_color_stop_rgba(1.00, glow_rgb[0], glow_rgb[1], glow_rgb[2], 0.00)
+    cr.rectangle(0.0, 0.0, float(width), float(height))
+    cr.set_source(glow)
+    cr.fill()
+
+
+def _draw_cover_contain(cr, pixbuf, width, height):
+    src_w = int(pixbuf.get_width() or 0)
+    src_h = int(pixbuf.get_height() or 0)
+    rect = _now_playing_cover_rect(
+        src_w,
+        src_h,
+        width,
+        height,
+        mode="cover",
+        frame_scale=_NOW_PLAYING_COVER_FRAME_SCALE,
+        align_y="center",
+    )
+    if rect is None:
+        return
+    _draw_pixbuf_to_rect(cr, pixbuf, rect)
+
+
+def _build_now_playing_cover_surface(pixbuf, width, height, dark_rgb=None):
     surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, width, height)
     cache_cr = cairo.Context(surface)
     cache_cr.set_operator(cairo.Operator.SOURCE)
@@ -473,12 +607,13 @@ def _build_now_playing_cover_surface(pixbuf, width, height):
     cache_cr.clip()
 
     cache_cr.push_group()
-    _draw_cover_fill(cache_cr, pixbuf, width, height)
+    _draw_now_playing_cover_background(cache_cr, pixbuf, width, height, dark_rgb)
+    _draw_cover_contain(cache_cr, pixbuf, width, height)
 
     vertical_scrim = cairo.LinearGradient(0.0, 0.0, 0.0, float(height))
-    vertical_scrim.add_color_stop_rgba(0.00, 0.0, 0.0, 0.0, 0.03)
-    vertical_scrim.add_color_stop_rgba(0.46, 0.0, 0.0, 0.0, 0.10)
-    vertical_scrim.add_color_stop_rgba(1.00, 0.0, 0.0, 0.0, 0.74)
+    vertical_scrim.add_color_stop_rgba(0.00, 0.0, 0.0, 0.0, 0.02)
+    vertical_scrim.add_color_stop_rgba(0.54, 0.0, 0.0, 0.0, 0.08)
+    vertical_scrim.add_color_stop_rgba(1.00, 0.0, 0.0, 0.0, 0.58)
     cache_cr.rectangle(0.0, 0.0, float(width), float(height))
     cache_cr.set_source(vertical_scrim)
     cache_cr.fill()
@@ -497,14 +632,15 @@ def _draw_now_playing_cover(area, cr, width, height, _data=None):
         return
 
     pixbuf = getattr(area, "_cover_pixbuf", None)
+    dark_rgb = getattr(area, "_cover_dark_rgb", None)
     if pixbuf is not None:
         # Use the source URL as the cache key — more stable than id(pixbuf)
         # which can be reused by the GC for a different object.
         url = getattr(area, "_target_url", None) or ""
-        cache_key = (url if url else id(pixbuf), width, height)
+        cache_key = (url if url else id(pixbuf), width, height, tuple(dark_rgb or ()))
         cache_surface = getattr(area, "_cover_cache_surface", None)
         if cache_surface is None or getattr(area, "_cover_cache_key", None) != cache_key:
-            cache_surface = _build_now_playing_cover_surface(pixbuf, width, height)
+            cache_surface = _build_now_playing_cover_surface(pixbuf, width, height, dark_rgb)
             area._cover_cache_key = cache_key
             area._cover_cache_surface = cache_surface
         cr.set_source_surface(cache_surface, 0.0, 0.0)
@@ -525,8 +661,7 @@ def _draw_now_playing_cover(area, cr, width, height, _data=None):
         0.0,
     )
     cr.clip()
-    cr.set_source_rgba(0.08, 0.08, 0.10, 0.95)
-    cr.paint()
+    _draw_now_playing_cover_background(cr, None, width, height, dark_rgb)
 
 
 def _set_size_request_if_changed(widget, width, height):
@@ -1043,6 +1178,21 @@ def _build_now_playing_left_panel(self, layout):
     )
     meta_panel.append(info_card)
 
+    meta_tool_band = Gtk.Overlay(hexpand=True, halign=Gtk.Align.FILL, valign=Gtk.Align.END)
+
+    track_meta_box = Gtk.Box(
+        orientation=Gtk.Orientation.VERTICAL,
+        spacing=6,
+        hexpand=True,
+        halign=Gtk.Align.FILL,
+    )
+    track_meta_box.set_valign(Gtk.Align.END)
+    # Reserve vertical room for the floating tool-row so long text grows upward
+    # instead of overlapping the three action buttons.
+    track_meta_box.set_margin_bottom(42)
+    info_card.append(meta_tool_band)
+    meta_tool_band.set_child(track_meta_box)
+
     self.now_playing_title_label = Gtk.Label(
         label="Nothing playing",
         xalign=0,
@@ -1052,7 +1202,7 @@ def _build_now_playing_left_panel(self, layout):
         css_classes=["now-playing-title"],
     )
     self.now_playing_title_label.set_max_width_chars(28)
-    info_card.append(self.now_playing_title_label)
+    track_meta_box.append(self.now_playing_title_label)
 
     self.now_playing_artist_label = Gtk.Label(
         label="",
@@ -1062,7 +1212,7 @@ def _build_now_playing_left_panel(self, layout):
         halign=Gtk.Align.FILL,
         css_classes=["now-playing-artist"],
     )
-    info_card.append(self.now_playing_artist_label)
+    track_meta_box.append(self.now_playing_artist_label)
 
     self.now_playing_album_label = Gtk.Label(
         label="",
@@ -1072,7 +1222,7 @@ def _build_now_playing_left_panel(self, layout):
         halign=Gtk.Align.FILL,
         css_classes=["now-playing-album"],
     )
-    info_card.append(self.now_playing_album_label)
+    track_meta_box.append(self.now_playing_album_label)
 
     controls_stack = Gtk.Box(
         orientation=Gtk.Orientation.VERTICAL,
@@ -1081,8 +1231,12 @@ def _build_now_playing_left_panel(self, layout):
         halign=Gtk.Align.FILL,
         css_classes=["now-playing-control-stack"],
     )
+    controls_stack.set_vexpand(False)
 
     tool_row = Gtk.Box(spacing=8, halign=Gtk.Align.CENTER, css_classes=["now-playing-tool-row"])
+    tool_row.set_vexpand(False)
+    tool_row.set_halign(Gtk.Align.CENTER)
+    tool_row.set_valign(Gtk.Align.END)
     self.now_playing_tool_row = tool_row
 
     self.now_playing_track_fav_btn = Gtk.Button(
@@ -1114,7 +1268,7 @@ def _build_now_playing_left_panel(self, layout):
     self.now_playing_vol_btn.connect("clicked", lambda _b: self.now_playing_vol_pop.popup())
     tool_row.append(self.now_playing_vol_btn)
 
-    controls_stack.append(tool_row)
+    meta_tool_band.add_overlay(tool_row)
 
     progress_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10, css_classes=["now-playing-progress-box"])
     progress_box.set_hexpand(True)

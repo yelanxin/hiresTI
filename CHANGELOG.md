@@ -1,5 +1,38 @@
 # Changelog
 
+## 1.5.0 - 2026-03-05
+ALSA mmap control and now-playing/layout polish release: explicit `ALSA（auto）` vs `ALSA（mmap）` behavior, mmap realtime-thread tuning, clearer driver guidance, and stronger overlay/list stability with long metadata.
+
+### Added
+- Added dedicated ALSA driver variants in UI/runtime: `ALSA（auto）` and `ALSA（mmap）`.
+- Added `Realtime Audio Priority` setting for the ALSA mmap writer thread (`Off`, `Low (40)`, `Recommended (60)`, `High (70)`, `Very High (80)`), including persistence and startup restore.
+- Added Rust FFI control for mmap RT priority (`rac_set_mmap_realtime_priority`) and Python adapter wiring.
+- Added mmap runtime diagnostics to Rust snapshots under `mmap_thread` (running state, realtime attempted/enabled/policy/priority/error, memlock status/mode, reset count).
+- Added Audio Driver inline help/popover copy to explain `ALSA（auto）` vs forced `ALSA（mmap）` and MMAP jitter/copy tradeoffs.
+
+### Changed
+- Exclusive mode driver behavior changed from forcing a single ALSA option to allowing switching between `ALSA（auto）` and `ALSA（mmap）` only.
+- Output Bit Depth copy and driver-family checks now treat both ALSA variants as explicit ALSA output paths.
+- Now Playing left-cover rendering now uses full-height cover fill with a dynamic backdrop pipeline, improving visual consistency across artwork aspect/content.
+- Now Playing right-side track rows now keep album/duration columns aligned under long titles via stricter label truncation and column ordering.
+- Home/search feed card presentation now uses tighter feed-specific media overlays/tints and more stable subtitle/title sizing behavior.
+- GTK icon-theme search-path setup now prefers bundled app icon paths ahead of inherited system paths.
+
+### Fixed
+- Fixed ALSA mmap startup/idle busy-spin risk by adding backoff when `try-pull-sample` returns no sample, preventing 100% CPU loops in no-flow states.
+- Fixed ALSA naming mismatches in Signal Path verdict/help logic so `ALSA（auto）` / `ALSA（mmap）` are evaluated consistently with ALSA-exclusive rules.
+- Fixed ALSA mmap spectrum path/state handling to keep spectrum pipeline behavior consistent across output switches and URI/timeline transitions.
+- Fixed settings-driver dropdown state transitions around exclusive-mode toggles and persisted driver restoration.
+
+### Tests
+- Added/updated regression coverage for:
+  - `tests/test_audio_settings_actions.py`
+  - `tests/test_app_init_runtime.py`
+  - `tests/test_now_playing_overlay_perf.py`
+  - `tests/test_home_section_header.py`
+
+---
+
 ## 1.4.9 - 2026-03-03
 Display-scaling and output-format control release: better 1x readability, device-aware ALSA bit-depth selection, and clearer PipeWire behavior.
 
