@@ -2311,6 +2311,29 @@ class TidalBackend:
                 while len(self._artist_artwork_cache) > self.max_artist_artwork_cache:
                     self._artist_artwork_cache.popitem(last=False)
 
+    def _get_url_from_stream(self, full_track):
+        """Resolve a playable HTTP URL via the newer playbackinfopostpaywall endpoint.
+
+        Uses get_stream() which supports HI_RES_LOSSLESS and works with all auth
+        types, unlike the legacy urlpostpaywall endpoint which caps at LOSSLESS.
+
+        Returns (url, stream) on success, raises on failure.
+        BTS manifests carry a direct HTTP URL (GStreamer-compatible).
+        MPD manifests are segment-based and not directly usable by playbin, so
+        we raise to let the caller fall back to get_url().
+        """
+        stream = full_track.get_stream()
+        manifest = stream.get_stream_manifest()
+        if not manifest.is_bts:
+            raise ValueError(
+                f"Manifest type not directly playable (mime={stream.manifest_mime_type}); "
+                "will fall back to legacy URL"
+            )
+        urls = manifest.get_urls()
+        if not urls:
+            raise ValueError("Empty URL list in BTS manifest")
+        return urls[0], stream
+
     def get_stream_url(self, track):
         preferred = self.quality
         qualities = self._get_stream_quality_fallback_chain()
@@ -2320,16 +2343,46 @@ class TidalBackend:
                 try:
                     self._apply_session_quality(q)
                     full_track = self.session.track(track.id)
-                    url = full_track.get_url()
-                    if idx > 0:
+
+                    # Prefer the newer playbackinfopostpaywall endpoint (get_stream).
+                    # It supports HI_RES_LOSSLESS; the legacy urlpostpaywall endpoint
+                    # caps at LOSSLESS regardless of subscription.
+                    url = None
+                    stream_info = None
+                    try:
+                        url, stream_info = self._get_url_from_stream(full_track)
+                    except Exception as stream_exc:
+                        logger.debug(
+                            "get_stream() path failed (%s), falling back to get_url(): %s",
+                            type(stream_exc).__name__,
+                            stream_exc,
+                        )
+                        url = full_track.get_url()
+
+                    if idx == 0:
+                        if stream_info is not None:
+                            logger.info(
+                                "Stream resolved for '%s': quality=%s %sbit/%sHz",
+                                getattr(track, "name", "?"),
+                                getattr(stream_info, "audio_quality", q),
+                                getattr(stream_info, "bit_depth", "?"),
+                                getattr(stream_info, "sample_rate", "?"),
+                            )
+                        else:
+                            logger.info(
+                                "Stream URL resolved for '%s' with quality %s",
+                                getattr(track, "name", "?"),
+                                q,
+                            )
+                    else:
                         logger.warning(
-                            "Stream quality fallback used for %s: preferred=%s actual=%s",
+                            "Stream quality fallback for '%s': preferred=%s actual=%s %sbit/%sHz",
                             getattr(track, "name", "unknown"),
                             preferred,
                             q,
+                            getattr(stream_info, "bit_depth", "?") if stream_info else "?",
+                            getattr(stream_info, "sample_rate", "?") if stream_info else "?",
                         )
-                    else:
-                        logger.info("Stream URL resolved for %s with quality %s", track.name, q)
                     return url
                 except Exception as e:
                     last_exc = e
