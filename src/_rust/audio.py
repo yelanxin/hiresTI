@@ -2258,6 +2258,19 @@ class RustAudioPlayerAdapter:
             except Exception:
                 logger.debug("RustAdapter.play: PipeWire retry path failed", exc_info=True)
                 return
+        # If the pipeline is in error state (e.g. device was busy during output switch),
+        # reset it via set_uri before attempting play. This mirrors what happens when the
+        # user selects a new track — set_uri brings the pipeline back from ERROR to READY.
+        if (str(getattr(self, "output_state", "")) == "error"
+                and not getattr(self, "_play_error_retry_active", False)):
+            uri = str(getattr(self, "_last_loaded_uri", "") or "")
+            if uri:
+                logger.info("RustAdapter.play: pipeline in error state, resetting via set_uri before retry")
+                self._play_error_retry_active = True
+                try:
+                    self.set_uri(uri)
+                finally:
+                    self._play_error_retry_active = False
         rc = self._rust.play()
         logger.info(
             "RustAdapter.play: rust play rc=%s driver=%s device=%s",
