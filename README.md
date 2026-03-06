@@ -14,7 +14,6 @@
 - Native Linux UI with GTK4 + Libadwaita
 - TIDAL OAuth login and account-scoped library access
 - TIDAL Max Hi-Res Lossless streaming up to 24-bit / 192kHz
-- Fast collection browsing (Albums, Liked Songs, Artists, Playlists, History)
 - Built-in queue drawer, lyrics support, and visualizer modules
 - MPRIS support (`org.mpris.MediaPlayer2.hiresti`) for desktop media controls
 - Built-in remote control with HTTP JSON-RPC, MCP endpoint.
