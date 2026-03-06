@@ -3897,10 +3897,6 @@ fn card_from_pipewire_output_node(device_id: &str) -> Option<String> {
     let mut core = dev["alsa_output.".len()..].to_string();
     let suffixes = [
         ".analog-stereo",
-        ".pro-output-0",
-        ".pro-output-1",
-        ".pro-output-2",
-        ".pro-output-3",
         ".multichannel-output",
         ".iec958-stereo",
     ];
@@ -3909,6 +3905,17 @@ fn card_from_pipewire_output_node(device_id: &str) -> Option<String> {
             let len = core.len() - sx.len();
             core.truncate(len);
             break;
+        }
+    }
+    // Strip .pro-output-N or .pro-output-N.M (e.g. .pro-output-0.2)
+    if let Some(pos) = core.rfind(".pro-output-") {
+        let rest = &core[pos + ".pro-output-".len()..];
+        let valid = !rest.is_empty()
+            && rest
+                .split('.')
+                .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
+        if valid {
+            core.truncate(pos);
         }
     }
     if core.is_empty() {
