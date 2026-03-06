@@ -430,7 +430,6 @@ def build_settings_page(app):
         app.on_mmap_realtime_priority_changed,
     )
     row_rt.append(app.mmap_realtime_priority_dd)
-    group_out.append(row_rt)
 
     row_lat = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
     lat_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
@@ -520,6 +519,10 @@ def build_settings_page(app):
     app.bit_depth_dd.connect("notify::selected-item", app.on_output_bit_depth_changed)
     row_depth.append(app.bit_depth_dd)
     group_out.append(row_depth)
+
+    saved_driver_init = app.settings.get("driver", "")
+    app.mmap_realtime_priority_dd.set_sensitive(saved_driver_init == "ALSA（mmap）")
+    group_out.append(row_rt)
 
     row_dev = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
     row_dev.append(Gtk.Label(label="Output Device", hexpand=True, xalign=0))

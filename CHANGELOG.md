@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.5.1 - 2026-03-05
+PipeWire device visibility, pro-audio auto-switching, and audio settings layout polish.
+
+### Added
+- Added informational dialog when selecting a PipeWire device that is not in Pro-Audio mode: notifies the user that the device will be automatically switched to Pro-Audio to enable adaptive sample rate.
+- After confirming the pro-audio dialog, the device dropdown now automatically selects the new pro-audio node without requiring manual re-selection.
+
+### Changed
+- `Realtime Audio Priority` setting is now only enabled when the `ALSA（mmap）` driver is selected; it is grayed out for all other drivers.
+- Moved `Realtime Audio Priority` below `Output Bit Depth` in Audio settings for a more logical output-configuration flow.
+
+### Fixed
+- Fixed MUSILAND Monitor 09 (and similar USB audio devices) not appearing in the PipeWire device list: the card fallback logic incorrectly skipped cards whose active profile matched the chosen profile even when no PipeWire sink node existed.
+- Fixed pro-audio profile switch always failing for devices listed via the `pwcardprofile:` fallback path: the Rust API and Python wrapper now both handle the `pwcardprofile:card|profile` device-id format.
+- Fixed device display name showing only the manufacturer name (e.g. "MUSILAND Monitor") instead of the full model name (e.g. "Monitor 09") in non-pro-audio mode: USB index suffix stripping now only removes the trailing bus-index segment (`-NN`) rather than all trailing digits and dashes, and the node `nick` field is preferred when the description ends with "Analog Stereo".
+- Fixed pro-audio target resolution after profile switch for `pwcardprofile:` devices: the resolver now extracts the card base name and locates the corresponding pro-audio node (`alsa_output.*pro-output-*`) in the refreshed device list.
+
+---
+
 ## 1.5.0 - 2026-03-05
 ALSA mmap control and now-playing/layout polish release: explicit `ALSA（auto）` vs `ALSA（mmap）` behavior, mmap realtime-thread tuning, clearer driver guidance, and stronger overlay/list stability with long metadata.
 

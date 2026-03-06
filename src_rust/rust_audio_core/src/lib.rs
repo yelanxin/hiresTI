@@ -3105,21 +3105,160 @@ fn pulseaudio_sink_card_indices() -> HashSet<u32> {
 }
 
 fn pipewire_display_name_from_strings(description: &str, nick: &str, fallback: &str) -> String {
-    let desc = description.trim();
-    let nick = nick.trim();
-    if !desc.is_empty() && !nick.is_empty() {
-        if desc.eq_ignore_ascii_case(nick) {
-            return desc.to_string();
+    fn normalize_ws(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    fn is_generic_pipewire_name(text: &str) -> bool {
+        let clean = normalize_ws(text);
+        if clean.is_empty() {
+            return true;
         }
-        return format!("{desc}/{nick}");
+        let lower = clean.to_ascii_lowercase();
+        if lower == "analog stereo" || lower == "digital stereo" {
+            return true;
+        }
+        if lower == "built-in audio" || lower == "built-in pro audio" || lower == "built-in audio pro" {
+            return true;
+        }
+        if let Some(rest) = lower.strip_prefix("built-in audio pro ") {
+            return !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit());
+        }
+        false
+    }
+
+    fn profile_label_from_node_name(node_name: &str) -> Option<String> {
+        let node = node_name.trim();
+        if !node.starts_with("alsa_output.") {
+            return None;
+        }
+        let (_base, profile) = node["alsa_output.".len()..].rsplit_once('.')?;
+        let label = match profile {
+            "analog-stereo" => "Analog",
+            "iec958-stereo" => "Digital",
+            "hdmi-stereo" => "HDMI 0",
+            p if p.starts_with("hdmi-stereo-extra") => {
+                let idx = p["hdmi-stereo-extra".len()..].trim();
+                if idx.is_empty() || !idx.chars().all(|c| c.is_ascii_digit()) {
+                    return None;
+                }
+                return Some(format!("HDMI {idx}"));
+            }
+            p if p.starts_with("pro-output-") => {
+                let idx = p["pro-output-".len()..].trim();
+                if idx == "0" {
+                    "Analog"
+                } else if !idx.is_empty() && idx.chars().all(|c| c.is_ascii_digit()) {
+                    return Some(format!("Output {idx}"));
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        };
+        Some(label.to_string())
+    }
+
+    fn card_label_from_node_name(node_name: &str) -> Option<String> {
+        let node = node_name.trim();
+        let Some(rest) = node.strip_prefix("alsa_output.") else {
+            return None;
+        };
+        let (base, _profile) = rest.rsplit_once('.')?;
+        let usb = base.strip_prefix("usb-")?;
+        // Strip only the trailing USB bus index "-NN" (last hyphen + all-digit suffix).
+        let usb = if let Some(pos) = usb.rfind('-') {
+            let suffix = &usb[pos + 1..];
+            if !suffix.is_empty() && suffix.chars().all(|c: char| c.is_ascii_digit()) {
+                &usb[..pos]
+            } else {
+                usb
+            }
+        } else {
+            usb
+        };
+        if usb.is_empty() {
+            return None;
+        }
+        let spaced = usb.replace(['_', '.'], " ");
+        let clean = normalize_ws(&spaced);
+        if clean.is_empty() {
+            return None;
+        }
+        if let Some(prefix) = clean.strip_suffix(" USB Audio") {
+            let prefix = prefix.trim();
+            if !prefix.is_empty() {
+                return Some(format!("{prefix} / USB Audio"));
+            }
+        }
+        Some(clean)
+    }
+
+    let desc = normalize_ws(description.trim());
+    let nick = normalize_ws(nick.trim());
+    let fallback = fallback.trim();
+    let fallback_card = card_label_from_node_name(fallback);
+    let fallback_profile = profile_label_from_node_name(fallback);
+
+    if let Some(card) = fallback_card.as_ref() {
+        if desc.to_ascii_lowercase().ends_with("analog stereo") || is_generic_pipewire_name(&desc) {
+            // Prefer nick when it carries the real model name (e.g. "Monitor 09"),
+            // rather than returning a fallback derived from the node path.
+            if desc.to_ascii_lowercase().ends_with("analog stereo")
+                && !nick.is_empty()
+                && !is_generic_pipewire_name(&nick)
+            {
+                return nick.clone();
+            }
+            return card.clone();
+        }
+    }
+
+    if !desc.is_empty() && !nick.is_empty() {
+        if desc.eq_ignore_ascii_case(&nick) {
+            if is_generic_pipewire_name(&desc) {
+                if let Some(card) = fallback_card {
+                    return card;
+                }
+                if let Some(profile) = fallback_profile {
+                    return format!("Built-in Audio / {profile}");
+                }
+            }
+            return desc;
+        }
+        if is_generic_pipewire_name(&desc) && !is_generic_pipewire_name(&nick) {
+            let base = fallback_card.unwrap_or_else(|| "Built-in Audio".to_string());
+            return format!("{base} / {nick}");
+        }
+        return format!("{desc} / {nick}");
     }
     if !desc.is_empty() {
-        return desc.to_string();
+        if is_generic_pipewire_name(&desc) {
+            if let Some(card) = fallback_card {
+                return card;
+            }
+            if let Some(profile) = fallback_profile {
+                return format!("Built-in Audio / {profile}");
+            }
+        }
+        return desc;
     }
     if !nick.is_empty() {
-        return nick.to_string();
+        if let Some(card) = fallback_card {
+            if !is_generic_pipewire_name(&nick) {
+                return format!("{card} / {nick}");
+            }
+            return card;
+        }
+        return nick;
     }
-    fallback.trim().to_string()
+    if let Some(card) = fallback_card {
+        return card;
+    }
+    if let Some(profile) = fallback_profile {
+        return format!("Built-in Audio / {profile}");
+    }
+    fallback.to_string()
 }
 
 fn choose_pipewire_output_profile_from_entries(
@@ -3895,6 +4034,7 @@ fn pulseaudio_set_card_profile(card: &str, profile: &str) -> Result<(), String> 
 
 fn ensure_pipewire_pro_audio_for_device(device_id: &str) -> Result<String, String> {
     let card = card_from_pipewire_output_node(device_id)
+        .or_else(|| parse_pipewire_card_profile_target(device_id).map(|(card, _)| card))
         .ok_or_else(|| "unsupported or empty device id".to_string())?;
     if let Some(active) = pulseaudio_card_active_profile(&card) {
         if active == "pro-audio" {
@@ -4968,19 +5108,46 @@ Playback:
                 "CS4208 Digital",
                 "alsa_output.pci-0000_00_1b.0.pro-output-1",
             ),
-            "Built-in Audio Pro 1/CS4208 Digital".to_string()
+            "Built-in Audio / CS4208 Digital".to_string()
         );
         assert_eq!(
             pipewire_display_name_from_strings(
                 "Built-in Audio Pro",
                 "Built-in Audio Pro",
-                "fallback"
+                "alsa_output.pci-0000_00_1b.0.analog-stereo"
             ),
-            "Built-in Audio Pro".to_string()
+            "Built-in Audio / Analog".to_string()
         );
         assert_eq!(
             pipewire_display_name_from_strings("", "CS4208 Digital", "fallback"),
             "CS4208 Digital".to_string()
+        );
+        assert_eq!(
+            pipewire_display_name_from_strings(
+                "Monitor 09 Analog Stereo",
+                "",
+                "alsa_output.usb-Monitor_09_USB_Audio-00.analog-stereo",
+            ),
+            "Monitor 09 / USB Audio".to_string()
+        );
+        assert_eq!(
+            pipewire_display_name_from_strings(
+                "Built-in Audio Pro 7",
+                "",
+                "alsa_output.pci-0000_00_03.0.hdmi-stereo-extra1",
+            ),
+            "Built-in Audio / HDMI 1".to_string()
+        );
+        // Actual MUSILAND Monitor 09: nick carries the real model name, desc adds
+        // "Analog Stereo" suffix — should return nick directly, not the fallback
+        // card label derived from the node path.
+        assert_eq!(
+            pipewire_display_name_from_strings(
+                "Monitor 09 Analog Stereo",
+                "Monitor 09",
+                "alsa_output.usb-MUSILAND_Monitor_09-00.analog-stereo",
+            ),
+            "Monitor 09".to_string()
         );
     }
 
@@ -4999,4 +5166,5 @@ Playback:
             Some("pro-audio".to_string())
         );
     }
+
 }

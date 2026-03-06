@@ -33,7 +33,7 @@ _NOW_PLAYING_TRACK_INFO_WIDTH = 170
 _NOW_PLAYING_TRACK_ALBUM_WIDTH = 120
 _NOW_PLAYING_TRACK_DURATION_WIDTH = 64
 _NOW_PLAYING_REVEAL_DURATION_MS = 260
-_NOW_PLAYING_LAYOUT_SETTLE_DELAYS_MS = (90, _NOW_PLAYING_REVEAL_DURATION_MS + 40)
+_NOW_PLAYING_LAYOUT_SETTLE_DELAYS_MS = (_NOW_PLAYING_REVEAL_DURATION_MS + 40, _NOW_PLAYING_REVEAL_DURATION_MS + 160)
 _TNUM_ATTR_LIST = Pango.AttrList.from_string("font-features 'tnum=1'")
 # Seconds to look ahead when highlighting the current lyric line, so the
 # highlight arrives slightly before the word is sung rather than after.
@@ -1633,10 +1633,8 @@ def show_now_playing_overlay(self, _btn=None):
         except Exception:
             pass
     _sync_now_playing_dynamic_color_for_current_track(self)
-    self._sync_now_playing_surface_size()
     _schedule_now_playing_surface_resync(self)
-    if not _now_playing_content_is_current(self):
-        self._refresh_now_playing_from_track()
+    needs_refresh = not _now_playing_content_is_current(self)
     if self.now_playing_backdrop is not None:
         self.now_playing_backdrop.set_visible(True)
     if self.now_playing_anchor is not None:
@@ -1650,13 +1648,24 @@ def show_now_playing_overlay(self, _btn=None):
             if getattr(self, "now_playing_revealer", None) is not revealer:
                 return False
             revealer.set_reveal_child(True)
+            self._sync_now_playing_surface_size()
             _schedule_now_playing_surface_resync(self)
-            try:
-                pos_s, dur_s = self.player.get_position()
-                playing_now = bool(self.player.is_playing())
-            except Exception:
-                pos_s, dur_s, playing_now = 0.0, float(getattr(getattr(self, "playing_track", None), "duration", 0) or 0.0), False
-            self._sync_now_playing_overlay_state(pos_s, dur_s, playing_now)
+            if needs_refresh:
+                # Defer content rebuild to next idle so GTK can render the
+                # first animation frame before doing the heavy queue rebuild.
+                def _do_refresh():
+                    if getattr(self, "now_playing_revealer", None) is not revealer:
+                        return False
+                    self._refresh_now_playing_from_track()
+                    return False
+                GLib.idle_add(_do_refresh)
+            else:
+                try:
+                    pos_s, dur_s = self.player.get_position()
+                    playing_now = bool(self.player.is_playing())
+                except Exception:
+                    pos_s, dur_s, playing_now = 0.0, float(getattr(getattr(self, "playing_track", None), "duration", 0) or 0.0), False
+                self._sync_now_playing_overlay_state(pos_s, dur_s, playing_now)
             return False
 
         GLib.idle_add(_begin_reveal)

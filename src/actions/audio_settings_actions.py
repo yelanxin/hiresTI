@@ -305,7 +305,7 @@ def _get_output_probe_intervals(app):
     return 12.0, 20.0
 
 
-def _refresh_devices_for_current_driver_ui_only(app, reason="hotplug-watch"):
+def _refresh_devices_for_current_driver_ui_only(app, reason="hotplug-watch", prefer_device_id=None):
     """Refresh current driver's device dropdown only, without applying output switch."""
     selected_driver = app.driver_dd.get_selected_item()
     if not selected_driver:
@@ -334,7 +334,12 @@ def _refresh_devices_for_current_driver_ui_only(app, reason="hotplug-watch"):
             app.device_dd.set_sensitive(len(devices) > 1)
 
             sel_idx = 0
-            if prefer_name:
+            if prefer_device_id:
+                for i, d in enumerate(devices):
+                    if d.get("device_id") == prefer_device_id:
+                        sel_idx = i
+                        break
+            elif prefer_name:
                 for i, d in enumerate(devices):
                     if d.get("name") == prefer_name:
                         sel_idx = i
@@ -843,6 +848,8 @@ def on_driver_changed(app, dd, p):
                         break
 
             app.device_dd.set_sensitive(len(devices) > 1)
+            if hasattr(app, "mmap_realtime_priority_dd"):
+                app.mmap_realtime_priority_dd.set_sensitive(driver_name == DRIVER_ALSA_MMAP)
 
             if sel_idx < len(devices):
                 app.device_dd.set_selected(sel_idx)
@@ -882,25 +889,76 @@ def on_driver_changed(app, dd, p):
     Thread(target=worker, daemon=True).start()
 
 
+def _pipewire_device_needs_pro_audio(device_id):
+    """Heuristic: True if device_id is not already in/targeting pro-audio mode."""
+    dev = str(device_id or "").strip()
+    if not dev:
+        return False
+    if ".pro-output-" in dev:
+        return False
+    if dev.startswith("pwcardprofile:") and "|pro-audio" in dev:
+        return False
+    return True
+
+
+def _show_pro_audio_switch_info(app, on_confirm):
+    """Informational dialog: device will be auto-switched to pro-audio. Calls on_confirm after OK."""
+    dialog = Gtk.Dialog(title="Pro-Audio Mode", transient_for=app.win, modal=True)
+    root = Gtk.Box(
+        orientation=Gtk.Orientation.VERTICAL,
+        spacing=12,
+        margin_top=16,
+        margin_bottom=16,
+        margin_start=20,
+        margin_end=20,
+    )
+    msg = Gtk.Label(
+        label=(
+            "The selected device is not in Pro-Audio mode.\n\n"
+            "It will be automatically switched to Pro-Audio to enable adaptive sample rate switching."
+        ),
+        wrap=True,
+        xalign=0.0,
+        max_width_chars=48,
+    )
+    root.append(msg)
+    action_row = Gtk.Box(spacing=8, halign=Gtk.Align.END)
+    ok_btn = Gtk.Button(label="OK", css_classes=["suggested-action"])
+    ok_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.OK))
+    action_row.append(ok_btn)
+    root.append(action_row)
+    dialog.set_child(root)
+
+    def _on_response(d, _resp):
+        d.destroy()
+        on_confirm()
+
+    dialog.connect("response", _on_response)
+    dialog.present()
+
+
 def on_device_changed(app, dd, p):
     if app.ignore_device_change:
         return
     _stop_output_hotplug_watch(app)
     _touch_output_probe_burst(app, seconds=30)
     idx = dd.get_selected()
-    if hasattr(app, "current_device_list") and idx < len(app.current_device_list):
-        device_info = app.current_device_list[idx]
-        previous_name = str(getattr(app, "current_device_name", "") or "")
-        previous_saved = str(app.settings.get("device", "") or "")
-        previous_idx = None
-        for i, info in enumerate(list(getattr(app, "current_device_list", []) or [])):
-            if str(info.get("name", "") or "") == previous_name:
-                previous_idx = i
-                break
-        remembered_name = str(getattr(app, "_last_disconnected_device_name", "") or "")
-        target_name = device_info["name"]
-        driver_label = app.driver_dd.get_selected_item().get_string()
-        _sync_output_bit_depth_dropdown(app, device_info)
+    if not (hasattr(app, "current_device_list") and idx < len(app.current_device_list)):
+        return
+    device_info = app.current_device_list[idx]
+    previous_name = str(getattr(app, "current_device_name", "") or "")
+    previous_saved = str(app.settings.get("device", "") or "")
+    previous_idx = None
+    for i, info in enumerate(list(getattr(app, "current_device_list", []) or [])):
+        if str(info.get("name", "") or "") == previous_name:
+            previous_idx = i
+            break
+    remembered_name = str(getattr(app, "_last_disconnected_device_name", "") or "")
+    target_name = device_info["name"]
+    driver_label = app.driver_dd.get_selected_item().get_string()
+    _sync_output_bit_depth_dropdown(app, device_info)
+
+    def _do_switch():
         ok = app.player.set_output(driver_label, device_info["device_id"])
         if not ok:
             if previous_idx is not None and previous_idx != idx:
@@ -931,6 +989,19 @@ def on_device_changed(app, dd, p):
         if hasattr(app, "_apply_viz_sync_offset_for_device"):
             app._apply_viz_sync_offset_for_device(driver_label, device_id=device_info["device_id"], device_name=target_name)
         update_output_status_ui(app)
+
+    if (driver_label == "PipeWire"
+            and bool(getattr(app.player, "active_rate_switch", False))
+            and _pipewire_device_needs_pro_audio(device_info.get("device_id"))):
+        def _do_switch_and_refresh():
+            _do_switch()
+            new_id = str(getattr(app.player, "requested_device_id", "") or "")
+            _refresh_devices_for_current_driver_ui_only(
+                app, reason="pro-audio-switch", prefer_device_id=new_id or None
+            )
+        _show_pro_audio_switch_info(app, _do_switch_and_refresh)
+    else:
+        _do_switch()
 
 
 def on_output_bit_depth_changed(app, dd, p):

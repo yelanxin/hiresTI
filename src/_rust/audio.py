@@ -725,8 +725,6 @@ class RustAudioPlayerAdapter:
             dev = str(device_id or "").strip()
             if not dev:
                 return False
-            if dev.startswith("pwcardprofile:"):
-                return False
             last_rc = -1
             for attempt in range(1, 4):
                 rc_rust = int(self._rust.set_pipewire_pro_audio(dev))
@@ -905,11 +903,26 @@ class RustAudioPlayerAdapter:
         """
         try:
             dev = str(device_id or "").strip()
+            devices = self._rust.list_devices("PipeWire") or []
+            ids = [str(d.get("device_id") or "").strip() for d in devices]
+
+            # Handle pwcardprofile: format (e.g. pwcardprofile:alsa_card.usb-FOO|analog-stereo)
+            if dev.startswith("pwcardprofile:"):
+                card_part = dev[len("pwcardprofile:"):]
+                card_name = card_part.split("|")[0]  # e.g. alsa_card.usb-MUSILAND_Monitor_09-00
+                alsa_base = card_name.replace("alsa_card.", "")  # e.g. usb-MUSILAND_Monitor_09-00
+                node_prefix = "alsa_output." + alsa_base + "."
+                matching = [i for i in ids if i.startswith(node_prefix)]
+                if not matching:
+                    return device_id
+                for cand in matching:
+                    if ".pro-" in cand:
+                        return cand
+                return matching[0]
+
             if not dev.startswith("alsa_output.") or "." not in dev:
                 return device_id
             base, _old_profile = dev.rsplit(".", 1)
-            devices = self._rust.list_devices("PipeWire") or []
-            ids = [str(d.get("device_id") or "").strip() for d in devices]
             same_base = [i for i in ids if i.startswith(base + ".")]
             if not same_base:
                 return device_id
