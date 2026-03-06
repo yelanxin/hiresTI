@@ -1947,15 +1947,23 @@ def render_top_dashboard(app, prefer_cache=True):
                     if not pairs:
                         clicked = list(items or [])[clicked_src_idx] if 0 <= clicked_src_idx < len(list(items or [])) else None
                         if clicked is not None:
-                            _open_item(clicked)
+                            GLib.idle_add(lambda: (_open_item(clicked), False)[1])
                         return
 
                     tracks = [t for _, t in pairs]
-                    play_idx = 0
+                    play_idx = None
                     for i, (src_idx, _t) in enumerate(pairs):
                         if src_idx == clicked_src_idx:
                             play_idx = i
                             break
+
+                    if play_idx is None:
+                        # Clicked item didn't resolve as a playable track (e.g. mix/album
+                        # in a mixed section) — open it instead of silently playing track 0.
+                        clicked = list(items or [])[clicked_src_idx] if 0 <= clicked_src_idx < len(list(items or [])) else None
+                        if clicked is not None:
+                            GLib.idle_add(lambda: (_open_item(clicked), False)[1])
+                        return
 
                     def apply():
                         app.current_track_list = list(tracks)
@@ -2305,15 +2313,21 @@ def render_new_dashboard(app, prefer_cache=True):
                     if not pairs:
                         clicked = list(items or [])[clicked_src_idx] if 0 <= clicked_src_idx < len(list(items or [])) else None
                         if clicked is not None:
-                            _open_item(clicked)
+                            GLib.idle_add(lambda: (_open_item(clicked), False)[1])
                         return
 
                     tracks = [t for _, t in pairs]
-                    play_idx = 0
+                    play_idx = None
                     for i, (src_idx, _t) in enumerate(pairs):
                         if src_idx == clicked_src_idx:
                             play_idx = i
                             break
+
+                    if play_idx is None:
+                        clicked = list(items or [])[clicked_src_idx] if 0 <= clicked_src_idx < len(list(items or [])) else None
+                        if clicked is not None:
+                            GLib.idle_add(lambda: (_open_item(clicked), False)[1])
+                        return
 
                     def apply():
                         app.current_track_list = list(tracks)

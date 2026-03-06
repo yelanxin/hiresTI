@@ -2335,18 +2335,18 @@ class TidalBackend:
             return urls[0], stream
 
         if manifest.is_mpd:
-            # Write the MPD XML to a reusable temp file.  GStreamer's dashdemux
-            # will parse it and fetch the segment URLs (which are absolute HTTPS
-            # URLs embedded in the manifest).
+            # Write the MPD XML to a per-track temp file.  Using a shared single
+            # file caused a race condition: the prefetch thread overwrote the file
+            # for the current track before GStreamer finished reading it, causing
+            # GStreamer to load the wrong track's segments.
             mpd_xml = stream.get_manifest_data()
-            if not hasattr(self, "_mpd_tmp_path") or not self._mpd_tmp_path:
-                fd, self._mpd_tmp_path = tempfile.mkstemp(
-                    suffix=".mpd", prefix="hiresti_"
-                )
-                os.close(fd)
-            with open(self._mpd_tmp_path, "w", encoding="utf-8") as f:
+            track_id = str(getattr(full_track, "id", "") or "tmp")
+            tmp_path = os.path.join(
+                tempfile.gettempdir(), f"hiresti_{track_id}.mpd"
+            )
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 f.write(mpd_xml)
-            return f"file://{self._mpd_tmp_path}", stream
+            return f"file://{tmp_path}", stream
 
         raise ValueError(f"Unknown manifest type: {stream.manifest_mime_type}")
 
