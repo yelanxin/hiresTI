@@ -12,6 +12,7 @@
 - A high performance Rust audio engine core
 - Native Linux UI with GTK4 + Libadwaita
 - TIDAL OAuth login and account-scoped library access
+- TIDAL Max Hi-Res Lossless streaming up to 24-bit / 192kHz
 - Bit-perfect playback flow with optional exclusive output controls
 - Fast collection browsing (Albums, Liked Songs, Artists, Queue, History)
 - Cloud playlist management with folder support and cover collage previews
