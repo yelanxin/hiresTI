@@ -1774,6 +1774,15 @@ impl Engine {
         if self.last_depth > 0 {
             parts.push(format!("depth={}", self.last_depth));
         }
+        // Always include parsed source format alongside the output format so the
+        // UI can display the original media resolution (e.g. 24-bit/96kHz) rather
+        // than the internal pipeline container format (e.g. S32LE = 32-bit).
+        if self.source_rate > 0 {
+            parts.push(format!("source_rate={}", self.source_rate));
+        }
+        if self.source_depth > 0 {
+            parts.push(format!("source_depth={}", self.source_depth));
+        }
         if !parts.is_empty() {
             self.emit_event(EVT_TAG, &parts.join(";"));
         }

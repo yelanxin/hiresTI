@@ -1247,6 +1247,34 @@ class RustAudioPlayerAdapter:
                 info["depth"] = dv
                 changed = True
 
+        # source_rate / source_depth: parsed by Rust from the GStreamer TAG codec
+        # text (e.g. "FLAC, 192000 Hz, 24-bit").  These reflect the original media
+        # resolution and take precedence over the output container format (S32LE)
+        # for display purposes.
+        src_rate = fields.get("source_rate")
+        if src_rate is not None:
+            try:
+                srv = int(float(src_rate))
+            except Exception:
+                srv = 0
+            if srv > 0 and int(info.get("source_rate", 0) or 0) != srv:
+                info["source_rate"] = srv
+                if int(info.get("rate", 0) or 0) <= 0:
+                    info["rate"] = srv
+                changed = True
+
+        src_depth = fields.get("source_depth")
+        if src_depth is not None:
+            try:
+                sdv = int(float(src_depth))
+            except Exception:
+                sdv = 0
+            if sdv > 0 and int(info.get("source_depth", 0) or 0) != sdv:
+                info["source_depth"] = sdv
+                if int(info.get("depth", 0) or 0) <= 0:
+                    info["depth"] = sdv
+                changed = True
+
         out_rate_v = int(info.get("output_rate", 0) or 0)
         out_depth_v = int(info.get("output_depth", 0) or 0)
         if out_rate_v > 0 and out_depth_v > 0:
