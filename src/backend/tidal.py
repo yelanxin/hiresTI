@@ -2312,27 +2312,43 @@ class TidalBackend:
                     self._artist_artwork_cache.popitem(last=False)
 
     def _get_url_from_stream(self, full_track):
-        """Resolve a playable HTTP URL via the newer playbackinfopostpaywall endpoint.
+        """Resolve a playable URI via the newer playbackinfopostpaywall endpoint.
 
         Uses get_stream() which supports HI_RES_LOSSLESS and works with all auth
         types, unlike the legacy urlpostpaywall endpoint which caps at LOSSLESS.
 
-        Returns (url, stream) on success, raises on failure.
-        BTS manifests carry a direct HTTP URL (GStreamer-compatible).
-        MPD manifests are segment-based and not directly usable by playbin, so
-        we raise to let the caller fall back to get_url().
+        Returns (uri, stream) on success, raises on failure.
+        - BTS manifests: direct HTTP URL, GStreamer handles natively.
+        - MPD manifests: written to a temp file and returned as file:// URI so
+          GStreamer's dashdemux (gst-plugins-bad) can parse and fetch segments.
         """
+        import os
+        import tempfile
+
         stream = full_track.get_stream()
         manifest = stream.get_stream_manifest()
-        if not manifest.is_bts:
-            raise ValueError(
-                f"Manifest type not directly playable (mime={stream.manifest_mime_type}); "
-                "will fall back to legacy URL"
-            )
-        urls = manifest.get_urls()
-        if not urls:
-            raise ValueError("Empty URL list in BTS manifest")
-        return urls[0], stream
+
+        if manifest.is_bts:
+            urls = manifest.get_urls()
+            if not urls:
+                raise ValueError("Empty URL list in BTS manifest")
+            return urls[0], stream
+
+        if manifest.is_mpd:
+            # Write the MPD XML to a reusable temp file.  GStreamer's dashdemux
+            # will parse it and fetch the segment URLs (which are absolute HTTPS
+            # URLs embedded in the manifest).
+            mpd_xml = stream.get_manifest_data()
+            if not hasattr(self, "_mpd_tmp_path") or not self._mpd_tmp_path:
+                fd, self._mpd_tmp_path = tempfile.mkstemp(
+                    suffix=".mpd", prefix="hiresti_"
+                )
+                os.close(fd)
+            with open(self._mpd_tmp_path, "w", encoding="utf-8") as f:
+                f.write(mpd_xml)
+            return f"file://{self._mpd_tmp_path}", stream
+
+        raise ValueError(f"Unknown manifest type: {stream.manifest_mime_type}")
 
     def get_stream_url(self, track):
         preferred = self.quality
