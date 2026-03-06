@@ -81,7 +81,13 @@ def _prefetch_next_track(app, current_index):
             "artwork_url": app.backend.get_artwork_url(next_track, 320),
         }
 
-        cache[track_id] = {"url": prefetch_url, "quality": quality_key, "meta": meta}
+        cache[track_id] = {
+            "url": prefetch_url,
+            "quality": quality_key,
+            "meta": meta,
+            "bit_depth": getattr(app.backend, "_last_stream_bit_depth", 0),
+            "sample_rate": getattr(app.backend, "_last_stream_sample_rate", 0),
+        }
         if len(cache) > MAX_PREFETCH_CACHE:
             oldest_key = next(iter(cache))
             cache.pop(oldest_key, None)
@@ -294,12 +300,18 @@ def play_track(app, index):
             cached = cache.get(track.id)
             url = None
             max_tracks = int(getattr(app, "audio_cache_tracks", 0) or 0)
+            bit_depth = 0
+            sample_rate = 0
             if cached and cached.get("quality") == quality_key and cached.get("url"):
                 url = cached.get("url")
+                bit_depth = int(cached.get("bit_depth", 0) or 0)
+                sample_rate = int(cached.get("sample_rate", 0) or 0)
                 cache.pop(track.id, None)
                 logger.debug("Using prefetched stream url for track: %s", track.id)
             else:
                 url = app.backend.get_stream_url(track)
+                bit_depth = int(getattr(app.backend, "_last_stream_bit_depth", 0) or 0)
+                sample_rate = int(getattr(app.backend, "_last_stream_sample_rate", 0) or 0)
 
             if url and max_tracks > 0 and str(url).startswith("http"):
                 Thread(
@@ -317,6 +329,8 @@ def play_track(app, index):
                     if request_id != getattr(app, "_play_request_id", 0):
                         return False
                     prev_state = str(getattr(app.player, "output_state", "idle") or "idle")
+                    if hasattr(app.player, "hint_source_format") and (bit_depth or sample_rate):
+                        app.player.hint_source_format(bit_depth, sample_rate)
                     app.player.load(url)
                     app.player.play()
                     audio_settings_actions.update_output_status_ui(app)

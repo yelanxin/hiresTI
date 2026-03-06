@@ -29,6 +29,11 @@ def restart_player_with_url(app, url, pos):
     if not url:
         return
     app.player.stop()
+    if hasattr(app.player, "hint_source_format"):
+        bd = int(getattr(app.backend, "_last_stream_bit_depth", 0) or 0)
+        sr = int(getattr(app.backend, "_last_stream_sample_rate", 0) or 0)
+        if bd or sr:
+            app.player.hint_source_format(bd, sr)
     app.player.load(url)
     app.player.play()
     GLib.timeout_add(700, lambda: app.player.seek(pos))

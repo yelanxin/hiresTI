@@ -2375,6 +2375,15 @@ class TidalBackend:
                         )
                         url = full_track.get_url()
 
+                    # Cache source format from TIDAL API for the player to inject
+                    # into stream_info (GStreamer TAGs don't carry Hz/-bit info).
+                    self._last_stream_bit_depth = int(
+                        getattr(stream_info, "bit_depth", 0) or 0
+                    )
+                    self._last_stream_sample_rate = int(
+                        getattr(stream_info, "sample_rate", 0) or 0
+                    )
+
                     if idx == 0:
                         if stream_info is not None:
                             logger.info(

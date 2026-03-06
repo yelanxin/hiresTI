@@ -2179,6 +2179,15 @@ class RustAudioPlayerAdapter:
         finally:
             self._rust.close()
 
+    def hint_source_format(self, bit_depth, sample_rate):
+        """Store source format from the TIDAL API to inject on next load().
+
+        GStreamer TAG messages for FLAC do not carry Hz/-bit info, so the
+        values must be supplied externally before load() is called.
+        """
+        self._pending_source_depth = int(bit_depth or 0)
+        self._pending_source_rate = int(sample_rate or 0)
+
     def load(self, uri):
         try:
             self._last_loaded_uri = str(uri or "")
@@ -2197,15 +2206,19 @@ class RustAudioPlayerAdapter:
             logger.warning("RustAdapter.load blocked: PipeWire rate pre-adjust failed")
             return
         prev = dict(getattr(self, "stream_info", {}) or {})
+        pending_sr = int(getattr(self, "_pending_source_rate", 0) or 0)
+        pending_sd = int(getattr(self, "_pending_source_depth", 0) or 0)
+        self._pending_source_rate = 0
+        self._pending_source_depth = 0
         self.stream_info = {
             "codec": "Loading...",
             "bitrate": 0,
-            "rate": int(prev.get("rate", 0) or 0),
-            "depth": int(prev.get("depth", 0) or 0),
+            "rate": pending_sr or int(prev.get("rate", 0) or 0),
+            "depth": pending_sd or int(prev.get("depth", 0) or 0),
             "fmt_str": prev.get("fmt_str", ""),
-            "source_rate": int(prev.get("source_rate", 0) or 0),
-            "source_depth": int(prev.get("source_depth", 0) or 0),
-            "source_fmt_str": prev.get("source_fmt_str", ""),
+            "source_rate": pending_sr or 0,
+            "source_depth": pending_sd or 0,
+            "source_fmt_str": "",
             "output_rate": 0,
             "output_depth": 0,
             "output_fmt_str": "",
