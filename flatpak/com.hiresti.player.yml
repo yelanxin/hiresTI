@@ -23,6 +23,7 @@ finish-args:
   - --filesystem=xdg-run/pipewire-0
   - --device=dri
   - --talk-name=org.freedesktop.secrets
+  - --talk-name=org.freedesktop.Flatpak
 
 modules:
   - python3-requirements.json

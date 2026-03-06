@@ -901,11 +901,6 @@ def _pipewire_device_needs_pro_audio(device_id):
     return True
 
 
-def _is_flatpak():
-    import os
-    return os.path.exists("/.flatpak-info")
-
-
 def _show_pro_audio_switch_info(app, on_confirm):
     """Informational dialog: device will be auto-switched to pro-audio. Calls on_confirm after OK."""
     dialog = Gtk.Dialog(title="Pro-Audio Mode", transient_for=app.win, modal=True)
@@ -917,20 +912,11 @@ def _show_pro_audio_switch_info(app, on_confirm):
         margin_start=20,
         margin_end=20,
     )
-    if _is_flatpak():
-        label_text = (
-            "The selected device is not in Pro-Audio mode.\n\n"
-            "Due to Flatpak sandbox restrictions, automatic switching is not available. "
-            "Please switch this device to Pro-Audio manually in GNOME Settings → Sound, "
-            "then re-select it here."
-        )
-    else:
-        label_text = (
+    msg = Gtk.Label(
+        label=(
             "The selected device is not in Pro-Audio mode.\n\n"
             "It will be automatically switched to Pro-Audio to enable adaptive sample rate switching."
-        )
-    msg = Gtk.Label(
-        label=label_text,
+        ),
         wrap=True,
         xalign=0.0,
         max_width_chars=48,
@@ -945,8 +931,7 @@ def _show_pro_audio_switch_info(app, on_confirm):
 
     def _on_response(d, _resp):
         d.destroy()
-        if not _is_flatpak():
-            on_confirm()
+        on_confirm()
 
     dialog.connect("response", _on_response)
     dialog.present()

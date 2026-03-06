@@ -716,15 +716,64 @@ class RustAudioPlayerAdapter:
     _ERR_NETWORK_KEYS = ("timeout", "timed out", "network", "connection", "dns", "tls", "ssl")
     _ERR_CODEC_KEYS = ("decode", "decoder", "codec", "not-negotiated", "caps", "demux", "parser")
 
+    @staticmethod
+    def _card_name_from_device_id(device_id):
+        """Extract ALSA card name from a PipeWire device_id string."""
+        dev = str(device_id or "").strip()
+        if dev.startswith("pwcardprofile:"):
+            card_part = dev[len("pwcardprofile:"):]
+            return card_part.split("|")[0]
+        if dev.startswith("alsa_output."):
+            base = dev[len("alsa_output."):].rsplit(".", 1)[0]
+            return "alsa_card." + base
+        return None
+
+    def _ensure_pro_audio_via_flatpak_spawn(self, device_id):
+        """
+        Flatpak path: escape sandbox via flatpak-spawn --host and run pactl on the host.
+        Needed because WirePlumber denies card profile changes from sandboxed PA clients.
+        """
+        import subprocess
+        card = self._card_name_from_device_id(device_id)
+        if not card:
+            logger.warning("_ensure_pro_audio_via_flatpak_spawn: cannot extract card from %s", device_id)
+            return False
+        for attempt in range(1, 4):
+            try:
+                result = subprocess.run(
+                    ["flatpak-spawn", "--host", "pactl", "set-card-profile", card, "pro-audio"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode == 0:
+                    logger.info(
+                        "PipeWire pro-audio profile set via flatpak-spawn --host: card=%s attempt=%d",
+                        card, attempt,
+                    )
+                    time.sleep(0.12)
+                    return True
+                logger.debug(
+                    "flatpak-spawn --host pactl failed (attempt %d): %s",
+                    attempt, result.stderr.strip(),
+                )
+            except Exception:
+                logger.debug("flatpak-spawn --host failed", exc_info=True)
+            time.sleep(0.12)
+        logger.warning("Failed to set pro-audio via flatpak-spawn --host: card=%s", card)
+        return False
+
     def _ensure_pipewire_pro_audio_profile(self, device_id):
         """
         Ask Rust core to switch matching card profile to pro-audio.
+        In Flatpak, WirePlumber blocks the PA compat call, so escape via flatpak-spawn --host.
         Keep retries to absorb transient session-manager delays.
         """
         try:
             dev = str(device_id or "").strip()
             if not dev:
                 return False
+            import os
+            if os.path.exists("/.flatpak-info"):
+                return self._ensure_pro_audio_via_flatpak_spawn(dev)
             last_rc = -1
             for attempt in range(1, 4):
                 rc_rust = int(self._rust.set_pipewire_pro_audio(dev))
