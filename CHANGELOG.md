@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.5.1 - 2026-03-05
+## 1.5.2 - 2026-03-05
 PipeWire device visibility, pro-audio auto-switching, and audio settings layout polish.
 
 ### Added
