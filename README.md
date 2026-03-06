@@ -10,10 +10,10 @@
 ## Highlights
 
 - A high performance Rust audio engine core
+- Bit-perfect playback flow with optional exclusive output controls
 - Native Linux UI with GTK4 + Libadwaita
 - TIDAL OAuth login and account-scoped library access
 - TIDAL Max Hi-Res Lossless streaming up to 24-bit / 192kHz
-- Bit-perfect playback flow with optional exclusive output controls
 - Fast collection browsing (Albums, Liked Songs, Artists, Playlists, History)
 - Built-in queue drawer, lyrics support, and visualizer modules
 - MPRIS support (`org.mpris.MediaPlayer2.hiresti`) for desktop media controls
