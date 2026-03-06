@@ -854,6 +854,14 @@ fn alsa_mmap_writer_thread(
     let mut ctx: Option<AlsaMmapCtx> = None;
     let mut last_rate: u32 = 0;
     let mut open_fail_count: u32 = 0;
+    // Tracks idle pre-warm attempts (separate from open_fail_count which is
+    // used only when samples are flowing).
+    let mut idle_open_attempts: u32 = 0;
+    // True once the first PCM sample has been received.  Used to decide
+    // whether to release the ALSA handle on pipeline-NULL transitions: we
+    // hold the pre-warmed handle until actual playback begins so the device
+    // is already open when the user clicks play.
+    let mut ever_playing = false;
     let mut dma_locked = false;
 
     loop {
@@ -867,10 +875,80 @@ fn alsa_mmap_writer_thread(
             appsink.emit_by_name::<Option<gst::Sample>>("try-pull-sample", &[&100_000_000u64]);
         let sample = match sample {
             None => {
-                ctx = None;
+                // Release the ALSA handle only once we have been actively
+                // playing.  Before the first play, keep a pre-warmed handle
+                // open so the device is ready immediately when play starts.
+                if ever_playing {
+                    ctx = None;
+                }
                 accum.clear();
                 if stop.load(Ordering::Relaxed) {
                     break;
+                }
+                // Pre-warm: while the pipeline is idle (NULL/READY), try to
+                // open the ALSA device in the background.  This is especially
+                // important after switching away from the PipeWire driver:
+                // PipeWire releases its hold on the ALSA device asynchronously,
+                // so retrying here (with backoff) ensures the device is free
+                // before the user clicks play.
+                if ctx.is_none() && idle_open_attempts < 20 {
+                    let rate = if last_rate > 0 { last_rate } else { 44100 };
+                    let pf = frames_for_duration_us(period_us, rate, 64, 4096);
+                    let bf = frames_for_duration_us(
+                        target_buffer_us,
+                        rate,
+                        pf.saturating_mul(2),
+                        16_384,
+                    );
+                    match AlsaMmapCtx::open(
+                        &device,
+                        rate,
+                        pf as u32,
+                        bf as u32,
+                        audio_format.alsa_format,
+                        audio_format.frame_bytes,
+                        audio_format.log_label,
+                    ) {
+                        Ok(c) => {
+                            eprintln!(
+                                "[alsa-mmap] pre-warmed {} format={} rate={}",
+                                device, c.format_label, c.rate
+                            );
+                            update_mmap_thread_diagnostics(&diagnostics, |state| {
+                                state.negotiated_rate = c.rate;
+                                state.period_frames = c.period_frames;
+                                state.buffer_frames = c.buffer_frames;
+                            });
+                            last_rate = rate;
+                            idle_open_attempts = 0;
+                            if !dma_locked {
+                                unsafe { libc::mlockall(libc::MCL_CURRENT) };
+                                dma_locked = true;
+                            }
+                            ctx = Some(c);
+                        }
+                        Err(e) => {
+                            idle_open_attempts += 1;
+                            eprintln!(
+                                "[alsa-mmap] pre-warm attempt {}: {} \
+                                 — device busy (PipeWire still releasing?)",
+                                idle_open_attempts, e
+                            );
+                            if idle_open_attempts == 3 {
+                                push_thread_event(
+                                    &events,
+                                    EVT_ERROR,
+                                    format!(
+                                        "alsa-mmap open failed after {} attempts: {}",
+                                        idle_open_attempts, e
+                                    ),
+                                );
+                            }
+                            let backoff_ms = if idle_open_attempts <= 5 { 200 } else { 300 };
+                            thread::sleep(Duration::from_millis(backoff_ms));
+                            continue;
+                        }
+                    }
                 }
                 // In NULL/READY or during short route rebuild gaps, appsink can
                 // return immediately without blocking. Back off a little here so
@@ -880,6 +958,10 @@ fn alsa_mmap_writer_thread(
             }
             Some(s) => s,
         };
+
+        // First sample received — switch to active-playback mode.
+        ever_playing = true;
+        idle_open_attempts = 0;
 
         // Detect sample rate; (re)open ALSA when it changes.
         let rate = sample
