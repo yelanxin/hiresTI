@@ -950,8 +950,7 @@ fn alsa_mmap_writer_thread(
                             ),
                         );
                     }
-                    // Give up only after a sustained run of failures (~20 × 100 ms
-                    // pull-timeout ≈ 2 s of retries after the initial error event).
+                    // Give up only after a sustained run of failures (~20 × backoff ≈ 4 s).
                     if open_fail_count >= 20 {
                         eprintln!(
                             "[alsa-mmap] giving up after {} failures, stopping mmap thread",
@@ -959,7 +958,11 @@ fn alsa_mmap_writer_thread(
                         );
                         break;
                     }
-                    // Keep pulling samples so the appsink does not stall the pipeline.
+                    // Back off between open attempts so PipeWire/WirePlumber has time
+                    // to release the ALSA device after the previous driver disconnects.
+                    // Early attempts: 200 ms; later attempts: 300 ms.
+                    let backoff_ms = if open_fail_count <= 5 { 200 } else { 300 };
+                    thread::sleep(Duration::from_millis(backoff_ms));
                     continue;
                 }
             }
