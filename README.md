@@ -120,6 +120,8 @@ flatpak run com.hiresti.player
 >
 > User data is stored under `~/.var/app/com.hiresti.player/`.
 
+> ⚠️ **Flatpak limitations:** Due to sandbox restrictions, some audio features (such as automatic Pro-Audio profile switching) may have reduced functionality compared to native packages. For the best experience, it is recommended to use the native package for your distribution (RPM, DEB, or Arch).
+
 
 ## Upgrade Guide
 
