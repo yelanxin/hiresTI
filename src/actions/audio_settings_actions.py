@@ -826,6 +826,12 @@ def on_driver_changed(app, dd, p):
         app.settings["driver"] = driver_name
         app.save_settings()
 
+    # Stop playback and release the current audio path before switching driver,
+    # so the device is free when the new driver (e.g. ALSA exclusive) opens it.
+    if app.player.is_playing():
+        app.player.pause()
+    app.player.stop()
+
     app.current_device_name = "Default"
     app.update_tech_label(app.player.stream_info)
 
