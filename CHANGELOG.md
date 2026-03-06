@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.5.3 - 2026-03-05
+**Critical audio quality fix**: streaming now correctly delivers Hi-Res Lossless (up to 24-bit/192kHz) and source format is accurately reported throughout the UI.
+
+### Fixed
+- **[Critical] Fixed TIDAL streaming capped at CD quality (16-bit/44.1kHz)**: The player was using a legacy API endpoint (`urlpostpaywall`) that does not support HI_RES_LOSSLESS. Switched to the `playbackinfopostpaywall` endpoint (`get_stream()`) which correctly delivers TIDAL Max Hi-Res Lossless streams. Added support for both BTS (direct URL) and MPD (MPEG-DASH manifest) stream formats returned by the new endpoint.
+- **[Critical] Fixed source format display always showing 32-bit/192kHz**: The audio engine's internal mmap container format (S32LE) was being reported as the source bit depth/sample rate instead of the actual TIDAL stream metadata. Source format is now injected directly from the TIDAL API (`Stream.bit_depth` / `Stream.sample_rate`) before each load, bypassing the unreliable GStreamer TAG text parser.
+- Fixed Signal Path page showing incorrect source bit depth and sample rate: now reads from stream metadata (set by TIDAL API) rather than the Rust audio engine snapshot, which only reflects the internal PCM container format.
+- Fixed ALSA mmap "device busy" error when switching from PipeWire to ALSA mmap driver: the mmap writer thread now pre-warms the ALSA device handle during idle, avoiding a race condition where the device was still held by PipeWire when the first audio frame arrived.
+
+---
+
 ## 1.5.2 - 2026-03-05
 PipeWire device visibility, pro-audio auto-switching, and audio settings layout polish.
 

@@ -497,8 +497,9 @@ class AudioSignalPathWindow(Adw.Window):
 
         sample_rate = "Unknown"
         bit_depth = "Unknown"
-        src_rate = int(snap_src.get("rate", 0) or 0)
-        src_depth = int(snap_src.get("depth", 0) or 0)
+        _si = getattr(self.player, "stream_info", {}) or {}
+        src_rate = int(_si.get("source_rate", 0) or snap_src.get("rate", 0) or 0)
+        src_depth = int(_si.get("source_depth", 0) or snap_src.get("depth", 0) or 0)
         if src_rate > 0:
             sample_rate = f"{src_rate/1000.0:g}kHz"
         if src_depth > 0:
@@ -690,8 +691,9 @@ class AudioSignalPathWindow(Adw.Window):
             snap_out = {}
         sample_rate = "Unknown"
         bit_depth = "Unknown"
-        src_rate = int(snap_src.get("rate", 0) or 0)
-        src_depth = int(snap_src.get("depth", 0) or 0)
+        _si = getattr(self.player, "stream_info", {}) or {}
+        src_rate = int(_si.get("source_rate", 0) or snap_src.get("rate", 0) or 0)
+        src_depth = int(_si.get("source_depth", 0) or snap_src.get("depth", 0) or 0)
         if src_rate > 0:
             sample_rate = f"{src_rate/1000.0:g}kHz"
         if src_depth > 0:
@@ -1096,8 +1098,9 @@ class AudioSignalPathWindow(Adw.Window):
         )
         sample_rate = "Unknown"
         bit_depth = "Unknown"
-        src_rate = int(snap_src.get("rate", 0) or 0)
-        src_depth = int(snap_src.get("depth", 0) or 0)
+        _si = getattr(self.player, "stream_info", {}) or {}
+        src_rate = int(_si.get("source_rate", 0) or snap_src.get("rate", 0) or 0)
+        src_depth = int(_si.get("source_depth", 0) or snap_src.get("depth", 0) or 0)
         if src_rate > 0:
             sample_rate = f"{src_rate/1000.0:g}kHz"
         if src_depth > 0:

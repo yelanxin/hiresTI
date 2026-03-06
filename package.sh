@@ -23,7 +23,7 @@ else
 fi
 
 if [ -z "$TYPE" ] || [ -z "$VERSION" ]; then
-    echo "Usage: ./package.sh [deb|rpm|rpm-fedora|rpm-el9|arch|flatpak|all] [version]"
+    echo "Usage: ./package.sh [deb|rpm|rpm-fedora|rpm-el9|arch|flatpak|all] [version]  (note: 'all' skips flatpak)"
     echo "Example: ./package.sh all 1.0.0"
     exit 1
 fi
@@ -43,7 +43,7 @@ if [[ "$TYPE" == "arch" || "$TYPE" == "all" ]] && ! command -v zstd &> /dev/null
     exit 1
 fi
 
-if [[ "$TYPE" == "flatpak" || "$TYPE" == "all" ]] && ! command -v flatpak-builder &> /dev/null; then
+if [[ "$TYPE" == "flatpak" ]] && ! command -v flatpak-builder &> /dev/null; then
     echo "Error: 'flatpak-builder' is required for Flatpak build."
     exit 1
 fi
@@ -514,8 +514,6 @@ EOF
     build_rpm_variant "el9" "el9" "python3, python3-gobject, python3-cairo, gtk4, libadwaita, gstreamer1-plugins-base, gstreamer1-plugins-good, gstreamer1-plugins-bad-free, gstreamer1-plugins-ugly-free"
     echo "📦 Building Arch package..."
     build_arch_package
-    echo "📦 Building Flatpak package..."
-    build_flatpak_package
 else
     echo "Error: unsupported type '$TYPE'. Use deb | rpm | rpm-fedora | rpm-el9 | arch | flatpak | all"
     exit 1
