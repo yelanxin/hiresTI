@@ -4,11 +4,11 @@ import os
 from dataclasses import dataclass, field, fields
 from typing import Any, Optional
 
-from core.constants import AlsaMmapRealtimePriority
+from core.constants import AlsaMmapRealtimePriority, VisualizerSettings
 
 logger = logging.getLogger(__name__)
 
-CURRENT_SETTINGS_VERSION = 2
+CURRENT_SETTINGS_VERSION = 4
 
 
 @dataclass
@@ -29,9 +29,8 @@ class SettingsSchema:
     last_view: str = "grid_view"
     viz_expanded: bool = False
     spectrum_theme: int = 0
-    viz_backend_policy: int = 0
     viz_bar_count: int = 32
-    viz_profile: int = 1
+    viz_profile: int = 2
     viz_effect: int = 3
     lyrics_font_preset: int = 1
     lyrics_bg_motion: int = 1
@@ -65,9 +64,8 @@ DEFAULT_SETTINGS = {
     "last_view": "grid_view",
     "viz_expanded": False,
     "spectrum_theme": 0,
-    "viz_backend_policy": 0,
     "viz_bar_count": 32,
-    "viz_profile": 1,
+    "viz_profile": 2,
     "viz_effect": 3,
     "lyrics_font_preset": 1,
     "lyrics_bg_motion": 1,
@@ -103,10 +101,9 @@ _VALIDATION_RULES = {
     "last_view": (str, None, None, "grid_view"),
     "viz_expanded": (bool, None, None, False),
     "spectrum_theme": (int, 0, 64, 0),
-    "viz_backend_policy": (int, 0, 0, 0),
     "viz_bar_count": (int, 4, 128, 32),
-    "viz_profile": (int, 0, 3, 1),
-    "viz_effect": (int, 0, 16, 3),
+    "viz_profile": (int, 0, 4, 2),
+    "viz_effect": (int, 0, 23, 3),
     "lyrics_font_preset": (int, 0, 2, 1),
     "lyrics_bg_motion": (int, 0, 2, 1),
     "lyrics_user_offset_ms": (int, -2000, 2000, 0),
@@ -205,11 +202,18 @@ def normalize_settings(raw: Optional[dict[str, Any]]) -> dict[str, Any]:
     normalized["last_view"] = _as_str(raw.get("last_view"), DEFAULT_SETTINGS["last_view"])
     normalized["viz_expanded"] = _as_bool(raw.get("viz_expanded"), DEFAULT_SETTINGS["viz_expanded"])
     normalized["spectrum_theme"] = _as_int(raw.get("spectrum_theme"), DEFAULT_SETTINGS["spectrum_theme"], minimum=0, maximum=64)
-    normalized["viz_backend_policy"] = _as_int(raw.get("viz_backend_policy"), DEFAULT_SETTINGS["viz_backend_policy"], minimum=0, maximum=0)
     normalized["viz_bar_count"] = _as_int(raw.get("viz_bar_count"), DEFAULT_SETTINGS["viz_bar_count"], minimum=4, maximum=128)
-    # Current profile options: Soft/Dynamic/Extreme/Insane => 0..3
-    normalized["viz_profile"] = _as_int(raw.get("viz_profile"), DEFAULT_SETTINGS["viz_profile"], minimum=0, maximum=3)
-    # Current effect options after removing Radial and Fall: 17 entries => 0..16
+    if normalized["viz_bar_count"] not in VisualizerSettings.BAR_OPTIONS:
+        normalized["viz_bar_count"] = DEFAULT_SETTINGS["viz_bar_count"]
+    # Current profile options: Gentle/Soft/Dynamic/Extreme/Insane => 0..4
+    raw_viz_profile = raw.get("viz_profile")
+    if isinstance(raw_viz_profile, int) and raw_settings_version < 4:
+        raw_viz_profile += 1
+    normalized["viz_profile"] = _as_int(raw_viz_profile, DEFAULT_SETTINGS["viz_profile"], minimum=0, maximum=4)
+    # Current effect options after removing Radial, legacy Fall, Pro Bars,
+    # and Pro Line, then adding Orbit, Shards, Stereo Mirror, Lissajous,
+    # Stereo Scope, Balance Wave, Center Side, Phase Flower, and Stereo Meter:
+    # 24 entries => 0..23
     raw_viz_effect = raw.get("viz_effect")
     if isinstance(raw_viz_effect, int):
         if raw_settings_version < 1 and raw_viz_effect >= 6:
@@ -218,7 +222,13 @@ def normalize_settings(raw: Optional[dict[str, Any]]) -> dict[str, Any]:
         if raw_settings_version < 2 and raw_viz_effect >= 14:
             # Legacy shift: v1 list contained Fall at index 13.
             raw_viz_effect -= 1
-    normalized["viz_effect"] = _as_int(raw_viz_effect, DEFAULT_SETTINGS["viz_effect"], minimum=0, maximum=16)
+        if raw_settings_version < 3:
+            raw_viz_effect = {
+                14: 0,   # Pro Bars -> Bars
+                15: 1,   # Pro Line -> Wave
+                16: 14,  # Pro Fall -> Fall
+            }.get(raw_viz_effect, raw_viz_effect)
+    normalized["viz_effect"] = _as_int(raw_viz_effect, DEFAULT_SETTINGS["viz_effect"], minimum=0, maximum=23)
     normalized["lyrics_font_preset"] = _as_int(raw.get("lyrics_font_preset"), DEFAULT_SETTINGS["lyrics_font_preset"], minimum=0, maximum=2)
     normalized["lyrics_bg_motion"] = _as_int(raw.get("lyrics_bg_motion"), DEFAULT_SETTINGS["lyrics_bg_motion"], minimum=0, maximum=2)
     normalized["lyrics_user_offset_ms"] = _as_int(raw.get("lyrics_user_offset_ms"), DEFAULT_SETTINGS["lyrics_user_offset_ms"], minimum=-2000, maximum=2000)

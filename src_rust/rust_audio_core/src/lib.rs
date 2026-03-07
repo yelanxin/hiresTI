@@ -1,5 +1,6 @@
 use gst::prelude::*;
 use gstreamer as gst;
+use gst::glib;
 use libpulse_binding as pulse;
 use pipewire as pw;
 use pulse::callbacks::ListResult;
@@ -453,6 +454,16 @@ struct AlsaMmapCtx {
 }
 
 impl AlsaMmapCtx {
+    fn reset_start_sequence(&mut self) {
+        self.primed_frames = 0;
+        self.started = false;
+        self.start_fail_count = 0;
+    }
+
+    fn recover_requires_restart(rc: i32) -> bool {
+        rc == -libc::EPIPE || rc == -libc::ESTRPIPE
+    }
+
     /// Open `device` (e.g. `"hw:0,0"`) in MMAP_INTERLEAVED mode.
     /// `want_rate`, `want_period_frames`, and `want_buffer_frames` are hints;
     /// ALSA picks the nearest supported values.
@@ -605,6 +616,9 @@ impl AlsaMmapCtx {
                 if rec < 0 {
                     return Err(rec);
                 }
+                if Self::recover_requires_restart(rc) {
+                    self.reset_start_sequence();
+                }
                 if stop.load(Ordering::Relaxed) {
                     return Err(-125);
                 }
@@ -613,6 +627,9 @@ impl AlsaMmapCtx {
                     let wait_rec = unsafe { snd_pcm_recover(pcm, wait_rc, 1) };
                     if wait_rec < 0 {
                         return Err(wait_rec);
+                    }
+                    if Self::recover_requires_restart(wait_rc) {
+                        self.reset_start_sequence();
                     }
                 }
                 continue;
@@ -626,6 +643,9 @@ impl AlsaMmapCtx {
                     let wait_rec = unsafe { snd_pcm_recover(pcm, wait_rc, 1) };
                     if wait_rec < 0 {
                         return Err(wait_rec);
+                    }
+                    if Self::recover_requires_restart(wait_rc) {
+                        self.reset_start_sequence();
                     }
                 }
                 continue;
@@ -651,6 +671,9 @@ impl AlsaMmapCtx {
                 let rec = unsafe { snd_pcm_recover(pcm, committed as i32, 1) };
                 if rec < 0 {
                     return Err(rec);
+                }
+                if Self::recover_requires_restart(committed as i32) {
+                    self.reset_start_sequence();
                 }
                 continue;
             }
@@ -1154,8 +1177,12 @@ pub struct Engine {
     spectrum_seq: u64,
     spectrum_pos_s: f64,
     spectrum_vals: [f32; SPECTRUM_BANDS_MAX],
+    spectrum_left_vals: [f32; SPECTRUM_BANDS_MAX],
+    spectrum_right_vals: [f32; SPECTRUM_BANDS_MAX],
     spectrum_len: usize,
     spectrum_ring_vals: [[f32; SPECTRUM_BANDS_MAX]; SPECTRUM_RING_CAP],
+    spectrum_ring_left_vals: [[f32; SPECTRUM_BANDS_MAX]; SPECTRUM_RING_CAP],
+    spectrum_ring_right_vals: [[f32; SPECTRUM_BANDS_MAX]; SPECTRUM_RING_CAP],
     spectrum_ring_len: [u16; SPECTRUM_RING_CAP],
     spectrum_ring_pos_s: [f64; SPECTRUM_RING_CAP],
     spectrum_ring_seq: [u64; SPECTRUM_RING_CAP],
@@ -1701,6 +1728,62 @@ impl Engine {
         None
     }
 
+    fn spectrum_scalar_from_value(v: &glib::SendValue) -> Option<f32> {
+        if let Ok(x) = v.get::<f32>() {
+            if x.is_finite() {
+                return Some(x);
+            }
+        }
+        if let Ok(x) = v.get::<f64>() {
+            if x.is_finite() {
+                return Some(x as f32);
+            }
+        }
+        None
+    }
+
+    fn spectrum_channels_from_value(v: &glib::SendValue) -> Option<Vec<Vec<f32>>> {
+        if let Ok(arr) = v.get::<gst::Array>() {
+            return Self::spectrum_channels_from_values(arr.as_slice());
+        }
+        if let Ok(list) = v.get::<gst::List>() {
+            return Self::spectrum_channels_from_values(list.as_slice());
+        }
+        Self::spectrum_scalar_from_value(v).map(|x| vec![vec![x]])
+    }
+
+    fn spectrum_channels_from_values(values: &[glib::SendValue]) -> Option<Vec<Vec<f32>>> {
+        if values.is_empty() {
+            return Some(Vec::new());
+        }
+
+        let mut scalar_channel = Vec::with_capacity(values.len());
+        let mut all_scalar = true;
+        for v in values {
+            if let Some(x) = Self::spectrum_scalar_from_value(v) {
+                scalar_channel.push(x);
+            } else {
+                all_scalar = false;
+                break;
+            }
+        }
+        if all_scalar {
+            return Some(vec![scalar_channel]);
+        }
+
+        let mut channels = Vec::new();
+        for v in values {
+            if let Some(mut nested) = Self::spectrum_channels_from_value(v) {
+                channels.append(&mut nested);
+            }
+        }
+        if channels.is_empty() {
+            None
+        } else {
+            Some(channels)
+        }
+    }
+
     fn query_output_format(&self) -> (Option<i32>, Option<i32>) {
         let sink: Option<gst::Element> = self.playbin.property("audio-sink");
         let Some(sink) = sink else {
@@ -1794,7 +1877,11 @@ impl Engine {
         self.spectrum_ring_write = 0;
         self.spectrum_ring_count = 0;
         self.spectrum_vals = [0.0; SPECTRUM_BANDS_MAX];
+        self.spectrum_left_vals = [0.0; SPECTRUM_BANDS_MAX];
+        self.spectrum_right_vals = [0.0; SPECTRUM_BANDS_MAX];
         self.spectrum_ring_vals = [[0.0; SPECTRUM_BANDS_MAX]; SPECTRUM_RING_CAP];
+        self.spectrum_ring_left_vals = [[0.0; SPECTRUM_BANDS_MAX]; SPECTRUM_RING_CAP];
+        self.spectrum_ring_right_vals = [[0.0; SPECTRUM_BANDS_MAX]; SPECTRUM_RING_CAP];
         self.spectrum_ring_len = [0; SPECTRUM_RING_CAP];
         self.spectrum_ring_pos_s = [0.0; SPECTRUM_RING_CAP];
         self.spectrum_ring_seq = [0; SPECTRUM_RING_CAP];
@@ -1821,8 +1908,11 @@ impl Engine {
         for p in spectrum.list_properties() {
             let pn = p.name();
             if pn == "bands" {
-                // Match Python analyzer defaults for similar "liveliness".
-                spectrum.set_property_from_str("bands", "64");
+                // Use a denser upstream spectrum so high-frequency motion stays
+                // visible after front-end resampling into the selected bar count.
+                spectrum.set_property_from_str("bands", "96");
+            } else if pn == "multi-channel" {
+                let _ = spectrum.set_property("multi-channel", true);
             } else if pn == "interval" {
                 // Higher temporal density to reduce perceived frame drops.
                 spectrum.set_property_from_str("interval", "16000000");
@@ -1869,57 +1959,52 @@ impl Engine {
             return;
         }
         self.spectrum_seen_msgs = self.spectrum_seen_msgs.wrapping_add(1);
-        let text = s.to_string();
-        let lower = text.to_ascii_lowercase();
-        let Some(kpos) = lower.find("magnitude") else {
-            if self.spectrum_seen_msgs % 120 == 0 {
-                self.emit_event(
-                    EVT_STATE,
-                    &format!(
-                        "spectrum-msgs={} parsed={}",
-                        self.spectrum_seen_msgs, self.spectrum_msg_count
-                    ),
-                );
-            }
-            return;
-        };
-        let rest = &text[kpos..];
-        let mag_only = if let Some(open_pos) = rest.find('{').or_else(|| rest.find('<')) {
-            let close_char = if rest.as_bytes().get(open_pos) == Some(&b'{') {
-                '}'
-            } else {
-                '>'
-            };
-            if let Some(close_rel) = rest[(open_pos + 1)..].find(close_char) {
-                &rest[(open_pos + 1)..(open_pos + 1 + close_rel)]
-            } else {
-                rest
-            }
-        } else {
-            rest
-        };
-        let mut tmp = [0.0f32; SPECTRUM_BANDS_MAX];
+        let channels = s
+            .value("magnitude")
+            .ok()
+            .and_then(Self::spectrum_channels_from_value);
+        let mut mono = [0.0f32; SPECTRUM_BANDS_MAX];
+        let mut left = [0.0f32; SPECTRUM_BANDS_MAX];
+        let mut right = [0.0f32; SPECTRUM_BANDS_MAX];
         let mut n = 0usize;
-        // Same numeric extraction contract as Python fallback parser:
-        // extract only floats from magnitude payload.
-        for part in mag_only
-            .split(|c: char| !(c.is_ascii_digit() || matches!(c, '-' | '+' | '.' | 'e' | 'E')))
-        {
-            if n >= tmp.len() {
-                break;
-            }
-            let t = part.trim();
-            if t.is_empty() {
-                continue;
-            }
-            if let Ok(v) = t.parse::<f32>() {
-                if !v.is_finite() {
-                    continue;
+        if let Some(channels) = channels {
+            let channel_count = channels.len().max(1);
+            n = channels
+                .iter()
+                .map(|ch| ch.len())
+                .max()
+                .unwrap_or(0)
+                .min(SPECTRUM_BANDS_MAX);
+            for i in 0..n {
+                let mut sum = 0.0f32;
+                let mut present = 0usize;
+                for ch in &channels {
+                    if i < ch.len() {
+                        sum += ch[i];
+                        present += 1;
+                    }
                 }
-                tmp[n] = v;
-                n += 1;
+                if present > 0 {
+                    mono[i] = sum / (present as f32);
+                }
+                if let Some(ch0) = channels.get(0) {
+                    if i < ch0.len() {
+                        left[i] = ch0[i];
+                    }
+                }
+                if let Some(ch1) = channels.get(1) {
+                    if i < ch1.len() {
+                        right[i] = ch1[i];
+                    } else {
+                        right[i] = left[i];
+                    }
+                } else {
+                    right[i] = left[i];
+                }
             }
+            let _ = channel_count;
         }
+
         if n == 0 {
             if self.spectrum_seen_msgs % 120 == 0 {
                 self.emit_event(
@@ -1960,12 +2045,18 @@ impl Engine {
         }
         self.spectrum_pos_s = frame_pos_s;
 
-        self.spectrum_vals[..n].copy_from_slice(&tmp[..n]);
+        self.spectrum_vals[..n].copy_from_slice(&mono[..n]);
+        self.spectrum_left_vals[..n].copy_from_slice(&left[..n]);
+        self.spectrum_right_vals[..n].copy_from_slice(&right[..n]);
         self.spectrum_len = n;
         self.spectrum_seq = self.spectrum_seq.wrapping_add(1);
         let ridx = self.spectrum_ring_write;
         self.spectrum_ring_vals[ridx] = [0.0; SPECTRUM_BANDS_MAX];
-        self.spectrum_ring_vals[ridx][..n].copy_from_slice(&tmp[..n]);
+        self.spectrum_ring_left_vals[ridx] = [0.0; SPECTRUM_BANDS_MAX];
+        self.spectrum_ring_right_vals[ridx] = [0.0; SPECTRUM_BANDS_MAX];
+        self.spectrum_ring_vals[ridx][..n].copy_from_slice(&mono[..n]);
+        self.spectrum_ring_left_vals[ridx][..n].copy_from_slice(&left[..n]);
+        self.spectrum_ring_right_vals[ridx][..n].copy_from_slice(&right[..n]);
         self.spectrum_ring_len[ridx] = n as u16;
         self.spectrum_ring_pos_s[ridx] = frame_pos_s;
         self.spectrum_ring_seq[ridx] = self.spectrum_seq;
@@ -2058,8 +2149,12 @@ impl Engine {
             spectrum_seq: 0,
             spectrum_pos_s: 0.0,
             spectrum_vals: [0.0; SPECTRUM_BANDS_MAX],
+            spectrum_left_vals: [0.0; SPECTRUM_BANDS_MAX],
+            spectrum_right_vals: [0.0; SPECTRUM_BANDS_MAX],
             spectrum_len: 0,
             spectrum_ring_vals: [[0.0; SPECTRUM_BANDS_MAX]; SPECTRUM_RING_CAP],
+            spectrum_ring_left_vals: [[0.0; SPECTRUM_BANDS_MAX]; SPECTRUM_RING_CAP],
+            spectrum_ring_right_vals: [[0.0; SPECTRUM_BANDS_MAX]; SPECTRUM_RING_CAP],
             spectrum_ring_len: [0; SPECTRUM_RING_CAP],
             spectrum_ring_pos_s: [0.0; SPECTRUM_RING_CAP],
             spectrum_ring_seq: [0; SPECTRUM_RING_CAP],
@@ -2841,6 +2936,99 @@ pub extern "C" fn rac_get_spectrum_frames_since(
             ptr::copy_nonoverlapping(
                 engine.spectrum_ring_vals[idx].as_ptr(),
                 out_vals.add(base),
+                len,
+            );
+            *out_lens.add(written) = len as c_int;
+            *out_pos_s.add(written) = engine.spectrum_ring_pos_s[idx];
+            *out_seq.add(written) = seq;
+        }
+        written += 1;
+    }
+
+    unsafe {
+        *out_frames = written as c_int;
+    }
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn rac_get_stereo_spectrum_frames_since(
+    ptr: *const Engine,
+    since_seq: u64,
+    out_mono_vals: *mut f32,
+    out_left_vals: *mut f32,
+    out_right_vals: *mut f32,
+    max_frames: c_int,
+    max_bands: c_int,
+    out_frames: *mut c_int,
+    out_lens: *mut c_int,
+    out_pos_s: *mut c_double,
+    out_seq: *mut u64,
+) -> c_int {
+    let Some(engine) = as_engine(ptr) else {
+        return -1;
+    };
+    if out_mono_vals.is_null()
+        || out_left_vals.is_null()
+        || out_right_vals.is_null()
+        || out_frames.is_null()
+        || out_lens.is_null()
+        || out_pos_s.is_null()
+        || out_seq.is_null()
+    {
+        return -2;
+    }
+    let max_f = if max_frames <= 0 {
+        0usize
+    } else {
+        max_frames as usize
+    };
+    let max_b = if max_bands <= 0 {
+        0usize
+    } else {
+        max_bands as usize
+    };
+    if max_f == 0 || max_b == 0 {
+        unsafe {
+            *out_frames = 0;
+        }
+        return 0;
+    }
+
+    let oldest = if engine.spectrum_ring_count < SPECTRUM_RING_CAP {
+        0usize
+    } else {
+        engine.spectrum_ring_write
+    };
+
+    let mut written = 0usize;
+    for j in 0..engine.spectrum_ring_count {
+        let idx = (oldest + j) % SPECTRUM_RING_CAP;
+        let seq = engine.spectrum_ring_seq[idx];
+        if seq <= since_seq {
+            continue;
+        }
+        if written >= max_f {
+            break;
+        }
+        let len = (engine.spectrum_ring_len[idx] as usize)
+            .min(max_b)
+            .min(SPECTRUM_BANDS_MAX);
+        let base = written * max_b;
+        unsafe {
+            ptr::copy_nonoverlapping(
+                engine.spectrum_ring_vals[idx].as_ptr(),
+                out_mono_vals.add(base),
+                len,
+            );
+            ptr::copy_nonoverlapping(
+                engine.spectrum_ring_left_vals[idx].as_ptr(),
+                out_left_vals.add(base),
+                len,
+            );
+            ptr::copy_nonoverlapping(
+                engine.spectrum_ring_right_vals[idx].as_ptr(),
+                out_right_vals.add(base),
                 len,
             );
             *out_lens.add(written) = len as c_int;
@@ -4977,6 +5165,33 @@ mod tests {
         assert_eq!(frames_for_duration_us(10_000, 44_100, 64, 4096), 441);
         assert_eq!(frames_for_duration_us(10_000, 48_000, 64, 4096), 480);
         assert_eq!(frames_for_duration_us(10_000, 96_000, 64, 4096), 960);
+    }
+
+    #[test]
+    fn alsa_mmap_recover_from_xrun_requires_restart() {
+        let mut ctx = AlsaMmapCtx {
+            pcm: AlsaHandle(std::ptr::null_mut()),
+            period_frames: 480,
+            buffer_frames: 1920,
+            frame_bytes: 8,
+            rate: 48_000,
+            primed_frames: 1440,
+            started: true,
+            start_fail_count: 2,
+            format_label: "S32_LE",
+        };
+
+        assert!(AlsaMmapCtx::recover_requires_restart(-libc::EPIPE));
+        ctx.reset_start_sequence();
+
+        assert_eq!(ctx.primed_frames, 0);
+        assert!(!ctx.started);
+        assert_eq!(ctx.start_fail_count, 0);
+    }
+
+    #[test]
+    fn alsa_mmap_recover_from_interrupt_keeps_running_state() {
+        assert!(!AlsaMmapCtx::recover_requires_restart(-libc::EINTR));
     }
 
     #[test]

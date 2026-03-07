@@ -9,7 +9,7 @@ import random
 import logging
 
 from gi.repository import Gtk, GLib
-from viz.visualizer import SpectrumVisualizer
+from ui import config as ui_config
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +26,7 @@ def _apply_overlay_scroll_padding(self, expanded):
         if hasattr(self, "viz_stack") and self.viz_stack is not None:
             overlay_h = self.viz_stack.get_height()
         if overlay_h <= 1:
-            overlay_h = 250
+            overlay_h = self._desired_viz_height()
         extra = overlay_h + breathing_px
     if hasattr(self, "collection_content_box") and self.collection_content_box is not None:
         self.collection_content_box.set_margin_bottom(self.collection_base_margin_bottom + extra)
@@ -47,6 +47,160 @@ def _ensure_overlay_handles_visible(self):
         queue_anchor.set_visible(True)
         queue_anchor.queue_resize()
     return GLib.SOURCE_REMOVE
+
+
+def _is_viz_surface_visible(self):
+    revealer = getattr(self, "viz_revealer", None)
+    return bool(revealer is not None and revealer.get_reveal_child())
+
+
+def _desired_viz_height(self, available_h=None):
+    win_h = 0
+    if available_h is not None:
+        try:
+            win_h = int(available_h or 0)
+        except Exception:
+            win_h = 0
+    if win_h <= 0 and getattr(self, "win", None) is not None:
+        try:
+            win_h = int(self.win.get_height() or 0)
+        except Exception:
+            win_h = 0
+    if win_h <= 0 and getattr(self, "body_overlay", None) is not None:
+        try:
+            win_h = int(self.body_overlay.get_height() or 0)
+        except Exception:
+            win_h = 0
+    if win_h <= 0 and getattr(self, "content_overlay", None) is not None:
+        try:
+            win_h = int(self.content_overlay.get_height() or 0)
+        except Exception:
+            win_h = 0
+    if win_h <= 0:
+        win_h = int(getattr(ui_config, "WINDOW_HEIGHT", 500) or 500)
+    return max(160, int(win_h * 0.3333333333))
+
+
+def _sync_viz_height_to_window(self, available_h=None):
+    desired_h = self._desired_viz_height(available_h)
+    if bool(getattr(self, "_viz_fullscreen_active", False)):
+        full_h = 0
+        if getattr(self, "body_overlay", None) is not None:
+            try:
+                full_h = int(self.body_overlay.get_height() or 0)
+            except Exception:
+                full_h = 0
+        if full_h <= 0 and available_h is not None:
+            try:
+                full_h = int(available_h or 0)
+            except Exception:
+                full_h = 0
+        if full_h <= 0 and getattr(self, "content_overlay", None) is not None:
+            try:
+                full_h = int(self.content_overlay.get_height() or 0)
+            except Exception:
+                full_h = 0
+        if full_h <= 0 and getattr(self, "win", None) is not None:
+            try:
+                full_h = int(self.win.get_height() or 0)
+            except Exception:
+                full_h = 0
+        row_h = 0
+        if getattr(self, "viz_theme_row", None) is not None:
+            try:
+                row_h = int(self.viz_theme_row.get_height() or 0)
+            except Exception:
+                row_h = 0
+        if row_h <= 0:
+            row_h = 56
+        desired_h = max(220, full_h - row_h)
+    if getattr(self, "viz_stack", None) is not None:
+        self.viz_stack.set_size_request(-1, desired_h)
+        self.viz_stack.queue_resize()
+    if getattr(self, "viz_stack_box", None) is not None:
+        self.viz_stack_box.set_size_request(-1, desired_h)
+        self.viz_stack_box.queue_resize()
+    if getattr(self, "viz_revealer", None) is not None and self.viz_revealer.get_reveal_child():
+        self._apply_overlay_scroll_padding(True)
+
+
+def toggle_viz_fullscreen(self, _btn=None):
+    self._set_viz_fullscreen(not bool(getattr(self, "_viz_fullscreen_active", False)))
+
+
+def _set_viz_fullscreen(self, fullscreen, restore_drawer=True):
+    fullscreen = bool(fullscreen)
+    if bool(getattr(self, "_viz_fullscreen_active", False)) == fullscreen:
+        return
+    normal_host = getattr(self, "viz_revealer", None)
+    if normal_host is None:
+        return
+
+    if fullscreen:
+        self._viz_restore_expanded_after_fullscreen = bool(normal_host.get_reveal_child())
+        if hasattr(self, "hide_now_playing_overlay") and callable(getattr(self, "hide_now_playing_overlay", None)):
+            try:
+                self.hide_now_playing_overlay()
+            except Exception:
+                pass
+        normal_host.set_reveal_child(True)
+        self._viz_fullscreen_active = True
+        if getattr(self, "viz_handle_box", None) is not None:
+            self.viz_handle_box.set_visible(False)
+        if getattr(self, "viz_fullscreen_btn", None) is not None:
+            self.viz_fullscreen_btn.set_icon_name("hiresti-mini-symbolic")
+            self.viz_fullscreen_btn.set_tooltip_text("Restore Waveform")
+        self._sync_viz_height_to_window()
+        self._schedule_viz_height_resync(delay_ms=120)
+        return
+
+    self._viz_fullscreen_active = False
+    should_reveal = bool(restore_drawer and getattr(self, "_viz_restore_expanded_after_fullscreen", True))
+    normal_host.set_reveal_child(should_reveal)
+    if getattr(self, "viz_handle_box", None) is not None:
+        self.viz_handle_box.set_visible(True)
+    if getattr(self, "viz_fullscreen_btn", None) is not None:
+        self.viz_fullscreen_btn.set_icon_name("view-fullscreen-symbolic")
+        self.viz_fullscreen_btn.set_tooltip_text("Expand Waveform")
+    if should_reveal:
+        self._apply_overlay_scroll_padding(True)
+    else:
+        self._apply_overlay_scroll_padding(False)
+    self._sync_viz_height_to_window()
+    self._schedule_viz_handle_realign(animate=False)
+
+
+def _schedule_viz_height_resync(self, available_h=None, delay_ms=120):
+    pending = int(getattr(self, "_viz_height_sync_source", 0) or 0)
+    if pending:
+        try:
+            GLib.source_remove(pending)
+        except Exception:
+            pass
+        self._viz_height_sync_source = 0
+
+    def _run():
+        self._viz_height_sync_source = 0
+        live_h = available_h
+        if live_h is None:
+            live_h = 0
+            if getattr(self, "win", None) is not None:
+                try:
+                    live_h = int(self.win.get_height() or 0)
+                except Exception:
+                    live_h = 0
+            if live_h <= 0 and getattr(self, "body_overlay", None) is not None:
+                try:
+                    live_h = int(self.body_overlay.get_height() or 0)
+                except Exception:
+                    live_h = 0
+        self._sync_viz_height_to_window(available_h=live_h)
+        return False
+
+    if int(delay_ms or 0) <= 0:
+        self._viz_height_sync_source = GLib.idle_add(_run)
+    else:
+        self._viz_height_sync_source = GLib.timeout_add(int(delay_ms), _run)
 
 
 # ---------------------------------------------------------------------------
@@ -125,18 +279,6 @@ def _selected_name_from_dropdown(self, dd):
     return names[idx]
 
 
-# ---------------------------------------------------------------------------
-# Backend selection & rebuild
-# ---------------------------------------------------------------------------
-
-def _build_visualizer_for_backend(self, _backend_key):
-    return SpectrumVisualizer(), "cairo"
-
-
-def _resolve_viz_backend_key(self, effect_name=None):
-    return "cairo"
-
-
 def _sync_viz_dropdown_models(self, theme_name=None, effect_name=None, profile_name=None):
     self._viz_ui_syncing = True
     try:
@@ -160,41 +302,6 @@ def _sync_viz_dropdown_models(self, theme_name=None, effect_name=None, profile_n
                 self.viz_profile_dd.set_selected(idx)
     finally:
         self._viz_ui_syncing = False
-
-
-def _rebuild_visualizer_backend(self, backend_key, effect_name=None):
-    if self.viz_stack is None:
-        return
-    if effect_name is None:
-        effect_name = self._selected_name_from_dropdown(self.viz_effect_dd)
-    theme_name = self._selected_name_from_dropdown(self.viz_theme_dd)
-    profile_name = self._selected_name_from_dropdown(self.viz_profile_dd)
-    bar_count = int(self.settings.get("viz_bar_count", 32) or 32)
-    vis_name = self.viz_stack.get_visible_child_name() if self.viz_stack is not None else "spectrum"
-
-    new_viz, actual_key = self._build_visualizer_for_backend(backend_key)
-    new_viz.set_num_bars(bar_count)
-    new_viz.set_valign(Gtk.Align.FILL)
-    if theme_name and theme_name in (new_viz.get_theme_names() or []):
-        new_viz.set_theme(theme_name)
-    if profile_name and profile_name in (new_viz.get_profile_names() or []):
-        new_viz.set_profile(profile_name)
-    if effect_name and effect_name in (new_viz.get_effect_names() or []):
-        new_viz.set_effect(effect_name)
-
-    if self.viz is not None:
-        try:
-            self.viz_stack.remove(self.viz)
-        except Exception:
-            pass
-    self.viz = new_viz
-    self._viz_backend_key = actual_key
-    self.viz_stack.add_titled(self.viz, "spectrum", "Spectrum")
-    if vis_name:
-        self.viz_stack.set_visible_child_name(vis_name)
-    self._sync_viz_tab_runtime_state()
-    self._sync_viz_dropdown_models(theme_name=theme_name, effect_name=effect_name, profile_name=profile_name)
-    logger.info("Visualizer backend switched: %s (requested=%s effect=%s)", actual_key, backend_key, effect_name)
 
 
 # ---------------------------------------------------------------------------
@@ -255,10 +362,6 @@ def _apply_viz_effect_by_index(self, idx, update_dropdown=False):
         if idx < 0 or idx >= len(names):
             idx = 0
         effect_name = names[idx]
-    desired = self._resolve_viz_backend_key(effect_name)
-    if desired != self._viz_backend_key:
-        self._rebuild_visualizer_backend(desired, effect_name=effect_name)
-        names = self.viz.get_effect_names() or []
     if effect_name not in names:
         effect_name = names[0] if names else None
     if effect_name:
@@ -377,6 +480,8 @@ def on_viz_page_changed(self, stack, _param):
         self.viz_profile_dd.set_visible(is_spectrum)
     if self.viz_effect_dd is not None:
         self.viz_effect_dd.set_visible(is_spectrum)
+    if self.viz_fullscreen_btn is not None:
+        self.viz_fullscreen_btn.set_visible(is_spectrum or is_lyrics)
     if self.lyrics_font_label is not None:
         self.lyrics_font_label.set_visible(is_lyrics)
     if self.lyrics_font_dd is not None:
@@ -392,8 +497,7 @@ def on_viz_page_changed(self, stack, _param):
 
 
 def _sync_viz_tab_runtime_state(self):
-    revealer = getattr(self, "viz_revealer", None)
-    is_open = bool(revealer is not None and revealer.get_reveal_child())
+    is_open = self._is_viz_surface_visible()
     page = str(getattr(self, "_viz_current_page", "spectrum") or "spectrum")
     spectrum_active = bool(is_open and page == "spectrum")
     lyrics_active = bool(is_open and page == "lyrics")
@@ -420,8 +524,7 @@ def _should_enable_spectrum_stream(self):
     # Lyrics static mode genuinely needs no live data.
     page = str(getattr(self, "_viz_current_page", "spectrum") or "spectrum")
     if page == "lyrics":
-        revealer = getattr(self, "viz_revealer", None)
-        if revealer is not None and revealer.get_reveal_child():
+        if self._is_viz_surface_visible():
             motion_idx = int(self.settings.get("lyrics_bg_motion", 1) or 0)
             if motion_idx == 0:
                 return False
@@ -507,13 +610,35 @@ def _apply_viz_panel_theme(self):
 # Spectrum data callback & frame blending
 # ---------------------------------------------------------------------------
 
+def _copy_spectrum_frame(frame):
+    if isinstance(frame, dict):
+        mono = list(frame.get("mono") or [])
+        left = list(frame.get("left") or mono)
+        right = list(frame.get("right") or mono)
+        return {"mono": mono, "left": left, "right": right}
+    return list(frame or [])
+
+
+def _spectrum_frame_channel(frame, key="mono"):
+    if isinstance(frame, dict):
+        vals = frame.get(key)
+        if vals is None:
+            vals = frame.get("mono", [])
+        return list(vals or [])
+    return list(frame or [])
+
+
+def _spectrum_frame_len(frame):
+    return len(_spectrum_frame_channel(frame, "mono"))
+
+
 def on_spectrum_data(self, magnitudes, position_s=None):
     if not magnitudes:
         return
     trace = str(os.getenv("HIRESTI_VIZ_TRACE", "0")).strip().lower() in ("1", "true", "yes", "on")
     now_cb = time.monotonic()
-    frame = magnitudes if isinstance(magnitudes, list) else list(magnitudes)
-    self._last_spectrum_frame = frame
+    frame = _copy_spectrum_frame(magnitudes)
+    self._last_spectrum_frame = _copy_spectrum_frame(frame)
     self._last_spectrum_ts = now_cb
     if trace:
         if self._viz_trace_open_ts > 0.0 and (not self._viz_trace_first_real_logged):
@@ -521,7 +646,7 @@ def on_spectrum_data(self, magnitudes, position_s=None):
             logger.info(
                 "VIZ TRACE first-real: delta_open=%.1fms len=%d page=%s",
                 (now_cb - self._viz_trace_open_ts) * 1000.0,
-                len(frame),
+                _spectrum_frame_len(frame),
                 str(getattr(self, "_viz_current_page", "spectrum")),
             )
         if self._viz_trace_last_cb_ts > 0.0:
@@ -540,8 +665,7 @@ def on_spectrum_data(self, magnitudes, position_s=None):
             self._stop_viz_placeholder()
     else:
         self._viz_real_frame_streak = 0
-    revealer = self.viz_revealer
-    if revealer is None or (not revealer.get_reveal_child()):
+    if not self._is_viz_surface_visible():
         return
     now = time.monotonic()
     if self._viz_warmup_until > now and self._viz_seed_frame:
@@ -559,7 +683,7 @@ def _apply_viz_frame(self, frame):
         return
     current_page = self._viz_current_page
     if current_page == "lyrics" and self.bg_viz is not None:
-        self.bg_viz.update_energy(frame)
+        self.bg_viz.update_energy(_spectrum_frame_channel(frame, "mono"))
     if current_page == "spectrum" and self.viz is not None:
         self.viz.update_data(frame)
 
@@ -574,8 +698,7 @@ def _stop_viz_placeholder(self):
 
 def _start_viz_placeholder_if_needed(self):
     self._stop_viz_placeholder()
-    revealer = getattr(self, "viz_revealer", None)
-    if revealer is None or (not revealer.get_reveal_child()):
+    if not self._is_viz_surface_visible():
         return
     # With the always-on stream policy, _last_spectrum_ts is kept current
     # while audio is playing.  If a fresh frame arrived recently, skip the
@@ -655,18 +778,37 @@ def _start_viz_placeholder_if_needed(self):
 
 def _blend_spectrum_frames(self, seed, live, t):
     if not seed:
-        return list(live or [])
+        return _copy_spectrum_frame(live)
     if not live:
-        return list(seed)
-    a = list(seed)
-    b = list(live)
+        return _copy_spectrum_frame(seed)
+    a = _spectrum_frame_channel(seed, "mono")
+    b = _spectrum_frame_channel(live, "mono")
     n = max(len(a), len(b))
     if len(a) < n:
         a.extend([a[-1] if a else 0.0] * (n - len(a)))
     if len(b) < n:
         b.extend([b[-1] if b else 0.0] * (n - len(b)))
     k = max(0.0, min(1.0, float(t)))
-    return [a[i] + ((b[i] - a[i]) * k) for i in range(n)]
+    mono = [a[i] + ((b[i] - a[i]) * k) for i in range(n)]
+    if isinstance(seed, dict) or isinstance(live, dict):
+        la = _spectrum_frame_channel(seed, "left")
+        lb = _spectrum_frame_channel(live, "left")
+        ra = _spectrum_frame_channel(seed, "right")
+        rb = _spectrum_frame_channel(live, "right")
+        ln = max(len(la), len(lb))
+        rn = max(len(ra), len(rb))
+        if len(la) < ln:
+            la.extend([la[-1] if la else 0.0] * (ln - len(la)))
+        if len(lb) < ln:
+            lb.extend([lb[-1] if lb else 0.0] * (ln - len(lb)))
+        if len(ra) < rn:
+            ra.extend([ra[-1] if ra else 0.0] * (rn - len(ra)))
+        if len(rb) < rn:
+            rb.extend([rb[-1] if rb else 0.0] * (rn - len(rb)))
+        left = [la[i] + ((lb[i] - la[i]) * k) for i in range(ln)] if ln > 0 else list(mono)
+        right = [ra[i] + ((rb[i] - ra[i]) * k) for i in range(rn)] if rn > 0 else list(mono)
+        return {"mono": mono, "left": left or list(mono), "right": right or list(mono)}
+    return mono
 
 
 # ---------------------------------------------------------------------------
@@ -701,6 +843,8 @@ def toggle_visualizer(self, btn):
     """
     [Overlay 适配版]
     """
+    if bool(getattr(self, "_viz_fullscreen_active", False)):
+        self._set_viz_fullscreen(False, restore_drawer=False)
     is_visible = self.viz_revealer.get_reveal_child()
     target_state = not is_visible
     self._set_visualizer_expanded(target_state)
@@ -709,12 +853,14 @@ def toggle_visualizer(self, btn):
 
 
 def _set_visualizer_expanded(self, expanded):
+    if not expanded and bool(getattr(self, "_viz_fullscreen_active", False)):
+        self._set_viz_fullscreen(False, restore_drawer=False)
     trace = str(os.getenv("HIRESTI_VIZ_TRACE", "0")).strip().lower() in ("1", "true", "yes", "on")
     if expanded:
         self._viz_trace_open_ts = time.monotonic()
         self._viz_trace_last_cb_ts = 0.0
         self._viz_trace_first_real_logged = False
-        self._viz_seed_frame = list(self._last_spectrum_frame) if self._last_spectrum_frame else None
+        self._viz_seed_frame = _copy_spectrum_frame(self._last_spectrum_frame) if self._last_spectrum_frame else None
         # If the stream was kept alive (always-on policy), _last_spectrum_frame
         # is fresh (<= 0.5 s old) — no blending warmup is needed.  Only warm up
         # when opening from a cold state (first ever open, or after a long pause
@@ -797,7 +943,7 @@ def _set_visualizer_expanded(self, expanded):
         self.viz_btn.add_css_class("active")
     else:
         if self._last_spectrum_frame:
-            self._viz_seed_frame = list(self._last_spectrum_frame)
+            self._viz_seed_frame = _copy_spectrum_frame(self._last_spectrum_frame)
         self.viz_btn.set_icon_name("hiresti-pan-up-symbolic")
         self.viz_btn.remove_css_class("active")
         if self._viz_fade_source:
@@ -987,11 +1133,57 @@ def _apply_lyrics_font_preset_by_index(self, idx, update_dropdown=False):
         idx = 1
     for cls in ("lyrics-font-live", "lyrics-font-studio", "lyrics-font-compact"):
         self.lyrics_vbox.remove_css_class(cls)
+        if getattr(self, "now_playing_lyrics_vbox", None) is not None:
+            self.now_playing_lyrics_vbox.remove_css_class(cls)
     class_map = {0: "lyrics-font-live", 1: "lyrics-font-studio", 2: "lyrics-font-compact"}
-    self.lyrics_vbox.add_css_class(class_map.get(idx, "lyrics-font-studio"))
+    cls = class_map.get(idx, "lyrics-font-studio")
+    self.lyrics_vbox.add_css_class(cls)
+    if getattr(self, "now_playing_lyrics_vbox", None) is not None:
+        self.now_playing_lyrics_vbox.add_css_class(cls)
+    self._apply_lyrics_font_layout(idx)
     self.settings["lyrics_font_preset"] = idx
     if update_dropdown and self.lyrics_font_dd is not None:
         self.lyrics_font_dd.set_selected(idx)
+
+
+def _lyrics_font_layout_values(self, idx):
+    layout_map = {
+        0: {"box_spacing": 16, "row_spacing": 6, "row_margin": 8},
+        1: {"box_spacing": 10, "row_spacing": 3, "row_margin": 4},
+        2: {"box_spacing": 5, "row_spacing": 1, "row_margin": 1},
+    }
+    return layout_map.get(int(idx), layout_map[1])
+
+
+def _apply_lyrics_font_layout_to_box(self, box, idx):
+    if box is None:
+        return
+    cfg = self._lyrics_font_layout_values(idx)
+    try:
+        box.set_spacing(int(cfg["box_spacing"]))
+    except Exception:
+        pass
+    child = box.get_first_child()
+    while child is not None:
+        next_child = child.get_next_sibling()
+        try:
+            if isinstance(child, Gtk.Box) and child.has_css_class("lyric-row"):
+                child.set_spacing(int(cfg["row_spacing"]))
+                child.set_margin_top(int(cfg["row_margin"]))
+                child.set_margin_bottom(int(cfg["row_margin"]))
+        except Exception:
+            pass
+        child = next_child
+
+
+def _apply_lyrics_font_layout(self, idx=None):
+    if idx is None:
+        try:
+            idx = int(self.settings.get("lyrics_font_preset", 1) or 1)
+        except Exception:
+            idx = 1
+    self._apply_lyrics_font_layout_to_box(getattr(self, "lyrics_vbox", None), idx)
+    self._apply_lyrics_font_layout_to_box(getattr(self, "now_playing_lyrics_vbox", None), idx)
 
 
 def on_lyrics_font_preset_changed(self, dd, _param):

@@ -196,19 +196,49 @@ impl VizStateEngine {
 
 fn map_input_to_heights(input: &[f32], out: &mut [f32], db_min: f32, db_range: f32) {
     let n = out.len();
-    let in_n = input.len().min(n);
-    for i in 0..in_n {
-        let val = input[i];
-        let mut h = if val <= db_min { 0.0 } else { (val - db_min) / db_range };
-        if h < 0.0 {
-            h = 0.0;
-        } else if h > 1.0 {
-            h = 1.0;
-        }
-        out[i] = h;
+    let in_n = input.len();
+    if in_n == 0 || n == 0 {
+        return;
     }
-    if in_n < n {
-        out[in_n..n].fill(0.0);
+    if in_n == n {
+        for i in 0..n {
+            let val = input[i];
+            let mut h = if val <= db_min { 0.0 } else { (val - db_min) / db_range };
+            if h < 0.0 {
+                h = 0.0;
+            } else if h > 1.0 {
+                h = 1.0;
+            }
+            out[i] = h;
+        }
+        return;
+    }
+    for i in 0..n {
+        let t0 = (i as f32) / (n as f32);
+        let t1 = ((i + 1) as f32) / (n as f32);
+        let mut x0 = (t0 * (in_n as f32)) as usize;
+        let mut x1 = (t1 * (in_n as f32)) as usize;
+        if x0 >= in_n {
+            x0 = in_n - 1;
+        }
+        if x1 <= x0 {
+            x1 = (x0 + 1).min(in_n);
+        } else if x1 > in_n {
+            x1 = in_n;
+        }
+        let mut sum = 0.0_f32;
+        let mut cnt = 0_usize;
+        for &val in &input[x0..x1] {
+            let mut h = if val <= db_min { 0.0 } else { (val - db_min) / db_range };
+            if h < 0.0 {
+                h = 0.0;
+            } else if h > 1.0 {
+                h = 1.0;
+            }
+            sum += h;
+            cnt += 1;
+        }
+        out[i] = if cnt > 0 { sum / (cnt as f32) } else { 0.0 };
     }
 }
 

@@ -113,12 +113,10 @@ def _get_ui_loop_interval_ms(self):
     if not self.playing_track_id:
         return 280
     if not is_playing:
-        revealer = self.viz_revealer
-        if revealer is not None and revealer.get_reveal_child():
+        if hasattr(self, "_is_viz_surface_visible") and self._is_viz_surface_visible():
             return 120
         return 220
-    revealer = self.viz_revealer
-    if revealer is not None and revealer.get_reveal_child():
+    if hasattr(self, "_is_viz_surface_visible") and self._is_viz_surface_visible():
         if self._viz_current_page == "lyrics":
             return 25
         return 40
@@ -170,6 +168,10 @@ def update_layout_proportions(self, w, p):
             overlay_h = 0
     if overlay_h <= 0:
         overlay_h = int(ui_config.WINDOW_HEIGHT)
+    if hasattr(self, "_sync_viz_height_to_window"):
+        self._sync_viz_height_to_window(available_h=overlay_h)
+    if hasattr(self, "_schedule_viz_height_resync"):
+        self._schedule_viz_height_resync(delay_ms=140)
     queue_gap = int(max(0, round(overlay_h * 0.10)))
     queue_anchor = getattr(self, "queue_anchor", None)
     if queue_anchor is not None:

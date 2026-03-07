@@ -13,6 +13,7 @@ gi.require_version("Gdk", "4.0")
 from gi.repository import Gtk, Adw, Pango, GLib, Gdk
 
 from background_viz import BackgroundVisualizer
+from visualizer import SpectrumVisualizer
 from ui import config as ui_config
 
 logger = logging.getLogger(__name__)
@@ -687,6 +688,18 @@ def build_body(app, container):
     app.viz_revealer.set_hexpand(True)
     app.viz_revealer.set_vexpand(False)
 
+    app.viz_fullscreen_revealer = Gtk.Revealer(transition_type=Gtk.RevealerTransitionType.CROSSFADE)
+    app.viz_fullscreen_revealer.set_reveal_child(False)
+    app.viz_fullscreen_revealer.set_visible(False)
+    app.viz_fullscreen_revealer.set_halign(Gtk.Align.FILL)
+    app.viz_fullscreen_revealer.set_valign(Gtk.Align.FILL)
+    app.viz_fullscreen_revealer.set_hexpand(True)
+    app.viz_fullscreen_revealer.set_vexpand(True)
+    app.viz_fullscreen_revealer.add_css_class("viz-panel")
+    app.viz_fullscreen_revealer.add_css_class("viz-fullscreen-revealer")
+    if getattr(app, "content_overlay", None) is not None:
+        app.content_overlay.add_overlay(app.viz_fullscreen_revealer)
+
     app.viz_btn = Gtk.Button(icon_name="hiresti-pan-up-symbolic", css_classes=["flat", "viz-handle-btn"])
     app.viz_btn.set_tooltip_text("Waveform / Lyrics")
     app.viz_btn.set_size_request(50, 23)
@@ -735,12 +748,17 @@ def build_body(app, container):
 
     app.viz_stack = Gtk.Stack()
     app.viz_stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
-    app.viz_stack.set_size_request(-1, 250)
+    app.viz_stack.set_size_request(-1, int(ui_config.WINDOW_HEIGHT / 3))
     app.viz_switcher.set_stack(app.viz_stack)
     app.viz_stack.connect("notify::visible-child-name", app.on_viz_page_changed)
 
-    app.viz, app._viz_backend_key = app._build_visualizer_for_backend("cairo")
-    logger.info("Visualizer backend selected: %s", app._viz_backend_key)
+    app.viz_surface_overlay = Gtk.Overlay()
+    app.viz_surface_overlay.set_hexpand(True)
+    app.viz_surface_overlay.set_vexpand(True)
+    app.viz_surface_overlay.set_child(app.viz_stack)
+
+    app.viz = SpectrumVisualizer()
+    logger.info("Visualizer backend selected: cairo")
     app.viz.set_num_bars(32)
     app.viz.set_valign(Gtk.Align.FILL)
     app.viz_stack.add_titled(app.viz, "spectrum", "Spectrum")
@@ -778,6 +796,7 @@ def build_body(app, container):
     app.lyrics_font_dd.connect("notify::selected", app.on_lyrics_font_preset_changed)
 
     theme_row = Gtk.Box(spacing=10)
+    app.viz_theme_row = theme_row
     theme_row.add_css_class("viz-theme-row")
     theme_row.set_hexpand(True)
     theme_row.set_halign(Gtk.Align.FILL)
@@ -794,6 +813,15 @@ def build_body(app, container):
     right_ctrl_box.append(app.viz_profile_dd)
     right_ctrl_box.append(app.viz_effect_dd)
     right_ctrl_box.append(app.viz_theme_dd)
+    app.viz_fullscreen_btn = Gtk.Button(icon_name="view-fullscreen-symbolic", css_classes=["flat", "circular"])
+    app.viz_fullscreen_btn.set_tooltip_text("Expand Waveform")
+    app.viz_fullscreen_btn.connect("clicked", app.toggle_viz_fullscreen)
+    app.viz_fullscreen_btn.set_halign(Gtk.Align.END)
+    app.viz_fullscreen_btn.set_valign(Gtk.Align.START)
+    app.viz_fullscreen_btn.set_margin_top(10)
+    app.viz_fullscreen_btn.set_margin_end(10)
+    app.viz_fullscreen_btn.add_css_class("viz-fullscreen-btn")
+    app.viz_surface_overlay.add_overlay(app.viz_fullscreen_btn)
     app.lyrics_font_dd.set_visible(False)
     app.lyrics_ctrl_box = Gtk.Box(spacing=0)
     app.lyrics_ctrl_box.add_css_class("viz-right-controls")
@@ -840,10 +868,13 @@ def build_body(app, container):
     app.lyrics_tab_root.add_overlay(app.lyrics_offset_box)
     app.viz_stack.add_titled(app.lyrics_tab_root, "lyrics", "Lyrics")
 
-    app.viz_stack_box.append(app.viz_stack)
+    app.viz_stack_box.append(app.viz_surface_overlay)
+    app.viz_stack_box.set_size_request(-1, int(ui_config.WINDOW_HEIGHT / 3))
     app.viz_root.append(theme_row)
     app.viz_root.append(app.viz_stack_box)
     app.viz_revealer.set_child(app.viz_root)
+    if hasattr(app, "_sync_viz_height_to_window"):
+        app._sync_viz_height_to_window()
     app.on_viz_page_changed(app.viz_stack, None)
 
     app.sidebar_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["sidebar-shell"])

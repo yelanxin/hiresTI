@@ -11,6 +11,9 @@ def _init_widget_refs(self):
     self.vol_scale = None
     self.vol_pop = None
     self.viz_revealer = None
+    self.viz_fullscreen_revealer = None
+    self.viz_fullscreen_btn = None
+    self.viz_surface_overlay = None
     self.viz_theme_dd = None
     self.viz_bars_dd = None
     self.viz_effect_dd = None
@@ -27,6 +30,7 @@ def _init_widget_refs(self):
     self.bg_viz = None
     self.lyrics_tab_root = None
     self.viz = None
+    self.viz_theme_row = None
     self.eq_btn = None
     self.eq_pop = None
     self.mode_btn = None
@@ -130,8 +134,10 @@ def _init_widget_refs(self):
 
 
 def _init_viz_refs(self):
-    self._viz_backend_key = None
     self._viz_ui_syncing = False
+    self._viz_fullscreen_active = False
+    self._viz_restore_expanded_after_fullscreen = True
+    self._viz_height_sync_source = 0
     self._viz_effect_apply_source = None
     self._viz_profile_apply_source = None
     self._viz_theme_apply_source = None

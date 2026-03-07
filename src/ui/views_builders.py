@@ -10,7 +10,6 @@ from ui.track_table import build_tracks_header, append_header_action_spacers
 
 
 def build_grid_view(app):
-    content_max_width = 1180
     grid_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["home-view"])
     title_box = Gtk.Box(
         orientation=Gtk.Orientation.VERTICAL,
@@ -43,9 +42,7 @@ def build_grid_view(app):
     title_row.append(app.grid_subtitle_label)
     title_row.append(app.artist_fav_btn)
     title_box.append(title_row)
-    top_clamp = Adw.Clamp(maximum_size=content_max_width, tightening_threshold=920)
-    top_clamp.set_child(title_box)
-    grid_vbox.append(top_clamp)
+    grid_vbox.append(title_box)
 
     app.login_prompt_box = Gtk.Box(
         orientation=Gtk.Orientation.VERTICAL,
@@ -113,9 +110,7 @@ def build_grid_view(app):
         css_classes=["home-content-box"],
     )
     app.collection_base_margin_bottom = 32
-    content_clamp = Adw.Clamp(maximum_size=content_max_width, tightening_threshold=920)
-    content_clamp.set_child(app.collection_content_box)
-    app.alb_scroll.set_child(content_clamp)
+    app.alb_scroll.set_child(app.collection_content_box)
     grid_vbox.append(app.alb_scroll)
     app.right_stack.add_named(grid_vbox, "grid_view")
 

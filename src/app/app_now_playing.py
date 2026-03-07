@@ -2070,6 +2070,12 @@ def _render_now_playing_lyrics(self, lyrics_obj=None, status_msg=None):
                 }
             )
 
+    if hasattr(self, "_apply_lyrics_font_layout"):
+        try:
+            self._apply_lyrics_font_layout()
+        except Exception as e:
+            logger.debug("Now playing lyrics font layout apply failed: %s", e)
+
     try:
         pos_s, _dur_s = self.player.get_position()
     except Exception:

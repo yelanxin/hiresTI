@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.6.0 - 2026-03-07
+Visualizer overhaul + playback-scrubbing stability release: stereo-aware spectrum data, fullscreen waveform viewing, a redesigned waterfall/waveform presentation, and a critical ALSA mmap seek recovery fix.
+
+### Added
+- Added fullscreen mode for the visualizer/lyrics drawer, including dedicated expand/restore controls and window-height-aware resizing.
+- Added stereo spectrum transport from the Rust audio core to Python/UI (`mono`, `left`, `right` channels), enabling true stereo visual effects instead of mono-only fallback data.
+- Added new stereo-focused visualizer effects and rendering paths, including `Stereo Mirror`, `Stereo Scope`, `Balance Wave`, `Center Side`, `Phase Flower`, and `Stereo Meter`.
+- Added settings migrations and regression coverage for the revised visualizer effect/profile lists and supported bar-count options.
+
+### Changed
+- Reworked the visualizer runtime to use a single Cairo-based rendering path instead of switching between legacy backend variants, simplifying behavior across effects and reducing backend-specific divergence.
+- Visualizer spectrum preprocessing now uses denser upstream spectrum data and stereo channel parsing, improving high-frequency motion and channel separation.
+- The waterfall/analyzer presentation has been redesigned into a smoother scrolling waveform-style renderer with clearer center-line and envelope shaping.
+- Visualizer profile defaults and migrations now insert the new `Gentle` profile at the low-intensity end of the range.
+- Supported visualizer bar counts have been narrowed to `4, 8, 16, 32, 48, 64`, removing oversized density options that did not scale cleanly with the new renderer.
+- Home view content no longer uses the previous fixed-width clamp, so fullscreen windows can use the available horizontal space instead of forcing a centered narrow column.
+
+### Fixed
+- **[Critical] Fixed seek/scrubbing failure on `ALSA（mmap）`**: after a flush-seek, ALSA XRUN/stream-recovery paths could leave the mmap device in `PREPARED` state without re-priming/restarting playback, causing the progress bar to move while audio failed to resume. The mmap start sequence is now reset correctly after recoverable errors.
+- Fixed spectrum frame interpolation and queue sampling so stereo-aware frames remain stable across timeline jumps, visual warmup, and backward seeks.
+- Fixed fullscreen/reveal resize jitter in the visualizer drawer by resynchronizing overlay height after window-state transitions.
+- Fixed legacy visualizer settings values (`viz_effect`, `viz_profile`, `viz_bar_count`) landing on invalid or removed options after upgrade.
+
+### Tests
+- Verified with:
+  - `CCACHE_DISABLE=1 cargo test --manifest-path src_rust/rust_audio_core/Cargo.toml`
+  - `python -m py_compile src/ui/views_builders.py`
+  - `pytest -q tests/test_viz_bar_options.py tests/test_viz_effect_settings_migration.py tests/test_viz_profile_settings_migration.py`
+
+---
+
 ## 1.5.3 - 2026-03-05
 **Critical audio quality fix**: streaming now correctly delivers Hi-Res Lossless (up to 24-bit/192kHz) and source format is accurately reported throughout the UI.
 

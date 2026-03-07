@@ -225,6 +225,12 @@ def render_lyrics_list(app, lyrics_obj=None, status_msg=None):
                     }
                 )
 
+    if hasattr(app, "_apply_lyrics_font_layout"):
+        try:
+            app._apply_lyrics_font_layout()
+        except Exception as e:
+            logger.debug("Lyrics font layout apply failed: %s", e)
+
 
 def play_track(app, index):
     logger.info("play_track called. index=%s", index)

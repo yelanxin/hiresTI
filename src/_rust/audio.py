@@ -50,6 +50,7 @@ class _RustAudioCore:
         self._event_cb_fn = None
         self._event_py_cb = None
         self._spectrum_batch_cache = {}
+        self._rac_get_stereo_spectrum_frames_since = None
 
         so_paths = [
             # Development: src/_rust/audio.py -> project_root/src_rust/
@@ -183,6 +184,23 @@ class _RustAudioCore:
                 ctypes.POINTER(ctypes.c_double),
                 ctypes.POINTER(ctypes.c_uint64),
             ]
+            self._rac_get_stereo_spectrum_frames_since = None
+            if hasattr(lib, "rac_get_stereo_spectrum_frames_since"):
+                lib.rac_get_stereo_spectrum_frames_since.restype = ctypes.c_int
+                lib.rac_get_stereo_spectrum_frames_since.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_uint64,
+                    ctypes.POINTER(ctypes.c_float),
+                    ctypes.POINTER(ctypes.c_float),
+                    ctypes.POINTER(ctypes.c_float),
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.POINTER(ctypes.c_int),
+                    ctypes.POINTER(ctypes.c_int),
+                    ctypes.POINTER(ctypes.c_double),
+                    ctypes.POINTER(ctypes.c_uint64),
+                ]
+                self._rac_get_stereo_spectrum_frames_since = lib.rac_get_stereo_spectrum_frames_since
             lib.rac_set_spectrum_enabled.restype = ctypes.c_int
             lib.rac_set_spectrum_enabled.argtypes = [ctypes.c_void_p, ctypes.c_int]
 
@@ -628,32 +646,53 @@ class _RustAudioCore:
                 cache = self._spectrum_batch_cache.get(cache_key)
                 if cache is None:
                     cache = {
-                        "vals": (ctypes.c_float * (mf * mb))(),
+                        "mono_vals": (ctypes.c_float * (mf * mb))(),
+                        "left_vals": (ctypes.c_float * (mf * mb))(),
+                        "right_vals": (ctypes.c_float * (mf * mb))(),
                         "out_frames": ctypes.c_int(0),
                         "out_lens": (ctypes.c_int * mf)(),
                         "out_pos": (ctypes.c_double * mf)(),
                         "out_seq": (ctypes.c_uint64 * mf)(),
                     }
                     self._spectrum_batch_cache[cache_key] = cache
-                vals = cache["vals"]
+                mono_vals = cache["mono_vals"]
+                left_vals = cache["left_vals"]
+                right_vals = cache["right_vals"]
                 out_frames = cache["out_frames"]
                 out_lens = cache["out_lens"]
                 out_pos = cache["out_pos"]
                 out_seq = cache["out_seq"]
                 out_frames.value = 0
-                rc = int(
-                    self.lib.rac_get_spectrum_frames_since(
-                        self.handle,
-                        ctypes.c_uint64(max(0, int(since_seq))),
-                        vals,
-                        mf,
-                        mb,
-                        ctypes.byref(out_frames),
-                        out_lens,
-                        out_pos,
-                        out_seq,
+                if self._rac_get_stereo_spectrum_frames_since is not None:
+                    rc = int(
+                        self._rac_get_stereo_spectrum_frames_since(
+                            self.handle,
+                            ctypes.c_uint64(max(0, int(since_seq))),
+                            mono_vals,
+                            left_vals,
+                            right_vals,
+                            mf,
+                            mb,
+                            ctypes.byref(out_frames),
+                            out_lens,
+                            out_pos,
+                            out_seq,
+                        )
                     )
-                )
+                else:
+                    rc = int(
+                        self.lib.rac_get_spectrum_frames_since(
+                            self.handle,
+                            ctypes.c_uint64(max(0, int(since_seq))),
+                            mono_vals,
+                            mf,
+                            mb,
+                            ctypes.byref(out_frames),
+                            out_lens,
+                            out_pos,
+                            out_seq,
+                        )
+                    )
                 if rc != 0:
                     return []
                 nframes = max(0, min(int(out_frames.value), mf))
@@ -661,11 +700,22 @@ class _RustAudioCore:
                 for i in range(nframes):
                     ln = max(0, min(int(out_lens[i]), mb))
                     base = i * mb
+                    mono = [float(mono_vals[base + j]) for j in range(ln)]
+                    if self._rac_get_stereo_spectrum_frames_since is not None:
+                        left = [float(left_vals[base + j]) for j in range(ln)]
+                        right = [float(right_vals[base + j]) for j in range(ln)]
+                        payload = {
+                            "mono": mono,
+                            "left": left,
+                            "right": right,
+                        }
+                    else:
+                        payload = mono
                     frames.append(
                         (
                             int(out_seq[i]),
                             float(out_pos[i]),
-                            [float(vals[base + j]) for j in range(ln)],
+                            payload,
                         )
                     )
                 return frames
@@ -1939,6 +1989,21 @@ class RustAudioPlayerAdapter:
                 )
 
     def _sample_spectrum_at_pos(self, target_pos_s):
+        def _copy_frame(frame):
+            if isinstance(frame, dict):
+                return {
+                    "mono": list(frame.get("mono") or []),
+                    "left": list(frame.get("left") or frame.get("mono") or []),
+                    "right": list(frame.get("right") or frame.get("mono") or []),
+                }
+            return list(frame or [])
+
+        def _blend_lists(a, b, t):
+            n = min(len(a), len(b))
+            if n <= 0:
+                return []
+            return [(a[i] * (1.0 - t)) + (b[i] * t) for i in range(n)]
+
         q = self._viz_spectrum_queue
         if not q:
             return None
@@ -1953,15 +2018,24 @@ class RustAudioPlayerAdapter:
                 break
 
         if prev_item is None:
-            return list(q[0][1])
+            return _copy_frame(q[0][1])
         if next_item is None:
-            return list(prev_item[1])
+            return _copy_frame(prev_item[1])
 
         p0, f0 = prev_item
         p1, f1 = next_item
         if p1 <= p0:
-            return list(f0)
+            return _copy_frame(f0)
         t = max(0.0, min(1.0, (target_pos_s - p0) / (p1 - p0)))
+        if isinstance(f0, dict) or isinstance(f1, dict):
+            d0 = _copy_frame(f0)
+            d1 = _copy_frame(f1)
+            mono = _blend_lists(d0.get("mono", []), d1.get("mono", []), t)
+            if not mono:
+                return None
+            left = _blend_lists(d0.get("left", d0.get("mono", [])), d1.get("left", d1.get("mono", [])), t)
+            right = _blend_lists(d0.get("right", d0.get("mono", [])), d1.get("right", d1.get("mono", [])), t)
+            return {"mono": mono, "left": left or mono, "right": right or mono}
         n = min(len(f0), len(f1))
         if n <= 0:
             return None
