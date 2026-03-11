@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::ffi::{CStr, CString};
 use std::io;
-use std::os::raw::{c_char, c_double, c_int, c_void};
+use std::os::raw::{c_char, c_double, c_int, c_uint, c_void};
 use std::path::Path;
 use std::ptr;
 use std::rc::Rc;
@@ -25,6 +25,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::thread;
 use std::time::Duration;
+
+mod dsp;
+
+use dsp::{DspGraphConfig, DspGraphRuntime, PEQ_BAND_COUNT};
 
 static GST_INIT: Once = Once::new();
 static PW_INIT: Once = Once::new();
@@ -908,13 +912,18 @@ fn alsa_mmap_writer_thread(
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
-                // Pre-warm: while the pipeline is idle (NULL/READY), try to
-                // open the ALSA device in the background.  This is especially
-                // important after switching away from the PipeWire driver:
-                // PipeWire releases its hold on the ALSA device asynchronously,
-                // so retrying here (with backoff) ensures the device is free
-                // before the user clicks play.
-                if ctx.is_none() && idle_open_attempts < 20 {
+                // Pre-warm: while the pipeline is idle (NULL/READY) and before
+                // the first play, open the ALSA device in the background.  This
+                // is especially important after switching away from the PipeWire
+                // driver: PipeWire releases its hold on the ALSA device
+                // asynchronously, so retrying here (with backoff) ensures the
+                // device is free before the user clicks play.
+                // Once ever_playing is set, do NOT pre-warm: the device will be
+                // opened on demand when the next sample arrives (line ~1000).
+                // Pre-warming after ever_playing would create an open/close
+                // tight-loop because ctx is dropped unconditionally above
+                // (line 908) on every no-sample iteration.
+                if ctx.is_none() && idle_open_attempts < 20 && !ever_playing {
                     let rate = if last_rate > 0 { last_rate } else { 44100 };
                     let pf = frames_for_duration_us(period_us, rate, 64, 4096);
                     let bf = frames_for_duration_us(
@@ -1167,7 +1176,9 @@ fn parse_pipewire_card_profile_target(device_id: &str) -> Option<(String, String
 #[derive(Debug)]
 pub struct Engine {
     playbin: gst::Element,
-    _audio_filter_bin: Option<gst::Bin>,
+    audio_filter_graph: Option<DspGraphRuntime>,
+    audio_filter_rebuild_pending: bool,
+    dsp_config: DspGraphConfig,
     uri: String,
     last_error: Option<String>,
     event_cb: Option<EventCallback>,
@@ -1888,66 +1899,786 @@ impl Engine {
     }
 
     fn set_spectrum_filter_enabled(&mut self, enabled: bool) {
-        if enabled {
-            if let Some(ref bin) = self._audio_filter_bin {
-                let elem: gst::Element = bin.clone().upcast();
-                self.playbin.set_property("audio-filter", &elem);
-            }
-        } else {
+        self.spectrum_enabled = enabled;
+        if !enabled {
+            self.reset_spectrum_timeline();
+        }
+        let _ = self.sync_audio_filter_graph();
+    }
+
+    /// Returns whether a DSP bin is currently attached as playbin's audio-filter.
+    /// Queries playbin directly, so it is always in sync with GStreamer's internal
+    /// state (e.g. after set_state(Null) resets the property automatically).
+    fn is_filter_attached(&self) -> bool {
+        self.playbin
+            .property::<Option<gst::Element>>("audio-filter")
+            .is_some()
+    }
+
+    fn sync_audio_filter_graph(&mut self) -> Result<(), String> {
+        if self.audio_filter_rebuild_pending && self.audio_filter_graph_rebuild_is_safe() {
+            self.audio_filter_graph = None;
             self.playbin
                 .set_property("audio-filter", Option::<gst::Element>::None);
-            self.reset_spectrum_timeline();
+            self.audio_filter_rebuild_pending = false;
+        }
+        if self.audio_filter_graph.is_none() {
+            self.audio_filter_graph = Some(DspGraphRuntime::build(&self.dsp_config)?);
+        }
+        // Snapshot attachment state *after* any rebuild-triggered detach but *before*
+        // taking a mutable borrow on the graph (Rust borrow checker limitation).
+        // is_filter_attached() queries playbin directly so this reflects true state.
+        let filter_attached = self.is_filter_attached();
+        let Some(graph) = self.audio_filter_graph.as_mut() else {
+            if filter_attached {
+                self.playbin
+                    .set_property("audio-filter", Option::<gst::Element>::None);
+            }
+            return Ok(());
+        };
+
+        graph.set_spectrum_messages_enabled(self.spectrum_enabled);
+        graph.apply_config(&self.dsp_config)?;
+
+        if self.spectrum_enabled || self.dsp_config.has_active_processing() {
+            if !filter_attached {
+                let elem = graph.bin_element();
+                self.playbin.set_property("audio-filter", &elem);
+            }
+            // Already attached; apply_config already hot-updated plugin properties.
+        } else if filter_attached {
+            self.playbin
+                .set_property("audio-filter", Option::<gst::Element>::None);
+        }
+        Ok(())
+    }
+
+    fn refresh_audio_filter_graph(&mut self) -> Result<(), String> {
+        self.sync_audio_filter_graph()
+    }
+
+    fn audio_filter_graph_rebuild_is_safe(&self) -> bool {
+        let state = self.playbin.state(gst::ClockTime::from_mseconds(0)).1;
+        // Paused is also safe: no data is flowing, and a brief pipeline
+        // reconfiguration on the next resume is acceptable.
+        matches!(state, gst::State::Null | gst::State::Ready | gst::State::Paused)
+    }
+
+    fn rebuild_audio_filter_graph(&mut self) -> Result<(), String> {
+        self.audio_filter_graph = None;
+        // New bin element; detach so sync will re-attach with the new element.
+        self.playbin
+            .set_property("audio-filter", Option::<gst::Element>::None);
+        self.audio_filter_rebuild_pending = false;
+        self.sync_audio_filter_graph()
+    }
+
+    fn set_peq_band_gain(&mut self, band_index: usize, gain_db: f64) -> c_int {
+        let clamped = match self.dsp_config.peq.set_band_gain(band_index, gain_db) {
+            Ok(value) => value,
+            Err(err) => {
+                self.set_error(err.clone());
+                self.emit_event(EVT_ERROR, &err);
+                return -2;
+            }
+        };
+        match self.sync_audio_filter_graph() {
+            Ok(()) => {
+                self.emit_event(
+                    EVT_STATE,
+                    &format!(
+                        "dsp-peq band={} gain_db={:.2} active={}",
+                        band_index,
+                        clamped,
+                        self.dsp_config.has_active_processing()
+                    ),
+                );
+                0
+            }
+            Err(err) => {
+                self.set_error(err.clone());
+                self.emit_event(EVT_ERROR, &err);
+                -3
+            }
         }
     }
 
-    fn setup_spectrum_filter(playbin: &gst::Element) -> Option<gst::Bin> {
-        let spectrum = gst::ElementFactory::make("spectrum")
-            .name("rust-spectrum")
-            .build()
-            .ok()?;
-        for p in spectrum.list_properties() {
-            let pn = p.name();
-            if pn == "bands" {
-                // Use a denser upstream spectrum so high-frequency motion stays
-                // visible after front-end resampling into the selected bar count.
-                spectrum.set_property_from_str("bands", "96");
-            } else if pn == "multi-channel" {
-                let _ = spectrum.set_property("multi-channel", true);
-            } else if pn == "interval" {
-                // Higher temporal density to reduce perceived frame drops.
-                spectrum.set_property_from_str("interval", "16000000");
+    fn reset_peq(&mut self) -> c_int {
+        self.dsp_config.peq.reset();
+        match self.sync_audio_filter_graph() {
+            Ok(()) => {
+                self.emit_event(EVT_STATE, "dsp-peq reset");
+                0
+            }
+            Err(err) => {
+                self.set_error(err.clone());
+                self.emit_event(EVT_ERROR, &err);
+                -2
             }
         }
-        let mut set_msg = false;
-        for p in spectrum.list_properties() {
-            let pn = p.name();
-            if pn == "message" {
-                let _ = spectrum.set_property("message", true);
-                set_msg = true;
-                break;
+    }
+
+    fn set_dsp_master_enabled(&mut self, enabled: bool) -> c_int {
+        let previous_config = self.dsp_config.clone();
+        self.dsp_config.enabled = enabled;
+        if self.audio_filter_graph_rebuild_is_safe() {
+            match self.rebuild_audio_filter_graph() {
+                Ok(()) => {
+                    self.emit_event(
+                        EVT_STATE,
+                        &format!(
+                            "dsp-master enabled={} active={} rebuild=1",
+                            self.dsp_config.enabled,
+                            self.dsp_config.has_active_processing()
+                        ),
+                    );
+                    0
+                }
+                Err(err) => {
+                    self.dsp_config = previous_config;
+                    self.set_error(err.clone());
+                    self.emit_event(EVT_ERROR, &err);
+                    -2
+                }
             }
-            if pn == "post-messages" {
-                let _ = spectrum.set_property("post-messages", true);
-                set_msg = true;
-                break;
+        } else {
+            self.audio_filter_rebuild_pending = true;
+            self.emit_event(
+                EVT_STATE,
+                &format!(
+                    "dsp-master enabled={} active={} rebuild=0 deferred=1",
+                    self.dsp_config.enabled,
+                    self.dsp_config.has_active_processing()
+                ),
+            );
+            0
+        }
+    }
+
+    fn set_dsp_order(&mut self, order_csv: &str) -> c_int {
+        let previous_config = self.dsp_config.clone();
+        let ids: Vec<&str> = order_csv
+            .split(',')
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .collect();
+        self.dsp_config.set_order_from_ids(&ids);
+        if self.audio_filter_graph_rebuild_is_safe() {
+            match self.rebuild_audio_filter_graph() {
+                Ok(()) => {
+                    self.emit_event(
+                        EVT_STATE,
+                        &format!("dsp-order {} rebuild=1", self.dsp_config.order_ids().join(",")),
+                    );
+                    0
+                }
+                Err(err) => {
+                    self.dsp_config = previous_config;
+                    self.set_error(err.clone());
+                    self.emit_event(EVT_ERROR, &err);
+                    -2
+                }
+            }
+        } else {
+            self.audio_filter_rebuild_pending = true;
+            self.emit_event(
+                EVT_STATE,
+                &format!("dsp-order {} rebuild=0 deferred=1", self.dsp_config.order_ids().join(",")),
+            );
+            0
+        }
+    }
+
+    fn set_peq_enabled(&mut self, enabled: bool) -> c_int {
+        self.dsp_config.peq.set_enabled(enabled);
+        match self.sync_audio_filter_graph() {
+            Ok(()) => {
+                self.emit_event(
+                    EVT_STATE,
+                    &format!(
+                        "dsp-peq enabled={} active={}",
+                        self.dsp_config.peq.enabled,
+                        self.dsp_config.has_active_processing()
+                    ),
+                );
+                0
+            }
+            Err(err) => {
+                self.set_error(err.clone());
+                self.emit_event(EVT_ERROR, &err);
+                -2
             }
         }
-        if !set_msg {
-            return None;
+    }
+
+    fn set_convolver_enabled(&mut self, enabled: bool) -> c_int {
+        self.dsp_config.convolver.set_enabled(enabled);
+        match self.refresh_audio_filter_graph() {
+            Ok(()) => {
+                self.emit_event(
+                    EVT_STATE,
+                    &format!(
+                        "dsp-convolver enabled={} active={} taps={}",
+                        self.dsp_config.convolver.enabled,
+                        self.dsp_config.has_active_processing(),
+                        self.dsp_config.convolver.tap_count()
+                    ),
+                );
+                0
+            }
+            Err(err) => {
+                self.set_error(err.clone());
+                self.emit_event(EVT_ERROR, &err);
+                -2
+            }
         }
-        let bin = gst::Bin::new();
-        if bin.add(&spectrum).is_err() {
-            return None;
+    }
+
+    fn set_convolver_mix(&mut self, mix: f64) -> c_int {
+        let clamped = self.dsp_config.convolver.set_mix(mix);
+        match self.refresh_audio_filter_graph() {
+            Ok(()) => {
+                self.emit_event(EVT_STATE, &format!("dsp-convolver mix={:.3}", clamped));
+                0
+            }
+            Err(err) => {
+                self.set_error(err.clone());
+                self.emit_event(EVT_ERROR, &err);
+                -2
+            }
         }
-        let sink_pad = spectrum.static_pad("sink")?;
-        let src_pad = spectrum.static_pad("src")?;
-        let ghost_sink = gst::GhostPad::with_target(&sink_pad).ok()?;
-        let ghost_src = gst::GhostPad::with_target(&src_pad).ok()?;
-        if bin.add_pad(&ghost_sink).is_err() || bin.add_pad(&ghost_src).is_err() {
-            return None;
+    }
+
+    fn set_convolver_pre_delay(&mut self, ms: f64) -> c_int {
+        let clamped = self.dsp_config.convolver.set_pre_delay_ms(ms);
+        match self.refresh_audio_filter_graph() {
+            Ok(()) => {
+                self.emit_event(
+                    EVT_STATE,
+                    &format!("dsp-convolver pre_delay_ms={:.1}", clamped),
+                );
+                0
+            }
+            Err(err) => {
+                self.set_error(err.clone());
+                self.emit_event(EVT_ERROR, &err);
+                -2
+            }
         }
-        playbin.set_property("audio-filter", &bin);
-        Some(bin)
+    }
+
+    fn set_limiter_enabled(&mut self, enabled: bool) -> c_int {
+        self.dsp_config.limiter.set_enabled(enabled);
+        match self.refresh_audio_filter_graph() {
+            Ok(()) => {
+                self.emit_event(
+                    EVT_STATE,
+                    &format!(
+                        "dsp-limiter enabled={} active={} threshold={:.3} ratio={:.2}",
+                        self.dsp_config.limiter.enabled,
+                        self.dsp_config.has_active_processing(),
+                        self.dsp_config.limiter.threshold,
+                        self.dsp_config.limiter.ratio
+                    ),
+                );
+                0
+            }
+            Err(err) => {
+                self.set_error(err.clone());
+                self.emit_event(EVT_ERROR, &err);
+                -2
+            }
+        }
+    }
+
+    fn set_limiter_threshold(&mut self, threshold: f64) -> c_int {
+        let clamped = self.dsp_config.limiter.set_threshold(threshold);
+        match self.refresh_audio_filter_graph() {
+            Ok(()) => {
+                self.emit_event(
+                    EVT_STATE,
+                    &format!("dsp-limiter threshold={:.3}", clamped),
+                );
+                0
+            }
+            Err(err) => {
+                self.set_error(err.clone());
+                self.emit_event(EVT_ERROR, &err);
+                -2
+            }
+        }
+    }
+
+    fn set_limiter_ratio(&mut self, ratio: f64) -> c_int {
+        let clamped = self.dsp_config.limiter.set_ratio(ratio);
+        match self.refresh_audio_filter_graph() {
+            Ok(()) => {
+                self.emit_event(
+                    EVT_STATE,
+                    &format!("dsp-limiter ratio={:.2}", clamped),
+                );
+                0
+            }
+            Err(err) => {
+                self.set_error(err.clone());
+                self.emit_event(EVT_ERROR, &err);
+                -2
+            }
+        }
+    }
+
+    fn set_resampler_enabled(&mut self, enabled: bool) -> c_int {
+        self.dsp_config.resampler.set_enabled(enabled);
+        match self.refresh_audio_filter_graph() {
+            Ok(()) => {
+                self.emit_event(
+                    EVT_STATE,
+                    &format!("dsp-resampler enabled={enabled}"),
+                );
+                0
+            }
+            Err(err) => {
+                self.set_error(err.clone());
+                self.emit_event(EVT_ERROR, &err);
+                -2
+            }
+        }
+    }
+
+    fn set_resampler_target_rate(&mut self, rate: u32) -> c_int {
+        self.dsp_config.resampler.set_target_rate(rate);
+        match self.refresh_audio_filter_graph() {
+            Ok(()) => {
+                self.emit_event(
+                    EVT_STATE,
+                    &format!("dsp-resampler target_rate={rate}"),
+                );
+                0
+            }
+            Err(err) => {
+                self.set_error(err.clone());
+                self.emit_event(EVT_ERROR, &err);
+                -2
+            }
+        }
+    }
+
+    fn set_resampler_quality(&mut self, quality: i32) -> c_int {
+        self.dsp_config.resampler.set_quality(quality);
+        match self.refresh_audio_filter_graph() {
+            Ok(()) => {
+                self.emit_event(
+                    EVT_STATE,
+                    &format!("dsp-resampler quality={quality}"),
+                );
+                0
+            }
+            Err(err) => {
+                self.set_error(err.clone());
+                self.emit_event(EVT_ERROR, &err);
+                -2
+            }
+        }
+    }
+
+    fn set_tape_enabled(&mut self, enabled: bool) -> c_int {
+        self.dsp_config.tape.set_enabled(enabled);
+        match self.refresh_audio_filter_graph() {
+            Ok(()) => {
+                self.emit_event(EVT_STATE, &format!("dsp-tape enabled={enabled}"));
+                0
+            }
+            Err(err) => {
+                self.set_error(err.clone());
+                self.emit_event(EVT_ERROR, &err);
+                -2
+            }
+        }
+    }
+
+    fn set_tape_drive(&mut self, drive: i32) -> c_int {
+        self.dsp_config.tape.set_drive(drive);
+        match self.refresh_audio_filter_graph() {
+            Ok(()) => {
+                self.emit_event(EVT_STATE, &format!("dsp-tape drive={drive}"));
+                0
+            }
+            Err(err) => {
+                self.set_error(err.clone());
+                self.emit_event(EVT_ERROR, &err);
+                -2
+            }
+        }
+    }
+
+    fn set_tape_tone(&mut self, tone: i32) -> c_int {
+        self.dsp_config.tape.set_tone(tone);
+        match self.refresh_audio_filter_graph() {
+            Ok(()) => {
+                self.emit_event(EVT_STATE, &format!("dsp-tape tone={tone}"));
+                0
+            }
+            Err(err) => {
+                self.set_error(err.clone());
+                self.emit_event(EVT_ERROR, &err);
+                -2
+            }
+        }
+    }
+
+    fn set_tape_warmth(&mut self, warmth: i32) -> c_int {
+        self.dsp_config.tape.set_warmth(warmth);
+        match self.refresh_audio_filter_graph() {
+            Ok(()) => {
+                self.emit_event(EVT_STATE, &format!("dsp-tape warmth={warmth}"));
+                0
+            }
+            Err(err) => {
+                self.set_error(err.clone());
+                self.emit_event(EVT_ERROR, &err);
+                -2
+            }
+        }
+    }
+
+    fn set_tube_enabled(&mut self, enabled: bool) -> c_int {
+        self.dsp_config.tube.set_enabled(enabled);
+        match self.refresh_audio_filter_graph() {
+            Ok(()) => {
+                self.emit_event(EVT_STATE, &format!("dsp-tube enabled={enabled}"));
+                0
+            }
+            Err(err) => {
+                self.set_error(err.clone());
+                self.emit_event(EVT_ERROR, &err);
+                -2
+            }
+        }
+    }
+
+    fn set_tube_drive(&mut self, drive: i32) -> c_int {
+        self.dsp_config.tube.set_drive(drive);
+        match self.refresh_audio_filter_graph() {
+            Ok(()) => {
+                self.emit_event(EVT_STATE, &format!("dsp-tube drive={drive}"));
+                0
+            }
+            Err(err) => {
+                self.set_error(err.clone());
+                self.emit_event(EVT_ERROR, &err);
+                -2
+            }
+        }
+    }
+
+    fn set_tube_bias(&mut self, bias: i32) -> c_int {
+        self.dsp_config.tube.set_bias(bias);
+        match self.refresh_audio_filter_graph() {
+            Ok(()) => {
+                self.emit_event(EVT_STATE, &format!("dsp-tube bias={bias}"));
+                0
+            }
+            Err(err) => {
+                self.set_error(err.clone());
+                self.emit_event(EVT_ERROR, &err);
+                -2
+            }
+        }
+    }
+
+    fn set_tube_sag(&mut self, sag: i32) -> c_int {
+        self.dsp_config.tube.set_sag(sag);
+        match self.refresh_audio_filter_graph() {
+            Ok(()) => {
+                self.emit_event(EVT_STATE, &format!("dsp-tube sag={sag}"));
+                0
+            }
+            Err(err) => {
+                self.set_error(err.clone());
+                self.emit_event(EVT_ERROR, &err);
+                -2
+            }
+        }
+    }
+
+    fn set_tube_air(&mut self, air: i32) -> c_int {
+        self.dsp_config.tube.set_air(air);
+        match self.refresh_audio_filter_graph() {
+            Ok(()) => {
+                self.emit_event(EVT_STATE, &format!("dsp-tube air={air}"));
+                0
+            }
+            Err(err) => {
+                self.set_error(err.clone());
+                self.emit_event(EVT_ERROR, &err);
+                -2
+            }
+        }
+    }
+
+    fn set_widener_enabled(&mut self, enabled: bool) -> c_int {
+        self.dsp_config.widener.set_enabled(enabled);
+        match self.refresh_audio_filter_graph() {
+            Ok(()) => {
+                self.emit_event(EVT_STATE, &format!("dsp-widener enabled={enabled}"));
+                0
+            }
+            Err(err) => {
+                self.set_error(err.clone());
+                self.emit_event(EVT_ERROR, &err);
+                -2
+            }
+        }
+    }
+
+    fn set_widener_width(&mut self, width: i32) -> c_int {
+        self.dsp_config.widener.set_width(width);
+        match self.refresh_audio_filter_graph() {
+            Ok(()) => {
+                self.emit_event(EVT_STATE, &format!("dsp-widener width={width}"));
+                0
+            }
+            Err(err) => {
+                self.set_error(err.clone());
+                self.emit_event(EVT_ERROR, &err);
+                -2
+            }
+        }
+    }
+
+    fn set_widener_bass_mono_freq(&mut self, freq: i32) -> c_int {
+        self.dsp_config.widener.set_bass_mono_freq(freq);
+        match self.refresh_audio_filter_graph() {
+            Ok(()) => {
+                self.emit_event(EVT_STATE, &format!("dsp-widener bass_mono_freq={freq}"));
+                0
+            }
+            Err(err) => {
+                self.set_error(err.clone());
+                self.emit_event(EVT_ERROR, &err);
+                -2
+            }
+        }
+    }
+
+    fn set_widener_bass_mono_amount(&mut self, amount: i32) -> c_int {
+        self.dsp_config.widener.set_bass_mono_amount(amount);
+        match self.refresh_audio_filter_graph() {
+            Ok(()) => {
+                self.emit_event(EVT_STATE, &format!("dsp-widener bass_mono_amount={amount}"));
+                0
+            }
+            Err(err) => {
+                self.set_error(err.clone());
+                self.emit_event(EVT_ERROR, &err);
+                -2
+            }
+        }
+    }
+
+    fn lv2_add_slot(&mut self, uri: &str) -> Result<String, c_int> {
+        let previous_config = self.dsp_config.clone();
+        let slot_id = self.dsp_config.add_lv2_slot(uri);
+        if self.audio_filter_graph_rebuild_is_safe() {
+            match self.rebuild_audio_filter_graph() {
+                Ok(()) => {
+                    self.emit_event(
+                        EVT_STATE,
+                        &format!("dsp-lv2 add slot_id={slot_id} uri={uri} rebuild=1"),
+                    );
+                    Ok(slot_id)
+                }
+                Err(err) => {
+                    self.dsp_config = previous_config;
+                    self.set_error(err.clone());
+                    self.emit_event(EVT_ERROR, &err);
+                    Err(-2)
+                }
+            }
+        } else {
+            self.audio_filter_rebuild_pending = true;
+            self.emit_event(
+                EVT_STATE,
+                &format!("dsp-lv2 add slot_id={slot_id} uri={uri} rebuild=0 deferred=1"),
+            );
+            Ok(slot_id)
+        }
+    }
+
+    fn lv2_restore_slot(&mut self, slot_id: &str, uri: &str) -> c_int {
+        let previous_config = self.dsp_config.clone();
+        self.dsp_config.restore_lv2_slot(slot_id, uri);
+        match self.rebuild_audio_filter_graph() {
+            Ok(()) => {
+                self.emit_event(
+                    EVT_STATE,
+                    &format!("dsp-lv2 restore slot_id={slot_id} uri={uri}"),
+                );
+                0
+            }
+            Err(err) => {
+                self.dsp_config = previous_config;
+                self.set_error(err.clone());
+                self.emit_event(EVT_ERROR, &err);
+                -2
+            }
+        }
+    }
+
+    fn lv2_clear_slots_for_restore(&mut self) -> c_int {
+        self.dsp_config.lv2_slots.clear();
+        0
+    }
+
+    fn lv2_restore_slot_deferred(&mut self, slot_id: &str, uri: &str) -> c_int {
+        if self.dsp_config.lv2_slot(slot_id).is_some() {
+            return 0;
+        }
+        self.dsp_config.restore_lv2_slot(slot_id, uri);
+        0
+    }
+
+    fn lv2_finish_restore_slots(&mut self) -> c_int {
+        match self.rebuild_audio_filter_graph() {
+            Ok(()) => {
+                self.emit_event(EVT_STATE, "dsp-lv2 restore-batch");
+                0
+            }
+            Err(err) => {
+                self.set_error(err.clone());
+                self.emit_event(EVT_ERROR, &err);
+                -2
+            }
+        }
+    }
+
+    fn lv2_remove_slot(&mut self, slot_id: &str) -> c_int {
+        let previous_config = self.dsp_config.clone();
+        self.dsp_config.remove_lv2_slot(slot_id);
+        if self.audio_filter_graph_rebuild_is_safe() {
+            match self.rebuild_audio_filter_graph() {
+                Ok(()) => {
+                    self.emit_event(EVT_STATE, &format!("dsp-lv2 remove slot_id={slot_id} rebuild=1"));
+                    0
+                }
+                Err(err) => {
+                    self.dsp_config = previous_config;
+                    self.set_error(err.clone());
+                    self.emit_event(EVT_ERROR, &err);
+                    -2
+                }
+            }
+        } else {
+            self.audio_filter_rebuild_pending = true;
+            self.emit_event(EVT_STATE, &format!("dsp-lv2 remove slot_id={slot_id} rebuild=0 deferred=1"));
+            0
+        }
+    }
+
+    fn lv2_set_slot_enabled(&mut self, slot_id: &str, enabled: bool) -> c_int {
+        let previous_config = self.dsp_config.clone();
+        if let Some(slot) = self.dsp_config.lv2_slot_mut(slot_id) {
+            slot.set_enabled(enabled);
+        } else {
+            return -2;
+        }
+        if self.audio_filter_graph_rebuild_is_safe() {
+            match self.rebuild_audio_filter_graph() {
+                Ok(()) => {
+                    self.emit_event(
+                        EVT_STATE,
+                        &format!(
+                            "dsp-lv2 enabled slot_id={slot_id} enabled={enabled} active={} rebuild=1",
+                            self.dsp_config.has_active_processing()
+                        ),
+                    );
+                    0
+                }
+                Err(err) => {
+                    self.dsp_config = previous_config;
+                    self.set_error(err.clone());
+                    self.emit_event(EVT_ERROR, &err);
+                    -3
+                }
+            }
+        } else {
+            self.audio_filter_rebuild_pending = true;
+            self.emit_event(
+                EVT_STATE,
+                &format!(
+                    "dsp-lv2 enabled slot_id={slot_id} enabled={enabled} active={} rebuild=0 deferred=1",
+                    self.dsp_config.has_active_processing()
+                ),
+            );
+            0
+        }
+    }
+
+    fn lv2_set_port_value(&mut self, slot_id: &str, symbol: &str, value: f32) -> c_int {
+        let previous_config = self.dsp_config.clone();
+        if let Some(slot) = self.dsp_config.lv2_slot_mut(slot_id) {
+            slot.set_port_value(symbol, value);
+        } else {
+            return -2;
+        }
+        match self.refresh_audio_filter_graph() {
+            Ok(()) => {
+                self.emit_event(
+                    EVT_STATE,
+                    &format!("dsp-lv2 port slot_id={slot_id} symbol={symbol} value={value}"),
+                );
+                0
+            }
+            Err(err) => {
+                self.dsp_config = previous_config;
+                self.set_error(err.clone());
+                self.emit_event(EVT_ERROR, &err);
+                -3
+            }
+        }
+    }
+
+    fn load_convolver_ir(&mut self, path: &str) -> c_int {
+        let mut updated = self.dsp_config.convolver.clone();
+        if let Err(err) = updated.load_from_file(path) {
+            self.set_error(err.clone());
+            self.emit_event(EVT_ERROR, &err);
+            return -2;
+        }
+        self.dsp_config.convolver = updated;
+        match self.refresh_audio_filter_graph() {
+            Ok(()) => {
+                self.emit_event(
+                    EVT_STATE,
+                    &format!(
+                        "dsp-convolver load path={} taps={}",
+                        self.dsp_config.convolver.impulse_path,
+                        self.dsp_config.convolver.tap_count()
+                    ),
+                );
+                0
+            }
+            Err(err) => {
+                self.set_error(err.clone());
+                self.emit_event(EVT_ERROR, &err);
+                -3
+            }
+        }
+    }
+
+    fn clear_convolver_ir(&mut self) -> c_int {
+        self.dsp_config.convolver.clear();
+        match self.refresh_audio_filter_graph() {
+            Ok(()) => {
+                self.emit_event(EVT_STATE, "dsp-convolver cleared");
+                0
+            }
+            Err(err) => {
+                self.set_error(err.clone());
+                self.emit_event(EVT_ERROR, &err);
+                -2
+            }
+        }
     }
 
     fn parse_spectrum_structure(&mut self, s: &gst::StructureRef, msg_ts_s: Option<f64>) {
@@ -2135,11 +2866,20 @@ impl Engine {
             });
         }
 
-        let filter_bin = Self::setup_spectrum_filter(&playbin);
+        let dsp_config = DspGraphConfig::default();
+        let mut audio_filter_graph = DspGraphRuntime::build(&dsp_config).ok();
+        if let Some(ref mut graph) = audio_filter_graph {
+            graph.set_spectrum_messages_enabled(true);
+            let _ = graph.apply_config(&dsp_config);
+            let elem = graph.bin_element();
+            playbin.set_property("audio-filter", &elem);
+        }
 
         Ok(Self {
             playbin,
-            _audio_filter_bin: filter_bin,
+            audio_filter_graph,
+            audio_filter_rebuild_pending: false,
+            dsp_config,
             uri: String::new(),
             last_error: None,
             event_cb: None,
@@ -2260,6 +3000,12 @@ impl Engine {
                         .unwrap_or(false);
                     if is_self {
                         self.emit_event(EVT_STATE, &format!("{:?}", sc.current()));
+                        // Opportunistically consume a pending DSP rebuild on any
+                        // state transition. sync_audio_filter_graph checks is_safe()
+                        // internally and no-ops if the new state is not suitable.
+                        if self.audio_filter_rebuild_pending {
+                            let _ = self.sync_audio_filter_graph();
+                        }
                     }
                 }
                 gst::MessageView::Element(elm) => {
@@ -2491,7 +3237,11 @@ impl Engine {
         self.stop_mmap_sink();
 
         let driver_norm = normalized_driver_label(driver);
-        self.set_spectrum_filter_enabled(true);
+        self.spectrum_enabled = true;
+        if let Err(err) = self.sync_audio_filter_graph() {
+            self.set_error(format!("audio-filter setup failed: {err}"));
+            self.emit_event(EVT_ERROR, &format!("audio-filter setup failed: {err}"));
+        }
         self.emit_event(EVT_STATE, "spectrum-path=enabled");
         let original_device = device
             .map(|d| d.trim().to_string())
@@ -3049,7 +3799,7 @@ pub extern "C" fn rac_set_spectrum_enabled(ptr: *mut Engine, enabled: c_int) -> 
     let Some(engine) = as_mut_engine(ptr) else {
         return -1;
     };
-    engine.spectrum_enabled = enabled != 0;
+    engine.set_spectrum_filter_enabled(enabled != 0);
     if !engine.spectrum_enabled {
         engine.spectrum_len = 0;
         engine.spectrum_ring_count = 0;
@@ -3624,10 +4374,18 @@ fn list_pipewire_card_fallbacks() -> Vec<(String, Option<String>)> {
                         Some((name, p.n_sinks, p.priority, p.available))
                     })
                     .collect();
-                let Some(profile_name) = choose_pipewire_output_profile_from_entries(
-                    active_profile.as_deref(),
-                    &profiles,
-                ) else {
+                let preferred_profile = profiles.iter().find_map(|(name, sinks, _priority, available)| {
+                    if name.trim() == "pro-audio" && *sinks > 0 && *available {
+                        return Some(name.trim().to_string());
+                    }
+                    None
+                });
+                let Some(profile_name) = preferred_profile.or_else(|| {
+                    choose_pipewire_output_profile_from_entries(
+                        active_profile.as_deref(),
+                        &profiles,
+                    )
+                }) else {
                     return;
                 };
                 let label = pipewire_display_name_from_strings(
@@ -4435,6 +5193,15 @@ pub extern "C" fn rac_set_uri(ptr: *mut Engine, uri: *const c_char) -> c_int {
     engine.last_depth = 0;
     engine.source_rate = 0;
     engine.source_depth = 0;
+    // Re-attach the DSP bin while still in Null state so it is ready when
+    // rac_play transitions the pipeline to Playing.
+    if let Err(err) = engine.sync_audio_filter_graph() {
+        // A failure here means the audio-filter (including the spectrum element)
+        // will not be attached when the pipeline transitions to Playing.  Emit an
+        // error event so the Python layer can detect the stall and recover.
+        engine.set_error(format!("audio-filter sync failed after set_uri: {err}"));
+        engine.emit_event(EVT_ERROR, &format!("audio-filter sync failed after set_uri: {err}"));
+    }
     0
 }
 
@@ -4460,7 +5227,12 @@ pub extern "C" fn rac_pause(ptr: *mut Engine) -> c_int {
     let Some(engine) = as_mut_engine(ptr) else {
         return -1;
     };
-    engine.set_state(gst::State::Paused)
+    let rc = engine.set_state(gst::State::Paused);
+    // Apply any pending DSP structural rebuild now that the pipeline is paused.
+    if engine.audio_filter_rebuild_pending {
+        let _ = engine.sync_audio_filter_graph();
+    }
+    rc
 }
 
 #[no_mangle]
@@ -4469,7 +5241,8 @@ pub extern "C" fn rac_stop(ptr: *mut Engine) -> c_int {
         return -1;
     };
     engine.reset_spectrum_timeline();
-    engine.set_state(gst::State::Null)
+    let rc = engine.set_state(gst::State::Null);
+    rc
 }
 
 #[no_mangle]
@@ -4797,6 +5570,482 @@ pub extern "C" fn rac_set_preferred_output_format(
             -2
         }
     }
+}
+
+#[no_mangle]
+pub extern "C" fn rac_set_peq_band_gain(
+    ptr: *mut Engine,
+    band_index: c_int,
+    gain_db: c_double,
+) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    if !gain_db.is_finite() {
+        engine.set_error("rac_set_peq_band_gain: non-finite value");
+        engine.emit_event(EVT_ERROR, "rac_set_peq_band_gain: non-finite value");
+        return -2;
+    }
+    if band_index < 0 || (band_index as usize) >= PEQ_BAND_COUNT {
+        engine.set_error("rac_set_peq_band_gain: band index out of range");
+        engine.emit_event(EVT_ERROR, "rac_set_peq_band_gain: band index out of range");
+        return -3;
+    }
+    engine.set_peq_band_gain(band_index as usize, gain_db)
+}
+
+#[no_mangle]
+pub extern "C" fn rac_reset_peq(ptr: *mut Engine) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    engine.reset_peq()
+}
+
+#[no_mangle]
+pub extern "C" fn rac_set_dsp_enabled(ptr: *mut Engine, enabled: c_int) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    engine.set_dsp_master_enabled(enabled != 0)
+}
+
+#[no_mangle]
+pub extern "C" fn rac_set_dsp_order(ptr: *mut Engine, order_csv: *const c_char) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    if order_csv.is_null() {
+        engine.set_error("rac_set_dsp_order: null order");
+        engine.emit_event(EVT_ERROR, "rac_set_dsp_order: null order");
+        return -2;
+    }
+    match unsafe { CStr::from_ptr(order_csv) }.to_str() {
+        Ok(value) => engine.set_dsp_order(value),
+        Err(_) => {
+            engine.set_error("rac_set_dsp_order: invalid utf-8");
+            engine.emit_event(EVT_ERROR, "rac_set_dsp_order: invalid utf-8");
+            -3
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn rac_set_peq_enabled(ptr: *mut Engine, enabled: c_int) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    engine.set_peq_enabled(enabled != 0)
+}
+
+#[no_mangle]
+pub extern "C" fn rac_set_convolver_enabled(ptr: *mut Engine, enabled: c_int) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    engine.set_convolver_enabled(enabled != 0)
+}
+
+#[no_mangle]
+pub extern "C" fn rac_set_convolver_mix(ptr: *mut Engine, mix: c_double) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    if !mix.is_finite() {
+        engine.set_error("rac_set_convolver_mix: non-finite value");
+        engine.emit_event(EVT_ERROR, "rac_set_convolver_mix: non-finite value");
+        return -2;
+    }
+    engine.set_convolver_mix(mix)
+}
+
+#[no_mangle]
+pub extern "C" fn rac_set_convolver_pre_delay(ptr: *mut Engine, ms: c_double) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    if !ms.is_finite() {
+        engine.set_error("rac_set_convolver_pre_delay: non-finite value");
+        engine.emit_event(EVT_ERROR, "rac_set_convolver_pre_delay: non-finite value");
+        return -2;
+    }
+    engine.set_convolver_pre_delay(ms)
+}
+
+#[no_mangle]
+pub extern "C" fn rac_set_limiter_enabled(ptr: *mut Engine, enabled: c_int) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    engine.set_limiter_enabled(enabled != 0)
+}
+
+#[no_mangle]
+pub extern "C" fn rac_set_limiter_threshold(ptr: *mut Engine, threshold: c_double) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    if !threshold.is_finite() {
+        engine.set_error("rac_set_limiter_threshold: non-finite value");
+        engine.emit_event(EVT_ERROR, "rac_set_limiter_threshold: non-finite value");
+        return -2;
+    }
+    engine.set_limiter_threshold(threshold)
+}
+
+#[no_mangle]
+pub extern "C" fn rac_set_limiter_ratio(ptr: *mut Engine, ratio: c_double) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    if !ratio.is_finite() {
+        engine.set_error("rac_set_limiter_ratio: non-finite value");
+        engine.emit_event(EVT_ERROR, "rac_set_limiter_ratio: non-finite value");
+        return -2;
+    }
+    engine.set_limiter_ratio(ratio)
+}
+
+#[no_mangle]
+pub extern "C" fn rac_set_resampler_enabled(ptr: *mut Engine, enabled: c_int) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    engine.set_resampler_enabled(enabled != 0)
+}
+
+#[no_mangle]
+pub extern "C" fn rac_set_resampler_target_rate(ptr: *mut Engine, rate: c_uint) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    engine.set_resampler_target_rate(rate)
+}
+
+#[no_mangle]
+pub extern "C" fn rac_set_resampler_quality(ptr: *mut Engine, quality: c_int) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    engine.set_resampler_quality(quality)
+}
+
+#[no_mangle]
+pub extern "C" fn rac_set_tape_enabled(ptr: *mut Engine, enabled: c_int) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    engine.set_tape_enabled(enabled != 0)
+}
+
+#[no_mangle]
+pub extern "C" fn rac_set_tape_drive(ptr: *mut Engine, drive: c_int) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    engine.set_tape_drive(drive)
+}
+
+#[no_mangle]
+pub extern "C" fn rac_set_tape_tone(ptr: *mut Engine, tone: c_int) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    engine.set_tape_tone(tone)
+}
+
+#[no_mangle]
+pub extern "C" fn rac_set_tape_warmth(ptr: *mut Engine, warmth: c_int) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    engine.set_tape_warmth(warmth)
+}
+
+#[no_mangle]
+pub extern "C" fn rac_set_tube_enabled(ptr: *mut Engine, enabled: c_int) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    engine.set_tube_enabled(enabled != 0)
+}
+
+#[no_mangle]
+pub extern "C" fn rac_set_tube_drive(ptr: *mut Engine, drive: c_int) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    engine.set_tube_drive(drive)
+}
+
+#[no_mangle]
+pub extern "C" fn rac_set_tube_bias(ptr: *mut Engine, bias: c_int) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    engine.set_tube_bias(bias)
+}
+
+#[no_mangle]
+pub extern "C" fn rac_set_tube_sag(ptr: *mut Engine, sag: c_int) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    engine.set_tube_sag(sag)
+}
+
+#[no_mangle]
+pub extern "C" fn rac_set_tube_air(ptr: *mut Engine, air: c_int) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    engine.set_tube_air(air)
+}
+
+#[no_mangle]
+pub extern "C" fn rac_set_widener_enabled(ptr: *mut Engine, enabled: c_int) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    engine.set_widener_enabled(enabled != 0)
+}
+
+#[no_mangle]
+pub extern "C" fn rac_set_widener_width(ptr: *mut Engine, width: c_int) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    engine.set_widener_width(width)
+}
+
+#[no_mangle]
+pub extern "C" fn rac_set_widener_bass_mono_freq(ptr: *mut Engine, freq: c_int) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    engine.set_widener_bass_mono_freq(freq)
+}
+
+#[no_mangle]
+pub extern "C" fn rac_set_widener_bass_mono_amount(ptr: *mut Engine, amount: c_int) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    engine.set_widener_bass_mono_amount(amount)
+}
+
+/// Add a new LV2 slot. On success, writes the slot_id string into *out_slot_id_ptr
+/// (caller must free with rac_lv2_free_string). Returns 0 on success, negative on error.
+#[no_mangle]
+pub extern "C" fn rac_lv2_add_slot(
+    ptr: *mut Engine,
+    uri: *const c_char,
+    out_slot_id_ptr: *mut *mut c_char,
+) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    if uri.is_null() || out_slot_id_ptr.is_null() {
+        return -1;
+    }
+    let uri_str = unsafe {
+        match std::ffi::CStr::from_ptr(uri).to_str() {
+            Ok(s) => s,
+            Err(_) => return -1,
+        }
+    };
+    match engine.lv2_add_slot(uri_str) {
+        Ok(slot_id) => {
+            let c_str = match std::ffi::CString::new(slot_id) {
+                Ok(s) => s,
+                Err(_) => return -2,
+            };
+            unsafe { *out_slot_id_ptr = c_str.into_raw() };
+            0
+        }
+        Err(rc) => rc,
+    }
+}
+
+/// Restore a previously saved LV2 slot (e.g., on startup).
+#[no_mangle]
+pub extern "C" fn rac_lv2_restore_slot(
+    ptr: *mut Engine,
+    slot_id: *const c_char,
+    uri: *const c_char,
+) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    if slot_id.is_null() || uri.is_null() {
+        return -1;
+    }
+    let (slot_id_str, uri_str) = unsafe {
+        let s = match std::ffi::CStr::from_ptr(slot_id).to_str() {
+            Ok(s) => s,
+            Err(_) => return -1,
+        };
+        let u = match std::ffi::CStr::from_ptr(uri).to_str() {
+            Ok(u) => u,
+            Err(_) => return -1,
+        };
+        (s, u)
+    };
+    engine.lv2_restore_slot(slot_id_str, uri_str)
+}
+
+#[no_mangle]
+pub extern "C" fn rac_lv2_clear_slots_for_restore(ptr: *mut Engine) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    engine.lv2_clear_slots_for_restore()
+}
+
+#[no_mangle]
+pub extern "C" fn rac_lv2_restore_slot_deferred(
+    ptr: *mut Engine,
+    slot_id: *const c_char,
+    uri: *const c_char,
+) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    if slot_id.is_null() || uri.is_null() {
+        return -1;
+    }
+    let (slot_id_str, uri_str) = unsafe {
+        let s = match std::ffi::CStr::from_ptr(slot_id).to_str() {
+            Ok(s) => s,
+            Err(_) => return -1,
+        };
+        let u = match std::ffi::CStr::from_ptr(uri).to_str() {
+            Ok(u) => u,
+            Err(_) => return -1,
+        };
+        (s, u)
+    };
+    engine.lv2_restore_slot_deferred(slot_id_str, uri_str)
+}
+
+#[no_mangle]
+pub extern "C" fn rac_lv2_finish_restore_slots(ptr: *mut Engine) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    engine.lv2_finish_restore_slots()
+}
+
+#[no_mangle]
+pub extern "C" fn rac_lv2_remove_slot(ptr: *mut Engine, slot_id: *const c_char) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    if slot_id.is_null() {
+        return -1;
+    }
+    let slot_id_str = unsafe {
+        match std::ffi::CStr::from_ptr(slot_id).to_str() {
+            Ok(s) => s,
+            Err(_) => return -1,
+        }
+    };
+    engine.lv2_remove_slot(slot_id_str)
+}
+
+#[no_mangle]
+pub extern "C" fn rac_lv2_set_slot_enabled(
+    ptr: *mut Engine,
+    slot_id: *const c_char,
+    enabled: c_int,
+) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    if slot_id.is_null() {
+        return -1;
+    }
+    let slot_id_str = unsafe {
+        match std::ffi::CStr::from_ptr(slot_id).to_str() {
+            Ok(s) => s,
+            Err(_) => return -1,
+        }
+    };
+    engine.lv2_set_slot_enabled(slot_id_str, enabled != 0)
+}
+
+#[no_mangle]
+pub extern "C" fn rac_lv2_set_port_value(
+    ptr: *mut Engine,
+    slot_id: *const c_char,
+    symbol: *const c_char,
+    value: f32,
+) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    if slot_id.is_null() || symbol.is_null() {
+        return -1;
+    }
+    let (slot_id_str, symbol_str) = unsafe {
+        let s = match std::ffi::CStr::from_ptr(slot_id).to_str() {
+            Ok(s) => s,
+            Err(_) => return -1,
+        };
+        let sym = match std::ffi::CStr::from_ptr(symbol).to_str() {
+            Ok(s) => s,
+            Err(_) => return -1,
+        };
+        (s, sym)
+    };
+    engine.lv2_set_port_value(slot_id_str, symbol_str, value)
+}
+
+/// Scan all installed LV2 plugins. Returns a JSON string (caller must free with rac_lv2_free_string).
+#[no_mangle]
+pub extern "C" fn rac_lv2_scan_plugins(_ptr: *mut Engine) -> *mut c_char {
+    use crate::dsp::lv2_scan_plugins;
+    let json = lv2_scan_plugins();
+    match std::ffi::CString::new(json) {
+        Ok(c_str) => c_str.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Free a string returned by rac_lv2_add_slot or rac_lv2_scan_plugins.
+#[no_mangle]
+pub extern "C" fn rac_lv2_free_string(ptr: *mut c_char) {
+    if !ptr.is_null() {
+        unsafe { drop(std::ffi::CString::from_raw(ptr)) };
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn rac_load_convolver_ir(ptr: *mut Engine, path: *const c_char) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    if path.is_null() {
+        engine.set_error("rac_load_convolver_ir: null path");
+        engine.emit_event(EVT_ERROR, "rac_load_convolver_ir: null path");
+        return -2;
+    }
+    match unsafe { CStr::from_ptr(path) }.to_str() {
+        Ok(value) => engine.load_convolver_ir(value),
+        Err(_) => {
+            engine.set_error("rac_load_convolver_ir: invalid utf-8");
+            engine.emit_event(EVT_ERROR, "rac_load_convolver_ir: invalid utf-8");
+            -3
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn rac_clear_convolver_ir(ptr: *mut Engine) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    engine.clear_convolver_ir()
 }
 
 #[no_mangle]
@@ -5192,6 +6441,40 @@ mod tests {
     #[test]
     fn alsa_mmap_recover_from_interrupt_keeps_running_state() {
         assert!(!AlsaMmapCtx::recover_requires_restart(-libc::EINTR));
+    }
+
+    #[test]
+    fn peq_config_enables_processing_when_any_band_moves() {
+        let mut config = dsp::PeqConfig::default();
+        assert!(config.is_flat());
+        assert!(!config.is_active());
+
+        let gain = config.set_band_gain(3, 4.5).expect("set band gain");
+
+        assert_eq!(gain, 4.5);
+        assert!(!config.is_flat());
+        assert!(config.is_active());
+
+        config.reset();
+        assert!(config.is_flat());
+        assert!(!config.is_active());
+    }
+
+    #[test]
+    fn dsp_graph_config_requires_master_and_active_node() {
+        let mut config = DspGraphConfig::default();
+        assert!(!config.has_active_processing());
+
+        let _ = config.peq.set_band_gain(0, 3.0);
+        assert!(config.has_active_processing());
+
+        config.enabled = false;
+        assert!(!config.has_active_processing());
+        assert!(!config.effective_peq_config().enabled);
+
+        config.enabled = true;
+        assert!(config.has_active_processing());
+        assert!(config.effective_peq_config().enabled);
     }
 
     #[test]
