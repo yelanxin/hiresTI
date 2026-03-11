@@ -19,6 +19,84 @@ _OUTPUT_BIT_DEPTH_GUESS_FORMATS = {
 
 DRIVER_ALSA_AUTO = "ALSA（auto）"
 DRIVER_ALSA_MMAP = "ALSA（mmap）"
+_PLAYBACK_STATUS_NORMAL = "normal"
+_PLAYBACK_STATUS_BIT_PERFECT = "bit-perfect"
+_PLAYBACK_STATUS_EXCLUSIVE = "exclusive"
+_PLAYBACK_STATUS_DSP = "dsp"
+_PLAYBACK_STATUS_ICONS = {
+    _PLAYBACK_STATUS_NORMAL: "hiresti-status-normal-symbolic",
+    _PLAYBACK_STATUS_BIT_PERFECT: "hiresti-status-bit-perfect-symbolic",
+    _PLAYBACK_STATUS_EXCLUSIVE: "hiresti-status-exclusive-symbolic",
+    _PLAYBACK_STATUS_DSP: "hiresti-status-dsp-symbolic",
+}
+_PLAYBACK_STATUS_TOOLTIPS = {
+    _PLAYBACK_STATUS_NORMAL: "Normal Mode",
+    _PLAYBACK_STATUS_BIT_PERFECT: "Bit-Perfect Mode Active",
+    _PLAYBACK_STATUS_EXCLUSIVE: "Exclusive Mode Active",
+    _PLAYBACK_STATUS_DSP: "DSP Processing Active",
+}
+
+
+def _dsp_processing_active(app):
+    player = getattr(app, "player", None)
+    if player is None or not bool(getattr(player, "dsp_enabled", False)):
+        return False
+
+    settings = getattr(app, "settings", {}) or {}
+    convolver_path = str(
+        getattr(player, "convolver_ir_path", "")
+        or settings.get("dsp_convolver_path", "")
+        or ""
+    ).strip()
+    if bool(getattr(player, "peq_enabled", False)):
+        return True
+    if bool(getattr(player, "convolver_enabled", False)) and bool(convolver_path):
+        return True
+    if bool(getattr(player, "limiter_enabled", False)):
+        return True
+    if bool(getattr(player, "resampler_enabled", False)):
+        return True
+    if bool(getattr(player, "tape_enabled", False)):
+        return True
+    if bool(getattr(player, "tube_enabled", False)):
+        return True
+    if bool(getattr(player, "widener_enabled", False)):
+        return True
+    return any(bool((info or {}).get("enabled", True)) for info in dict(getattr(player, "lv2_slots", {}) or {}).values())
+
+
+def _playback_status_visual(app):
+    player = getattr(app, "player", None)
+    if player is not None:
+        if bool(getattr(player, "exclusive_lock_mode", False)):
+            status = _PLAYBACK_STATUS_EXCLUSIVE
+        elif bool(getattr(player, "bit_perfect_mode", False)):
+            status = _PLAYBACK_STATUS_BIT_PERFECT
+        elif _dsp_processing_active(app):
+            status = _PLAYBACK_STATUS_DSP
+        else:
+            status = _PLAYBACK_STATUS_NORMAL
+    else:
+        status = _PLAYBACK_STATUS_NORMAL
+    return status, _PLAYBACK_STATUS_ICONS[status], _PLAYBACK_STATUS_TOOLTIPS[status]
+
+
+def _sync_playback_status_icon(self):
+    _status, icon_name, tooltip = _playback_status_visual(self)
+    for btn in (
+        getattr(self, "playback_status_btn", None),
+        getattr(self, "now_playing_status_btn", None),
+    ):
+        if btn is None:
+            continue
+        try:
+            btn.set_icon_name(icon_name)
+        except Exception:
+            pass
+        try:
+            btn.set_tooltip_text(tooltip)
+        except Exception:
+            pass
 
 
 def _canonical_output_format_name(fmt):
@@ -351,6 +429,8 @@ def _refresh_devices_for_current_driver_ui_only(app, reason="hotplug-watch", pre
             _sync_output_bit_depth_dropdown(app, device_info)
             app.ignore_device_change = False
             app.update_tech_label(app.player.stream_info)
+            if hasattr(app, "_update_dsp_ui_state"):
+                app._update_dsp_ui_state()
             logger.info("Output device list refreshed (%s): %d devices", reason, len(devices))
             if reason == "hotplug-watch" and added and hasattr(app, "show_output_notice"):
                 remembered_name = str(getattr(app, "_last_disconnected_device_name", "") or "")
@@ -592,10 +672,14 @@ def _monitor_selected_device_presence(app):
             try:
                 devices = app.player.get_devices_for_driver(driver_name)
                 names = [d.get("name") for d in devices]
+                ids = [d.get("device_id") for d in devices]
+                requested_id = getattr(app.player, "requested_device_id", None)
 
                 def apply_result():
                     app._device_presence_probe_running = False
                     if device_name in names:
+                        return False
+                    if requested_id and requested_id in ids:
                         return False
                     if hasattr(app, "show_output_notice"):
                         app.show_output_notice(
@@ -656,6 +740,7 @@ def _passive_sync_device_list(app):
             try:
                 devices = app.player.get_devices_for_driver(driver_name)
                 new_sig = _device_enum_signature(devices)
+                new_names = [d.get("name") for d in devices]
 
                 def apply_result():
                     app._device_list_sync_running = False
@@ -680,6 +765,8 @@ def _passive_sync_device_list(app):
                     _sync_output_bit_depth_dropdown(app, device_info)
                     app.ignore_device_change = False
                     app.update_tech_label(app.player.stream_info)
+                    if hasattr(app, "_update_dsp_ui_state"):
+                        app._update_dsp_ui_state()
                     logger.info("Output device list synced (passive): driver=%s count=%d", driver_name, len(devices))
                     return False
 
@@ -694,6 +781,8 @@ def _passive_sync_device_list(app):
 
 def update_output_status_ui(app):
     if not hasattr(app, "output_status_label") or app.output_status_label is None:
+        if hasattr(app, "_sync_playback_status_icon"):
+            app._sync_playback_status_icon()
         return
 
     state = getattr(app.player, "output_state", "idle")
@@ -736,6 +825,8 @@ def update_output_status_ui(app):
             app.set_diag_health("output", "idle")
     _monitor_selected_device_presence(app)
     _passive_sync_device_list(app)
+    if hasattr(app, "_sync_playback_status_icon"):
+        app._sync_playback_status_icon()
 
 
 def on_recover_output_clicked(app, _btn=None):
@@ -803,6 +894,15 @@ def on_mmap_realtime_priority_changed(app, dd, p):
 
 
 def on_driver_changed(app, dd, p):
+    driver_change_t0 = time.monotonic()
+
+    def _driver_mark(stage):
+        logger.info(
+            "STARTUP TIMING driver-change %s +%.1fms",
+            str(stage),
+            (time.monotonic() - driver_change_t0) * 1000.0,
+        )
+
     if getattr(app, "ignore_driver_change", False):
         return
     _stop_output_hotplug_watch(app)
@@ -811,6 +911,7 @@ def on_driver_changed(app, dd, p):
     if not selected:
         return
     driver_name = selected.get_string()
+    _driver_mark(f"begin driver={driver_name}")
 
     if app.ex_switch.get_active() and not _driver_is_alsa_family(driver_name):
         app._force_driver_selection(DRIVER_ALSA_AUTO)
@@ -825,20 +926,40 @@ def on_driver_changed(app, dd, p):
     if not app.ex_switch.get_active() or _driver_is_alsa_family(driver_name):
         app.settings["driver"] = driver_name
         app.save_settings()
+    _driver_mark("settings-saved")
 
     # Stop playback and release the current audio path before switching driver,
     # so the device is free when the new driver (e.g. ALSA exclusive) opens it.
+    # Skip the stop on first-launch initialization when no output route has been
+    # established yet; this avoids a pointless synchronous stop during startup.
+    had_active_output = bool(
+        getattr(app.player, "current_device_id", None)
+        or str(getattr(app.player, "output_state", "idle") or "idle") != "idle"
+    )
     if app.player.is_playing():
         app.player.pause()
-    app.player.stop()
+        app.player.stop()
+    elif had_active_output:
+        app.player.stop()
+    _driver_mark("stop-complete")
 
     app.current_device_name = "Default"
     app.update_tech_label(app.player.stream_info)
+    if hasattr(app, "_update_dsp_ui_state"):
+        app._update_dsp_ui_state()
+    _driver_mark("ui-reset")
 
     def worker():
+        worker_t0 = time.monotonic()
         devices = app.player.get_devices_for_driver(driver_name)
+        logger.info(
+            "STARTUP TIMING driver-change enum-complete driver=%s +%.1fms",
+            driver_name,
+            (time.monotonic() - worker_t0) * 1000.0,
+        )
 
         def apply_devices():
+            apply_t0 = time.monotonic()
             app.ignore_device_change = True
 
             app.current_device_list = devices
@@ -863,16 +984,34 @@ def on_driver_changed(app, dd, p):
             device_info = devices[sel_idx] if sel_idx < len(devices) else None
             _sync_output_bit_depth_dropdown(app, device_info)
             app.ignore_device_change = False
+            if hasattr(app, "_update_dsp_ui_state"):
+                app._update_dsp_ui_state()
+            logger.info(
+                "STARTUP TIMING driver-change apply-devices driver=%s +%.1fms",
+                driver_name,
+                (time.monotonic() - apply_t0) * 1000.0,
+            )
 
             target_id = None
             if sel_idx < len(devices):
                 target_id = devices[sel_idx]["device_id"]
                 app.current_device_name = devices[sel_idx]["name"]
+            if hasattr(app, "_update_dsp_ui_state"):
+                app._update_dsp_ui_state()
 
             app.update_tech_label(app.player.stream_info)
+            _driver_mark(f"devices-applied target={target_id or 'default'}")
 
             def apply_output_async():
+                output_t0 = time.monotonic()
                 ok = app.player.set_output(driver_name, target_id)
+                logger.info(
+                    "STARTUP TIMING driver-change set-output driver=%s target=%s +%.1fms ok=%s",
+                    driver_name,
+                    target_id or "default",
+                    (time.monotonic() - output_t0) * 1000.0,
+                    bool(ok),
+                )
                 if not ok and hasattr(app, "show_output_notice"):
                     app.show_output_notice(
                         f"Failed to switch output to {app.current_device_name or 'selected device'}",
@@ -885,6 +1024,8 @@ def on_driver_changed(app, dd, p):
                         device_id=target_id,
                         device_name=app.current_device_name,
                     )
+                if hasattr(app, "_update_dsp_ui_state"):
+                    GLib.idle_add(lambda: (app._update_dsp_ui_state(), False)[1])
                 GLib.idle_add(lambda: update_output_status_ui(app) or False)
 
             Thread(target=apply_output_async, daemon=True).start()
@@ -905,6 +1046,19 @@ def _pipewire_device_needs_pro_audio(device_id):
     if dev.startswith("pwcardprofile:") and "|pro-audio" in dev:
         return False
     return True
+
+
+def _normalize_pipewire_device_id(device_id):
+    dev = str(device_id or "").strip()
+    if not dev.startswith("pwcardprofile:"):
+        return device_id
+    if "|pro-audio" in dev:
+        return device_id
+    card_part = dev[len("pwcardprofile:"):]
+    card_name = card_part.split("|", 1)[0].strip()
+    if not card_name:
+        return device_id
+    return f"pwcardprofile:{card_name}|pro-audio"
 
 
 def _show_pro_audio_switch_info(app, on_confirm):
@@ -965,7 +1119,11 @@ def on_device_changed(app, dd, p):
     _sync_output_bit_depth_dropdown(app, device_info)
 
     def _do_switch():
-        ok = app.player.set_output(driver_label, device_info["device_id"])
+        original_device_id = device_info["device_id"]
+        target_device_id = original_device_id
+        if driver_label == "PipeWire":
+            target_device_id = _normalize_pipewire_device_id(target_device_id)
+        ok = app.player.set_output(driver_label, target_device_id)
         if not ok:
             if previous_idx is not None and previous_idx != idx:
                 app.ignore_device_change = True
@@ -983,6 +1141,8 @@ def on_device_changed(app, dd, p):
                     "error",
                     4200,
                 )
+            if hasattr(app, "_update_dsp_ui_state"):
+                app._update_dsp_ui_state()
             update_output_status_ui(app)
             return
         if remembered_name and target_name == remembered_name:
@@ -992,8 +1152,17 @@ def on_device_changed(app, dd, p):
         app.update_tech_label(app.player.stream_info)
         app.settings["device"] = target_name
         app.save_settings()
+        if hasattr(app, "_update_dsp_ui_state"):
+            app._update_dsp_ui_state()
         if hasattr(app, "_apply_viz_sync_offset_for_device"):
-            app._apply_viz_sync_offset_for_device(driver_label, device_id=device_info["device_id"], device_name=target_name)
+            app._apply_viz_sync_offset_for_device(driver_label, device_id=target_device_id, device_name=target_name)
+        if driver_label == "PipeWire" and target_device_id != original_device_id:
+            new_id = str(getattr(app.player, "requested_device_id", "") or target_device_id or "")
+            _refresh_devices_for_current_driver_ui_only(
+                app,
+                reason="pipewire-target-normalized",
+                prefer_device_id=new_id or None,
+            )
         update_output_status_ui(app)
 
     if (driver_label == "PipeWire"
@@ -1258,15 +1427,54 @@ def update_tech_label(self, info):
 
 def on_bit_perfect_toggled(self, switch, state):
     self.settings["bit_perfect"] = state; self.save_settings()
+    logger.info(
+        "Bit-perfect toggle request state=%s current_dsp_enabled=%s lv2_slots=%s",
+        bool(state),
+        bool(getattr(getattr(self, "player", None), "dsp_enabled", False)),
+        [
+            (sid, bool((info or {}).get("enabled", True)))
+            for sid, info in dict(getattr(getattr(self, "player", None), "lv2_slots", {}) or {}).items()
+        ],
+    )
+    if state and bool(getattr(getattr(self, "player", None), "dsp_enabled", False)):
+        try:
+            dsp_disabled = bool(self.player.set_dsp_enabled(False))
+        except Exception:
+            dsp_disabled = False
+        if dsp_disabled:
+            self.settings["dsp_enabled"] = False
+            self.save_settings()
+        if dsp_disabled and hasattr(self, "show_output_notice"):
+            self.show_output_notice("DSP disabled: Bit-Perfect mode enabled", "info", 2600)
+        if dsp_disabled and hasattr(self, "_lv2_restart_playback_for_graph_rebind"):
+            try:
+                self._lv2_restart_playback_for_graph_rebind(reason="bit-perfect-toggle")
+            except Exception:
+                logger.debug("bit-perfect lv2 rebind failed", exc_info=True)
     self._lock_volume_controls(state)
     self.ex_switch.set_sensitive(state)
     if not state: self.ex_switch.set_active(False)
     is_ex = self.ex_switch.get_active()
     self.player.toggle_bit_perfect(state, exclusive_lock=is_ex)
-    if getattr(self, "eq_btn", None) is not None:
-        self.eq_btn.set_sensitive(not state)
+    logger.info(
+        "Bit-perfect toggle applied state=%s player_dsp_enabled=%s player_bit_perfect=%s",
+        bool(state),
+        bool(getattr(getattr(self, "player", None), "dsp_enabled", False)),
+        bool(getattr(getattr(self, "player", None), "bit_perfect_mode", False)),
+    )
+    for btn in (
+        getattr(self, "eq_btn", None),
+        getattr(self, "dsp_btn", None),
+        getattr(self, "now_playing_dsp_btn", None),
+    ):
+        if btn is not None:
+            btn.set_sensitive(not state)
     if state and getattr(self, "eq_pop", None) is not None:
         self.eq_pop.popdown()
+    if hasattr(self, "_update_dsp_ui_state"):
+        self._update_dsp_ui_state()
+    elif hasattr(self, "_sync_playback_status_icon"):
+        self._sync_playback_status_icon()
     if self.bp_label is not None: self.bp_label.set_visible(state)
     if is_ex:
         prev_driver = _selected_driver_name(self)
@@ -1320,6 +1528,8 @@ def on_exclusive_toggled(self, switch, state):
     self.save_settings()
 
     self.player.toggle_bit_perfect(True, exclusive_lock=state)
+    if hasattr(self, "_sync_playback_status_icon"):
+        self._sync_playback_status_icon()
 
     self.latency_dd.set_sensitive(state)
 

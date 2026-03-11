@@ -43,7 +43,7 @@ button.circular {
     background-color: rgba(10, 10, 10, 0.98);
     background-image: none;
     border-top: 1px solid rgba(255, 255, 255, 0.2);
-    padding: 10px;
+    padding: 14px;
     border-radius: 12px;
     margin: 0px 35px 1px 35px;
 }
@@ -68,8 +68,442 @@ button.circular {
     border-spacing: 0;
 }
 
+.dsp-workspace {
+    min-height: 0;
+}
+
+.dsp-workspace-switcher {
+    margin-bottom: 4px;
+}
+
+.dsp-workspace-switcher,
+.dsp-workspace-switcher > box {
+    background: none;
+    background-color: transparent;
+    box-shadow: none;
+    padding: 0;
+}
+
+.dsp-workspace-switcher button {
+    min-height: 32px;
+    min-width: 0;
+    padding: 5px 10px 7px 10px;
+    margin-right: 14px;
+    border-radius: 0;
+    border: none;
+    border-bottom: 2px solid transparent;
+    background-image: none;
+    background-color: transparent;
+    box-shadow: none;
+    text-shadow: none;
+    color: rgba(245, 248, 252, 0.70);
+    font-size: 12px;
+    font-weight: 800;
+}
+
+.dsp-workspace-switcher button:last-child {
+    margin-right: 0;
+}
+
+.dsp-workspace-switcher button:hover {
+    background-color: transparent;
+    color: rgba(255, 255, 255, 0.94);
+}
+
+.dsp-workspace-switcher button:checked {
+    background-color: transparent;
+    border-bottom-color: alpha(@accent_bg_color, 0.95);
+    color: alpha(@accent_fg_color, 0.98);
+}
+
+.dsp-workspace-switcher button:backdrop {
+    background-image: none;
+}
+
+.viz-surface-light .dsp-workspace-switcher button {
+    background-color: transparent;
+    color: rgba(18, 22, 30, 0.68);
+}
+
+.viz-surface-light .dsp-workspace-switcher button:hover {
+    background-color: transparent;
+    color: rgba(18, 22, 30, 0.94);
+}
+
+.viz-surface-light .dsp-workspace-switcher button:checked {
+    background-color: transparent;
+    border-bottom-color: alpha(@accent_bg_color, 0.90);
+    color: rgba(18, 22, 30, 0.98);
+}
+
+.dsp-sidebar {
+    min-width: 250px;
+}
+
+.dsp-master-card,
+.dsp-detail-card,
+.dsp-module-list row {
+    border-radius: 12px;
+}
+
+.dsp-master-card,
+.dsp-detail-card {
+    padding: 16px;
+}
+
+.dsp-master-card,
+.dsp-detail-card,
+.dsp-module-list row {
+    background-color: alpha(white, 0.04);
+    border: 1px solid alpha(white, 0.08);
+}
+
+.viz-surface-light .dsp-master-card,
+.viz-surface-light .dsp-detail-card,
+.viz-surface-light .dsp-module-list row {
+    background-color: rgba(255, 255, 255, 0.88);
+    border-color: rgba(24, 28, 36, 0.08);
+}
+
+.dsp-module-list {
+    background: transparent;
+}
+
+.dsp-module-list row:selected {
+    background-color: alpha(@accent_bg_color, 0.18);
+    border-color: alpha(@accent_bg_color, 0.35);
+}
+
+.dsp-chain-card {
+    background-color: rgba(10, 14, 24, 0.88);
+    background-image:
+        radial-gradient(circle at 20% 18%, rgba(90, 150, 255, 0.05) 0%, rgba(90, 150, 255, 0.00) 26%),
+        linear-gradient(180deg, rgba(26, 34, 54, 0.36) 0%, rgba(8, 12, 20, 0.90) 100%);
+    border-color: rgba(150, 174, 220, 0.12);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+}
+
+.viz-surface-light .dsp-chain-card {
+    background-color: rgba(244, 248, 255, 0.94);
+    background-image:
+        radial-gradient(circle at 18% 16%, rgba(110, 170, 255, 0.08) 0%, rgba(110, 170, 255, 0.00) 24%),
+        linear-gradient(180deg, rgba(255, 255, 255, 0.98) 0%, rgba(234, 241, 252, 0.92) 100%);
+    border-color: rgba(90, 116, 156, 0.10);
+}
+
+.dsp-chain-button {
+    min-width: 136px;
+    min-height: 50px;
+    padding: 0;
+    border-radius: 10px;
+    border: 1px solid rgba(154, 170, 208, 0.18);
+    border-bottom: 1px solid rgba(214, 223, 245, 0.08);
+    background-color: rgba(39, 43, 62, 0.95);
+    background-image:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.035) 0%, rgba(255, 255, 255, 0.00) 28%),
+        linear-gradient(
+            180deg,
+            rgba(70, 76, 100, 0.94) 0%,
+            rgba(37, 41, 58, 0.98) 100%
+        );
+    box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, 0.05),
+        0 10px 22px rgba(0, 0, 0, 0.24),
+        0 2px 6px rgba(0, 0, 0, 0.16);
+}
+
+.dsp-chain-button:hover {
+    border-color: rgba(164, 184, 228, 0.26);
+    border-bottom-color: rgba(214, 223, 245, 0.10);
+    background-color: rgba(44, 49, 72, 0.98);
+    background-image:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.06) 0%, rgba(255, 255, 255, 0.00) 30%),
+        linear-gradient(
+            180deg,
+            rgba(78, 88, 116, 0.96) 0%,
+            rgba(42, 47, 68, 0.99) 100%
+        );
+}
+
+.viz-surface-light .dsp-chain-button {
+    border-color: rgba(70, 92, 130, 0.12);
+    border-bottom-color: rgba(70, 92, 130, 0.10);
+    background-color: rgba(255, 255, 255, 0.98);
+    background-image:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.86) 0%, rgba(255, 255, 255, 0.00) 28%),
+        linear-gradient(
+            180deg,
+            rgba(246, 249, 255, 0.98) 0%,
+            rgba(226, 233, 246, 0.96) 100%
+        );
+    box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, 0.82),
+        0 10px 22px rgba(36, 48, 74, 0.10),
+        0 2px 6px rgba(36, 48, 74, 0.06);
+}
+
+.viz-surface-light .dsp-chain-button:hover {
+    border-color: rgba(110, 134, 176, 0.20);
+    border-bottom-color: rgba(70, 92, 130, 0.10);
+    background-color: rgba(250, 252, 255, 0.99);
+    background-image:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.92) 0%, rgba(255, 255, 255, 0.00) 30%),
+        linear-gradient(
+            180deg,
+            rgba(250, 252, 255, 0.98) 0%,
+            rgba(232, 239, 250, 0.98) 100%
+        );
+}
+
+.dsp-chain-button-active {
+    border-color: rgba(184, 198, 230, 0.20);
+    border-bottom-color: rgba(214, 223, 245, 0.10);
+}
+
+.dsp-chain-button-inactive {
+    border-color: rgba(124, 136, 166, 0.10);
+    border-bottom-color: rgba(124, 136, 166, 0.26);
+    background-image:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.03) 0%, rgba(255, 255, 255, 0.00) 28%),
+        linear-gradient(
+            180deg,
+            rgba(64, 70, 94, 0.92) 0%,
+            rgba(35, 39, 56, 0.98) 100%
+        );
+}
+
+.dsp-chain-button-io {
+    border-color: rgba(184, 198, 230, 0.20);
+    border-bottom-color: rgba(214, 223, 245, 0.10);
+}
+
+.viz-surface-light .dsp-chain-button-active {
+    border-color: rgba(110, 134, 176, 0.20);
+    border-bottom-color: rgba(70, 92, 130, 0.10);
+}
+
+.viz-surface-light .dsp-chain-button-inactive {
+    border-color: rgba(70, 84, 104, 0.12);
+    border-bottom-color: rgba(120, 128, 144, 0.28);
+    background-image:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.92) 0%, rgba(255, 255, 255, 0.00) 28%),
+        linear-gradient(
+            180deg,
+            rgba(238, 242, 250, 0.98) 0%,
+            rgba(224, 231, 244, 0.96) 100%
+        );
+}
+
+.viz-surface-light .dsp-chain-button-io {
+    border-color: rgba(110, 134, 176, 0.20);
+    border-bottom-color: rgba(70, 92, 130, 0.10);
+}
+
+.dsp-chain-order,
+.dsp-chain-state {
+    font-weight: 800;
+    letter-spacing: 0.04em;
+}
+
+.dsp-chain-title {
+    min-height: 20px;
+    font-size: 13px;
+    font-weight: 800;
+    letter-spacing: 0.02em;
+    color: rgba(245, 248, 252, 0.96);
+}
+
+.dsp-chain-lamp {
+    min-width: 16px;
+    min-height: 8px;
+    border-radius: 999px;
+    background-color: rgba(152, 160, 184, 0.28);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+}
+
+.dsp-chain-button-active .dsp-chain-lamp,
+.dsp-chain-button-io .dsp-chain-lamp {
+    background-color: @accent_bg_color;
+    box-shadow:
+        0 0 10px alpha(@accent_bg_color, 0.55),
+        0 0 18px alpha(@accent_bg_color, 0.28);
+}
+
+.viz-surface-light .dsp-chain-lamp {
+    background-color: rgba(126, 136, 160, 0.30);
+}
+
+.viz-surface-light .dsp-chain-button-active .dsp-chain-lamp,
+.viz-surface-light .dsp-chain-button-io .dsp-chain-lamp {
+    background-color: @accent_bg_color;
+    box-shadow:
+        0 0 10px alpha(@accent_bg_color, 0.34),
+        0 0 16px alpha(@accent_bg_color, 0.16);
+}
+
+.dsp-chain-button-inactive .dsp-chain-title {
+    color: rgba(226, 232, 245, 0.78);
+}
+
+.viz-surface-light .dsp-chain-title {
+    color: rgba(18, 22, 30, 0.96);
+}
+
+.viz-surface-light .dsp-chain-button-inactive .dsp-chain-title {
+    color: rgba(18, 22, 30, 0.66);
+}
+
+.dsp-chain-arrow {
+    font-size: 26px;
+    font-weight: 800;
+    opacity: 0.72;
+    color: rgba(132, 182, 255, 0.72);
+}
+
+.dsp-chain-connector {
+    color: alpha(@accent_bg_color, 0.92);
+}
+
+.dsp-chain-connector-line {
+    min-height: 1px;
+    border-radius: 999px;
+    background-color: alpha(@accent_bg_color, 0.72);
+}
+
+.dsp-chain-connector-line-vertical {
+    min-width: 1px;
+    min-height: 8px;
+    border-radius: 999px;
+    background-color: alpha(@accent_bg_color, 0.72);
+}
+
+.dsp-chain-connector-head {
+    font-size: 9px;
+    font-weight: 900;
+    color: alpha(@accent_bg_color, 0.96);
+    margin-top: -1px;
+}
+
+.viz-surface-light .dsp-chain-connector {
+    color: alpha(@accent_bg_color, 0.88);
+}
+
+.viz-surface-light .dsp-chain-connector-line {
+    background-color: alpha(@accent_bg_color, 0.64);
+}
+
+.viz-surface-light .dsp-chain-connector-line-vertical {
+    background-color: alpha(@accent_bg_color, 0.64);
+}
+
+.viz-surface-light .dsp-chain-connector-head {
+    color: alpha(@accent_bg_color, 0.90);
+}
+
+.dsp-chain-handle {
+    opacity: 0.88;
+    color: rgba(212, 220, 240, 0.82);
+}
+
 .viz-theme-dd {
-    margin-right: 4px;
+    margin-right: 0;
+}
+
+.dsp-preset-dd button {
+    border: 1px solid alpha(currentColor, 0.12);
+    box-shadow: none;
+    text-shadow: none;
+    background-image: none;
+    background-color: alpha(white, 0.04);
+    min-height: 30px;
+    min-width: 0;
+    padding: 4px 12px;
+    font-weight: 700;
+    font-size: 12px;
+    color: rgba(245, 248, 252, 0.90);
+    border-radius: 10px;
+}
+
+.dsp-preset-dd button:hover {
+    background-color: alpha(white, 0.08);
+}
+
+.viz-surface-light .dsp-preset-dd button {
+    background-color: rgba(255, 255, 255, 0.92);
+    border-color: rgba(24, 28, 36, 0.12);
+    color: rgba(18, 22, 30, 0.92);
+}
+
+.viz-surface-light .dsp-preset-dd button:hover {
+    background-color: rgba(244, 247, 251, 0.98);
+}
+
+.viz-toolbar-btn {
+    min-width: 35px;
+    min-height: 35px;
+    padding: 0;
+    margin-left: 0;
+    border-radius: 0;
+    background-color: rgba(34, 38, 48, 0.98);
+    border: 1px solid rgba(255, 255, 255, 0.24);
+    border-bottom: none;
+    box-shadow: none;
+    text-shadow: none;
+    color: rgba(245, 248, 252, 0.88);
+    font-weight: 800;
+    font-size: 12px;
+}
+
+.viz-toolbar-btn:hover {
+    background-color: rgba(50, 56, 70, 0.98);
+    color: rgba(255, 255, 255, 0.98);
+}
+
+.viz-toolbar-btn.viz-right-last {
+    border-radius: 0 12px 0 0;
+}
+
+.viz-toolbar-btn.viz-floating-corner-btn {
+    border-radius: 12px 12px 0 0;
+}
+
+.viz-overlay-btn {
+    min-width: 28px;
+    min-height: 28px;
+    padding: 0;
+    border: none;
+    border-radius: 10px;
+    background: transparent;
+    background-color: transparent;
+    background-image: none;
+    box-shadow: none;
+    text-shadow: none;
+    color: rgba(245, 248, 252, 0.88);
+}
+
+.viz-overlay-btn:hover {
+    background-color: rgba(255, 255, 255, 0.08);
+    color: rgba(255, 255, 255, 0.98);
+}
+
+.viz-surface-light .viz-overlay-btn {
+    color: rgba(18, 22, 30, 0.86);
+}
+
+.viz-surface-light .viz-overlay-btn:hover {
+    background-color: rgba(20, 24, 32, 0.06);
+    color: rgba(18, 22, 30, 0.96);
+}
+
+.viz-surface-light .viz-toolbar-btn {
+    color: rgba(18, 22, 30, 0.86);
+    background-color: rgba(247, 249, 252, 0.98);
+    border-color: rgba(30, 35, 45, 0.20);
+}
+
+.viz-surface-light .viz-toolbar-btn:hover {
+    color: rgba(18, 22, 30, 0.96);
+    background-color: rgba(233, 238, 246, 0.98);
 }
 
 .viz-right-last,
@@ -344,7 +778,6 @@ button.circular {
         border-radius: 12px 0 0 0;
     }
 
-    /* 4. 右边按钮：只圆右边 */
     .mini-switcher button:last-child {
         border-radius: 0 12px 0 0;
         margin-right: 0;
@@ -397,8 +830,7 @@ button.circular {
     .lyrics-font-dd button {
         border-radius: 12px 0 0 0;
     }
-    .viz-right-last button,
-    .lyrics-motion-dd button {
+    .viz-right-last button {
         border-radius: 0 12px 0 0;
     }
 
@@ -429,11 +861,14 @@ button.circular {
     .lyrics-scroller {
         background: transparent;
         background-color: transparent;
+        border-radius: 0;
     }
 
     /* Box 也要透明 */
-    .lyrics-scroller > box {
+    .lyrics-scroller > box,
+    .lyrics-scroller viewport {
         background: transparent;
+        border-radius: 0;
     }
     .lyric-line {
         font-size: 16px; 
@@ -601,6 +1036,9 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
     min-width: 28px;
     min-height: 28px;
     padding: 2px;
+}
+.player-side-btn.eq-btn image {
+    -gtk-icon-size: 20px;
 }
 .album-cover-img { border-radius: 8px; -gtk-icon-transform: scale(1);}
 .header-art { border-radius: 12px; }

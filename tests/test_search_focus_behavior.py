@@ -136,3 +136,27 @@ def test_suppressed_search_focus_is_cleared_on_focus_enter(monkeypatch):
     assert shown == []
     assert win.focus_values == [None]
     assert app.search_suggest_popover.popdown_calls == 1
+
+
+def test_dsp_order_edit_blocks_search_focus_enter(monkeypatch):
+    entry = _Widget()
+    win = _Win(focus=entry)
+    app = SimpleNamespace(
+        search_suggest_popover=_Popover(visible=True),
+        search_entry=entry,
+        win=win,
+        _search_focus_suppressed_until_us=0,
+        _dsp_order_editing=True,
+        _dsp_order_drag_active=False,
+    )
+
+    monkeypatch.setattr(builders.GLib, "idle_add", lambda func: func())
+
+    shown = []
+    monkeypatch.setattr(builders, "_maybe_show_search_suggestions", lambda _app: shown.append(True))
+
+    builders._on_search_entry_focus_enter(app)
+
+    assert shown == []
+    assert win.focus_values == [None]
+    assert app.search_suggest_popover.popdown_calls == 1

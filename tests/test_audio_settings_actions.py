@@ -85,6 +85,8 @@ class _ModelDropdown(_SelectableDropdown):
 class _Player:
     def __init__(self):
         self.toggle_calls = []
+        self.dsp_enabled = False
+        self.dsp_calls = []
         self.stream_info = {}
         self.set_output_calls = []
         self.output_format_pref_calls = []
@@ -92,6 +94,11 @@ class _Player:
 
     def toggle_bit_perfect(self, enabled, exclusive_lock=False):
         self.toggle_calls.append((bool(enabled), bool(exclusive_lock)))
+
+    def set_dsp_enabled(self, enabled):
+        self.dsp_enabled = bool(enabled)
+        self.dsp_calls.append(bool(enabled))
+        return True
 
     def set_output(self, driver, device_id):
         self.set_output_calls.append((driver, device_id))
@@ -147,6 +154,38 @@ def test_on_bit_perfect_toggled_allows_missing_eq_controls():
     assert ex_switch.sensitive_calls == [True]
     assert driver_dd.sensitive_calls == [True]
     assert bp_label.visible_calls == [True]
+
+
+def test_on_bit_perfect_toggled_disables_dsp_and_shows_notice():
+    notices = []
+    saved = []
+    player = _Player()
+    player.dsp_enabled = True
+    ex_switch = _Switch(active=False)
+    driver_dd = _DriverDropdown()
+    app = SimpleNamespace(
+        settings={},
+        save_settings=lambda: saved.append(True),
+        _lock_volume_controls=lambda state: None,
+        ex_switch=ex_switch,
+        player=player,
+        eq_btn=None,
+        eq_pop=None,
+        bp_label=None,
+        driver_dd=driver_dd,
+        dsp_btn=None,
+        now_playing_dsp_btn=None,
+        _force_driver_selection=lambda _driver: None,
+        on_driver_changed=lambda *_args: None,
+        show_output_notice=lambda text, level, timeout: notices.append((text, level, timeout)),
+    )
+
+    audio_settings_actions.on_bit_perfect_toggled(app, None, True)
+
+    assert player.dsp_calls == [False]
+    assert app.settings["dsp_enabled"] is False
+    assert saved == [True, True]
+    assert notices == [("DSP disabled: Bit-Perfect mode enabled", "info", 2600)]
 
 
 def test_on_device_changed_rolls_back_selection_when_output_switch_fails(monkeypatch):
@@ -327,3 +366,307 @@ def test_on_mmap_realtime_priority_changed_applies_and_restarts_for_mmap():
     assert saved == [True]
     assert player.realtime_priority_calls == [70]
     assert restarts == [True]
+
+
+def test_on_driver_changed_skips_stop_during_first_startup_init(monkeypatch):
+    monkeypatch.setattr(audio_settings_actions, "_stop_output_hotplug_watch", lambda _app: None)
+    monkeypatch.setattr(audio_settings_actions, "_touch_output_probe_burst", lambda _app, seconds=0: None)
+    monkeypatch.setattr(audio_settings_actions, "_sync_output_bit_depth_dropdown", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(audio_settings_actions, "update_output_status_ui", lambda _app: None)
+    monkeypatch.setattr(audio_settings_actions.Gtk, "StringList", SimpleNamespace(new=lambda items: list(items)))
+    monkeypatch.setattr(audio_settings_actions.GLib, "idle_add", lambda fn: fn())
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            if self._target is not None:
+                self._target()
+
+    monkeypatch.setattr(audio_settings_actions, "Thread", _ImmediateThread)
+
+    class _StartupPlayer(_Player):
+        def __init__(self):
+            super().__init__()
+            self.stop_calls = []
+            self.pause_calls = []
+            self.output_state = "idle"
+            self.current_device_id = None
+
+        def is_playing(self):
+            return False
+
+        def pause(self):
+            self.pause_calls.append(True)
+
+        def stop(self):
+            self.stop_calls.append(True)
+
+        def get_devices_for_driver(self, driver):
+            return [{"name": "DAC", "device_id": "hw:1,0"}]
+
+    player = _StartupPlayer()
+    driver_dd = _DriverDropdown()
+    driver_dd.model = ["ALSA"]
+    device_dd = _ModelDropdown()
+    app = SimpleNamespace(
+        ignore_driver_change=False,
+        ex_switch=_Switch(active=False),
+        settings={},
+        save_settings=lambda: None,
+        player=player,
+        driver_dd=driver_dd,
+        device_dd=device_dd,
+        mmap_realtime_priority_dd=_Switch(),
+        current_device_name="Default",
+        current_device_list=[],
+        update_tech_label=lambda _stream: None,
+        _apply_viz_sync_offset_for_device=lambda *_args, **_kwargs: None,
+        show_output_notice=lambda *_args, **_kwargs: None,
+    )
+
+    audio_settings_actions.on_driver_changed(app, driver_dd, None)
+
+    assert player.pause_calls == []
+    assert player.stop_calls == []
+    assert player.set_output_calls == [("ALSA", "hw:1,0")]
+
+
+def test_on_driver_changed_refreshes_dsp_overview(monkeypatch):
+    monkeypatch.setattr(audio_settings_actions, "_stop_output_hotplug_watch", lambda _app: None)
+    monkeypatch.setattr(audio_settings_actions, "_touch_output_probe_burst", lambda _app, seconds=0: None)
+    monkeypatch.setattr(audio_settings_actions, "_sync_output_bit_depth_dropdown", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(audio_settings_actions, "update_output_status_ui", lambda _app: None)
+    monkeypatch.setattr(audio_settings_actions.Gtk, "StringList", SimpleNamespace(new=lambda items: list(items)))
+    monkeypatch.setattr(audio_settings_actions.GLib, "idle_add", lambda fn: fn())
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            if self._target is not None:
+                self._target()
+
+    monkeypatch.setattr(audio_settings_actions, "Thread", _ImmediateThread)
+
+    class _StartupPlayer(_Player):
+        def __init__(self):
+            super().__init__()
+            self.output_state = "idle"
+            self.current_device_id = None
+
+        def is_playing(self):
+            return False
+
+        def stop(self):
+            pass
+
+        def get_devices_for_driver(self, driver):
+            return [{"name": "DAC", "device_id": "hw:1,0"}]
+
+    dsp_updates = []
+    player = _StartupPlayer()
+    driver_dd = _DriverDropdown()
+    driver_dd.model = ["ALSA"]
+    device_dd = _ModelDropdown()
+    app = SimpleNamespace(
+        ignore_driver_change=False,
+        ex_switch=_Switch(active=False),
+        settings={},
+        save_settings=lambda: None,
+        player=player,
+        driver_dd=driver_dd,
+        device_dd=device_dd,
+        mmap_realtime_priority_dd=_Switch(),
+        current_device_name="Default",
+        current_device_list=[],
+        update_tech_label=lambda _stream: None,
+        _apply_viz_sync_offset_for_device=lambda *_args, **_kwargs: None,
+        _update_dsp_ui_state=lambda: dsp_updates.append(True),
+        show_output_notice=lambda *_args, **_kwargs: None,
+    )
+
+    audio_settings_actions.on_driver_changed(app, driver_dd, None)
+
+    assert len(dsp_updates) >= 3
+
+
+def test_passive_sync_device_list_updates_dropdown_without_nameerror(monkeypatch):
+    monkeypatch.setattr(audio_settings_actions, "_get_output_probe_intervals", lambda _app: (0.0, 0.0))
+    monkeypatch.setattr(audio_settings_actions, "_driver_key", lambda _name: "pipewire")
+    monkeypatch.setattr(audio_settings_actions, "_device_enum_signature", lambda devices: tuple(d.get("name") for d in devices))
+    monkeypatch.setattr(audio_settings_actions, "_sync_output_bit_depth_dropdown", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(audio_settings_actions.Gtk, "StringList", SimpleNamespace(new=lambda items: list(items)))
+    monkeypatch.setattr(audio_settings_actions.GLib, "idle_add", lambda fn: fn())
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            if self._target is not None:
+                self._target()
+
+    monkeypatch.setattr(audio_settings_actions, "Thread", _ImmediateThread)
+
+    player = SimpleNamespace(
+        stream_info={},
+        get_devices_for_driver=lambda _driver: [
+            {"name": "Monitor 09", "device_id": "pw:1"},
+            {"name": "HDMI 1", "device_id": "pw:2"},
+        ],
+    )
+    driver_dd = _DriverDropdown()
+    driver_dd.model = ["PipeWire"]
+    device_dd = _ModelDropdown(selected=0)
+    app = SimpleNamespace(
+        _device_list_sync_next_ts=0.0,
+        _device_list_sync_running=False,
+        ignore_device_change=False,
+        _output_hotplug_source=0,
+        driver_dd=driver_dd,
+        device_dd=device_dd,
+        current_device_name="Old Device",
+        current_device_list=[{"name": "Old Device", "device_id": "pw:0"}],
+        player=player,
+        update_tech_label=lambda _stream: None,
+    )
+
+    audio_settings_actions._passive_sync_device_list(app)
+
+    assert app.current_device_name == "Monitor 09"
+    assert device_dd.model == ["Monitor 09", "HDMI 1"]
+    assert device_dd.get_selected() == 0
+
+
+def test_on_device_changed_normalizes_pipewire_card_profile_target_to_pro_audio(monkeypatch):
+    notices = []
+    saved = []
+    tech_updates = []
+
+    player = _Player()
+    driver_dd = SimpleNamespace(get_selected_item=lambda: _DriverItem("PipeWire"))
+    device_dd = _SelectableDropdown(selected=0)
+    app = SimpleNamespace(
+        ignore_device_change=False,
+        current_device_list=[
+            {
+                "name": "Monitor 09",
+                "device_id": "pwcardprofile:alsa_card.usb-MUSILAND_Monitor_09-00|output:analog-stereo",
+            }
+        ],
+        current_device_name="Default System Output",
+        settings={"device": "Default System Output"},
+        player=player,
+        driver_dd=driver_dd,
+        device_dd=device_dd,
+        save_settings=lambda: saved.append(True),
+        update_tech_label=lambda stream: tech_updates.append(stream),
+        show_output_notice=lambda text, state, timeout: notices.append((text, state, timeout)),
+        _last_disconnected_device_name="",
+        _last_disconnected_driver="",
+    )
+
+    monkeypatch.setattr(audio_settings_actions, "_stop_output_hotplug_watch", lambda _app: None)
+    monkeypatch.setattr(audio_settings_actions, "_touch_output_probe_burst", lambda _app, seconds=0: None)
+    monkeypatch.setattr(audio_settings_actions, "_sync_output_bit_depth_dropdown", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(audio_settings_actions, "update_output_status_ui", lambda _app: None)
+    refreshes = []
+    monkeypatch.setattr(
+        audio_settings_actions,
+        "_refresh_devices_for_current_driver_ui_only",
+        lambda app, reason="x", prefer_device_id=None: refreshes.append((reason, prefer_device_id)),
+    )
+    player.requested_device_id = "alsa_output.usb-MUSILAND_Monitor_09-00.pro-output-0"
+
+    audio_settings_actions.on_device_changed(app, device_dd, None)
+
+    assert player.set_output_calls == [
+        ("PipeWire", "pwcardprofile:alsa_card.usb-MUSILAND_Monitor_09-00|pro-audio")
+    ]
+    assert app.current_device_name == "Monitor 09"
+    assert app.settings["device"] == "Monitor 09"
+    assert saved == [True]
+    assert notices == []
+    assert refreshes == [("pipewire-target-normalized", "alsa_output.usb-MUSILAND_Monitor_09-00.pro-output-0")]
+
+
+def test_on_device_changed_refreshes_dsp_overview(monkeypatch):
+    dsp_updates = []
+    player = _Player()
+    driver_dd = SimpleNamespace(get_selected_item=lambda: _DriverItem("ALSA"))
+    device_dd = _SelectableDropdown(selected=0)
+    app = SimpleNamespace(
+        ignore_device_change=False,
+        current_device_list=[{"name": "DAC One", "device_id": "hw:1,0"}],
+        current_device_name="Default Output",
+        settings={"device": "Default Output"},
+        player=player,
+        driver_dd=driver_dd,
+        device_dd=device_dd,
+        save_settings=lambda: None,
+        update_tech_label=lambda _stream: None,
+        _update_dsp_ui_state=lambda: dsp_updates.append(True),
+        show_output_notice=lambda *_args, **_kwargs: None,
+        _last_disconnected_device_name="",
+        _last_disconnected_driver="",
+    )
+
+    monkeypatch.setattr(audio_settings_actions, "_stop_output_hotplug_watch", lambda _app: None)
+    monkeypatch.setattr(audio_settings_actions, "_touch_output_probe_burst", lambda _app, seconds=0: None)
+    monkeypatch.setattr(audio_settings_actions, "_sync_output_bit_depth_dropdown", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(audio_settings_actions, "update_output_status_ui", lambda _app: None)
+
+    audio_settings_actions.on_device_changed(app, device_dd, None)
+
+    assert player.set_output_calls == [("ALSA", "hw:1,0")]
+    assert app.current_device_name == "DAC One"
+    assert dsp_updates == [True]
+
+
+def test_monitor_selected_device_presence_accepts_requested_device_id(monkeypatch):
+    monkeypatch.setattr(audio_settings_actions, "_get_output_probe_intervals", lambda _app: (0.0, 0.0))
+    monkeypatch.setattr(audio_settings_actions, "_driver_key", lambda _name: "pipewire")
+    monkeypatch.setattr(audio_settings_actions.GLib, "idle_add", lambda fn: fn())
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            if self._target is not None:
+                self._target()
+
+    monkeypatch.setattr(audio_settings_actions, "Thread", _ImmediateThread)
+
+    notices = []
+    refreshes = []
+    hotplug = []
+    app = SimpleNamespace(
+        _device_presence_next_ts=0.0,
+        _device_presence_probe_running=False,
+        ignore_device_change=False,
+        _output_hotplug_source=0,
+        driver_dd=SimpleNamespace(get_selected_item=lambda: _DriverItem("PipeWire")),
+        device_dd=SimpleNamespace(get_selected_item=lambda: _DriverItem("Monitor 09")),
+        player=SimpleNamespace(
+            requested_device_id="alsa_output.usb-MUSILAND_Monitor_09-00.pro-output-0",
+            get_devices_for_driver=lambda _driver: [
+                {
+                    "name": "Monitor 09 Pro / Monitor 09",
+                    "device_id": "alsa_output.usb-MUSILAND_Monitor_09-00.pro-output-0",
+                }
+            ],
+        ),
+        show_output_notice=lambda text, level, timeout: notices.append((text, level, timeout)),
+    )
+    monkeypatch.setattr(audio_settings_actions, "refresh_devices_keep_driver_select_first", lambda *_args, **_kwargs: refreshes.append(True))
+    monkeypatch.setattr(audio_settings_actions, "start_output_hotplug_watch", lambda *_args, **_kwargs: hotplug.append(True))
+
+    audio_settings_actions._monitor_selected_device_presence(app)
+
+    assert notices == []
+    assert refreshes == []
+    assert hotplug == []

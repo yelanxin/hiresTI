@@ -15,6 +15,7 @@ gi.require_version("GstPbutils", "1.0")
 from gi.repository import Gst, GstPbutils
 
 logger = logging.getLogger(__name__)
+_LV2_HOST_MANAGED_PORT_SYMBOLS = {"enabled", "enable", "bypass"}
 
 DRIVER_ALSA_AUTO = "ALSA（auto）"
 DRIVER_ALSA_MMAP = "ALSA（mmap）"
@@ -52,19 +53,29 @@ class _RustAudioCore:
         self._spectrum_batch_cache = {}
         self._rac_get_stereo_spectrum_frames_since = None
 
-        so_paths = [
-            # Development: src/_rust/audio.py -> project_root/src_rust/
-            Path(__file__).resolve().parent.parent / "src_rust" / "rust_audio_core" / "target" / "release" / "librust_audio_core.so",
-            # Installed: usr/share/hiresti/_rust/audio.py -> usr/share/hiresti/src_rust/
-            Path(__file__).resolve().parent.parent.parent / "src_rust" / "rust_audio_core" / "target" / "release" / "librust_audio_core.so",
-            # Flatpak: /app/share/hiresti/src_rust/
+        dev_root = Path(__file__).resolve().parent.parent / "src_rust" / "rust_audio_core" / "target"
+        installed_root = Path(__file__).resolve().parent.parent.parent / "src_rust" / "rust_audio_core" / "target"
+        local_candidates = [
+            dev_root / "release" / "librust_audio_core.so",
+            dev_root / "debug" / "librust_audio_core.so",
+            installed_root / "release" / "librust_audio_core.so",
+            installed_root / "debug" / "librust_audio_core.so",
+        ]
+        installed_candidates = [
             Path("/app/share/hiresti/src_rust/rust_audio_core/target/release/librust_audio_core.so"),
-            # System install
             Path("/usr/share/hiresti/src_rust/rust_audio_core/target/release/librust_audio_core.so"),
         ]
-        so_path = next((p for p in so_paths if p.exists()), None)
+        existing_local = [p for p in local_candidates if p.exists()]
+        so_path = None
+        if existing_local:
+            so_path = max(existing_local, key=lambda path: path.stat().st_mtime)
+        else:
+            so_path = next((p for p in installed_candidates if p.exists()), None)
         if so_path is None:
-            logger.info("Rust audio core library not found; path tried=%s", [str(p) for p in so_paths])
+            logger.info(
+                "Rust audio core library not found; path tried=%s",
+                [str(p) for p in local_candidates + installed_candidates],
+            )
             return
 
         try:
@@ -134,6 +145,136 @@ class _RustAudioCore:
             if hasattr(lib, "rac_set_preferred_output_format"):
                 lib.rac_set_preferred_output_format.restype = ctypes.c_int
                 lib.rac_set_preferred_output_format.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+            if hasattr(lib, "rac_set_dsp_enabled"):
+                lib.rac_set_dsp_enabled.restype = ctypes.c_int
+                lib.rac_set_dsp_enabled.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            if hasattr(lib, "rac_set_dsp_order"):
+                lib.rac_set_dsp_order.restype = ctypes.c_int
+                lib.rac_set_dsp_order.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+            if hasattr(lib, "rac_set_peq_enabled"):
+                lib.rac_set_peq_enabled.restype = ctypes.c_int
+                lib.rac_set_peq_enabled.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            if hasattr(lib, "rac_set_convolver_enabled"):
+                lib.rac_set_convolver_enabled.restype = ctypes.c_int
+                lib.rac_set_convolver_enabled.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            if hasattr(lib, "rac_set_limiter_enabled"):
+                lib.rac_set_limiter_enabled.restype = ctypes.c_int
+                lib.rac_set_limiter_enabled.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            if hasattr(lib, "rac_set_peq_band_gain"):
+                lib.rac_set_peq_band_gain.restype = ctypes.c_int
+                lib.rac_set_peq_band_gain.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_int,
+                    ctypes.c_double,
+                ]
+            if hasattr(lib, "rac_set_limiter_threshold"):
+                lib.rac_set_limiter_threshold.restype = ctypes.c_int
+                lib.rac_set_limiter_threshold.argtypes = [ctypes.c_void_p, ctypes.c_double]
+            if hasattr(lib, "rac_set_limiter_ratio"):
+                lib.rac_set_limiter_ratio.restype = ctypes.c_int
+                lib.rac_set_limiter_ratio.argtypes = [ctypes.c_void_p, ctypes.c_double]
+            if hasattr(lib, "rac_load_convolver_ir"):
+                lib.rac_load_convolver_ir.restype = ctypes.c_int
+                lib.rac_load_convolver_ir.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+            if hasattr(lib, "rac_clear_convolver_ir"):
+                lib.rac_clear_convolver_ir.restype = ctypes.c_int
+                lib.rac_clear_convolver_ir.argtypes = [ctypes.c_void_p]
+            if hasattr(lib, "rac_set_convolver_mix"):
+                lib.rac_set_convolver_mix.restype = ctypes.c_int
+                lib.rac_set_convolver_mix.argtypes = [ctypes.c_void_p, ctypes.c_double]
+            if hasattr(lib, "rac_set_convolver_pre_delay"):
+                lib.rac_set_convolver_pre_delay.restype = ctypes.c_int
+                lib.rac_set_convolver_pre_delay.argtypes = [ctypes.c_void_p, ctypes.c_double]
+            if hasattr(lib, "rac_reset_peq"):
+                lib.rac_reset_peq.restype = ctypes.c_int
+                lib.rac_reset_peq.argtypes = [ctypes.c_void_p]
+            if hasattr(lib, "rac_set_resampler_enabled"):
+                lib.rac_set_resampler_enabled.restype = ctypes.c_int
+                lib.rac_set_resampler_enabled.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            if hasattr(lib, "rac_set_resampler_target_rate"):
+                lib.rac_set_resampler_target_rate.restype = ctypes.c_int
+                lib.rac_set_resampler_target_rate.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+            if hasattr(lib, "rac_set_resampler_quality"):
+                lib.rac_set_resampler_quality.restype = ctypes.c_int
+                lib.rac_set_resampler_quality.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            if hasattr(lib, "rac_set_tape_enabled"):
+                lib.rac_set_tape_enabled.restype = ctypes.c_int
+                lib.rac_set_tape_enabled.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            if hasattr(lib, "rac_set_tape_drive"):
+                lib.rac_set_tape_drive.restype = ctypes.c_int
+                lib.rac_set_tape_drive.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            if hasattr(lib, "rac_set_tape_tone"):
+                lib.rac_set_tape_tone.restype = ctypes.c_int
+                lib.rac_set_tape_tone.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            if hasattr(lib, "rac_set_tape_warmth"):
+                lib.rac_set_tape_warmth.restype = ctypes.c_int
+                lib.rac_set_tape_warmth.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            if hasattr(lib, "rac_set_tube_enabled"):
+                lib.rac_set_tube_enabled.restype = ctypes.c_int
+                lib.rac_set_tube_enabled.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            if hasattr(lib, "rac_set_tube_drive"):
+                lib.rac_set_tube_drive.restype = ctypes.c_int
+                lib.rac_set_tube_drive.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            if hasattr(lib, "rac_set_tube_bias"):
+                lib.rac_set_tube_bias.restype = ctypes.c_int
+                lib.rac_set_tube_bias.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            if hasattr(lib, "rac_set_tube_sag"):
+                lib.rac_set_tube_sag.restype = ctypes.c_int
+                lib.rac_set_tube_sag.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            if hasattr(lib, "rac_set_tube_air"):
+                lib.rac_set_tube_air.restype = ctypes.c_int
+                lib.rac_set_tube_air.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            if hasattr(lib, "rac_set_widener_enabled"):
+                lib.rac_set_widener_enabled.restype = ctypes.c_int
+                lib.rac_set_widener_enabled.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            if hasattr(lib, "rac_set_widener_width"):
+                lib.rac_set_widener_width.restype = ctypes.c_int
+                lib.rac_set_widener_width.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            if hasattr(lib, "rac_set_widener_bass_mono_freq"):
+                lib.rac_set_widener_bass_mono_freq.restype = ctypes.c_int
+                lib.rac_set_widener_bass_mono_freq.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            if hasattr(lib, "rac_set_widener_bass_mono_amount"):
+                lib.rac_set_widener_bass_mono_amount.restype = ctypes.c_int
+                lib.rac_set_widener_bass_mono_amount.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            if hasattr(lib, "rac_lv2_add_slot"):
+                lib.rac_lv2_add_slot.restype = ctypes.c_int
+                lib.rac_lv2_add_slot.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_char_p,
+                    ctypes.POINTER(ctypes.c_char_p),
+                ]
+            if hasattr(lib, "rac_lv2_restore_slot"):
+                lib.rac_lv2_restore_slot.restype = ctypes.c_int
+                lib.rac_lv2_restore_slot.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
+            if hasattr(lib, "rac_lv2_clear_slots_for_restore"):
+                lib.rac_lv2_clear_slots_for_restore.restype = ctypes.c_int
+                lib.rac_lv2_clear_slots_for_restore.argtypes = [ctypes.c_void_p]
+            if hasattr(lib, "rac_lv2_restore_slot_deferred"):
+                lib.rac_lv2_restore_slot_deferred.restype = ctypes.c_int
+                lib.rac_lv2_restore_slot_deferred.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
+            if hasattr(lib, "rac_lv2_finish_restore_slots"):
+                lib.rac_lv2_finish_restore_slots.restype = ctypes.c_int
+                lib.rac_lv2_finish_restore_slots.argtypes = [ctypes.c_void_p]
+            if hasattr(lib, "rac_lv2_remove_slot"):
+                lib.rac_lv2_remove_slot.restype = ctypes.c_int
+                lib.rac_lv2_remove_slot.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+            if hasattr(lib, "rac_lv2_set_slot_enabled"):
+                lib.rac_lv2_set_slot_enabled.restype = ctypes.c_int
+                lib.rac_lv2_set_slot_enabled.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+            if hasattr(lib, "rac_lv2_set_port_value"):
+                lib.rac_lv2_set_port_value.restype = ctypes.c_int
+                lib.rac_lv2_set_port_value.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_char_p,
+                    ctypes.c_char_p,
+                    ctypes.c_float,
+                ]
+            if hasattr(lib, "rac_lv2_scan_plugins"):
+                lib.rac_lv2_scan_plugins.restype = ctypes.c_void_p
+                lib.rac_lv2_scan_plugins.argtypes = [ctypes.c_void_p]
+            if hasattr(lib, "rac_lv2_free_string"):
+                lib.rac_lv2_free_string.restype = None
+                lib.rac_lv2_free_string.argtypes = [ctypes.c_void_p]
 
             lib.rac_set_speed.restype = ctypes.c_int
             lib.rac_set_speed.argtypes = [ctypes.c_void_p, ctypes.c_double]
@@ -354,6 +495,328 @@ class _RustAudioCore:
         fmt = str(format_name or "").strip()
         fmt_b = fmt.encode("utf-8", "ignore") if fmt else None
         return self._call_int("rac_set_preferred_output_format", fmt_b, default_rc=-2)
+
+    def set_dsp_enabled(self, enabled):
+        if (not self.available) or self._closed:
+            return -1
+        if not hasattr(self.lib, "rac_set_dsp_enabled"):
+            return -3
+        return self._call_int("rac_set_dsp_enabled", ctypes.c_int(1 if enabled else 0), default_rc=-2)
+
+    def set_dsp_order(self, module_ids):
+        if (not self.available) or self._closed:
+            return -1
+        if not hasattr(self.lib, "rac_set_dsp_order"):
+            return -3
+        if isinstance(module_ids, (list, tuple)):
+            value = ",".join(str(item or "").strip() for item in module_ids if str(item or "").strip())
+        else:
+            value = str(module_ids or "").strip()
+        if not value:
+            return -2
+        return self._call_int("rac_set_dsp_order", value.encode("utf-8", "ignore"), default_rc=-2)
+
+    def set_peq_enabled(self, enabled):
+        if (not self.available) or self._closed:
+            return -1
+        if not hasattr(self.lib, "rac_set_peq_enabled"):
+            return -3
+        return self._call_int("rac_set_peq_enabled", ctypes.c_int(1 if enabled else 0), default_rc=-2)
+
+    def set_convolver_enabled(self, enabled):
+        if (not self.available) or self._closed:
+            return -1
+        if not hasattr(self.lib, "rac_set_convolver_enabled"):
+            return -3
+        return self._call_int("rac_set_convolver_enabled", ctypes.c_int(1 if enabled else 0), default_rc=-2)
+
+    def set_limiter_enabled(self, enabled):
+        if (not self.available) or self._closed:
+            return -1
+        if not hasattr(self.lib, "rac_set_limiter_enabled"):
+            return -3
+        return self._call_int("rac_set_limiter_enabled", ctypes.c_int(1 if enabled else 0), default_rc=-2)
+
+    def set_peq_band_gain(self, band_index, gain_db):
+        if (not self.available) or self._closed:
+            return -1
+        if not hasattr(self.lib, "rac_set_peq_band_gain"):
+            return -3
+        return self._call_int(
+            "rac_set_peq_band_gain",
+            ctypes.c_int(int(band_index)),
+            ctypes.c_double(float(gain_db or 0.0)),
+            default_rc=-2,
+        )
+
+    def reset_peq(self):
+        if (not self.available) or self._closed:
+            return -1
+        if not hasattr(self.lib, "rac_reset_peq"):
+            return -3
+        return self._call_int("rac_reset_peq", default_rc=-2)
+
+    def load_convolver_ir(self, path):
+        if (not self.available) or self._closed:
+            return -1
+        if not hasattr(self.lib, "rac_load_convolver_ir"):
+            return -3
+        data = str(path or "").encode("utf-8", "ignore")
+        return self._call_int("rac_load_convolver_ir", data, default_rc=-2)
+
+    def set_limiter_threshold(self, threshold):
+        if (not self.available) or self._closed:
+            return -1
+        if not hasattr(self.lib, "rac_set_limiter_threshold"):
+            return -3
+        return self._call_int(
+            "rac_set_limiter_threshold",
+            ctypes.c_double(float(threshold or 0.0)),
+            default_rc=-2,
+        )
+
+    def set_limiter_ratio(self, ratio):
+        if (not self.available) or self._closed:
+            return -1
+        if not hasattr(self.lib, "rac_set_limiter_ratio"):
+            return -3
+        return self._call_int(
+            "rac_set_limiter_ratio",
+            ctypes.c_double(float(ratio or 0.0)),
+            default_rc=-2,
+        )
+
+    def clear_convolver_ir(self):
+        if (not self.available) or self._closed:
+            return -1
+        if not hasattr(self.lib, "rac_clear_convolver_ir"):
+            return -3
+        return self._call_int("rac_clear_convolver_ir", default_rc=-2)
+
+    def set_convolver_mix(self, mix):
+        if (not self.available) or self._closed:
+            return -1
+        if not hasattr(self.lib, "rac_set_convolver_mix"):
+            return -3
+        return self._call_int("rac_set_convolver_mix", ctypes.c_double(float(mix)), default_rc=-2)
+
+    def set_convolver_pre_delay(self, ms):
+        if (not self.available) or self._closed:
+            return -1
+        if not hasattr(self.lib, "rac_set_convolver_pre_delay"):
+            return -3
+        return self._call_int("rac_set_convolver_pre_delay", ctypes.c_double(float(ms)), default_rc=-2)
+
+    def set_resampler_enabled(self, enabled):
+        if (not self.available) or self._closed:
+            return -1
+        if not hasattr(self.lib, "rac_set_resampler_enabled"):
+            return -3
+        return self._call_int("rac_set_resampler_enabled", ctypes.c_int(1 if enabled else 0), default_rc=-2)
+
+    def set_resampler_target_rate(self, rate):
+        if (not self.available) or self._closed:
+            return -1
+        if not hasattr(self.lib, "rac_set_resampler_target_rate"):
+            return -3
+        return self._call_int("rac_set_resampler_target_rate", ctypes.c_uint(int(rate)), default_rc=-2)
+
+    def set_resampler_quality(self, quality):
+        if (not self.available) or self._closed:
+            return -1
+        if not hasattr(self.lib, "rac_set_resampler_quality"):
+            return -3
+        return self._call_int("rac_set_resampler_quality", ctypes.c_int(int(quality)), default_rc=-2)
+
+    def set_tape_enabled(self, enabled):
+        if (not self.available) or self._closed:
+            return -1
+        if not hasattr(self.lib, "rac_set_tape_enabled"):
+            return -3
+        return self._call_int("rac_set_tape_enabled", ctypes.c_int(1 if enabled else 0), default_rc=-2)
+
+    def set_tape_drive(self, drive):
+        if (not self.available) or self._closed:
+            return -1
+        if not hasattr(self.lib, "rac_set_tape_drive"):
+            return -3
+        return self._call_int("rac_set_tape_drive", ctypes.c_int(int(drive)), default_rc=-2)
+
+    def set_tape_tone(self, tone):
+        if (not self.available) or self._closed:
+            return -1
+        if not hasattr(self.lib, "rac_set_tape_tone"):
+            return -3
+        return self._call_int("rac_set_tape_tone", ctypes.c_int(int(tone)), default_rc=-2)
+
+    def set_tape_warmth(self, warmth):
+        if (not self.available) or self._closed:
+            return -1
+        if not hasattr(self.lib, "rac_set_tape_warmth"):
+            return -3
+        return self._call_int("rac_set_tape_warmth", ctypes.c_int(int(warmth)), default_rc=-2)
+
+    def set_tube_enabled(self, enabled):
+        if (not self.available) or self._closed:
+            return -1
+        if not hasattr(self.lib, "rac_set_tube_enabled"):
+            return -3
+        return self._call_int("rac_set_tube_enabled", ctypes.c_int(1 if enabled else 0), default_rc=-2)
+
+    def set_tube_drive(self, drive):
+        if (not self.available) or self._closed:
+            return -1
+        if not hasattr(self.lib, "rac_set_tube_drive"):
+            return -3
+        return self._call_int("rac_set_tube_drive", ctypes.c_int(int(drive)), default_rc=-2)
+
+    def set_tube_bias(self, bias):
+        if (not self.available) or self._closed:
+            return -1
+        if not hasattr(self.lib, "rac_set_tube_bias"):
+            return -3
+        return self._call_int("rac_set_tube_bias", ctypes.c_int(int(bias)), default_rc=-2)
+
+    def set_tube_sag(self, sag):
+        if (not self.available) or self._closed:
+            return -1
+        if not hasattr(self.lib, "rac_set_tube_sag"):
+            return -3
+        return self._call_int("rac_set_tube_sag", ctypes.c_int(int(sag)), default_rc=-2)
+
+    def set_tube_air(self, air):
+        if (not self.available) or self._closed:
+            return -1
+        if not hasattr(self.lib, "rac_set_tube_air"):
+            return -3
+        return self._call_int("rac_set_tube_air", ctypes.c_int(int(air)), default_rc=-2)
+
+    def set_widener_enabled(self, enabled):
+        if (not self.available) or self._closed:
+            return -1
+        if not hasattr(self.lib, "rac_set_widener_enabled"):
+            return -3
+        return self._call_int("rac_set_widener_enabled", ctypes.c_int(1 if enabled else 0), default_rc=-2)
+
+    def set_widener_width(self, width):
+        if (not self.available) or self._closed:
+            return -1
+        if not hasattr(self.lib, "rac_set_widener_width"):
+            return -3
+        return self._call_int("rac_set_widener_width", ctypes.c_int(int(width)), default_rc=-2)
+
+    def set_widener_bass_mono_freq(self, freq):
+        if (not self.available) or self._closed:
+            return -1
+        if not hasattr(self.lib, "rac_set_widener_bass_mono_freq"):
+            return -3
+        return self._call_int("rac_set_widener_bass_mono_freq", ctypes.c_int(int(freq)), default_rc=-2)
+
+    def set_widener_bass_mono_amount(self, amount):
+        if (not self.available) or self._closed:
+            return -1
+        if not hasattr(self.lib, "rac_set_widener_bass_mono_amount"):
+            return -3
+        return self._call_int("rac_set_widener_bass_mono_amount", ctypes.c_int(int(amount)), default_rc=-2)
+
+    def lv2_add_slot(self, uri):
+        """Add an LV2 slot. Returns (slot_id_str, rc) where rc=0 on success."""
+        if (not self.available) or self._closed:
+            return None, -1
+        if not hasattr(self.lib, "rac_lv2_add_slot"):
+            return None, -3
+        out_ptr = ctypes.c_char_p(None)
+        rc = self.lib.rac_lv2_add_slot(
+            self.handle, uri.encode() if isinstance(uri, str) else uri, ctypes.byref(out_ptr)
+        )
+        if rc == 0 and out_ptr.value is not None:
+            slot_id = out_ptr.value.decode()
+            if hasattr(self.lib, "rac_lv2_free_string"):
+                self.lib.rac_lv2_free_string(ctypes.cast(out_ptr, ctypes.c_void_p))
+            return slot_id, 0
+        return None, rc
+
+    def lv2_restore_slot(self, slot_id, uri):
+        if (not self.available) or self._closed:
+            return -1
+        if not hasattr(self.lib, "rac_lv2_restore_slot"):
+            return -3
+        return self.lib.rac_lv2_restore_slot(
+            self.handle,
+            slot_id.encode() if isinstance(slot_id, str) else slot_id,
+            uri.encode() if isinstance(uri, str) else uri,
+        )
+
+    def lv2_clear_slots_for_restore(self):
+        if (not self.available) or self._closed:
+            return -1
+        if not hasattr(self.lib, "rac_lv2_clear_slots_for_restore"):
+            return -3
+        return self.lib.rac_lv2_clear_slots_for_restore(self.handle)
+
+    def lv2_restore_slot_deferred(self, slot_id, uri):
+        if (not self.available) or self._closed:
+            return -1
+        if not hasattr(self.lib, "rac_lv2_restore_slot_deferred"):
+            return -3
+        return self.lib.rac_lv2_restore_slot_deferred(
+            self.handle,
+            slot_id.encode() if isinstance(slot_id, str) else slot_id,
+            uri.encode() if isinstance(uri, str) else uri,
+        )
+
+    def lv2_finish_restore_slots(self):
+        if (not self.available) or self._closed:
+            return -1
+        if not hasattr(self.lib, "rac_lv2_finish_restore_slots"):
+            return -3
+        return self.lib.rac_lv2_finish_restore_slots(self.handle)
+
+    def lv2_remove_slot(self, slot_id):
+        if (not self.available) or self._closed:
+            return -1
+        if not hasattr(self.lib, "rac_lv2_remove_slot"):
+            return -3
+        return self.lib.rac_lv2_remove_slot(
+            self.handle, slot_id.encode() if isinstance(slot_id, str) else slot_id
+        )
+
+    def lv2_set_slot_enabled(self, slot_id, enabled):
+        if (not self.available) or self._closed:
+            return -1
+        if not hasattr(self.lib, "rac_lv2_set_slot_enabled"):
+            return -3
+        return self.lib.rac_lv2_set_slot_enabled(
+            self.handle,
+            slot_id.encode() if isinstance(slot_id, str) else slot_id,
+            ctypes.c_int(1 if enabled else 0),
+        )
+
+    def lv2_set_port_value(self, slot_id, symbol, value):
+        if (not self.available) or self._closed:
+            return -1
+        if not hasattr(self.lib, "rac_lv2_set_port_value"):
+            return -3
+        return self.lib.rac_lv2_set_port_value(
+            self.handle,
+            slot_id.encode() if isinstance(slot_id, str) else slot_id,
+            symbol.encode() if isinstance(symbol, str) else symbol,
+            ctypes.c_float(float(value)),
+        )
+
+    def lv2_scan_plugins(self):
+        """Scan installed LV2 plugins. Returns JSON string or None."""
+        if (not self.available) or self._closed:
+            return None
+        if not hasattr(self.lib, "rac_lv2_scan_plugins"):
+            return None
+        raw = self.lib.rac_lv2_scan_plugins(self.handle)
+        if not raw:
+            return None
+        result = ctypes.cast(raw, ctypes.c_char_p).value
+        if hasattr(self.lib, "rac_lv2_free_string"):
+            self.lib.rac_lv2_free_string(ctypes.c_void_p(raw))
+        return result.decode() if result else None
 
     def set_speed(self, speed):
         rc = self._call_int("rac_set_speed", ctypes.c_double(float(speed or 1.0)), default_rc=-2)
@@ -1102,6 +1565,34 @@ class RustAudioPlayerAdapter:
         self.alsa_mmap_realtime_priority = 60
         self.output_state = "idle"
         self.output_error = None
+        self.dsp_enabled = True
+        self.dsp_order = ["peq", "convolver", "tape", "tube", "widener"]
+        self.peq_enabled = False
+        self.convolver_enabled = False
+        self.convolver_ir_path = ""
+        self.convolver_mix = 1.0
+        self.convolver_pre_delay_ms = 0.0
+        self.resampler_enabled = False
+        self.resampler_target_rate = 0
+        self.resampler_quality = 10
+        self.tape_enabled = False
+        self.tape_drive = 30
+        self.tape_tone = 60
+        self.tape_warmth = 40
+        self.tube_enabled = False
+        self.tube_drive = 28
+        self.tube_bias = 55
+        self.tube_sag = 18
+        self.tube_air = 52
+        self.widener_enabled = False
+        self.widener_width = 125
+        self.widener_bass_mono_freq = 120
+        self.widener_bass_mono_amount = 100
+        # lv2_slots: dict of slot_id -> {"uri": str, "enabled": bool, "port_values": dict}
+        self.lv2_slots = {}
+        self.limiter_enabled = False
+        self.limiter_threshold = 0.85
+        self.limiter_ratio = 20.0
         self.preferred_output_format = ""
         self.requested_driver = None
         self.requested_device_id = None
@@ -1132,9 +1623,11 @@ class RustAudioPlayerAdapter:
         self._rust_last_play_ts = 0.0
         self._rust_last_spectrum_seen_ts = 0.0
         self._rust_last_spectrum_recover_ts = 0.0
+        self._spectrum_stall_count = 0
         self._rust_spectrum_requested = False
         self._rust_spectrum_forced_off = False
         self._rust_spectrum_enabled = False
+        self._limiter_negotiation_retry_pending = False
         self._viz_latency_cached_ms = 0.0
         self._viz_latency_smooth_ms = 0.0
         self._viz_msg_age_smooth_ms = 0.0
@@ -1668,6 +2161,36 @@ class RustAudioPlayerAdapter:
         return "unknown"
 
     def _apply_rust_error_policy(self, category, err_text):
+        text = str(err_text or "")
+        lower = text.lower()
+        if (
+            category == "codec"
+            and "not-negotiated" in lower
+            and bool(getattr(self, "limiter_enabled", False))
+            and not bool(getattr(self, "_limiter_negotiation_retry_pending", False))
+        ):
+            self._limiter_negotiation_retry_pending = True
+            self.output_state = "fallback"
+            self.output_error = "Limiter disabled: incompatible with current stream; retrying"
+            uri = str(getattr(self, "_last_loaded_uri", "") or "")
+
+            def _retry_without_limiter():
+                self._limiter_negotiation_retry_pending = False
+                try:
+                    self.set_limiter_enabled(False)
+                except Exception:
+                    logger.debug("Limiter auto-disable after not-negotiated failed", exc_info=True)
+                if not uri:
+                    return False
+                try:
+                    self.set_uri(uri)
+                    self.play()
+                except Exception:
+                    logger.debug("Retry without limiter failed", exc_info=True)
+                return False
+
+            GLib.idle_add(_retry_without_limiter)
+            return
         if category == "device":
             # In exclusive ALSA mode, errors from the sink (clock drift, underruns,
             # slave-method=none conflicts) must NOT trigger the reconnect recovery
@@ -1677,8 +2200,8 @@ class RustAudioPlayerAdapter:
                     _driver_key(getattr(self, "current_driver", "")) == "alsa_auto":
                 self._release_alsa_reservation()
                 self.output_state = "error"
-                self.output_error = str(err_text or "ALSA exclusive mode error")
-                return
+            self.output_error = text or "ALSA exclusive mode error"
+            return
             self.output_state = "fallback"
             self.output_error = "USB audio device disconnected; switching output"
             if not self._rust_disconnect_recovering:
@@ -1754,6 +2277,16 @@ class RustAudioPlayerAdapter:
         self.bit_perfect_mode = bool(enabled)
         self.exclusive_lock_mode = bool(exclusive_lock)
         self.active_rate_switch = bool(enabled) and (not bool(exclusive_lock))
+        logger.info(
+            "RustAdapter.toggle_bit_perfect enabled=%s exclusive_lock=%s dsp_enabled=%s lv2_slots=%s",
+            bool(enabled),
+            bool(exclusive_lock),
+            bool(getattr(self, "dsp_enabled", False)),
+            [
+                (sid, bool((info or {}).get("enabled", True)))
+                for sid, info in dict(getattr(self, "lv2_slots", {}) or {}).items()
+            ],
+        )
         if old_exclusive and not exclusive_lock:
             self._release_alsa_reservation()
         return True
@@ -1795,12 +2328,497 @@ class RustAudioPlayerAdapter:
         threading.Thread(target=_thread, daemon=True).start()
 
     def set_eq_band(self, band_index, gain):
-        # Rust engine path has no Python equalizer chain.
-        return False
+        try:
+            idx = int(band_index)
+            value = float(gain or 0.0)
+        except Exception:
+            return False
+        self.peq_enabled = True
+        rc = self._rust.set_peq_band_gain(idx, value)
+        if rc != 0:
+            logger.warning("RustAdapter.set_eq_band failed rc=%s band=%s gain=%s", rc, idx, value)
+            return False
+        self.output_error = None
+        return True
 
     def reset_eq(self):
-        # Rust engine path has no Python equalizer chain.
-        return False
+        rc = self._rust.reset_peq()
+        if rc != 0:
+            logger.warning("RustAdapter.reset_eq failed rc=%s", rc)
+            return False
+        self.peq_enabled = False
+        self.output_error = None
+        return True
+
+    def set_dsp_enabled(self, enabled):
+        state = bool(enabled)
+        logger.info(
+            "RustAdapter.set_dsp_enabled request enabled=%s current=%s bit_perfect=%s lv2_slots=%s",
+            state,
+            bool(getattr(self, "dsp_enabled", False)),
+            bool(getattr(self, "bit_perfect_mode", False)),
+            [
+                (sid, bool((info or {}).get("enabled", True)))
+                for sid, info in dict(getattr(self, "lv2_slots", {}) or {}).items()
+            ],
+        )
+        rc = self._rust.set_dsp_enabled(state)
+        if rc != 0:
+            logger.warning("RustAdapter.set_dsp_enabled failed rc=%s enabled=%s", rc, state)
+            return False
+        self.dsp_enabled = state
+        logger.info(
+            "RustAdapter.set_dsp_enabled ok enabled=%s bit_perfect=%s",
+            self.dsp_enabled,
+            bool(getattr(self, "bit_perfect_mode", False)),
+        )
+        self.output_error = None
+        return True
+
+    def set_dsp_order(self, module_ids):
+        order = [str(item or "").strip() for item in list(module_ids or []) if str(item or "").strip()]
+        rc = self._rust.set_dsp_order(order)
+        if rc != 0:
+            logger.warning("RustAdapter.set_dsp_order failed rc=%s order=%s", rc, order)
+            return False
+        self.dsp_order = list(order)
+        self.output_error = None
+        return True
+
+    def set_peq_enabled(self, enabled):
+        state = bool(enabled)
+        rc = self._rust.set_peq_enabled(state)
+        if rc != 0:
+            logger.warning("RustAdapter.set_peq_enabled failed rc=%s enabled=%s", rc, state)
+            return False
+        self.peq_enabled = state
+        self.output_error = None
+        return True
+
+    def set_convolver_enabled(self, enabled):
+        state = bool(enabled)
+        rc = self._rust.set_convolver_enabled(state)
+        if rc != 0:
+            logger.warning("RustAdapter.set_convolver_enabled failed rc=%s enabled=%s", rc, state)
+            return False
+        self.convolver_enabled = state
+        self.output_error = None
+        return True
+
+    def set_limiter_enabled(self, enabled):
+        state = bool(enabled)
+        rc = self._rust.set_limiter_enabled(state)
+        if rc != 0:
+            logger.warning("RustAdapter.set_limiter_enabled failed rc=%s enabled=%s", rc, state)
+            return False
+        self.limiter_enabled = state
+        self.output_error = None
+        return True
+
+    def set_limiter_threshold(self, threshold):
+        try:
+            value = float(threshold or 0.0)
+        except Exception:
+            return False
+        rc = self._rust.set_limiter_threshold(value)
+        if rc != 0:
+            logger.warning("RustAdapter.set_limiter_threshold failed rc=%s threshold=%s", rc, value)
+            return False
+        self.limiter_threshold = max(0.0, min(1.0, value))
+        self.output_error = None
+        return True
+
+    def set_limiter_ratio(self, ratio):
+        try:
+            value = float(ratio or 0.0)
+        except Exception:
+            return False
+        rc = self._rust.set_limiter_ratio(value)
+        if rc != 0:
+            logger.warning("RustAdapter.set_limiter_ratio failed rc=%s ratio=%s", rc, value)
+            return False
+        self.limiter_ratio = max(1.0, min(60.0, value))
+        self.output_error = None
+        return True
+
+    def load_convolver_ir(self, path):
+        raw = str(path or "").strip()
+        if not raw:
+            return False
+        rc = self._rust.load_convolver_ir(raw)
+        if rc != 0:
+            logger.warning("RustAdapter.load_convolver_ir failed rc=%s path=%s", rc, raw)
+            return False
+        self.convolver_ir_path = raw
+        self.output_error = None
+        return True
+
+    def clear_convolver_ir(self):
+        rc = self._rust.clear_convolver_ir()
+        if rc != 0:
+            logger.warning("RustAdapter.clear_convolver_ir failed rc=%s", rc)
+            return False
+        self.convolver_enabled = False
+        self.convolver_ir_path = ""
+        self.output_error = None
+        return True
+
+    def set_convolver_mix(self, mix):
+        value = max(0.0, min(1.0, float(mix)))
+        rc = self._rust.set_convolver_mix(value)
+        if rc != 0:
+            logger.warning("RustAdapter.set_convolver_mix failed rc=%s mix=%s", rc, value)
+            return False
+        self.convolver_mix = value
+        self.output_error = None
+        return True
+
+    def set_convolver_pre_delay(self, ms):
+        value = max(0.0, min(200.0, float(ms)))
+        rc = self._rust.set_convolver_pre_delay(value)
+        if rc != 0:
+            logger.warning("RustAdapter.set_convolver_pre_delay failed rc=%s ms=%s", rc, value)
+            return False
+        self.convolver_pre_delay_ms = value
+        self.output_error = None
+        return True
+
+    def set_resampler_enabled(self, enabled):
+        rc = self._rust.set_resampler_enabled(bool(enabled))
+        if rc != 0:
+            logger.warning("RustAdapter.set_resampler_enabled failed rc=%s enabled=%s", rc, enabled)
+            return False
+        self.resampler_enabled = bool(enabled)
+        self.output_error = None
+        return True
+
+    def set_resampler_target_rate(self, rate):
+        value = int(rate)
+        rc = self._rust.set_resampler_target_rate(value)
+        if rc != 0:
+            logger.warning("RustAdapter.set_resampler_target_rate failed rc=%s rate=%s", rc, value)
+            return False
+        self.resampler_target_rate = value
+        self.output_error = None
+        return True
+
+    def set_resampler_quality(self, quality):
+        value = max(0, min(10, int(quality)))
+        rc = self._rust.set_resampler_quality(value)
+        if rc != 0:
+            logger.warning("RustAdapter.set_resampler_quality failed rc=%s quality=%s", rc, value)
+            return False
+        self.resampler_quality = value
+        self.output_error = None
+        return True
+
+    def set_tape_enabled(self, enabled):
+        rc = self._rust.set_tape_enabled(bool(enabled))
+        if rc != 0:
+            logger.warning("RustAdapter.set_tape_enabled failed rc=%s enabled=%s", rc, enabled)
+            return False
+        self.tape_enabled = bool(enabled)
+        self.output_error = None
+        return True
+
+    def set_tape_drive(self, drive):
+        value = max(0, min(100, int(drive)))
+        rc = self._rust.set_tape_drive(value)
+        if rc != 0:
+            logger.warning("RustAdapter.set_tape_drive failed rc=%s drive=%s", rc, value)
+            return False
+        self.tape_drive = value
+        self.output_error = None
+        return True
+
+    def set_tape_tone(self, tone):
+        value = max(0, min(100, int(tone)))
+        rc = self._rust.set_tape_tone(value)
+        if rc != 0:
+            logger.warning("RustAdapter.set_tape_tone failed rc=%s tone=%s", rc, value)
+            return False
+        self.tape_tone = value
+        self.output_error = None
+        return True
+
+    def set_tape_warmth(self, warmth):
+        value = max(0, min(100, int(warmth)))
+        rc = self._rust.set_tape_warmth(value)
+        if rc != 0:
+            logger.warning("RustAdapter.set_tape_warmth failed rc=%s warmth=%s", rc, value)
+            return False
+        self.tape_warmth = value
+        self.output_error = None
+        return True
+
+    def set_tube_enabled(self, enabled):
+        rc = self._rust.set_tube_enabled(bool(enabled))
+        if rc != 0:
+            logger.warning("RustAdapter.set_tube_enabled failed rc=%s enabled=%s", rc, enabled)
+            return False
+        self.tube_enabled = bool(enabled)
+        self.output_error = None
+        return True
+
+    def set_tube_drive(self, drive):
+        value = max(0, min(100, int(drive)))
+        rc = self._rust.set_tube_drive(value)
+        if rc != 0:
+            logger.warning("RustAdapter.set_tube_drive failed rc=%s drive=%s", rc, value)
+            return False
+        self.tube_drive = value
+        self.output_error = None
+        return True
+
+    def set_tube_bias(self, bias):
+        value = max(0, min(100, int(bias)))
+        rc = self._rust.set_tube_bias(value)
+        if rc != 0:
+            logger.warning("RustAdapter.set_tube_bias failed rc=%s bias=%s", rc, value)
+            return False
+        self.tube_bias = value
+        self.output_error = None
+        return True
+
+    def set_tube_sag(self, sag):
+        value = max(0, min(100, int(sag)))
+        rc = self._rust.set_tube_sag(value)
+        if rc != 0:
+            logger.warning("RustAdapter.set_tube_sag failed rc=%s sag=%s", rc, value)
+            return False
+        self.tube_sag = value
+        self.output_error = None
+        return True
+
+    def set_tube_air(self, air):
+        value = max(0, min(100, int(air)))
+        rc = self._rust.set_tube_air(value)
+        if rc != 0:
+            logger.warning("RustAdapter.set_tube_air failed rc=%s air=%s", rc, value)
+            return False
+        self.tube_air = value
+        self.output_error = None
+        return True
+
+    def set_widener_enabled(self, enabled):
+        rc = self._rust.set_widener_enabled(bool(enabled))
+        if rc != 0:
+            logger.warning("RustAdapter.set_widener_enabled failed rc=%s enabled=%s", rc, enabled)
+            return False
+        self.widener_enabled = bool(enabled)
+        self.output_error = None
+        return True
+
+    def set_widener_width(self, width):
+        value = max(0, min(200, int(width)))
+        rc = self._rust.set_widener_width(value)
+        if rc != 0:
+            logger.warning("RustAdapter.set_widener_width failed rc=%s width=%s", rc, value)
+            return False
+        self.widener_width = value
+        self.output_error = None
+        return True
+
+    def set_widener_bass_mono_freq(self, freq):
+        value = max(40, min(250, int(freq)))
+        rc = self._rust.set_widener_bass_mono_freq(value)
+        if rc != 0:
+            logger.warning("RustAdapter.set_widener_bass_mono_freq failed rc=%s freq=%s", rc, value)
+            return False
+        self.widener_bass_mono_freq = value
+        self.output_error = None
+        return True
+
+    def set_widener_bass_mono_amount(self, amount):
+        value = max(0, min(100, int(amount)))
+        rc = self._rust.set_widener_bass_mono_amount(value)
+        if rc != 0:
+            logger.warning("RustAdapter.set_widener_bass_mono_amount failed rc=%s amount=%s", rc, value)
+            return False
+        self.widener_bass_mono_amount = value
+        self.output_error = None
+        return True
+
+    def lv2_add_slot(self, uri):
+        """Add a new LV2 plugin slot. Returns slot_id string or None on failure."""
+        slot_id, rc = self._rust.lv2_add_slot(uri)
+        if rc != 0 or slot_id is None:
+            logger.warning("RustAdapter.lv2_add_slot failed rc=%s uri=%s", rc, uri)
+            return None
+        self.lv2_slots[slot_id] = {"uri": uri, "enabled": True, "port_values": {}}
+        self.output_error = None
+        return slot_id
+
+    def lv2_restore_slot(self, slot_id, uri, enabled=True, port_values=None):
+        """Restore a saved LV2 slot (used on startup)."""
+        rc = self._rust.lv2_restore_slot(slot_id, uri)
+        if rc != 0:
+            logger.warning("RustAdapter.lv2_restore_slot failed rc=%s slot_id=%s uri=%s", rc, slot_id, uri)
+            return False
+        clean_port_values = {
+            symbol: float(value)
+            for symbol, value in dict(port_values or {}).items()
+            if str(symbol or "").strip().lower() not in _LV2_HOST_MANAGED_PORT_SYMBOLS
+        }
+        self.lv2_slots[slot_id] = {
+            "uri": uri,
+            "enabled": enabled,
+            "port_values": clean_port_values,
+        }
+        if not enabled:
+            self._rust.lv2_set_slot_enabled(slot_id, False)
+        if clean_port_values:
+            for symbol, value in clean_port_values.items():
+                self._rust.lv2_set_port_value(slot_id, symbol, value)
+        self.output_error = None
+        return True
+
+    def lv2_restore_slots(self, slots):
+        """Restore multiple saved LV2 slots with a single DSP graph rebuild."""
+        normalized = []
+        for slot in list(slots or []):
+            if not isinstance(slot, dict):
+                continue
+            slot_id = str(slot.get("slot_id", "") or "").strip()
+            uri = str(slot.get("uri", "") or "").strip()
+            if not slot_id or not uri:
+                continue
+            clean_port_values = {
+                symbol: float(value)
+                for symbol, value in dict(slot.get("port_values", {}) or {}).items()
+                if str(symbol or "").strip().lower() not in _LV2_HOST_MANAGED_PORT_SYMBOLS
+            }
+            normalized.append(
+                {
+                    "slot_id": slot_id,
+                    "uri": uri,
+                    "enabled": bool(slot.get("enabled", True)),
+                    "port_values": clean_port_values,
+                }
+            )
+        if not normalized:
+            self.lv2_slots = {}
+            self.output_error = None
+            return True
+        rust_lib = getattr(self._rust, "lib", None)
+        has_batch_restore = bool(
+            rust_lib is not None
+            and hasattr(rust_lib, "rac_lv2_clear_slots_for_restore")
+            and hasattr(rust_lib, "rac_lv2_restore_slot_deferred")
+            and hasattr(rust_lib, "rac_lv2_finish_restore_slots")
+        )
+        if not has_batch_restore:
+            ok = True
+            self.lv2_slots = {}
+            for slot in normalized:
+                ok = self.lv2_restore_slot(
+                    slot["slot_id"],
+                    slot["uri"],
+                    enabled=slot["enabled"],
+                    port_values=slot["port_values"],
+                ) and ok
+            return ok
+
+        previous_slots = dict(getattr(self, "lv2_slots", {}) or {})
+        rc = self._rust.lv2_clear_slots_for_restore()
+        if rc != 0:
+            logger.warning("RustAdapter.lv2_clear_slots_for_restore failed rc=%s", rc)
+            return False
+
+        restored = {}
+        for slot in normalized:
+            rc = self._rust.lv2_restore_slot_deferred(slot["slot_id"], slot["uri"])
+            if rc != 0:
+                logger.warning(
+                    "RustAdapter.lv2_restore_slot_deferred failed rc=%s slot_id=%s uri=%s",
+                    rc, slot["slot_id"], slot["uri"],
+                )
+                self.lv2_slots = previous_slots
+                return False
+            restored[slot["slot_id"]] = {
+                "uri": slot["uri"],
+                "enabled": slot["enabled"],
+                "port_values": dict(slot["port_values"]),
+            }
+
+        rc = self._rust.lv2_finish_restore_slots()
+        if rc != 0:
+            logger.warning("RustAdapter.lv2_finish_restore_slots failed rc=%s", rc)
+            self.lv2_slots = previous_slots
+            return False
+
+        self.lv2_slots = restored
+        for slot_id, slot in restored.items():
+            if not slot["enabled"]:
+                self._rust.lv2_set_slot_enabled(slot_id, False)
+            for symbol, value in slot["port_values"].items():
+                self._rust.lv2_set_port_value(slot_id, symbol, value)
+        self.output_error = None
+        return True
+
+    def lv2_remove_slot(self, slot_id):
+        """Remove an LV2 plugin slot."""
+        rc = self._rust.lv2_remove_slot(slot_id)
+        if rc != 0:
+            logger.warning("RustAdapter.lv2_remove_slot failed rc=%s slot_id=%s", rc, slot_id)
+            return False
+        self.lv2_slots.pop(slot_id, None)
+        self.output_error = None
+        return True
+
+    def lv2_set_slot_enabled(self, slot_id, enabled):
+        prev_enabled = None
+        if slot_id in self.lv2_slots:
+            prev_enabled = bool(self.lv2_slots[slot_id].get("enabled", True))
+        logger.info(
+            "RustAdapter.lv2_set_slot_enabled request slot_id=%s enabled=%s previous=%s",
+            slot_id,
+            bool(enabled),
+            prev_enabled,
+        )
+        rc = self._rust.lv2_set_slot_enabled(slot_id, enabled)
+        if rc != 0:
+            logger.warning("RustAdapter.lv2_set_slot_enabled failed rc=%s slot_id=%s enabled=%s", rc, slot_id, enabled)
+            return False
+        if slot_id in self.lv2_slots:
+            self.lv2_slots[slot_id]["enabled"] = bool(enabled)
+        logger.info("RustAdapter.lv2_set_slot_enabled ok slot_id=%s enabled=%s", slot_id, bool(enabled))
+        self.output_error = None
+        return True
+
+    def lv2_set_port_value(self, slot_id, symbol, value):
+        rc = self._rust.lv2_set_port_value(slot_id, symbol, float(value))
+        if rc != 0:
+            logger.warning(
+                "RustAdapter.lv2_set_port_value failed rc=%s slot_id=%s symbol=%s value=%s",
+                rc, slot_id, symbol, value,
+            )
+            return False
+        if (
+            slot_id in self.lv2_slots
+            and str(symbol or "").strip().lower() not in _LV2_HOST_MANAGED_PORT_SYMBOLS
+        ):
+            self.lv2_slots[slot_id]["port_values"][symbol] = float(value)
+        logger.info(
+            "RustAdapter.lv2_set_port_value ok slot_id=%s symbol=%s value=%s",
+            slot_id,
+            symbol,
+            float(value),
+        )
+        self.output_error = None
+        return True
+
+    def lv2_scan_plugins(self):
+        """Return list of plugin dicts parsed from JSON, or []."""
+        import json
+        raw = self._rust.lv2_scan_plugins()
+        if not raw:
+            return []
+        try:
+            return json.loads(raw)
+        except Exception as exc:
+            logger.warning("lv2_scan_plugins: json parse error: %s", exc)
+            return []
 
     def get_drivers(self):
         return ["Auto (Default)", "PipeWire", DRIVER_ALSA_AUTO, DRIVER_ALSA_MMAP]
@@ -1858,6 +2876,8 @@ class RustAudioPlayerAdapter:
                     or ("pipewire-sink" in lmsg)
                     or ("alsa-mmap thread-config" in lmsg)
                     or ("container-adapter" in lmsg)
+                    or ("audio-filter rebind" in lmsg)
+                    or ("dsp-lv2 " in lmsg)
                     or ("playing" in lmsg)
                     or ("paused" in lmsg)
                     or ("null" == lmsg)
@@ -2194,6 +3214,7 @@ class RustAudioPlayerAdapter:
                 self._last_rust_spectrum_seq = max(self._last_rust_spectrum_seq, seq)
                 self._rust_spectrum_frames_seen += 1
                 self._rust_last_spectrum_seen_ts = time.monotonic()
+                self._spectrum_stall_count = 0
                 if self._viz_trace_enabled and bool(self._rust_spectrum_enabled):
                     now_f = time.monotonic()
                     if self._viz_trace_last_frame_ts > 0.0:
@@ -2223,7 +3244,43 @@ class RustAudioPlayerAdapter:
                         self._viz_spectrum_queue.clear()
                     except Exception:
                         pass
-                    logger.info("Rust spectrum auto-resync: reset cursor after stall")
+                    self._spectrum_stall_count = getattr(self, "_spectrum_stall_count", 0) + 1
+                    logger.info(
+                        "Rust spectrum auto-resync: reset cursor after stall (count=%d)",
+                        self._spectrum_stall_count,
+                    )
+                    # After 5 consecutive stall cycles (~7.5 s with no frames),
+                    # the audio-filter is likely broken (e.g. DSP graph rebuild
+                    # failed silently after an LV2 toggle).  Force a pipeline
+                    # reload to recover — but only once per stall episode to
+                    # avoid a restart loop.
+                    if self._spectrum_stall_count == 5:
+                        uri = str(getattr(self, "_last_loaded_uri", "") or "")
+                        if uri:
+                            logger.warning(
+                                "Rust spectrum persistent stall: forcing pipeline reload uri=%s",
+                                (uri[:80] + "...") if len(uri) > 80 else uri,
+                            )
+                            try:
+                                pos_s = float(getattr(self, "_cached_pos_s", 0.0) or 0.0)
+                                self._reset_rust_visual_sync_state()
+                                self._rust.set_uri(uri)
+                                rc = self._rust.play()
+                                if rc == 0:
+                                    self._cached_is_playing = True
+                                    self._rust_last_play_ts = time.monotonic()
+                                    GLib.timeout_add(
+                                        800,
+                                        lambda: (
+                                            self._rust.seek(pos_s),
+                                            None,
+                                        )[1],
+                                    )
+                            except Exception:
+                                logger.debug(
+                                    "Rust spectrum stall recovery: reload failed",
+                                    exc_info=True,
+                                )
         except Exception:
             pass
         try:

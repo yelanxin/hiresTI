@@ -661,89 +661,230 @@ def _bind_horizontal_scroll_buttons(scroller, left_btn, right_btn):
     GLib.idle_add(_refresh)
 
 
+_QUEUE_WINDOW_BEFORE = 50   # rows before the current track to render
+_QUEUE_WINDOW_AFTER  = 150  # rows after the current track to render
+_QUEUE_EXPAND_STEP   = 50   # rows revealed per "show more" click
+
+
+def _build_queue_track_row(app, track, i, current_idx, compact):
+    """Build a single queue ListBoxRow. Extracted so expand handlers can reuse it."""
+    row = Gtk.ListBoxRow(css_classes=["track-row"])
+    row.queue_track_index = i
+    row.track_id = getattr(track, "id", None)
+
+    row_margin_y = 1 if compact else LAYOUT["row_margin_y"]
+    col_gap      = 5 if compact else LAYOUT["col_gap"]
+    row_margin_x = 0 if compact else LAYOUT["row_margin_x"]
+    idx_width    = 14 if compact else LAYOUT["index_width"]
+
+    box = Gtk.Box(
+        spacing=col_gap,
+        margin_top=row_margin_y,
+        margin_bottom=row_margin_y,
+        margin_start=row_margin_x,
+        margin_end=row_margin_x,
+    )
+    stack = Gtk.Stack()
+    stack.set_size_request(idx_width, -1)
+    stack.add_css_class("track-index-stack")
+    num_lbl = Gtk.Label(label=str(i + 1), css_classes=["dim-label"])
+    stack.add_named(num_lbl, "num")
+    play_icon = Gtk.Image(icon_name="media-playback-start-symbolic")
+    play_icon.add_css_class("accent")
+    stack.add_named(play_icon, "icon")
+    stack.set_visible_child_name("icon" if i == current_idx else "num")
+    box.append(stack)
+
+    title = getattr(track, "name", "Unknown Track")
+    if compact:
+        info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0, hexpand=True, valign=Gtk.Align.CENTER)
+        title_lbl = Gtk.Label(label=title, xalign=0, ellipsize=3, css_classes=["track-title", "queue-track-title"])
+        title_lbl.set_tooltip_text(title)
+        info.append(title_lbl)
+        box.append(info)
+    else:
+        title_lbl = Gtk.Label(label=title, xalign=0, ellipsize=3, hexpand=True, css_classes=["track-title"])
+        title_lbl.set_tooltip_text(title)
+        box.append(title_lbl)
+
+        artist_name = getattr(getattr(track, "artist", None), "name", "Unknown")
+        artist = Gtk.Label(label=artist_name, xalign=0, ellipsize=3, css_classes=["dim-label", "track-artist"])
+        artist.set_tooltip_text(artist_name)
+        artist.set_size_request(LAYOUT["artist_width"], -1)
+        artist.set_max_width_chars(16)
+        artist.set_margin_end(LAYOUT["cell_margin_end"])
+        box.append(artist)
+
+        album_name = getattr(getattr(track, "album", None), "name", "Unknown Album")
+        alb = Gtk.Label(label=album_name, xalign=0, ellipsize=3, css_classes=["dim-label", "track-album"])
+        alb.set_tooltip_text(album_name)
+        alb.set_size_request(LAYOUT["album_width"], -1)
+        alb.set_max_width_chars(16)
+        alb.set_margin_end(LAYOUT["cell_margin_end"])
+        box.append(alb)
+
+        dur = int(getattr(track, "duration", 0) or 0)
+        if dur > 0:
+            m, s = divmod(dur, 60)
+            d = Gtk.Label(label=f"{m}:{s:02d}", xalign=1, css_classes=["dim-label", "track-duration"])
+            d.set_attributes(Pango.AttrList.from_string("font-features 'tnum=1'"))
+            d.set_size_request(LAYOUT["time_width"], -1)
+            box.append(d)
+        else:
+            box.append(Gtk.Box(width_request=LAYOUT["time_width"]))
+
+    fav_btn = app.create_track_fav_button(track)
+    if compact:
+        fav_btn.set_margin_start(2)
+        fav_btn.set_margin_end(0)
+    box.append(fav_btn)
+
+    rm_btn = Gtk.Button(icon_name="list-remove-symbolic", css_classes=["flat", "playlist-tool-btn", "queue-remove-btn"])
+    rm_btn.set_tooltip_text("Remove from Queue")
+    if compact:
+        rm_btn.set_margin_start(0)
+        rm_btn.set_margin_end(0)
+    rm_btn.connect("clicked", lambda _b, idx=i: app.on_queue_remove_track_clicked(idx))
+    box.append(rm_btn)
+
+    row.set_child(box)
+    return row
+
+
+def _make_queue_expand_btn_row(label_text, on_click):
+    """A clickable 'show more' placeholder row."""
+    row = Gtk.ListBoxRow()
+    row.set_selectable(False)
+    row.set_activatable(False)
+    btn = Gtk.Button(
+        label=label_text,
+        css_classes=["flat", "dim-label"],
+        halign=Gtk.Align.START,
+        margin_start=4,
+        margin_top=2,
+        margin_bottom=2,
+    )
+    btn.connect("clicked", lambda _b: on_click())
+    row.set_child(btn)
+    return row
+
+
+def _queue_expand_above(list_box):
+    """Incrementally reveal _QUEUE_EXPAND_STEP rows above the current window."""
+    state = getattr(list_box, "_q_state", None)
+    if state is None:
+        return
+    tracks      = state["tracks"]
+    current_idx = state["current_idx"]
+    compact     = state["compact"]
+    app         = state["app"]
+    win_start   = state["win_start"]
+    win_end     = state["win_end"]
+    total       = len(tracks)
+
+    new_start = max(0, win_start - _QUEUE_EXPAND_STEP)
+    if new_start >= win_start:
+        return  # nothing to reveal
+
+    # Remove existing "above" placeholder (always the first row).
+    first = list_box.get_row_at_index(0)
+    if first is not None:
+        list_box.remove(first)
+
+    # Insert new track rows at positions 0..N-1 (forward order).
+    for offset, i in enumerate(range(new_start, win_start)):
+        track_row = _build_queue_track_row(app, tracks[i], i, current_idx, compact)
+        list_box.insert(track_row, offset)
+
+    # Insert a new "above" placeholder at position 0 if rows still hidden.
+    if new_start > 0:
+        newer_start = max(0, new_start - _QUEUE_EXPAND_STEP)
+        ph = _make_queue_expand_btn_row(
+            f"… {new_start} track{'s' if new_start != 1 else ''} above — show more",
+            lambda: _queue_expand_above(list_box),
+        )
+        list_box.insert(ph, 0)
+
+    state["win_start"] = new_start
+
+
+def _queue_expand_below(list_box):
+    """Incrementally reveal _QUEUE_EXPAND_STEP rows below the current window."""
+    state = getattr(list_box, "_q_state", None)
+    if state is None:
+        return
+    tracks      = state["tracks"]
+    current_idx = state["current_idx"]
+    compact     = state["compact"]
+    app         = state["app"]
+    win_end     = state["win_end"]
+    total       = len(tracks)
+
+    new_end = min(total, win_end + _QUEUE_EXPAND_STEP)
+    if new_end <= win_end:
+        return  # nothing to reveal
+
+    # Remove the existing "more" placeholder (always the last row).
+    # Walk from the end: get_row_at_index stops at None.
+    last = None
+    idx = 0
+    while True:
+        r = list_box.get_row_at_index(idx)
+        if r is None:
+            break
+        last = r
+        idx += 1
+    if last is not None:
+        list_box.remove(last)
+
+    # Append new track rows.
+    for i in range(win_end, new_end):
+        list_box.append(_build_queue_track_row(app, tracks[i], i, current_idx, compact))
+
+    # Append a new "more" placeholder if rows still hidden.
+    tail = total - new_end
+    if tail > 0:
+        list_box.append(_make_queue_expand_btn_row(
+            f"… {tail} more track{'s' if tail != 1 else ''} — show more",
+            lambda: _queue_expand_below(list_box),
+        ))
+
+    state["win_end"] = new_end
+
+
 def _populate_queue_rows(app, list_box, tracks, current_idx, compact=False):
     _clear_container(list_box)
-    for i, t in enumerate(tracks):
-        row = Gtk.ListBoxRow(css_classes=["track-row"])
-        row.queue_track_index = i
-        row.track_id = getattr(t, "id", None)
 
-        row_margin_y = 1 if compact else LAYOUT["row_margin_y"]
-        col_gap = 5 if compact else LAYOUT["col_gap"]
-        row_margin_x = 0 if compact else LAYOUT["row_margin_x"]
-        idx_width = 14 if compact else LAYOUT["index_width"]
-        box = Gtk.Box(
-            spacing=col_gap,
-            margin_top=row_margin_y,
-            margin_bottom=row_margin_y,
-            margin_start=row_margin_x,
-            margin_end=row_margin_x,
-        )
-        stack = Gtk.Stack()
-        stack.set_size_request(idx_width, -1)
-        stack.add_css_class("track-index-stack")
-        idx = Gtk.Label(label=str(i + 1), css_classes=["dim-label"])
-        stack.add_named(idx, "num")
-        icon = Gtk.Image(icon_name="media-playback-start-symbolic")
-        icon.add_css_class("accent")
-        stack.add_named(icon, "icon")
-        stack.set_visible_child_name("icon" if i == current_idx else "num")
-        box.append(stack)
+    total  = len(tracks)
+    anchor = max(0, min(current_idx, total - 1)) if total > 0 else 0
+    win_start = max(0, anchor - _QUEUE_WINDOW_BEFORE)
+    win_end   = min(total, anchor + _QUEUE_WINDOW_AFTER + 1)
 
-        title = getattr(t, "name", "Unknown Track")
-        if compact:
-            info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0, hexpand=True, valign=Gtk.Align.CENTER)
-            title_lbl = Gtk.Label(label=title, xalign=0, ellipsize=3, css_classes=["track-title", "queue-track-title"])
-            title_lbl.set_tooltip_text(title)
-            info.append(title_lbl)
-            box.append(info)
-        else:
-            title_lbl = Gtk.Label(label=title, xalign=0, ellipsize=3, hexpand=True, css_classes=["track-title"])
-            title_lbl.set_tooltip_text(title)
-            box.append(title_lbl)
+    # Store mutable state on the list_box for the incremental expand handlers.
+    list_box._q_state = {
+        "tracks":      tracks,
+        "current_idx": current_idx,
+        "compact":     compact,
+        "app":         app,
+        "win_start":   win_start,
+        "win_end":     win_end,
+    }
 
-            artist_name = getattr(getattr(t, "artist", None), "name", "Unknown")
-            artist = Gtk.Label(label=artist_name, xalign=0, ellipsize=3, css_classes=["dim-label", "track-artist"])
-            artist.set_tooltip_text(artist_name)
-            artist.set_size_request(LAYOUT["artist_width"], -1)
-            artist.set_max_width_chars(16)
-            artist.set_margin_end(LAYOUT["cell_margin_end"])
-            box.append(artist)
+    if win_start > 0:
+        list_box.append(_make_queue_expand_btn_row(
+            f"… {win_start} track{'s' if win_start != 1 else ''} above — show more",
+            lambda: _queue_expand_above(list_box),
+        ))
 
-            album_name = getattr(getattr(t, "album", None), "name", "Unknown Album")
-            alb = Gtk.Label(label=album_name, xalign=0, ellipsize=3, css_classes=["dim-label", "track-album"])
-            alb.set_tooltip_text(album_name)
-            alb.set_size_request(LAYOUT["album_width"], -1)
-            alb.set_max_width_chars(16)
-            alb.set_margin_end(LAYOUT["cell_margin_end"])
-            box.append(alb)
+    for i in range(win_start, win_end):
+        list_box.append(_build_queue_track_row(app, tracks[i], i, current_idx, compact))
 
-            dur = int(getattr(t, "duration", 0) or 0)
-            if dur > 0:
-                m, s = divmod(dur, 60)
-                d = Gtk.Label(label=f"{m}:{s:02d}", xalign=1, css_classes=["dim-label", "track-duration"])
-                d.set_attributes(Pango.AttrList.from_string("font-features 'tnum=1'"))
-                d.set_size_request(LAYOUT["time_width"], -1)
-                box.append(d)
-            else:
-                box.append(Gtk.Box(width_request=LAYOUT["time_width"]))
-
-        fav_btn = app.create_track_fav_button(t)
-        if compact:
-            fav_btn.set_margin_start(2)
-            fav_btn.set_margin_end(0)
-        box.append(fav_btn)
-
-        rm_btn = Gtk.Button(icon_name="list-remove-symbolic", css_classes=["flat", "playlist-tool-btn", "queue-remove-btn"])
-        rm_btn.set_tooltip_text("Remove from Queue")
-        if compact:
-            rm_btn.set_margin_start(0)
-            rm_btn.set_margin_end(0)
-        rm_btn.connect("clicked", lambda _b, idx=i: app.on_queue_remove_track_clicked(idx))
-        box.append(rm_btn)
-
-        row.set_child(box)
-        list_box.append(row)
+    tail = total - win_end
+    if tail > 0:
+        list_box.append(_make_queue_expand_btn_row(
+            f"… {tail} more track{'s' if tail != 1 else ''} — show more",
+            lambda: _queue_expand_below(list_box),
+        ))
 
 
 def render_search_history(app):
@@ -3458,7 +3599,13 @@ def render_queue_drawer(app):
 
     # Fast path: when queue content and playback index are unchanged, keep
     # existing row widgets to avoid costly full rebuild on drawer open.
-    sig_ids = tuple(str(getattr(t, "id", f"obj:{id(t)}")) for t in tracks)
+    # Use only the rendered window for the signature — iterating thousands of
+    # track IDs on every open is itself a noticeable cost.
+    total = len(tracks)
+    anchor = max(0, min(current_idx, total - 1)) if total > 0 else 0
+    sig_start = max(0, anchor - _QUEUE_WINDOW_BEFORE)
+    sig_end   = min(total, anchor + _QUEUE_WINDOW_AFTER + 1)
+    sig_ids = (total, tuple(str(getattr(t, "id", f"obj:{id(t)}")) for t in tracks[sig_start:sig_end]))
     sig = (sig_ids, current_idx)
     prev_sig = getattr(app, "_queue_drawer_render_sig", None)
     if prev_sig == sig and list_box.get_first_child() is not None:

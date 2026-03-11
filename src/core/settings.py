@@ -8,7 +8,9 @@ from core.constants import AlsaMmapRealtimePriority, VisualizerSettings
 
 logger = logging.getLogger(__name__)
 
-CURRENT_SETTINGS_VERSION = 4
+CURRENT_SETTINGS_VERSION = 6
+DSP_REORDERABLE_MODULES = ["peq", "convolver", "tape", "tube", "widener"]
+PEQ_BAND_COUNT = 10
 
 
 @dataclass
@@ -40,6 +42,34 @@ class SettingsSchema:
     paned_position: int = 0
     search_history: list = field(default_factory=list)
     audio_cache_tracks: int = 20
+    dsp_enabled: bool = True
+    dsp_peq_enabled: bool = False
+    dsp_peq_bands: list = field(default_factory=lambda: [0.0] * PEQ_BAND_COUNT)
+    dsp_convolver_enabled: bool = False
+    dsp_convolver_path: str = ""
+    dsp_convolver_mix: int = 100
+    dsp_convolver_pre_delay_ms: int = 0
+    dsp_order: list = field(default_factory=lambda: list(DSP_REORDERABLE_MODULES))
+    dsp_resampler_enabled: bool = False
+    dsp_resampler_target_rate: int = 0
+    dsp_resampler_quality: int = 10
+    dsp_tape_enabled: bool = False
+    dsp_tape_drive: int = 30
+    dsp_tape_tone: int = 60
+    dsp_tape_warmth: int = 40
+    dsp_tube_enabled: bool = False
+    dsp_tube_drive: int = 28
+    dsp_tube_bias: int = 55
+    dsp_tube_sag: int = 18
+    dsp_tube_air: int = 52
+    dsp_widener_enabled: bool = False
+    dsp_widener_width: int = 125
+    dsp_widener_bass_mono_freq: int = 120
+    dsp_widener_bass_mono_amount: int = 100
+    dsp_lv2_slots: list = field(default_factory=list)
+    dsp_limiter_enabled: bool = False
+    dsp_limiter_threshold: int = 85
+    dsp_limiter_ratio: int = 20
     output_auto_rebind_once: bool = False
     remote_api_enabled: bool = False
     remote_api_access_mode: str = "local"
@@ -75,6 +105,34 @@ DEFAULT_SETTINGS = {
     "paned_position": 0,
     "search_history": [],
     "audio_cache_tracks": 20,
+    "dsp_enabled": True,
+    "dsp_peq_enabled": False,
+    "dsp_peq_bands": [0.0] * PEQ_BAND_COUNT,
+    "dsp_convolver_enabled": False,
+    "dsp_convolver_path": "",
+    "dsp_convolver_mix": 100,
+    "dsp_convolver_pre_delay_ms": 0,
+    "dsp_order": list(DSP_REORDERABLE_MODULES),
+    "dsp_resampler_enabled": False,
+    "dsp_resampler_target_rate": 0,
+    "dsp_resampler_quality": 10,
+    "dsp_tape_enabled": False,
+    "dsp_tape_drive": 30,
+    "dsp_tape_tone": 60,
+    "dsp_tape_warmth": 40,
+    "dsp_tube_enabled": False,
+    "dsp_tube_drive": 28,
+    "dsp_tube_bias": 55,
+    "dsp_tube_sag": 18,
+    "dsp_tube_air": 52,
+    "dsp_widener_enabled": False,
+    "dsp_widener_width": 125,
+    "dsp_widener_bass_mono_freq": 120,
+    "dsp_widener_bass_mono_amount": 100,
+    "dsp_lv2_slots": [],
+    "dsp_limiter_enabled": False,
+    "dsp_limiter_threshold": 85,
+    "dsp_limiter_ratio": 20,
     "output_auto_rebind_once": False,
     "remote_api_enabled": False,
     "remote_api_access_mode": "local",
@@ -111,6 +169,32 @@ _VALIDATION_RULES = {
     "paned_position": (int, 0, None, 0),
     "search_history": (list, None, None, []),
     "audio_cache_tracks": (int, 0, 200, 20),
+    "dsp_enabled": (bool, None, None, True),
+    "dsp_peq_enabled": (bool, None, None, False),
+    "dsp_convolver_enabled": (bool, None, None, False),
+    "dsp_convolver_path": (str, None, None, ""),
+    "dsp_convolver_mix": (int, 0, 100, 100),
+    "dsp_convolver_pre_delay_ms": (int, 0, 200, 0),
+    "dsp_order": (list, None, None, list(DSP_REORDERABLE_MODULES)),
+    "dsp_resampler_enabled": (bool, None, None, False),
+    "dsp_resampler_target_rate": (int, 0, 384000, 0),
+    "dsp_resampler_quality": (int, 0, 10, 10),
+    "dsp_tape_enabled": (bool, None, None, False),
+    "dsp_tape_drive": (int, 0, 100, 30),
+    "dsp_tape_tone": (int, 0, 100, 60),
+    "dsp_tape_warmth": (int, 0, 100, 40),
+    "dsp_tube_enabled": (bool, None, None, False),
+    "dsp_tube_drive": (int, 0, 100, 28),
+    "dsp_tube_bias": (int, 0, 100, 55),
+    "dsp_tube_sag": (int, 0, 100, 18),
+    "dsp_tube_air": (int, 0, 100, 52),
+    "dsp_widener_enabled": (bool, None, None, False),
+    "dsp_widener_width": (int, 0, 200, 125),
+    "dsp_widener_bass_mono_freq": (int, 40, 250, 120),
+    "dsp_widener_bass_mono_amount": (int, 0, 100, 100),
+    "dsp_limiter_enabled": (bool, None, None, False),
+    "dsp_limiter_threshold": (int, 0, 100, 85),
+    "dsp_limiter_ratio": (int, 1, 60, 20),
     "output_auto_rebind_once": (bool, None, None, False),
     "remote_api_enabled": (bool, None, None, False),
     "remote_api_access_mode": (str, None, None, "local"),
@@ -154,6 +238,44 @@ def _as_str_list(value: Any, default: list, max_items: int = 10) -> list:
     return out
 
 
+def _normalize_dsp_order(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return list(DSP_REORDERABLE_MODULES)
+    seen = set()
+    out = []
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        module_id = item.strip()
+        if not module_id or module_id in seen:
+            continue
+        # Allow both built-in module ids and lv2_ slot ids
+        if module_id not in DSP_REORDERABLE_MODULES and not module_id.startswith("lv2_"):
+            continue
+        seen.add(module_id)
+        out.append(module_id)
+    # Append any missing built-in modules at the end
+    for module_id in DSP_REORDERABLE_MODULES:
+        if module_id not in seen:
+            out.append(module_id)
+    return out
+
+
+def _normalize_peq_bands(value: Any) -> list[float]:
+    if not isinstance(value, list):
+        return [0.0] * PEQ_BAND_COUNT
+    out = []
+    for item in value[:PEQ_BAND_COUNT]:
+        if isinstance(item, (int, float)) and not isinstance(item, bool):
+            band = float(item)
+            out.append(max(-24.0, min(12.0, band)))
+        else:
+            out.append(0.0)
+    while len(out) < PEQ_BAND_COUNT:
+        out.append(0.0)
+    return out
+
+
 def _as_int_dict(
     value: Any,
     default: dict,
@@ -173,6 +295,45 @@ def _as_int_dict(
             continue
         out[k] = v
         if len(out) >= max_items:
+            break
+    return out
+
+
+def _normalize_lv2_slots(value: Any) -> list:
+    """Validate and normalize the dsp_lv2_slots list."""
+    if not isinstance(value, list):
+        return []
+    out = []
+    seen_ids = set()
+    seen_uris = set()
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        slot_id = item.get("slot_id", "")
+        uri = item.get("uri", "")
+        if not isinstance(slot_id, str) or not slot_id.startswith("lv2_"):
+            continue
+        if not isinstance(uri, str) or not uri:
+            continue
+        if slot_id in seen_ids:
+            continue
+        uri_key = uri.strip()
+        if uri_key in seen_uris:
+            continue
+        seen_ids.add(slot_id)
+        seen_uris.add(uri_key)
+        enabled = item.get("enabled", True)
+        if not isinstance(enabled, bool):
+            enabled = True
+        port_values = item.get("port_values", {})
+        if not isinstance(port_values, dict):
+            port_values = {}
+        clean_ports = {}
+        for k, v in port_values.items():
+            if isinstance(k, str) and k and isinstance(v, (int, float)):
+                clean_ports[k] = float(v)
+        out.append({"slot_id": slot_id, "uri": uri, "enabled": enabled, "port_values": clean_ports})
+        if len(out) >= 32:
             break
     return out
 
@@ -237,6 +398,42 @@ def normalize_settings(raw: Optional[dict[str, Any]]) -> dict[str, Any]:
     normalized["paned_position"] = _as_int(raw.get("paned_position"), DEFAULT_SETTINGS["paned_position"], minimum=0)
     normalized["search_history"] = _as_str_list(raw.get("search_history"), DEFAULT_SETTINGS["search_history"])
     normalized["audio_cache_tracks"] = _as_int(raw.get("audio_cache_tracks"), DEFAULT_SETTINGS["audio_cache_tracks"], minimum=0, maximum=200)
+    normalized["dsp_enabled"] = _as_bool(raw.get("dsp_enabled"), DEFAULT_SETTINGS["dsp_enabled"])
+    normalized["dsp_peq_enabled"] = _as_bool(raw.get("dsp_peq_enabled"), DEFAULT_SETTINGS["dsp_peq_enabled"])
+    normalized["dsp_peq_bands"] = _normalize_peq_bands(raw.get("dsp_peq_bands"))
+    normalized["dsp_convolver_enabled"] = _as_bool(raw.get("dsp_convolver_enabled"), DEFAULT_SETTINGS["dsp_convolver_enabled"])
+    normalized["dsp_convolver_path"] = _as_str(raw.get("dsp_convolver_path"), DEFAULT_SETTINGS["dsp_convolver_path"])
+    normalized["dsp_convolver_mix"] = _as_int(raw.get("dsp_convolver_mix"), DEFAULT_SETTINGS["dsp_convolver_mix"], minimum=0, maximum=100)
+    normalized["dsp_convolver_pre_delay_ms"] = _as_int(raw.get("dsp_convolver_pre_delay_ms"), DEFAULT_SETTINGS["dsp_convolver_pre_delay_ms"], minimum=0, maximum=200)
+    normalized["dsp_resampler_enabled"] = _as_bool(raw.get("dsp_resampler_enabled"), DEFAULT_SETTINGS["dsp_resampler_enabled"])
+    normalized["dsp_resampler_target_rate"] = _as_int(raw.get("dsp_resampler_target_rate"), DEFAULT_SETTINGS["dsp_resampler_target_rate"], minimum=0, maximum=384000)
+    normalized["dsp_resampler_quality"] = _as_int(raw.get("dsp_resampler_quality"), DEFAULT_SETTINGS["dsp_resampler_quality"], minimum=0, maximum=10)
+    normalized["dsp_tape_enabled"] = _as_bool(raw.get("dsp_tape_enabled"), DEFAULT_SETTINGS["dsp_tape_enabled"])
+    normalized["dsp_tape_drive"] = _as_int(raw.get("dsp_tape_drive"), DEFAULT_SETTINGS["dsp_tape_drive"], minimum=0, maximum=100)
+    normalized["dsp_tape_tone"] = _as_int(raw.get("dsp_tape_tone"), DEFAULT_SETTINGS["dsp_tape_tone"], minimum=0, maximum=100)
+    normalized["dsp_tape_warmth"] = _as_int(raw.get("dsp_tape_warmth"), DEFAULT_SETTINGS["dsp_tape_warmth"], minimum=0, maximum=100)
+    normalized["dsp_tube_enabled"] = _as_bool(raw.get("dsp_tube_enabled"), DEFAULT_SETTINGS["dsp_tube_enabled"])
+    normalized["dsp_tube_drive"] = _as_int(raw.get("dsp_tube_drive"), DEFAULT_SETTINGS["dsp_tube_drive"], minimum=0, maximum=100)
+    normalized["dsp_tube_bias"] = _as_int(raw.get("dsp_tube_bias"), DEFAULT_SETTINGS["dsp_tube_bias"], minimum=0, maximum=100)
+    normalized["dsp_tube_sag"] = _as_int(raw.get("dsp_tube_sag"), DEFAULT_SETTINGS["dsp_tube_sag"], minimum=0, maximum=100)
+    normalized["dsp_tube_air"] = _as_int(raw.get("dsp_tube_air"), DEFAULT_SETTINGS["dsp_tube_air"], minimum=0, maximum=100)
+    normalized["dsp_widener_enabled"] = _as_bool(raw.get("dsp_widener_enabled"), DEFAULT_SETTINGS["dsp_widener_enabled"])
+    normalized["dsp_widener_width"] = _as_int(raw.get("dsp_widener_width"), DEFAULT_SETTINGS["dsp_widener_width"], minimum=0, maximum=200)
+    normalized["dsp_widener_bass_mono_freq"] = _as_int(raw.get("dsp_widener_bass_mono_freq"), DEFAULT_SETTINGS["dsp_widener_bass_mono_freq"], minimum=40, maximum=250)
+    normalized["dsp_widener_bass_mono_amount"] = _as_int(raw.get("dsp_widener_bass_mono_amount"), DEFAULT_SETTINGS["dsp_widener_bass_mono_amount"], minimum=0, maximum=100)
+    normalized["dsp_lv2_slots"] = _normalize_lv2_slots(raw.get("dsp_lv2_slots"))
+    valid_lv2_slot_ids = {slot["slot_id"] for slot in normalized["dsp_lv2_slots"]}
+    normalized["dsp_order"] = [
+        item
+        for item in _normalize_dsp_order(raw.get("dsp_order"))
+        if item in DSP_REORDERABLE_MODULES or item in valid_lv2_slot_ids
+    ]
+    for module_id in DSP_REORDERABLE_MODULES:
+        if module_id not in normalized["dsp_order"]:
+            normalized["dsp_order"].append(module_id)
+    normalized["dsp_limiter_enabled"] = _as_bool(raw.get("dsp_limiter_enabled"), DEFAULT_SETTINGS["dsp_limiter_enabled"])
+    normalized["dsp_limiter_threshold"] = _as_int(raw.get("dsp_limiter_threshold"), DEFAULT_SETTINGS["dsp_limiter_threshold"], minimum=0, maximum=100)
+    normalized["dsp_limiter_ratio"] = _as_int(raw.get("dsp_limiter_ratio"), DEFAULT_SETTINGS["dsp_limiter_ratio"], minimum=1, maximum=60)
     normalized["output_auto_rebind_once"] = _as_bool(raw.get("output_auto_rebind_once"), DEFAULT_SETTINGS["output_auto_rebind_once"])
     normalized["remote_api_enabled"] = _as_bool(raw.get("remote_api_enabled"), DEFAULT_SETTINGS["remote_api_enabled"])
     remote_mode = _as_str(raw.get("remote_api_access_mode"), DEFAULT_SETTINGS["remote_api_access_mode"]).lower()

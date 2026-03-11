@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.6.5 - 2026-03-11
+DSP expansion + Now Playing artwork polish release: a dedicated DSP workspace, a modular processing chain with built-in effects and LV2 hosting, and a more balanced cover presentation in the Now Playing overlay.
+
+### Added
+- Added a dedicated `DSP` workspace accessible from the main player/visualizer area, with a chain overview, per-module control pages, and a global DSP master switch.
+- Added a built-in DSP chain in the Rust audio core and Python adapter, including `10-band PEQ`, `Convolution` IR loading, `Tape`, `Tube`, `Stereo Widener`, `Limiter`, and `Resampler` controls.
+- Added built-in PEQ presets such as `Bass Boost`, `Vocal`, `Treble Lift`, `Warm`, `Late Night`, `Soft`, and `Bright`.
+- Added LV2 plugin discovery/hosting for system-installed plugins, including slot restore, enable/bypass state, per-port control persistence, and insertion into the reorderable DSP chain.
+- Added DSP-aware playback status indicators so the player can surface when DSP processing is active.
+
+### Changed
+- The DSP chain can now be reordered visually, with built-in modules and LV2 slots following the saved processing order after restart.
+- Startup restore now reapplies saved DSP settings end-to-end, including PEQ bands, convolution IR path/mix/pre-delay, tube/tape/widener parameters, limiter settings, resampler targets, and LV2 slots.
+- `Bit-Perfect Mode` now automatically disables the DSP chain so playback behavior stays unambiguous and truly bit-perfect.
+- Now Playing cover rendering has been reworked to keep album art centered in a square focal frame while using a blurred, artwork-derived background to fill the left panel more cleanly across different source aspect ratios.
+- Now Playing dynamic color extraction now primes and caches darker artwork tones earlier, reducing visible color jumps when tracks change or the overlay opens.
+
+### Fixed
+- Fixed DSP settings normalization so invalid saved values are clamped/sanitized instead of leaving the chain in a partial or inconsistent state after upgrade.
+- Fixed stale convolution state on startup by clearing saved IR state when an impulse-response file can no longer be loaded.
+- Fixed `Liked Songs` shuffle playback sometimes leaving part of the list unplayable, so random play now starts and advances reliably across the full liked-tracks selection.
+- Fixed search-focus edge cases around DSP order editing and Now Playing overlay close transitions.
+
 ## 1.6.0 - 2026-03-07
 Visualizer overhaul + playback-scrubbing stability release: stereo-aware spectrum data, fullscreen waveform viewing, a redesigned waterfall/waveform presentation, and a critical ALSA mmap seek recovery fix.
 

@@ -124,11 +124,9 @@ def get_next_index(app, direction=1):
             if not app.shuffle_indices:
                 return current
 
-            next_idx = random.randint(0, total - 1)
-            if total > 1:
-                while next_idx == current:
-                    next_idx = random.randint(0, total - 1)
-            return next_idx
+            # Use the same selection logic as on_next_track so that prefetch
+            # actually predicts the track that will be played next.
+            return random.choice(app.shuffle_indices)
         return (current - 1) % total
 
     return (current + direction) % total

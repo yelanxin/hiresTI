@@ -1,5 +1,6 @@
 from threading import Thread
 import logging
+import time
 
 from gi.repository import Gtk, GLib
 from core.errors import classify_exception, user_message
@@ -7,6 +8,8 @@ from actions import audio_settings_actions
 
 logger = logging.getLogger(__name__)
 MAX_PREFETCH_CACHE = 6
+# Tidal CDN stream URLs are pre-signed and expire; 20 min is a safe margin.
+PREFETCH_URL_TTL_SECONDS = 20 * 60
 NO_LYRICS_BOTTOM_HINT = "No usable lyrics for this track."
 
 
@@ -87,6 +90,7 @@ def _prefetch_next_track(app, current_index):
             "meta": meta,
             "bit_depth": getattr(app.backend, "_last_stream_bit_depth", 0),
             "sample_rate": getattr(app.backend, "_last_stream_sample_rate", 0),
+            "fetched_at": time.monotonic(),
         }
         if len(cache) > MAX_PREFETCH_CACHE:
             oldest_key = next(iter(cache))
@@ -308,12 +312,14 @@ def play_track(app, index):
             max_tracks = int(getattr(app, "audio_cache_tracks", 0) or 0)
             bit_depth = 0
             sample_rate = 0
-            if cached and cached.get("quality") == quality_key and cached.get("url"):
+            url_age = time.monotonic() - float(cached.get("fetched_at", 0) or 0) if cached else 0
+            if (cached and cached.get("quality") == quality_key and cached.get("url")
+                    and url_age < PREFETCH_URL_TTL_SECONDS):
                 url = cached.get("url")
                 bit_depth = int(cached.get("bit_depth", 0) or 0)
                 sample_rate = int(cached.get("sample_rate", 0) or 0)
                 cache.pop(track.id, None)
-                logger.debug("Using prefetched stream url for track: %s", track.id)
+                logger.debug("Using prefetched stream url for track: %s (age %.0fs)", track.id, url_age)
             else:
                 url = app.backend.get_stream_url(track)
                 bit_depth = int(getattr(app.backend, "_last_stream_bit_depth", 0) or 0)
@@ -527,6 +533,19 @@ def update_ui_loop(app):
         p, d = app.player.get_position()
         app._ui_cached_pd = (p, d)
         app._ui_last_pos_poll_ts = now
+
+    hold_pos = getattr(app, "_playback_rebind_hold_position_s", None)
+    hold_dur = float(getattr(app, "_playback_rebind_hold_duration_s", 0.0) or 0.0)
+    hold_until = float(getattr(app, "_playback_rebind_hold_until_s", 0.0) or 0.0)
+    if hold_pos is not None:
+        if now < hold_until and float(p or 0.0) + 0.75 < float(hold_pos):
+            p = float(hold_pos)
+            if hold_dur > 0.0:
+                d = hold_dur
+        else:
+            app._playback_rebind_hold_position_s = None
+            app._playback_rebind_hold_duration_s = 0.0
+            app._playback_rebind_hold_until_s = 0.0
 
     if d > 0:
         user_interacting_seek = bool(getattr(app, "_seek_user_interacting", False))

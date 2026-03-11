@@ -2,6 +2,7 @@
 
 import logging
 import os
+import time
 
 import gi
 
@@ -139,6 +140,8 @@ def _restore_runtime_state(self):
         if btn is not None:
             btn.set_icon_name(mode_icon)
             btn.set_tooltip_text(mode_tip)
+    if hasattr(self, "_sync_playback_status_icon"):
+        self._sync_playback_status_icon()
 
     if self.paned is not None and self.win is not None:
         sidebar_px = int(max(120, self.win.get_width() * float(ui_config.SIDEBAR_RATIO)))
@@ -168,6 +171,15 @@ def _run_post_activate_tasks(app):
 
 
 def do_activate(self):
+    activate_t0 = time.monotonic()
+
+    def _startup_mark(stage):
+        logger.info(
+            "STARTUP TIMING %s +%.1fms",
+            str(stage),
+            (time.monotonic() - activate_t0) * 1000.0,
+        )
+
     if self.window_created:
         self.win.present()
         return
@@ -180,12 +192,14 @@ def do_activate(self):
 
     src_dir = os.path.dirname(os.path.dirname(__file__))
     _configure_icon_theme(display)
+    _startup_mark("icon-theme")
 
     provider = Gtk.CssProvider()
     logo_svg = os.path.join(src_dir, "icons", "hicolor", "scalable", "apps", "hiresti.svg")
     css_data = ui_config.CSS_DATA.replace("__HIRESTI_LOGO_SVG__", logo_svg.replace("\\", "/"))
     provider.load_from_data(css_data.encode())
     Gtk.StyleContext.add_provider_for_display(display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    _startup_mark("css-loaded")
 
     # Detect display scale factor and apply DPI-adaptive sizes before building UI.
     _display_scale = _detect_display_scale(display)
@@ -201,6 +215,7 @@ def do_activate(self):
         )
     logger.info("Display scale=%d → font_scale=%.2f, COVER_SIZE=%d",
                 _display_scale, _font_scale, _helpers.COVER_SIZE)
+    _startup_mark("display-scale")
 
     self.win = Adw.ApplicationWindow(
         application=self,
@@ -228,12 +243,18 @@ def do_activate(self):
     self.content_vbox.set_vexpand(True)
     self.content_overlay.set_child(self.content_vbox)
     self._build_body(self.content_vbox)
+    _startup_mark("build-body")
     self._build_player_bar(self.content_vbox)
+    _startup_mark("build-player-bar")
     if hasattr(self, "_build_now_playing_overlay"):
         self._build_now_playing_overlay()
+        _startup_mark("build-now-playing-overlay")
     self._setup_theme_watch()
+    _startup_mark("theme-watch")
     self._restore_runtime_state()
+    _startup_mark("restore-runtime-state")
     self._set_login_view_pending()
+    _startup_mark("login-view-pending")
 
     # === 恢复设置逻辑 ===
     is_bp = self.settings.get("bit_perfect", False)
@@ -245,6 +266,7 @@ def do_activate(self):
         if self.bp_label is not None:
             self.bp_label.set_visible(True)
         self._lock_volume_controls(True)
+    _startup_mark("bit-perfect")
 
     # 2. 应用 Latency
     saved_rt_profile = self.settings.get(
@@ -256,12 +278,14 @@ def do_activate(self):
     self.player.set_alsa_mmap_realtime_priority(
         self.ALSA_MMAP_REALTIME_PRIORITY_MAP[saved_rt_profile]
     )
+    _startup_mark("alsa-mmap-priority")
 
     # 3. 应用 Latency
     saved_profile = self.settings.get("latency_profile", "Standard (100ms)")
     if saved_profile in self.LATENCY_MAP:
         buf_ms, lat_ms = self.LATENCY_MAP[saved_profile]
         self.player.set_alsa_latency(buf_ms, lat_ms)
+    _startup_mark("alsa-latency")
 
     # 4. 恢复驱动选择
     drivers = self.player.get_drivers()
@@ -282,9 +306,11 @@ def do_activate(self):
             self.driver_dd.set_selected(idx)
         except Exception as e:
             logger.warning("Failed to restore saved driver selection '%s': %s", saved_drv, e)
+    _startup_mark("driver-selection-restored")
 
     # Defer heavy output initialization until after first frame is presented.
     GLib.idle_add(lambda: (self.on_driver_changed(self.driver_dd, None), False)[1])
+    _startup_mark("driver-init-scheduled")
 
     if is_ex:
         self._refresh_driver_dropdown_options(saved_drv, exclusive_enabled=True)
@@ -292,8 +318,10 @@ def do_activate(self):
     key_controller = Gtk.EventControllerKey()
     key_controller.connect("key-pressed", self.on_key_pressed)
     self.win.add_controller(key_controller)
+    _startup_mark("key-controller")
 
     self.win.present()
+    _startup_mark("win-present")
     GLib.idle_add(_run_post_activate_tasks, self)
     GLib.idle_add(self._clear_initial_search_focus)
     GLib.timeout_add(120, self._clear_initial_search_focus)
@@ -310,3 +338,4 @@ def do_activate(self):
         self.body_overlay.connect("notify::height", self.update_layout_proportions)
     self.paned.connect("notify::position", self.on_paned_position_changed)
     GLib.idle_add(lambda: (self._schedule_viz_handle_realign(animate=False), False)[1])
+    _startup_mark("activate-done")

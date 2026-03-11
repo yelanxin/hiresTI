@@ -78,7 +78,7 @@ def _desired_viz_height(self, available_h=None):
             win_h = 0
     if win_h <= 0:
         win_h = int(getattr(ui_config, "WINDOW_HEIGHT", 500) or 500)
-    return max(160, int(win_h * 0.3333333333))
+    return max(160, int(win_h * 0.5))
 
 
 def _sync_viz_height_to_window(self, available_h=None):
@@ -117,6 +117,9 @@ def _sync_viz_height_to_window(self, available_h=None):
     if getattr(self, "viz_stack", None) is not None:
         self.viz_stack.set_size_request(-1, desired_h)
         self.viz_stack.queue_resize()
+    if getattr(self, "viz_surface_overlay", None) is not None:
+        self.viz_surface_overlay.set_size_request(-1, desired_h)
+        self.viz_surface_overlay.queue_resize()
     if getattr(self, "viz_stack_box", None) is not None:
         self.viz_stack_box.set_size_request(-1, desired_h)
         self.viz_stack_box.queue_resize()
@@ -149,7 +152,7 @@ def _set_viz_fullscreen(self, fullscreen, restore_drawer=True):
             self.viz_handle_box.set_visible(False)
         if getattr(self, "viz_fullscreen_btn", None) is not None:
             self.viz_fullscreen_btn.set_icon_name("hiresti-mini-symbolic")
-            self.viz_fullscreen_btn.set_tooltip_text("Restore Waveform")
+            self.viz_fullscreen_btn.set_tooltip_text("Restore Workspace")
         self._sync_viz_height_to_window()
         self._schedule_viz_height_resync(delay_ms=120)
         return
@@ -161,7 +164,13 @@ def _set_viz_fullscreen(self, fullscreen, restore_drawer=True):
         self.viz_handle_box.set_visible(True)
     if getattr(self, "viz_fullscreen_btn", None) is not None:
         self.viz_fullscreen_btn.set_icon_name("view-fullscreen-symbolic")
-        self.viz_fullscreen_btn.set_tooltip_text("Expand Waveform")
+        page = str(getattr(self, "_viz_current_page", "spectrum") or "spectrum")
+        if page == "dsp":
+            self.viz_fullscreen_btn.set_tooltip_text("Expand DSP")
+        elif page == "lyrics":
+            self.viz_fullscreen_btn.set_tooltip_text("Expand Lyrics")
+        else:
+            self.viz_fullscreen_btn.set_tooltip_text("Expand Waveform")
     if should_reveal:
         self._apply_overlay_scroll_padding(True)
     else:
@@ -473,6 +482,7 @@ def on_viz_page_changed(self, stack, _param):
     self._viz_current_page = page or "spectrum"
     is_spectrum = page == "spectrum"
     is_lyrics = page == "lyrics"
+    is_dsp = page == "dsp"
     self.viz_theme_dd.set_visible(is_spectrum)
     if self.viz_bars_dd is not None:
         self.viz_bars_dd.set_visible(is_spectrum)
@@ -481,7 +491,15 @@ def on_viz_page_changed(self, stack, _param):
     if self.viz_effect_dd is not None:
         self.viz_effect_dd.set_visible(is_spectrum)
     if self.viz_fullscreen_btn is not None:
-        self.viz_fullscreen_btn.set_visible(is_spectrum or is_lyrics)
+        self.viz_fullscreen_btn.set_visible(is_spectrum or is_lyrics or is_dsp)
+        if bool(getattr(self, "_viz_fullscreen_active", False)):
+            self.viz_fullscreen_btn.set_tooltip_text("Restore Workspace")
+        elif is_dsp:
+            self.viz_fullscreen_btn.set_tooltip_text("Expand DSP")
+        elif is_lyrics:
+            self.viz_fullscreen_btn.set_tooltip_text("Expand Lyrics")
+        else:
+            self.viz_fullscreen_btn.set_tooltip_text("Expand Waveform")
     if self.lyrics_font_label is not None:
         self.lyrics_font_label.set_visible(is_lyrics)
     if self.lyrics_font_dd is not None:
@@ -492,6 +510,8 @@ def on_viz_page_changed(self, stack, _param):
         self.lyrics_ctrl_box.set_visible(is_lyrics)
     if hasattr(self, "lyrics_offset_box") and self.lyrics_offset_box is not None:
         self.lyrics_offset_box.set_visible(is_lyrics)
+    if hasattr(self, "_update_dsp_ui_state") and is_dsp:
+        self._update_dsp_ui_state()
     self._sync_viz_tab_runtime_state()
     self._sync_spectrum_stream_state()
 
@@ -849,6 +869,35 @@ def toggle_visualizer(self, btn):
     target_state = not is_visible
     self._set_visualizer_expanded(target_state)
     self.settings["viz_expanded"] = target_state
+    self.schedule_save_settings()
+
+
+def open_dsp_workspace(self, _btn=None):
+    if bool(getattr(self, "_viz_fullscreen_active", False)):
+        self._set_viz_fullscreen(False, restore_drawer=False)
+    revealer = getattr(self, "viz_revealer", None)
+    stack = getattr(self, "viz_stack", None)
+    is_expanded = bool(revealer is not None and revealer.get_reveal_child())
+    current_page = ""
+    if stack is not None:
+        try:
+            current_page = str(stack.get_visible_child_name() or "")
+        except Exception:
+            current_page = ""
+    if is_expanded and current_page == "dsp":
+        self._set_visualizer_expanded(False)
+        self.settings["viz_expanded"] = False
+        self.schedule_save_settings()
+        return
+    if hasattr(self, "hide_now_playing_overlay"):
+        try:
+            self.hide_now_playing_overlay()
+        except Exception:
+            pass
+    if stack is not None:
+        stack.set_visible_child_name("dsp")
+    self._set_visualizer_expanded(True)
+    self.settings["viz_expanded"] = True
     self.schedule_save_settings()
 
 

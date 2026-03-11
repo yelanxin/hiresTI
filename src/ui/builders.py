@@ -2,6 +2,7 @@ import gi
 import logging
 import os
 import sys
+import time
 
 _viz_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'viz')
 if _viz_dir not in sys.path:
@@ -218,6 +219,13 @@ def _search_focus_is_suppressed(app):
     return int(getattr(app, "_search_focus_suppressed_until_us", 0) or 0) > int(now_us)
 
 
+def _search_focus_is_blocked(app):
+    return bool(
+        getattr(app, "_dsp_order_drag_active", False)
+        or getattr(app, "_dsp_order_editing", False)
+    )
+
+
 def _reset_search_press_state(app):
     app._search_press_active = False
     app._search_press_start_x = 0.0
@@ -263,6 +271,9 @@ def _maybe_show_search_suggestions(app):
     pop = getattr(app, "search_suggest_popover", None)
     if entry is None or pop is None:
         return
+    if _search_focus_is_blocked(app):
+        pop.popdown()
+        return
     if _search_focus_is_suppressed(app):
         return
     pending = int(getattr(app, "_search_suggest_focus_check_source", 0) or 0)
@@ -290,6 +301,9 @@ def _on_search_entry_changed_for_suggestions(app, entry):
 
 
 def _on_search_entry_focus_enter(app):
+    if _search_focus_is_blocked(app):
+        GLib.idle_add(lambda: _clear_search_focus(app))
+        return
     if _search_focus_is_suppressed(app):
         GLib.idle_add(lambda: _clear_search_focus(app))
         return
@@ -322,6 +336,8 @@ def _should_track_header_drag(app, hit):
 
 
 def _on_window_pressed_for_dismiss(app, x, y, gesture=None):
+    if _search_focus_is_blocked(app):
+        return
     global_share_pop = getattr(app, "global_share_popover", None)
     pop = getattr(app, "search_suggest_popover", None)
     entry = getattr(app, "search_entry", None)
@@ -368,6 +384,8 @@ def _on_window_pressed_for_dismiss(app, x, y, gesture=None):
 
 
 def _on_window_motion_for_search_focus(app, x, y):
+    if _search_focus_is_blocked(app):
+        return
     if not bool(getattr(app, "_search_press_active", False)):
         return
     if not bool(getattr(app, "_search_press_in_header", False)):
@@ -381,6 +399,9 @@ def _on_window_motion_for_search_focus(app, x, y):
 
 
 def _on_window_released_for_search_focus(app):
+    if _search_focus_is_blocked(app):
+        _reset_search_press_state(app)
+        return
     dragged = bool(getattr(app, "_search_header_dragging", False))
     _reset_search_press_state(app)
     if not dragged:
@@ -390,6 +411,10 @@ def _on_window_released_for_search_focus(app):
 
 
 def _on_window_focus_widget_changed(app):
+    if _search_focus_is_blocked(app):
+        _close_search_suggestions(app)
+        GLib.idle_add(lambda: _clear_search_focus(app))
+        return
     if _search_focus_is_suppressed(app):
         win = getattr(app, "win", None)
         entry = getattr(app, "search_entry", None)
@@ -586,7 +611,17 @@ def build_header(app, container):
 
 
 def build_body(app, container):
+    body_t0 = time.monotonic()
+
+    def _body_mark(stage):
+        logger.info(
+            "STARTUP TIMING build-body %s +%.1fms",
+            str(stage),
+            (time.monotonic() - body_t0) * 1000.0,
+        )
+
     _setup_global_context_menu(app, container)
+    _body_mark("context-menu")
 
     app.body_overlay = Gtk.Overlay()
     app.body_overlay.set_vexpand(True)
@@ -664,6 +699,7 @@ def build_body(app, container):
     app.queue_anchor.append(app.queue_handle_shell)
     app.queue_anchor.append(app.queue_revealer)
     app.body_overlay.add_overlay(app.queue_anchor)
+    _body_mark("queue-shell")
 
     app.output_notice_revealer = Gtk.Revealer(transition_type=Gtk.RevealerTransitionType.SLIDE_DOWN)
     app.output_notice_revealer.set_transition_duration(180)
@@ -699,9 +735,10 @@ def build_body(app, container):
     app.viz_fullscreen_revealer.add_css_class("viz-fullscreen-revealer")
     if getattr(app, "content_overlay", None) is not None:
         app.content_overlay.add_overlay(app.viz_fullscreen_revealer)
+    _body_mark("viz-fullscreen-shell")
 
     app.viz_btn = Gtk.Button(icon_name="hiresti-pan-up-symbolic", css_classes=["flat", "viz-handle-btn"])
-    app.viz_btn.set_tooltip_text("Waveform / Lyrics")
+    app.viz_btn.set_tooltip_text("Playback Workspace")
     app.viz_btn.set_size_request(50, 23)
     app.viz_btn.connect("clicked", app.toggle_visualizer)
 
@@ -734,6 +771,8 @@ def build_body(app, container):
     app.viz_root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
     app.viz_root.set_hexpand(True)
     app.viz_root.set_halign(Gtk.Align.FILL)
+    app.viz_root.set_valign(Gtk.Align.END)
+    app.viz_root.set_vexpand(False)
 
     app.viz_switcher = Gtk.StackSwitcher()
     app.viz_switcher.set_halign(Gtk.Align.START)
@@ -745,16 +784,22 @@ def build_body(app, container):
     app.viz_stack_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
     app.viz_stack_box.add_css_class("viz-panel")
     app.viz_stack_box.set_overflow(Gtk.Overflow.HIDDEN)
+    app.viz_stack_box.set_vexpand(False)
+    app.viz_stack_box.set_valign(Gtk.Align.END)
 
     app.viz_stack = Gtk.Stack()
     app.viz_stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
-    app.viz_stack.set_size_request(-1, int(ui_config.WINDOW_HEIGHT / 3))
+    app.viz_stack.set_size_request(-1, int(ui_config.WINDOW_HEIGHT / 2))
+    app.viz_stack.set_vexpand(False)
+    app.viz_stack.set_valign(Gtk.Align.FILL)
     app.viz_switcher.set_stack(app.viz_stack)
     app.viz_stack.connect("notify::visible-child-name", app.on_viz_page_changed)
+    _body_mark("viz-stack-shell")
 
     app.viz_surface_overlay = Gtk.Overlay()
     app.viz_surface_overlay.set_hexpand(True)
-    app.viz_surface_overlay.set_vexpand(True)
+    app.viz_surface_overlay.set_vexpand(False)
+    app.viz_surface_overlay.set_valign(Gtk.Align.FILL)
     app.viz_surface_overlay.set_child(app.viz_stack)
 
     app.viz = SpectrumVisualizer()
@@ -762,6 +807,7 @@ def build_body(app, container):
     app.viz.set_num_bars(32)
     app.viz.set_valign(Gtk.Align.FILL)
     app.viz_stack.add_titled(app.viz, "spectrum", "Spectrum")
+    _body_mark("viz-spectrum-tab")
 
     app.viz_bars_dd = Gtk.DropDown(model=Gtk.StringList.new([str(v) for v in app.VIZ_BAR_OPTIONS]))
     app.viz_bars_dd.add_css_class("viz-theme-dd")
@@ -805,7 +851,7 @@ def build_body(app, container):
     theme_row.set_margin_top(8)
     theme_row.append(app.viz_switcher)
     theme_row.append(Gtk.Box(hexpand=True))
-    right_ctrl_box = Gtk.Box(spacing=0)
+    right_ctrl_box = Gtk.Box(spacing=4)
     right_ctrl_box.add_css_class("viz-right-controls")
     right_ctrl_box.set_halign(Gtk.Align.END)
     theme_row.append(right_ctrl_box)
@@ -813,21 +859,22 @@ def build_body(app, container):
     right_ctrl_box.append(app.viz_profile_dd)
     right_ctrl_box.append(app.viz_effect_dd)
     right_ctrl_box.append(app.viz_theme_dd)
-    app.viz_fullscreen_btn = Gtk.Button(icon_name="view-fullscreen-symbolic", css_classes=["flat", "circular"])
+    app.viz_fullscreen_btn = Gtk.Button(icon_name="view-fullscreen-symbolic", css_classes=["flat", "viz-overlay-btn"])
     app.viz_fullscreen_btn.set_tooltip_text("Expand Waveform")
     app.viz_fullscreen_btn.connect("clicked", app.toggle_viz_fullscreen)
-    app.viz_fullscreen_btn.set_halign(Gtk.Align.END)
-    app.viz_fullscreen_btn.set_valign(Gtk.Align.START)
-    app.viz_fullscreen_btn.set_margin_top(10)
-    app.viz_fullscreen_btn.set_margin_end(10)
+    app.viz_fullscreen_btn.set_size_request(35, 35)
     app.viz_fullscreen_btn.add_css_class("viz-fullscreen-btn")
-    app.viz_surface_overlay.add_overlay(app.viz_fullscreen_btn)
     app.lyrics_font_dd.set_visible(False)
-    app.lyrics_ctrl_box = Gtk.Box(spacing=0)
+    app.lyrics_ctrl_box = Gtk.Box(spacing=4)
     app.lyrics_ctrl_box.add_css_class("viz-right-controls")
     app.lyrics_ctrl_box.set_visible(False)
     right_ctrl_box.append(app.lyrics_ctrl_box)
     app.lyrics_ctrl_box.append(app.lyrics_font_dd)
+    app.viz_corner_box = Gtk.Box(halign=Gtk.Align.END, valign=Gtk.Align.START)
+    app.viz_corner_box.set_margin_top(12)
+    app.viz_corner_box.set_margin_end(18)
+    app.viz_corner_box.append(app.viz_fullscreen_btn)
+    app.viz_surface_overlay.add_overlay(app.viz_corner_box)
 
     app.lyrics_tab_root = Gtk.Overlay()
     app.bg_viz = BackgroundVisualizer()
@@ -835,6 +882,7 @@ def build_body(app, container):
     app.lyrics_motion_dd = Gtk.DropDown(model=Gtk.StringList.new(app.bg_viz.get_motion_mode_names()))
     app.lyrics_motion_dd.add_css_class("viz-theme-dd")
     app.lyrics_motion_dd.add_css_class("lyrics-motion-dd")
+    app.lyrics_motion_dd.add_css_class("viz-right-last")
     app.lyrics_motion_dd.set_valign(Gtk.Align.CENTER)
     app.lyrics_motion_dd.connect("notify::selected", app.on_lyrics_motion_changed)
     app.lyrics_motion_dd.set_visible(False)
@@ -867,15 +915,25 @@ def build_body(app, container):
     app.lyrics_offset_box.append(btn_off_down)
     app.lyrics_tab_root.add_overlay(app.lyrics_offset_box)
     app.viz_stack.add_titled(app.lyrics_tab_root, "lyrics", "Lyrics")
+    _body_mark("viz-lyrics-tab")
+
+    app.dsp_tab_root = app._build_dsp_workspace()
+    app.dsp_tab_scroller = Gtk.ScrolledWindow(vexpand=True, hexpand=True)
+    app.dsp_tab_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+    app.dsp_tab_scroller.set_propagate_natural_height(False)
+    app.dsp_tab_scroller.set_child(app.dsp_tab_root)
+    app.viz_stack.add_titled(app.dsp_tab_scroller, "dsp", "DSP")
+    _body_mark("viz-dsp-tab")
 
     app.viz_stack_box.append(app.viz_surface_overlay)
-    app.viz_stack_box.set_size_request(-1, int(ui_config.WINDOW_HEIGHT / 3))
+    app.viz_stack_box.set_size_request(-1, int(ui_config.WINDOW_HEIGHT / 2))
     app.viz_root.append(theme_row)
     app.viz_root.append(app.viz_stack_box)
     app.viz_revealer.set_child(app.viz_root)
     if hasattr(app, "_sync_viz_height_to_window"):
         app._sync_viz_height_to_window()
     app.on_viz_page_changed(app.viz_stack, None)
+    _body_mark("viz-shell-finalized")
 
     app.sidebar_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["sidebar-shell"])
     app.nav_list = Gtk.ListBox(css_classes=["navigation-sidebar"], margin_top=10)
@@ -902,14 +960,21 @@ def build_body(app, container):
 
     app.sidebar_box.append(app.nav_list)
     app.paned.set_start_child(app.sidebar_box)
+    _body_mark("sidebar")
     app.right_stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
     app.paned.set_end_child(app.right_stack)
+    _body_mark("right-stack")
 
     app._build_grid_view()
+    _body_mark("grid-view")
     app._build_tracks_view()
+    _body_mark("tracks-view")
     app._build_settings_page()
+    _body_mark("settings-page")
     app._build_search_view()
+    _body_mark("search-view")
     app.paned.set_position(int(ui_config.WINDOW_WIDTH * ui_config.SIDEBAR_RATIO))
+    _body_mark("done")
 
 
 def build_player_bar(app, container):
@@ -1075,6 +1140,19 @@ def build_player_bar(app, container):
     app.mode_btn.set_tooltip_text(app.MODE_TOOLTIPS[app.MODE_LOOP])
     app.mode_btn.connect("clicked", app.on_toggle_mode)
     app.vol_box.append(app.mode_btn)
+
+    app.playback_status_btn = Gtk.Button(
+        icon_name="hiresti-status-normal-symbolic",
+        css_classes=["flat", "circular", "player-side-btn"],
+    )
+    app.playback_status_btn.set_focusable(False)
+    app.playback_status_btn.set_tooltip_text("Normal Mode")
+    app.vol_box.append(app.playback_status_btn)
+
+    app.dsp_btn = Gtk.Button(icon_name="hiresti-eq-symbolic", css_classes=["flat", "circular", "player-side-btn", "eq-btn"])
+    app.dsp_btn.set_tooltip_text("Open DSP Workspace")
+    app.dsp_btn.connect("clicked", app.open_dsp_workspace)
+    app.vol_box.append(app.dsp_btn)
 
     app.vol_btn = Gtk.Button(icon_name="hiresti-volume-high-symbolic", css_classes=["flat", "player-side-btn"])
     app.vol_pop = app._build_volume_popover()

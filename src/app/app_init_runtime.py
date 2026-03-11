@@ -21,7 +21,9 @@ def _init_paths_and_settings(self):
     self.backend = TidalBackend()
     self._cache_root = get_cache_dir()
     self._config_root = get_config_dir()
+    os.makedirs(self._cache_root, exist_ok=True)
     os.makedirs(self._config_root, exist_ok=True)
+    self._lv2_plugin_cache_file = os.path.join(self._cache_root, "lv2_plugins.json")
     self._account_scope = "guest"
 
     # Migrate settings.json from old cache location to config dir (one-time).
@@ -112,6 +114,143 @@ def _init_audio_and_data_services(self):
     self.audio_cache_tracks = int(
         self.settings.get("audio_cache_tracks", CacheSettings.DEFAULT_AUDIO_TRACKS) or 0
     )
+    saved_dsp_order = list(self.settings.get("dsp_order", ["peq", "convolver", "tape", "tube", "widener"]) or [])
+    if hasattr(self.player, "set_dsp_order"):
+        try:
+            self.player.set_dsp_order(saved_dsp_order)
+        except Exception:
+            logger.debug("set_dsp_order failed during startup", exc_info=True)
+    saved_peq_bands = list(self.settings.get("dsp_peq_bands", [0.0] * 10) or [])
+    while len(saved_peq_bands) < 10:
+        saved_peq_bands.append(0.0)
+    saved_peq_bands = [float(v or 0.0) for v in saved_peq_bands[:10]]
+    saved_peq_enabled = bool(self.settings.get("dsp_peq_enabled", False))
+    if hasattr(self.player, "set_eq_band"):
+        for idx, gain in enumerate(saved_peq_bands):
+            try:
+                self.player.set_eq_band(idx, gain)
+            except Exception:
+                logger.debug("set_eq_band failed during startup", exc_info=True)
+    if hasattr(self.player, "set_peq_enabled"):
+        try:
+            self.player.set_peq_enabled(saved_peq_enabled)
+        except Exception:
+            logger.debug("set_peq_enabled failed during startup", exc_info=True)
+    saved_convolver_path = str(self.settings.get("dsp_convolver_path", "") or "").strip()
+    saved_convolver_enabled = bool(self.settings.get("dsp_convolver_enabled", False))
+    if saved_convolver_path and hasattr(self.player, "load_convolver_ir"):
+        try:
+            loaded = bool(self.player.load_convolver_ir(saved_convolver_path))
+        except Exception:
+            loaded = False
+            logger.debug("load_convolver_ir failed during startup", exc_info=True)
+        if loaded and hasattr(self.player, "set_convolver_enabled"):
+            try:
+                self.player.set_convolver_enabled(saved_convolver_enabled)
+            except Exception:
+                logger.debug("set_convolver_enabled failed during startup", exc_info=True)
+            saved_mix = int(self.settings.get("dsp_convolver_mix", 100) or 100)
+            saved_pre_delay = int(self.settings.get("dsp_convolver_pre_delay_ms", 0) or 0)
+            if hasattr(self.player, "set_convolver_mix"):
+                try:
+                    self.player.set_convolver_mix(saved_mix / 100.0)
+                except Exception:
+                    logger.debug("set_convolver_mix failed during startup", exc_info=True)
+            if hasattr(self.player, "set_convolver_pre_delay"):
+                try:
+                    self.player.set_convolver_pre_delay(float(saved_pre_delay))
+                except Exception:
+                    logger.debug("set_convolver_pre_delay failed during startup", exc_info=True)
+        elif not loaded:
+            self.settings["dsp_convolver_path"] = ""
+            self.settings["dsp_convolver_enabled"] = False
+    saved_resampler_enabled = bool(self.settings.get("dsp_resampler_enabled", False))
+    saved_resampler_rate = int(self.settings.get("dsp_resampler_target_rate", 0) or 0)
+    saved_resampler_quality = int(self.settings.get("dsp_resampler_quality", 10) or 10)
+    if hasattr(self.player, "set_resampler_quality"):
+        try:
+            self.player.set_resampler_quality(saved_resampler_quality)
+        except Exception:
+            logger.debug("set_resampler_quality failed during startup", exc_info=True)
+    if saved_resampler_rate > 0 and hasattr(self.player, "set_resampler_target_rate"):
+        try:
+            self.player.set_resampler_target_rate(saved_resampler_rate)
+        except Exception:
+            logger.debug("set_resampler_target_rate failed during startup", exc_info=True)
+    if hasattr(self.player, "set_resampler_enabled"):
+        try:
+            self.player.set_resampler_enabled(saved_resampler_enabled)
+        except Exception:
+            logger.debug("set_resampler_enabled failed during startup", exc_info=True)
+    saved_tape_drive = int(self.settings.get("dsp_tape_drive", 30) or 30)
+    saved_tape_tone = int(self.settings.get("dsp_tape_tone", 60) or 60)
+    saved_tape_warmth = int(self.settings.get("dsp_tape_warmth", 40) or 40)
+    saved_tape_enabled = bool(self.settings.get("dsp_tape_enabled", False))
+    if hasattr(self.player, "set_tape_drive"):
+        try:
+            self.player.set_tape_drive(saved_tape_drive)
+            self.player.set_tape_tone(saved_tape_tone)
+            self.player.set_tape_warmth(saved_tape_warmth)
+            self.player.set_tape_enabled(saved_tape_enabled)
+        except Exception:
+            logger.debug("restore tape settings failed during startup", exc_info=True)
+    saved_tube_drive = int(self.settings.get("dsp_tube_drive", 28) or 28)
+    saved_tube_bias = int(self.settings.get("dsp_tube_bias", 55) or 55)
+    saved_tube_sag = int(self.settings.get("dsp_tube_sag", 18) or 18)
+    saved_tube_air = int(self.settings.get("dsp_tube_air", 52) or 52)
+    saved_tube_enabled = bool(self.settings.get("dsp_tube_enabled", False))
+    if hasattr(self.player, "set_tube_drive"):
+        try:
+            self.player.set_tube_drive(saved_tube_drive)
+            self.player.set_tube_bias(saved_tube_bias)
+            self.player.set_tube_sag(saved_tube_sag)
+            self.player.set_tube_air(saved_tube_air)
+            self.player.set_tube_enabled(saved_tube_enabled)
+        except Exception:
+            logger.debug("restore tube settings failed during startup", exc_info=True)
+    saved_widener_width = int(self.settings.get("dsp_widener_width", 125) or 125)
+    saved_widener_enabled = bool(self.settings.get("dsp_widener_enabled", False))
+    saved_widener_bass_mono_freq = int(self.settings.get("dsp_widener_bass_mono_freq", 120) or 120)
+    saved_widener_bass_mono_amount = int(self.settings.get("dsp_widener_bass_mono_amount", 100) or 100)
+    if hasattr(self.player, "set_widener_width"):
+        try:
+            self.player.set_widener_width(saved_widener_width)
+            self.player.set_widener_bass_mono_freq(saved_widener_bass_mono_freq)
+            self.player.set_widener_bass_mono_amount(saved_widener_bass_mono_amount)
+            self.player.set_widener_enabled(saved_widener_enabled)
+        except Exception:
+            logger.debug("restore widener settings failed during startup", exc_info=True)
+    saved_lv2_slots = self.settings.get("dsp_lv2_slots") or []
+    if saved_lv2_slots and hasattr(self.player, "lv2_restore_slots"):
+        try:
+            self.player.lv2_restore_slots(saved_lv2_slots)
+        except Exception:
+            logger.debug("restore lv2 slots failed during startup", exc_info=True)
+    elif saved_lv2_slots and hasattr(self.player, "lv2_restore_slot"):
+        try:
+            for slot in saved_lv2_slots:
+                sid = slot.get("slot_id", "")
+                uri = slot.get("uri", "")
+                if sid and uri:
+                    self.player.lv2_restore_slot(
+                        sid, uri,
+                        enabled=slot.get("enabled", True),
+                        port_values=slot.get("port_values", {}),
+                    )
+        except Exception:
+            logger.debug("restore lv2 slots failed during startup", exc_info=True)
+    limiter_threshold = int(self.settings.get("dsp_limiter_threshold", 85) or 85)
+    limiter_ratio = int(self.settings.get("dsp_limiter_ratio", 20) or 20)
+    try:
+        self.player.set_limiter_threshold(float(limiter_threshold) / 100.0)
+        self.player.set_limiter_ratio(float(limiter_ratio))
+        self.player.set_limiter_enabled(bool(self.settings.get("dsp_limiter_enabled", False)))
+    except Exception:
+        logger.debug("restore limiter settings failed during startup", exc_info=True)
+    try:
+        self.player.set_dsp_enabled(bool(self.settings.get("dsp_enabled", True)))
+    except Exception:
+        logger.debug("restore dsp master state failed during startup", exc_info=True)
     self._schedule_cache_maintenance()
 
 
@@ -149,7 +288,10 @@ def _init_runtime_state(self):
     self._playing_pulse_on = False
     self._home_sections_cache = None
     self.stream_prefetch_cache = {}
-    self.eq_band_values = [0.0] * 10
+    self.eq_band_values = list(self.settings.get("dsp_peq_bands", [0.0] * 10) or [])
+    while len(self.eq_band_values) < 10:
+        self.eq_band_values.append(0.0)
+    self.eq_band_values = [float(v or 0.0) for v in self.eq_band_values[:10]]
     self._eq_ui_syncing = False
     self._volume_ui_syncing = False
     self._init_ui_refs()

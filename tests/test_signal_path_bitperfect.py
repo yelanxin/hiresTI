@@ -80,7 +80,7 @@ def test_pipewire_verdict_help_mentions_system_mixer_and_volume():
 
     assert "shared PipeWire output still goes through the system mixer" in text
     assert "System volume changes" in text
-    assert "ALSA + Exclusive" in text
+    assert "ALSA（auto）/ALSA（mmap） + Exclusive" in text
 
 
 def test_alsa_verdict_help_mentions_exclusive_requirement():

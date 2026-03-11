@@ -31,6 +31,18 @@ class _PlayBtn:
         self.icon_name = name
 
 
+class _StatusBtn:
+    def __init__(self):
+        self.icon_name = None
+        self.tooltip = None
+
+    def set_icon_name(self, name):
+        self.icon_name = name
+
+    def set_tooltip_text(self, text):
+        self.tooltip = text
+
+
 def _make_app():
     app = SimpleNamespace()
     app.play_btn = _PlayBtn()
@@ -41,6 +53,15 @@ def _make_app():
     app.notices = []
     app.show_output_notice = lambda text, state, timeout: app.notices.append((text, state, timeout))
     return app
+
+
+def _make_status_app(player=None, settings=None):
+    return SimpleNamespace(
+        playback_status_btn=_StatusBtn(),
+        now_playing_status_btn=_StatusBtn(),
+        player=player,
+        settings=settings or {},
+    )
 
 
 def test_output_transition_switching(monkeypatch):
@@ -102,3 +123,74 @@ def test_output_transition_error(monkeypatch):
     assert app.play_btn.icon_name == "media-playback-start-symbolic"
     assert "boom" in app.notices[-1][0]
     assert app.notices[-1][1] == "error"
+
+
+def test_sync_playback_status_icon_prefers_exclusive_over_bit_perfect():
+    app = _make_status_app(
+        player=SimpleNamespace(
+            exclusive_lock_mode=True,
+            bit_perfect_mode=True,
+            dsp_enabled=False,
+            peq_enabled=False,
+            convolver_enabled=False,
+            convolver_ir_path="",
+            limiter_enabled=False,
+            resampler_enabled=False,
+            tape_enabled=False,
+            tube_enabled=False,
+            widener_enabled=False,
+            lv2_slots={},
+        ),
+    )
+
+    mod._sync_playback_status_icon(app)
+
+    assert app.playback_status_btn.icon_name == "hiresti-status-exclusive-symbolic"
+    assert app.playback_status_btn.tooltip == "Exclusive Mode Active"
+    assert app.now_playing_status_btn.icon_name == "hiresti-status-exclusive-symbolic"
+
+
+def test_sync_playback_status_icon_shows_dsp_only_when_processing_is_active():
+    dsp_app = _make_status_app(
+        player=SimpleNamespace(
+            exclusive_lock_mode=False,
+            bit_perfect_mode=False,
+            dsp_enabled=True,
+            peq_enabled=True,
+            convolver_enabled=False,
+            convolver_ir_path="",
+            limiter_enabled=False,
+            resampler_enabled=False,
+            tape_enabled=False,
+            tube_enabled=False,
+            widener_enabled=False,
+            lv2_slots={},
+        ),
+    )
+
+    mod._sync_playback_status_icon(dsp_app)
+
+    assert dsp_app.playback_status_btn.icon_name == "hiresti-status-dsp-symbolic"
+    assert dsp_app.playback_status_btn.tooltip == "DSP Processing Active"
+
+    normal_app = _make_status_app(
+        player=SimpleNamespace(
+            exclusive_lock_mode=False,
+            bit_perfect_mode=False,
+            dsp_enabled=True,
+            peq_enabled=False,
+            convolver_enabled=False,
+            convolver_ir_path="",
+            limiter_enabled=False,
+            resampler_enabled=False,
+            tape_enabled=False,
+            tube_enabled=False,
+            widener_enabled=False,
+            lv2_slots={},
+        ),
+    )
+
+    mod._sync_playback_status_icon(normal_app)
+
+    assert normal_app.playback_status_btn.icon_name == "hiresti-status-normal-symbolic"
+    assert normal_app.playback_status_btn.tooltip == "Normal Mode"

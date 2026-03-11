@@ -571,18 +571,16 @@ def _draw_now_playing_cover_background(cr, pixbuf, width, height, dark_rgb=None)
 def _draw_cover_contain(cr, pixbuf, width, height):
     src_w = int(pixbuf.get_width() or 0)
     src_h = int(pixbuf.get_height() or 0)
-    rect = _now_playing_cover_rect(
-        src_w,
-        src_h,
-        width,
-        height,
-        mode="cover",
-        frame_scale=_NOW_PLAYING_COVER_FRAME_SCALE,
-        align_y="center",
-    )
+    # Draw into a centered square (min dimension) so a 1:1 cover fills it
+    # completely. The blurred background layer covers any surrounding area.
+    square = max(1, int(min(width, height) * float(_NOW_PLAYING_COVER_FRAME_SCALE or 1.0)))
+    off_x = (width - square) / 2.0
+    off_y = (height - square) / 2.0
+    rect = _now_playing_cover_rect(src_w, src_h, square, square, mode="contain")
     if rect is None:
         return
-    _draw_pixbuf_to_rect(cr, pixbuf, rect)
+    rx, ry, rw, rh = rect
+    _draw_pixbuf_to_rect(cr, pixbuf, (rx + off_x, ry + off_y, rw, rh))
 
 
 def _build_now_playing_cover_surface(pixbuf, width, height, dark_rgb=None):
@@ -779,8 +777,21 @@ def _now_playing_right_content_left_in_left_stage(self):
     return max(0.0, float(surface_w - right_panel_w - _NOW_PLAYING_CONTENT_INSET))
 
 
-def _now_playing_split_widths(surface_w):
+_NOW_PLAYING_RIGHT_MIN_W = 340
+
+
+def _now_playing_split_widths(surface_w, surface_h=0):
     available_w = max(0, int(surface_w) - _NOW_PLAYING_CONTENT_INSET)
+    if surface_h > 0 and available_w > 0:
+        # Target a square left panel (width = height) so a 1:1 cover fills it
+        # completely at the default window size. Right panel gets the remainder,
+        # clamped to a minimum usable width.
+        left_w = min(int(surface_h), available_w)
+        right_w = max(0, available_w - left_w)
+        if right_w < _NOW_PLAYING_RIGHT_MIN_W and available_w > _NOW_PLAYING_RIGHT_MIN_W:
+            right_w = _NOW_PLAYING_RIGHT_MIN_W
+            left_w = max(0, available_w - right_w)
+        return (left_w, right_w)
     ratio_sum = max(1e-6, float(_NOW_PLAYING_LEFT_RATIO) + float(_NOW_PLAYING_RIGHT_RATIO))
     right_ratio = float(_NOW_PLAYING_RIGHT_RATIO) / ratio_sum
     right_w = int(round(float(available_w) * right_ratio))
@@ -1083,7 +1094,7 @@ def _sync_now_playing_surface_size(self):
     target_h = max(320, int(overlay_h) - margin_top - margin_bottom)
     _set_size_request_if_changed(surface, target_surface_w, target_h)
     surface_w = int(target_surface_w)
-    left_target_w, right_panel_w = _now_playing_split_widths(surface_w)
+    left_target_w, right_panel_w = _now_playing_split_widths(surface_w, target_h)
     if right_panel is not None:
         _set_size_request_if_changed(right_panel, right_panel_w, -1)
     visible_left_w = None
@@ -1275,6 +1286,22 @@ def _build_now_playing_left_panel(self, layout):
     self.now_playing_mode_btn.set_tooltip_text(self.MODE_TOOLTIPS.get(self.play_mode, "Loop All (Album/Playlist)"))
     self.now_playing_mode_btn.connect("clicked", self.on_toggle_mode)
     tool_row.append(self.now_playing_mode_btn)
+
+    self.now_playing_status_btn = Gtk.Button(
+        icon_name="hiresti-status-normal-symbolic",
+        css_classes=["flat", "circular", "player-side-btn", "now-playing-tool-btn"],
+    )
+    self.now_playing_status_btn.set_focusable(False)
+    self.now_playing_status_btn.set_tooltip_text("Normal Mode")
+    tool_row.append(self.now_playing_status_btn)
+
+    self.now_playing_dsp_btn = Gtk.Button(
+        icon_name="hiresti-eq-symbolic",
+        css_classes=["flat", "circular", "player-side-btn", "now-playing-tool-btn", "eq-btn"],
+    )
+    self.now_playing_dsp_btn.set_tooltip_text("Open DSP Workspace")
+    self.now_playing_dsp_btn.connect("clicked", self.open_dsp_workspace)
+    tool_row.append(self.now_playing_dsp_btn)
 
     self.now_playing_vol_btn = Gtk.Button(
         icon_name="hiresti-volume-high-symbolic",
@@ -1883,6 +1910,107 @@ def _load_now_playing_album_tracks_async(self, album):
     submit_daemon(task)
 
 
+def _npq_make_expand_row(label_text, on_click):
+    """Create a non-selectable ListBoxRow containing an expand button."""
+    ph = Gtk.ListBoxRow()
+    ph.set_selectable(False)
+    ph.set_activatable(False)
+    btn = Gtk.Button(
+        label=label_text,
+        css_classes=["flat", "dim-label"],
+        halign=Gtk.Align.START,
+        margin_start=4, margin_top=2, margin_bottom=2,
+    )
+    btn.connect("clicked", lambda _b: on_click())
+    ph.set_child(btn)
+    return ph
+
+
+def _npq_expand_above(self):
+    """Incrementally prepend rows above the current window, preserving scroll."""
+    state = getattr(self, "_npq_state", None)
+    if state is None or self.now_playing_queue_list is None:
+        return
+    tracks    = state["tracks"]
+    win_start = state["win_start"]
+    win_end   = state["win_end"]
+    _NPQ_EXPAND_STEP = 50
+    if win_start <= 0:
+        return
+    new_start = max(0, win_start - _NPQ_EXPAND_STEP)
+    # Remove the current "above" placeholder (first row)
+    first = self.now_playing_queue_list.get_row_at_index(0)
+    if first is not None:
+        self.now_playing_queue_list.remove(first)
+    # Insert new track rows at positions 0..N-1 (forward order preserves scroll)
+    for offset, i in enumerate(range(new_start, win_start)):
+        track = tracks[i]
+        row = _build_now_playing_track_row(track, i)
+        row.queue_track_index = i
+        self.now_playing_queue_list.insert(row, offset)
+    # Insert new "above" placeholder at position 0 if more tracks are still hidden
+    if new_start > 0:
+        ph = _npq_make_expand_row(
+            f"… {new_start} track{'s' if new_start != 1 else ''} above — show more",
+            lambda: _npq_expand_above(self),
+        )
+        self.now_playing_queue_list.insert(ph, 0)
+    state["win_start"] = new_start
+    if hasattr(self, "_update_track_list_icon"):
+        self._update_track_list_icon(target_list=self.now_playing_queue_list)
+
+
+def _npq_expand_below(self):
+    """Incrementally append rows below the current window, preserving scroll."""
+    state = getattr(self, "_npq_state", None)
+    if state is None or self.now_playing_queue_list is None:
+        return
+    tracks    = state["tracks"]
+    win_start = state["win_start"]
+    win_end   = state["win_end"]
+    total     = len(tracks)
+    _NPQ_EXPAND_STEP = 50
+    if win_end >= total:
+        return
+    new_end = min(total, win_end + _NPQ_EXPAND_STEP)
+    # Remove the last row (the "more" placeholder)
+    last = None
+    idx = 0
+    while True:
+        r = self.now_playing_queue_list.get_row_at_index(idx)
+        if r is None:
+            break
+        last = r
+        idx += 1
+    if last is not None:
+        self.now_playing_queue_list.remove(last)
+    # Append new track rows
+    for i in range(win_end, new_end):
+        track = tracks[i]
+        row = _build_now_playing_track_row(track, i)
+        row.queue_track_index = i
+        self.now_playing_queue_list.append(row)
+    # Append new "more" placeholder if tracks still hidden below
+    tail = total - new_end
+    if tail > 0:
+        ph = _npq_make_expand_row(
+            f"… {tail} more track{'s' if tail != 1 else ''} — show more",
+            lambda: _npq_expand_below(self),
+        )
+        self.now_playing_queue_list.append(ph)
+    state["win_end"] = new_end
+    if hasattr(self, "_update_track_list_icon"):
+        self._update_track_list_icon(target_list=self.now_playing_queue_list)
+
+
+def _render_now_playing_queue_windowed(self, queue_tracks, win_start, win_end):
+    """Re-render the queue list with an explicit window (called by expand buttons)."""
+    if self.now_playing_queue_list is None:
+        return
+    self.now_playing_queue_list.remove_all()
+    _render_now_playing_queue_body(self, queue_tracks, win_start=win_start, win_end=win_end)
+
+
 def _render_now_playing_queue(self, tracks):
     if self.now_playing_queue_list is None:
         return
@@ -1894,6 +2022,10 @@ def _render_now_playing_queue(self, tracks):
         count = len(queue_tracks)
         self.now_playing_queue_count_label.set_text(f"{count} track" if count == 1 else f"{count} tracks")
 
+    _render_now_playing_queue_body(self, queue_tracks)
+
+
+def _render_now_playing_queue_body(self, queue_tracks, win_start=None, win_end=None):
     if not queue_tracks:
         row = Gtk.ListBoxRow()
         row.set_selectable(False)
@@ -1913,15 +2045,58 @@ def _render_now_playing_queue(self, tracks):
         self.now_playing_queue_list.append(row)
         return
 
-    for idx, track in enumerate(queue_tracks):
+    _NPQ_EXPAND_STEP = 50
+
+    total = len(queue_tracks)
+    current_idx = int(getattr(self, "current_track_index", -1) or -1)
+    anchor = max(0, min(current_idx, total - 1)) if total > 0 else 0
+
+    # Retrieve (or initialise) the current window bounds, reset when the
+    # queue changes (different total or different anchor track).
+    prev_anchor = getattr(self, "_npq_anchor", -1)
+    prev_total  = getattr(self, "_npq_total",  -1)
+    if win_start is None or total != prev_total or anchor != prev_anchor:
+        win_start = max(0, anchor - 50)
+        win_end   = min(total, anchor + 151)
+        self._npq_anchor = anchor
+        self._npq_total  = total
+
+    win_start = max(0, min(win_start, total))
+    win_end   = max(win_start, min(win_end, total))
+
+    self._npq_state = {
+        "tracks": queue_tracks,
+        "win_start": win_start,
+        "win_end": win_end,
+    }
+
+    if win_start > 0:
+        ph = _npq_make_expand_row(
+            f"… {win_start} track{'s' if win_start != 1 else ''} above — show more",
+            lambda: _npq_expand_above(self),
+        )
+        self.now_playing_queue_list.append(ph)
+
+    for idx in range(win_start, win_end):
+        track = queue_tracks[idx]
         row = _build_now_playing_track_row(track, idx)
         row.queue_track_index = idx
         self.now_playing_queue_list.append(row)
 
+    tail = total - win_end
+    if tail > 0:
+        ph = _npq_make_expand_row(
+            f"… {tail} more track{'s' if tail != 1 else ''} — show more",
+            lambda: _npq_expand_below(self),
+        )
+        self.now_playing_queue_list.append(ph)
+
     if hasattr(self, "_update_track_list_icon"):
         self._update_track_list_icon(target_list=self.now_playing_queue_list)
-    if hasattr(self, "_update_list_ui"):
-        self._update_list_ui(int(getattr(self, "current_track_index", -1) or -1))
+    # Do NOT call _update_list_ui here — it calls select_row() which makes GTK
+    # scroll to keep the selected row visible, causing unwanted scroll-to-current
+    # on every expand click. The "playing-row" CSS from _update_track_list_icon
+    # is sufficient for visual highlighting.
 
 
 def _render_now_playing_album_tracks(self, tracks):
