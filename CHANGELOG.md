@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.6.6 - 2026-03-12
+Liked Songs shuffle reliability fix: tracks that were saved under old Tidal catalog IDs now resolve and play correctly instead of silently failing.
+
+### Fixed
+- Fixed tracks in Liked Songs occasionally failing to play during shuffle even though the same song is playable from its album. When a track's saved ID has been deprecated in the Tidal catalog (404), playback now automatically re-resolves the track through its album and plays the current active version. Log line `Stream URL album fallback: stale_id=… → alt_id=…` is emitted when the recovery path is taken.
+- Fixed Liked Songs shuffle getting stuck with no audio and no auto-advance when a track stream is completely unresolvable (e.g. both the track ID and album have been removed from Tidal). Playback now automatically skips to the next track, with a consecutive-skip guard of 10 to prevent infinite loops.
+
 ## 1.6.5 - 2026-03-11
 DSP expansion + Now Playing artwork polish release: a dedicated DSP workspace, a modular processing chain with built-in effects and LV2 hosting, and a more balanced cover presentation in the Now Playing overlay.
 

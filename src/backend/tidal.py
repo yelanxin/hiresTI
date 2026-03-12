@@ -2424,6 +2424,40 @@ class TidalBackend:
                         continue
             if last_exc is not None:
                 logger.warning("Stream URL error [%s]: %s", classify_exception(last_exc), last_exc)
+                # When a track ID is dead (404/not_found) — common for liked songs that
+                # reference old catalog IDs that were later replaced — try to recover the
+                # correct track by looking it up through its album.  This is exactly what
+                # users do manually when they "find the song in its album and play it".
+                if classify_exception(last_exc) == "not_found":
+                    album_id = getattr(getattr(track, "album", None), "id", None)
+                    track_name = str(getattr(track, "name", "") or "").strip().lower()
+                    if album_id and track_name:
+                        try:
+                            album = self.session.album(album_id)
+                            album_tracks = album.tracks()
+                            alt_track = next(
+                                (
+                                    t for t in (album_tracks or [])
+                                    if str(getattr(t, "name", "") or "").strip().lower() == track_name
+                                    and getattr(t, "id", None) != getattr(track, "id", None)
+                                ),
+                                None,
+                            )
+                            if alt_track is not None:
+                                logger.warning(
+                                    "Stream URL album fallback: stale_id=%s → album_id=%s alt_id=%s name=%r",
+                                    getattr(track, "id", None),
+                                    album_id,
+                                    alt_track.id,
+                                    getattr(track, "name", ""),
+                                )
+                                return self.get_stream_url(alt_track)
+                        except Exception as fb_exc:
+                            logger.debug(
+                                "Album fallback for track %s failed: %s",
+                                getattr(track, "id", None),
+                                fb_exc,
+                            )
             return None
         finally:
             # Restore selected preference for subsequent requests.

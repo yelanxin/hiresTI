@@ -340,6 +340,7 @@ def play_track(app, index):
                 def apply_playback():
                     if request_id != getattr(app, "_play_request_id", 0):
                         return False
+                    app._stream_missing_skip_count = 0
                     prev_state = str(getattr(app.player, "output_state", "idle") or "idle")
                     if hasattr(app.player, "hint_source_format") and (bit_depth or sample_rate):
                         app.player.hint_source_format(bit_depth, sample_rate)
@@ -391,6 +392,17 @@ def play_track(app, index):
                         app._mpris_sync_playback()
                     if hasattr(app, "_remote_publish_playback_event"):
                         app._remote_publish_playback_event("stream_missing")
+                    # Auto-skip unavailable tracks, but limit consecutive skips to
+                    # avoid an infinite loop when many tracks in a row are missing.
+                    skip_count = getattr(app, "_stream_missing_skip_count", 0) + 1
+                    app._stream_missing_skip_count = skip_count
+                    if skip_count <= 10 and hasattr(app, "on_next_track"):
+                        logger.warning("Auto-skipping unavailable track (skip #%d)", skip_count)
+                        app.on_next_track()
+                    else:
+                        if skip_count > 10:
+                            logger.warning("Stopped auto-skip after %d consecutive unavailable tracks", skip_count)
+                        app._stream_missing_skip_count = 0
                     return False
 
                 GLib.idle_add(apply_stream_missing)
