@@ -212,12 +212,14 @@ def on_nav_selected(app, box, row):
         if hasattr(app, "grid_subtitle_label") and app.grid_subtitle_label is not None:
             app.grid_subtitle_label.set_text("Artists you follow and love")
         app.create_album_flow()
+        render_token = int(getattr(app, "_artists_render_token", 0) or 0) + 1
+        app._artists_render_token = render_token
         if app.backend.user:
-            def task():
+            def task(token=render_token):
                 artists = list(app.backend.get_favorites() or [])
                 artists = ui_actions.sort_objects_by_name_fast(artists, context="favorite_artists")
                 logger.info("Artists page prepared: total=%s", len(artists))
-                GLib.idle_add(app.batch_load_artists, artists)
+                GLib.idle_add(app.batch_load_artists, artists, 10, token)
 
             Thread(target=task, daemon=True).start()
 

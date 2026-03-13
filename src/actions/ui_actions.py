@@ -1639,7 +1639,10 @@ def batch_load_albums(app, albs, batch=6):
     return False
 
 
-def batch_load_artists(app, artists, batch=10):
+def batch_load_artists(app, artists, batch=10, _token=None):
+    # Bail out if a newer artists-page render has started since this batch was scheduled.
+    if _token is not None and _token != getattr(app, "_artists_render_token", None):
+        return False
     if not artists:
         return False
     curr, rem = artists[:batch], artists[batch:]
@@ -1663,7 +1666,7 @@ def batch_load_artists(app, artists, batch=10):
         c.data_item = {"obj": art, "type": "Artist"}
         app.main_flow.append(c)
     if rem:
-        GLib.timeout_add(50, app.batch_load_artists, rem, batch)
+        GLib.timeout_add(50, app.batch_load_artists, rem, batch, _token)
     return False
 
 
