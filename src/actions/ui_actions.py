@@ -1630,10 +1630,10 @@ def batch_load_albums(app, albs, batch=6):
                 css_classes=["dim-label", "home-card-subtitle"],
             )
         )
-        c = Gtk.FlowBoxChild()
-        c.set_child(v)
-        c.data_item = {"obj": alb, "type": "Album"}
-        app.main_flow.append(c)
+        btn = Gtk.Button(css_classes=["flat", "history-card-btn", "home-feed-btn"])
+        btn.set_child(v)
+        btn.connect("clicked", lambda _b, a=alb: app.show_album_details(a))
+        app.main_flow.append(btn)
     if rem:
         GLib.timeout_add(50, app.batch_load_albums, rem, batch)
     return False
