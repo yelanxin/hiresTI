@@ -109,6 +109,15 @@ def _dashboard_track_row_button_classes(is_playing=False):
     return classes
 
 
+def _norm_trackish_text(value):
+    s = str(value or "").strip().lower()
+    keep = []
+    for ch in s:
+        if ch.isalnum() or ch.isspace():
+            keep.append(ch)
+    return " ".join("".join(keep).split())
+
+
 def _liked_tracks_signature(tracks):
     items = list(tracks or [])
     digest = blake2b(digest_size=8)
@@ -2638,6 +2647,8 @@ def render_artist_detail(app, artist, render_token=None):
             btn.set_hexpand(True)
             btn.set_halign(Gtk.Align.FILL)
             btn._dashboard_track_id = str(getattr(track, "id", "") or "").strip()
+            btn._dashboard_track_name = _norm_trackish_text(track_name)
+            btn._dashboard_track_artist = _norm_trackish_text(str(getattr(getattr(track, "artist", None), "name", "") or ""))
             btn._dashboard_playing_icon = playing_icon
             btn.set_child(row_box)
             btn.connect(

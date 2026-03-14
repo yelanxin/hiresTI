@@ -49,6 +49,14 @@ class _Button:
         self.visible = bool(value)
 
 
+class _Icon:
+    def __init__(self):
+        self.visible = None
+
+    def set_visible(self, value):
+        self.visible = bool(value)
+
+
 class _Widget:
     def __init__(self, name="widget"):
         self.name = name
@@ -60,6 +68,25 @@ class _Widget:
         siblings = self.parent.children
         idx = siblings.index(self)
         return siblings[idx + 1] if idx + 1 < len(siblings) else None
+
+    def get_first_child(self):
+        return None
+
+
+class _DashboardRow(_Widget):
+    def __init__(self, track_id="", track_name="", track_artist=""):
+        super().__init__(name="dashboard-row")
+        self._dashboard_track_id = str(track_id)
+        self._dashboard_track_name = str(track_name)
+        self._dashboard_track_artist = str(track_artist)
+        self._dashboard_playing_icon = _Icon()
+        self.classes = set()
+
+    def add_css_class(self, value):
+        self.classes.add(str(value))
+
+    def remove_css_class(self, value):
+        self.classes.discard(str(value))
 
 
 class _Container:
@@ -461,3 +488,22 @@ def test_artist_detail_hero_height_tracks_three_equal_columns():
     assert ui_actions._artist_detail_available_width(app) == 1080
     assert ui_actions._artist_detail_column_width(app) == 360
     assert ui_actions._artist_detail_hero_height(app) == 360
+
+
+def test_refresh_dashboard_playing_state_updates_artist_detail_top_track_row():
+    row = _DashboardRow(track_id="track-42", track_name="pretty boy", track_artist="m2m")
+    root = _Container([row])
+    app = SimpleNamespace(
+        collection_content_box=root,
+        playing_track_id="track-42",
+        playing_track=SimpleNamespace(
+            id="track-42",
+            name="Pretty Boy",
+            artist=SimpleNamespace(name="M2M"),
+        ),
+    )
+
+    ui_actions.refresh_dashboard_playing_state(app)
+
+    assert "track-row-playing" in row.classes
+    assert row._dashboard_playing_icon.visible is True
