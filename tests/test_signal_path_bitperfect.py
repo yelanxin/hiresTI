@@ -299,6 +299,17 @@ def test_display_output_depth_falls_back_to_stream_output_depth():
     assert win._display_output_depth("Unknown") == "32-bit"
 
 
+def test_apply_alsa_hw_runtime_override_prefers_kernel_hw_params_over_stream_container_depth():
+    win = _make_window("ALSA", exclusive=False, bit_perfect=False)
+    win.player.current_device_id = "hw:2,0"
+    win._get_kernel_hw_runtime = lambda: {"hardware_rate": "44.1kHz", "hardware_depth": "16-bit"}
+
+    rate, depth = win._apply_alsa_hw_runtime_override("ALSA（mmap）", "hw:2,0", "44.1kHz", "64-bit")
+
+    assert rate == "44.1kHz"
+    assert depth == "16-bit"
+
+
 def test_format_target_output_truncates_long_device_name():
     win = _make_window("PipeWire", exclusive=False, bit_perfect=False)
 

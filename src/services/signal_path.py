@@ -546,6 +546,20 @@ class AudioSignalPathWindow(Adw.Window):
             return f"{driver} Shared Path"
         return "System Controlled"
 
+    def _apply_alsa_hw_runtime_override(self, driver_name, device_id, output_rate, output_depth):
+        driver = str(driver_name or "").strip()
+        dev = str(device_id or "").strip().lower()
+        if driver not in ("ALSA", "ALSA（auto）", "ALSA (mmap)", "ALSA（mmap）"):
+            return output_rate, output_depth
+        if not dev.startswith("hw:"):
+            return output_rate, output_depth
+        hw_runtime = self._get_kernel_hw_runtime()
+        if hw_runtime.get("hardware_rate"):
+            output_rate = hw_runtime["hardware_rate"]
+        if hw_runtime.get("hardware_depth"):
+            output_depth = hw_runtime["hardware_depth"]
+        return output_rate, output_depth
+
     def _summary_rows_signature(self, rows):
         return tuple((str(key), str(value), str(style)) for key, value, style in rows)
 
@@ -736,6 +750,12 @@ class AudioSignalPathWindow(Adw.Window):
                     output_rows.append(("Stream Depth", sess_depth, False))
                 if sess_rate:
                     output_rows.append(("Stream Rate", sess_rate, False))
+            output_rate, output_depth = self._apply_alsa_hw_runtime_override(
+                current_driver,
+                getattr(self.player, "current_device_id", ""),
+                output_rate,
+                output_depth,
+            )
             output_rate = self._display_output_rate(output_rate)
             output_depth = self._display_output_depth(output_depth)
             output_rows.append(("Output Depth", output_depth, current_driver == "PipeWire" and bool(pw_runtime.get("hardware_depth"))))
@@ -809,6 +829,12 @@ class AudioSignalPathWindow(Adw.Window):
                     output_depth = hw_depth
                 if hw_rate:
                     output_rate = hw_rate
+            output_rate, output_depth = self._apply_alsa_hw_runtime_override(
+                driver,
+                getattr(self.player, "current_device_id", ""),
+                output_rate,
+                output_depth,
+            )
         output_rate = self._display_output_rate(output_rate)
         output_depth = self._display_output_depth(output_depth)
         rate_match = self._rate_only_match(sample_rate, output_rate)
@@ -1228,6 +1254,12 @@ class AudioSignalPathWindow(Adw.Window):
                 output_rate = f"{force_rate/1000.0:g}kHz"
         else:
             force_rate, allowed_raw = (0, "")
+        output_rate, output_depth = self._apply_alsa_hw_runtime_override(
+            driver,
+            getattr(self.player, "current_device_id", ""),
+            output_rate,
+            output_depth,
+        )
         output_rate = self._display_output_rate(output_rate)
         output_depth = self._display_output_depth(output_depth)
         rate_match = self._rate_only_match(sample_rate, output_rate)
