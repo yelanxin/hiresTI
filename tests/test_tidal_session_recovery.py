@@ -56,6 +56,7 @@ def _make_backend():
     backend._cached_albums = []
     backend._cached_albums_ts = 0.0
     backend._albums_cache_ttl = 0.0
+    backend._favorite_artists_index_dirty = False
     backend._mix_fail_until = {}
     backend._last_login_error = ""
     backend._session_recovery_lock = threading.Lock()
@@ -134,3 +135,127 @@ def test_get_tracks_recovers_album_fetch_with_fresh_session():
     result = backend.get_tracks(StaleAlbum("42"))
 
     assert result == [track]
+
+
+def test_get_favorites_prefers_paginated_api_and_applies_limit():
+    backend = _make_backend()
+    artists = [SimpleNamespace(id=str(i), name=f"Artist {i}") for i in range(150)]
+
+    class _Favorites:
+        def artists_paginated(self):
+            return list(artists)
+
+        def artists(self, **_kwargs):
+            raise AssertionError("manual pagination fallback should not be used")
+
+    backend.user = SimpleNamespace(favorites=_Favorites())
+    backend._call_with_session_recovery = lambda fn, context=None: fn()
+
+    result = backend.get_favorites(limit=120)
+
+    assert [item.id for item in result] == [str(i) for i in range(120)]
+
+
+def test_get_favorites_fallback_continues_after_short_first_page():
+    backend = _make_backend()
+    offsets = []
+
+    class _Favorites:
+        def artists(self, limit=50, offset=0, **_kwargs):
+            offsets.append((limit, offset))
+            if offset == 0:
+                return [SimpleNamespace(id=str(i), name=f"Artist {i}") for i in range(99)]
+            if offset == 99:
+                return [SimpleNamespace(id=str(i), name=f"Artist {i}") for i in range(99, 120)]
+            return []
+
+        def get_artists_count(self):
+            return 120
+
+    backend.user = SimpleNamespace(favorites=_Favorites())
+    backend._call_with_session_recovery = lambda fn, context=None: fn()
+
+    result = backend.get_favorites(limit=200)
+
+    assert len(result) == 120
+    assert result[0].id == "0"
+    assert result[-1].id == "119"
+    assert offsets == [(100, 0), (100, 99)]
+
+
+def test_get_favorite_artists_count_uses_count_api():
+    backend = _make_backend()
+
+    class _Favorites:
+        def get_artists_count(self):
+            return 321
+
+    backend.user = SimpleNamespace(favorites=_Favorites())
+    backend._call_with_session_recovery = lambda fn, context=None: fn()
+
+    assert backend.get_favorite_artists_count() == 321
+
+
+def test_get_favorite_artists_page_uses_limit_offset_and_sort():
+    backend = _make_backend()
+    calls = []
+    artists = [SimpleNamespace(id="a1", name="Artist 1")]
+
+    class _Favorites:
+        def artists(self, **kwargs):
+            calls.append(dict(kwargs))
+            return list(artists)
+
+    backend.user = SimpleNamespace(favorites=_Favorites())
+    backend._call_with_session_recovery = lambda fn, context=None: fn()
+
+    result = backend.get_favorite_artists_page(limit=50, offset=100, sort="date_desc")
+
+    assert result == artists
+    assert calls == [{
+        "limit": 50,
+        "offset": 100,
+        "order": tidal_mod.tidal_user.ArtistOrder.DateAdded,
+        "order_direction": tidal_mod.tidal_user.OrderDirection.Descending,
+    }]
+
+
+def test_get_artist_top_tracks_resolves_lightweight_artist():
+    backend = _make_backend()
+    calls = []
+    tracks = [SimpleNamespace(id="t1", name="Top Track")]
+
+    class _Artist:
+        def get_top_tracks(self, limit=None, offset=0):
+            calls.append((limit, offset))
+            return list(tracks)
+
+    backend.session = SimpleNamespace(artist=lambda _artist_id: _Artist())
+    backend._call_with_session_recovery = lambda fn, context=None: fn()
+
+    result = backend.get_artist_top_tracks(SimpleNamespace(id="artist-7", name="Demo"), limit=20, offset=5)
+
+    assert result == tracks
+    assert calls == [(20, 5)]
+
+
+def test_get_artist_ep_singles_all_paginates_all_pages():
+    backend = _make_backend()
+    calls = []
+
+    class _Artist:
+        def get_ep_singles(self, limit=None, offset=0):
+            calls.append((limit, offset))
+            if offset == 0:
+                return [SimpleNamespace(id="e1"), SimpleNamespace(id="e2")]
+            if offset == 2:
+                return [SimpleNamespace(id="e3")]
+            return []
+
+    backend.session = SimpleNamespace(artist=lambda _artist_id: _Artist())
+    backend._call_with_session_recovery = lambda fn, context=None: fn()
+
+    result = backend.get_artist_ep_singles_all(SimpleNamespace(id="artist-9", name="Demo"), limit=5)
+
+    assert [item.id for item in result] == ["e1", "e2", "e3"]
+    assert calls == [(5, 0), (5, 2), (5, 3)]

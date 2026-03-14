@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.6.7 - 2026-03-13
+Artists/artist-detail follow-up release: paged favorite-artist browsing, a redesigned artist hero/detail page, faster progressive section loading, and stronger liked-songs consistency after favorite toggles.
+
+### Added
+- Added paged `Artists` browsing with local in-memory search indexing, so the page can render the first artist page quickly while still supporting search across the full favorite-artist set once indexing completes.
+- Added a redesigned artist detail page with a hero artwork area, `Top Tracks`, `Albums`, and `EP & Singles` sections, plus artist-artwork-aware panel composition and adaptive album grids.
+
+### Changed
+- `Artists` page navigation now preserves the previous artist-list state and scroll position when drilling into an artist and returning back.
+- Artist detail loading is now progressive: hero appears immediately, and `Top Tracks`, `Albums`, and `EP & Singles` populate independently as their backend requests complete instead of waiting for the slowest section.
+- Artist detail `Top Tracks` now shows the first `10` tracks instead of `20`.
+- Artist detail section headers no longer show right-side count numbers.
+- Artist hero layout has been iterated to better match the intended reference composition, including edge-crop biasing on side panels and title-row placement for the artist favorite button.
+- Artist detail hero layout recalculation is now debounced: rapid resize signals from multiple widgets are coalesced into a single update instead of queuing redundant redraws.
+- `Artists` page no longer issues a separate artist-count API request while the search index is already being built in the background; total count is derived from the index once ready, reducing concurrent API load on page open.
+
+### Fixed
+- Fixed a missing DSP builder wiring target that caused startup `AttributeError: 'TidalApp' object has no attribute '_queue_rebuild_dsp_overview_chain'`.
+- Fixed favorite-artist fetch behavior stopping early on short pages (for example `99` artists) by preferring `tidalapi` paginated favorites APIs and using safer manual pagination fallback behavior.
+- Fixed artist-page back navigation restoring the list at the top instead of the previous scroll position.
+- Fixed artist-detail async album rendering leaking album cards back into the `Artists` page after returning from an artist.
+- Fixed `Liked Songs` state lag after favorite toggles by optimistically removing unliked tracks from the current list, optimistically adding newly liked tracks to the in-memory cache, and strengthening the liked-tracks view signature used to decide whether a rebuild can be skipped.
+- Fixed image-cache races that could leave zero-byte/partial files in the cover cache and trigger GTK image-loader warnings such as `application/x-zerosize`; cached image downloads now serialize per target path and write through temporary files with atomic replace.
+- Fixed `EP & Singles` showing an empty section header when an artist has no EP/singles entries.
+- Fixed artist cover images failing to load on artist detail pages: requests were using size `1280` which is not a valid TIDAL artist image dimension; now capped at `750` (the largest supported size for artist images).
+- Fixed a signal handler leak in the artist detail hero: `notify::width` and `notify::height` handlers connected to persistent app-level widgets (window, scroll area, content overlays) are now properly disconnected when leaving the artist page, preventing handlers from accumulating across multiple artist visits and firing redundantly on every window resize.
+- Fixed a spurious `get_favorites(limit=1)` call in the artist count fallback path that provided no useful count information; the path now returns `0` and lets the caller derive the total from page results.
+- Fixed deprecated TIDAL track IDs in `Liked Songs` causing repeated 404 round-trips: when the album fallback successfully resolves an alternative track during playback, the local liked-tracks cache and favorite ID set are now updated asynchronously so subsequent plays of the same song use the current ID directly.
+
 ## 1.6.6 - 2026-03-12
 Liked Songs shuffle reliability fix: tracks that were saved under old Tidal catalog IDs now resolve and play correctly instead of silently failing.
 

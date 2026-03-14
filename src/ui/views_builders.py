@@ -20,7 +20,9 @@ def build_grid_view(app):
         margin_bottom=10,
         css_classes=["home-topbar"],
     )
+    app.grid_title_box = title_box
     title_row = Gtk.Box(spacing=12)
+    app.grid_title_row = title_row
     app.grid_title_label = Gtk.Label(label="Home", xalign=0, css_classes=["section-title"])
     app.grid_subtitle_label = Gtk.Label(
         label="Fresh picks and playlists tailored to your listening",
@@ -109,6 +111,8 @@ def build_grid_view(app):
         margin_bottom=32,
         css_classes=["home-content-box"],
     )
+    app.collection_base_margin_start = 20
+    app.collection_base_margin_end = 20
     app.collection_base_margin_bottom = 32
     app.alb_scroll.set_child(app.collection_content_box)
     grid_vbox.append(app.alb_scroll)

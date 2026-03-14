@@ -183,6 +183,25 @@ def update_layout_proportions(self, w, p):
         self._schedule_now_playing_surface_resync()
     elif hasattr(self, "_sync_now_playing_surface_size"):
         GLib.idle_add(lambda: (self._sync_now_playing_surface_size(), False)[1])
+    refresh_artist_detail = getattr(self, "_artist_detail_layout_refresh", None)
+    if callable(refresh_artist_detail):
+        GLib.idle_add(refresh_artist_detail)
+
+        try:
+            old_src = int(getattr(self, "_artist_detail_layout_sync_source", 0) or 0)
+            if old_src:
+                GLib.source_remove(old_src)
+        except Exception:
+            pass
+
+        def _retry_artist_detail():
+            self._artist_detail_layout_sync_source = 0
+            refresh = getattr(self, "_artist_detail_layout_refresh", None)
+            if callable(refresh):
+                refresh()
+            return False
+
+        self._artist_detail_layout_sync_source = GLib.timeout_add(140, _retry_artist_detail)
     GLib.idle_add(lambda: (self._schedule_viz_handle_realign(animate=False), False)[1])
 
 

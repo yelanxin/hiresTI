@@ -6,6 +6,7 @@ import time
 from datetime import datetime
 import subprocess
 from hashlib import blake2b
+from types import SimpleNamespace
 
 import gi
 
@@ -14,6 +15,7 @@ from gi.repository import Gtk, GLib, Pango, Gdk, GObject
 
 import utils.helpers as utils
 from _rust.viz import RustVizCore
+from ui import config as ui_config
 from ui.track_table import LAYOUT, build_tracks_header, append_header_action_spacers
 from core.errors import classify_exception, user_message
 
@@ -105,6 +107,17 @@ def _dashboard_track_row_button_classes(is_playing=False):
     if is_playing:
         classes.append("track-row-playing")
     return classes
+
+
+def _liked_tracks_signature(tracks):
+    items = list(tracks or [])
+    digest = blake2b(digest_size=8)
+    digest.update(str(len(items)).encode("utf-8", "ignore"))
+    digest.update(b":")
+    for track in items:
+        digest.update(str(getattr(track, "id", "") or "").encode("utf-8", "ignore"))
+        digest.update(b"\n")
+    return (len(items), digest.hexdigest())
 
 
 def _build_feed_media_tint(media_size, *shape_classes):
@@ -1602,8 +1615,13 @@ def populate_tracks(app, tracks):
         app._update_track_list_icon()
 
 
-def batch_load_albums(app, albs, batch=6):
+def batch_load_albums(app, albs, batch=6, _flow=None, _token=None, _token_attr=None):
+    if _token_attr and _token is not None and _token != getattr(app, _token_attr, None):
+        return False
     if not albs:
+        return False
+    flow = _flow if _flow is not None else getattr(app, "main_flow", None)
+    if flow is None:
         return False
     curr, rem = albs[:batch], albs[batch:]
     for alb in curr:
@@ -1633,17 +1651,20 @@ def batch_load_albums(app, albs, batch=6):
         btn = Gtk.Button(css_classes=["flat", "history-card-btn", "home-feed-btn"])
         btn.set_child(v)
         btn.connect("clicked", lambda _b, a=alb: app.show_album_details(a))
-        app.main_flow.append(btn)
+        flow.append(btn)
     if rem:
-        GLib.timeout_add(50, app.batch_load_albums, rem, batch)
+        GLib.timeout_add(50, app.batch_load_albums, rem, batch, flow, _token, _token_attr)
     return False
 
 
-def batch_load_artists(app, artists, batch=10, _token=None):
+def batch_load_artists(app, artists, batch=10, _token=None, _flow=None):
     # Bail out if a newer artists-page render has started since this batch was scheduled.
     if _token is not None and _token != getattr(app, "_artists_render_token", None):
         return False
     if not artists:
+        return False
+    flow = _flow if _flow is not None else getattr(app, "main_flow", None)
+    if flow is None:
         return False
     curr, rem = artists[:batch], artists[batch:]
     for art in curr:
@@ -1664,10 +1685,1107 @@ def batch_load_artists(app, artists, batch=10, _token=None):
         c = Gtk.FlowBoxChild()
         c.set_child(v)
         c.data_item = {"obj": art, "type": "Artist"}
-        app.main_flow.append(c)
+        flow.append(c)
     if rem:
-        GLib.timeout_add(50, app.batch_load_artists, rem, batch, _token)
+        GLib.timeout_add(50, app.batch_load_artists, rem, batch, _token, flow)
     return False
+
+
+def _artist_added_sort_value(raw):
+    if raw is None:
+        return float("-inf")
+    if isinstance(raw, datetime):
+        try:
+            return float(raw.timestamp())
+        except Exception:
+            return float("-inf")
+    timestamp = getattr(raw, "timestamp", None)
+    if callable(timestamp):
+        try:
+            return float(timestamp())
+        except Exception:
+            return float("-inf")
+    text = str(raw or "").strip()
+    if not text:
+        return float("-inf")
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        return float(datetime.fromisoformat(text).timestamp())
+    except Exception:
+        return float("-inf")
+
+
+def _artist_index_entry_from_obj(artist):
+    artist_id = str(getattr(artist, "id", "") or "").strip()
+    name = str(getattr(artist, "name", "") or "").strip()
+    if not artist_id or not name:
+        return None
+    return {
+        "id": artist_id,
+        "name": name,
+        "name_lc": name.lower(),
+        "added": getattr(artist, "user_date_added", None),
+    }
+
+
+def _artist_obj_from_index_entry(entry):
+    if hasattr(entry, "id") and hasattr(entry, "name"):
+        return entry
+    return SimpleNamespace(
+        id=str((entry or {}).get("id", "") or ""),
+        name=str((entry or {}).get("name", "") or ""),
+    )
+
+
+def _filter_artist_index_entries(entries, query):
+    q = str(query or "").strip().lower()
+    if not q:
+        return list(entries or [])
+    return [
+        dict(entry)
+        for entry in list(entries or [])
+        if q in str(entry.get("name_lc", "") or "")
+    ]
+
+
+def _sort_artist_index_entries(entries, sort_key):
+    key = str(sort_key or "name_asc").strip().lower()
+    seq = [dict(entry) for entry in list(entries or [])]
+    if key == "name_desc":
+        seq.sort(key=lambda entry: (str(entry.get("name_lc", "") or ""), str(entry.get("id", "") or "")), reverse=True)
+    elif key == "date_asc":
+        seq.sort(
+            key=lambda entry: (
+                _artist_added_sort_value(entry.get("added")),
+                str(entry.get("name_lc", "") or ""),
+                str(entry.get("id", "") or ""),
+            )
+        )
+    elif key == "date_desc":
+        seq.sort(
+            key=lambda entry: (
+                _artist_added_sort_value(entry.get("added")),
+                str(entry.get("name_lc", "") or ""),
+                str(entry.get("id", "") or ""),
+            ),
+            reverse=True,
+        )
+    else:
+        seq.sort(key=lambda entry: (str(entry.get("name_lc", "") or ""), str(entry.get("id", "") or "")))
+    return seq
+
+
+def render_artists_dashboard(app):
+    logger.info(
+        "Artists dashboard opened: query=%r sort=%s page=%s",
+        getattr(app, "artists_query", ""),
+        getattr(app, "artists_sort", "name_asc"),
+        getattr(app, "artists_page", 0),
+    )
+    _clear_container(app.collection_content_box)
+    app.playlist_track_list = None
+    app.queue_track_list = None
+    app.artists_query = str(getattr(app, "artists_query", "") or "")
+    app.artists_sort = str(getattr(app, "artists_sort", "name_asc") or "name_asc")
+    app.artists_page = max(0, int(getattr(app, "artists_page", 0) or 0))
+    app.artists_page_size = max(1, int(getattr(app, "artists_page_size", 50) or 50))
+
+    current_user_id = str(getattr(getattr(app.backend, "user", None), "id", "") or "")
+    if current_user_id != str(getattr(app, "_artists_index_user_id", "") or ""):
+        app._artists_total_count = 0
+        app._artists_index_entries = []
+        app._artists_index_ready = False
+        app._artists_index_building = False
+        app._artists_index_user_id = current_user_id
+
+    if bool(getattr(app.backend, "_favorite_artists_index_dirty", False)):
+        app._artists_total_count = 0
+        app._artists_index_entries = []
+        app._artists_index_ready = False
+        app._artists_index_building = False
+
+    dashboard_token = int(getattr(app, "_artists_dashboard_token", 0) or 0) + 1
+    app._artists_dashboard_token = dashboard_token
+
+    toolbar = Gtk.Box(spacing=8, margin_start=0, margin_end=0, margin_top=6, margin_bottom=8)
+    search_entry = Gtk.Entry(hexpand=True)
+    search_entry.set_placeholder_text("Search favorite artists")
+    search_entry.set_text(app.artists_query)
+    toolbar.append(search_entry)
+    sort_label = Gtk.Label(label="Sort by", css_classes=["dim-label"], valign=Gtk.Align.CENTER)
+    toolbar.append(sort_label)
+    sort_options = [
+        ("name_asc", "Name (A-Z)"),
+        ("name_desc", "Name (Z-A)"),
+        ("date_desc", "Recently Added"),
+        ("date_asc", "Oldest Added"),
+    ]
+    sort_dd = Gtk.DropDown(model=Gtk.StringList.new([label for _key, label in sort_options]))
+    sort_lookup = {key: idx for idx, (key, _label) in enumerate(sort_options)}
+    sort_dd.set_selected(sort_lookup.get(app.artists_sort, 0))
+    toolbar.append(sort_dd)
+    app.collection_content_box.append(toolbar)
+
+    pager_bar = Gtk.Box(spacing=8, margin_start=0, margin_end=0, margin_bottom=8)
+    prev_btn = Gtk.Button(label="Prev", css_classes=["flat", "liked-action-btn"])
+    next_btn = Gtk.Button(label="Next", css_classes=["flat", "liked-action-btn"])
+    page_info_lbl = Gtk.Label(label="", css_classes=["dim-label"], xalign=0)
+    status_lbl = Gtk.Label(label="", css_classes=["dim-label"], xalign=1)
+    status_lbl.set_hexpand(True)
+    pager_bar.append(prev_btn)
+    pager_bar.append(next_btn)
+    pager_bar.append(page_info_lbl)
+    pager_bar.append(status_lbl)
+    app.collection_content_box.append(pager_bar)
+
+    app.create_album_flow()
+    flow = app.main_flow
+
+    def _render_items(items):
+        _clear_container(flow)
+        render_token = int(getattr(app, "_artists_render_token", 0) or 0) + 1
+        app._artists_render_token = render_token
+        if items:
+            app.batch_load_artists(items, 10, render_token, flow)
+
+    def _set_status(message):
+        status_lbl.set_text(str(message or ""))
+
+    def _update_pager(total_count, page_count, status_message=""):
+        total = max(0, int(total_count or 0))
+        pages = max(0, int(page_count or 0))
+        prev_btn.set_sensitive(app.artists_page > 0)
+        next_btn.set_sensitive(pages > 0 and app.artists_page < pages - 1)
+        if pages > 0:
+            noun = "match" if app.artists_query.strip() else "artist"
+            suffix = "es" if total != 1 and noun == "match" else "s" if total != 1 and noun == "artist" else ""
+            page_info_lbl.set_text(f"Page {app.artists_page + 1} of {pages} ({total} {noun}{suffix})")
+        elif total > 0:
+            page_info_lbl.set_text(f"{total} artist{'s' if total != 1 else ''}")
+        else:
+            page_info_lbl.set_text("0 artists")
+        _set_status(status_message)
+
+    def _update_from_local_index():
+        query = str(app.artists_query or "").strip()
+        if not query and not getattr(app, "_artists_index_ready", False):
+            return False
+        if query and not getattr(app, "_artists_index_ready", False):
+            _render_items([])
+            _update_pager(0, 0, "Building artist search index...")
+            prev_btn.set_sensitive(False)
+            next_btn.set_sensitive(False)
+            return True
+
+        filtered = _filter_artist_index_entries(getattr(app, "_artists_index_entries", []), query)
+        filtered = _sort_artist_index_entries(filtered, app.artists_sort)
+        total = len(filtered)
+        page_size = app.artists_page_size
+        total_pages = (total + page_size - 1) // page_size if total > 0 else 0
+        if total_pages > 0 and app.artists_page >= total_pages:
+            app.artists_page = total_pages - 1
+        elif total_pages == 0:
+            app.artists_page = 0
+        start = app.artists_page * page_size
+        end = start + page_size
+        page_items = [_artist_obj_from_index_entry(entry) for entry in filtered[start:end]]
+        _render_items(page_items)
+        if total == 0:
+            _update_pager(0, 0, "No artists match this search.")
+        else:
+            _update_pager(total, total_pages, "")
+        return True
+
+    def _load_remote_page():
+        request_token = int(getattr(app, "_artists_browser_request_token", 0) or 0) + 1
+        app._artists_browser_request_token = request_token
+        requested_page = int(app.artists_page)
+        sort_key = str(app.artists_sort or "name_asc")
+        known_total = max(0, int(getattr(app, "_artists_total_count", 0) or 0))
+        _render_items([])
+        _update_pager(known_total, 0, "Loading artists...")
+        prev_btn.set_sensitive(False)
+        next_btn.set_sensitive(False)
+
+        def task(token=request_token, dashboard=dashboard_token, page=requested_page, sort=sort_key, total_hint=known_total):
+            # Skip the count API call if the index is already building — it will update
+            # _artists_total_count when done, so a separate count fetch is redundant.
+            if total_hint > 0 or getattr(app, "_artists_index_building", False):
+                total = total_hint
+            else:
+                total = app.backend.get_favorite_artists_count()
+            items = list(
+                app.backend.get_favorite_artists_page(
+                    limit=app.artists_page_size,
+                    offset=page * app.artists_page_size,
+                    sort=sort,
+                ) or []
+            )
+
+            def apply():
+                if int(getattr(app, "_artists_dashboard_token", 0) or 0) != dashboard:
+                    return False
+                if int(getattr(app, "_artists_browser_request_token", 0) or 0) != token:
+                    return False
+                total_count = max(0, int(total or 0))
+                if total_count <= 0 and items:
+                    total_count = (page * app.artists_page_size) + len(items)
+                app._artists_total_count = total_count
+                total_pages = (total_count + app.artists_page_size - 1) // app.artists_page_size if total_count > 0 else 0
+                if total_pages > 0 and app.artists_page >= total_pages:
+                    app.artists_page = total_pages - 1
+                    _load_remote_page()
+                    return False
+                _render_items(items)
+                if total_count == 0:
+                    _update_pager(0, 0, "No favorite artists yet.")
+                else:
+                    status = "Building artist search index..." if getattr(app, "_artists_index_building", False) else ""
+                    _update_pager(total_count, total_pages, status)
+                if total_count > 0 and total_pages == 0:
+                    prev_btn.set_sensitive(app.artists_page > 0)
+                    next_btn.set_sensitive(bool(items) and len(items) >= app.artists_page_size)
+                return False
+
+            GLib.idle_add(apply)
+
+        Thread(target=task, daemon=True).start()
+
+    def _refresh_view():
+        if _update_from_local_index():
+            return
+        _load_remote_page()
+
+    def _ensure_index():
+        if not current_user_id:
+            return
+        if getattr(app, "_artists_index_ready", False) and not getattr(app.backend, "_favorite_artists_index_dirty", False):
+            return
+        if getattr(app, "_artists_index_building", False):
+            return
+        app._artists_index_building = True
+        build_token = int(getattr(app, "_artists_index_build_token", 0) or 0) + 1
+        app._artists_index_build_token = build_token
+        if not app.artists_query.strip():
+            _set_status("Building artist search index...")
+
+        def task(token=build_token, dashboard=dashboard_token, user_id=current_user_id):
+            artists = list(app.backend.get_favorites(limit=20000) or [])
+            entries = []
+            seen = set()
+            for artist in artists:
+                entry = _artist_index_entry_from_obj(artist)
+                if not entry:
+                    continue
+                artist_id = str(entry.get("id") or "")
+                if artist_id in seen:
+                    continue
+                seen.add(artist_id)
+                entries.append(entry)
+
+            def apply():
+                if int(getattr(app, "_artists_index_build_token", 0) or 0) != token:
+                    return False
+                if str(getattr(getattr(app.backend, "user", None), "id", "") or "") != user_id:
+                    return False
+                app._artists_index_entries = entries
+                app._artists_index_ready = True
+                app._artists_index_building = False
+                app._artists_index_user_id = user_id
+                app._artists_total_count = max(int(getattr(app, "_artists_total_count", 0) or 0), len(entries))
+                app.backend._favorite_artists_index_dirty = False
+                if int(getattr(app, "_artists_dashboard_token", 0) or 0) != dashboard:
+                    return False
+                if app.artists_query.strip():
+                    _refresh_view()
+                elif status_lbl.get_text() == "Building artist search index...":
+                    _set_status("")
+                return False
+
+            GLib.idle_add(apply)
+
+        Thread(target=task, daemon=True).start()
+
+    def _on_prev_clicked(_btn):
+        if app.artists_page <= 0:
+            return
+        app.artists_page -= 1
+        _refresh_view()
+
+    def _on_next_clicked(_btn):
+        app.artists_page += 1
+        _refresh_view()
+
+    def _on_search_changed(entry):
+        app.artists_query = str(entry.get_text() or "")
+        app.artists_page = 0
+        _refresh_view()
+
+    def _on_sort_changed(dropdown, _pspec):
+        idx = int(dropdown.get_selected())
+        app.artists_sort = sort_options[idx][0] if 0 <= idx < len(sort_options) else "name_asc"
+        app.artists_page = 0
+        _refresh_view()
+
+    prev_btn.connect("clicked", _on_prev_clicked)
+    next_btn.connect("clicked", _on_next_clicked)
+    search_entry.connect("changed", _on_search_changed)
+    sort_dd.connect("notify::selected", _on_sort_changed)
+
+    _refresh_view()
+    _ensure_index()
+
+
+def _album_release_sort_value(album):
+    raw = getattr(album, "release_date", None)
+    if isinstance(raw, datetime):
+        try:
+            return float(raw.timestamp())
+        except Exception:
+            return float("-inf")
+    text = str(raw or "").strip()
+    if not text:
+        return float("-inf")
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        return float(datetime.fromisoformat(text).timestamp())
+    except Exception:
+        year = _album_release_year_text(album)
+        try:
+            return float(int(year))
+        except Exception:
+            return float("-inf")
+
+
+def _sort_artist_release_groups(items):
+    seq = list(items or [])
+    seq.sort(
+        key=lambda item: (
+            _album_release_sort_value(item),
+            str(getattr(item, "name", "") or "").lower(),
+            str(getattr(item, "id", "") or ""),
+        ),
+        reverse=True,
+    )
+    return seq
+
+
+def _format_track_duration_label(track):
+    try:
+        dur = int(getattr(track, "duration", 0) or 0)
+    except Exception:
+        dur = 0
+    if dur <= 0:
+        return ""
+    mins, secs = divmod(dur, 60)
+    return f"{mins}:{secs:02d}"
+
+
+def _compact_count_text(value, suffix):
+    try:
+        num = int(value or 0)
+    except Exception:
+        num = 0
+    if num <= 0:
+        return ""
+    if num >= 1_000_000:
+        return f"{num / 1_000_000:.1f}M {suffix}"
+    if num >= 1_000:
+        return f"{num / 1_000:.1f}K {suffix}"
+    return f"{num} {suffix}"
+
+
+def _artist_fans_text(artist):
+    for attr in ("num_fans", "number_of_fans", "fans"):
+        val = getattr(artist, attr, None)
+        text = _compact_count_text(val, "fans")
+        if text:
+            return text
+    return "Top tracks, albums and EP & singles"
+
+
+def _load_picture_cover_async(picture, url_provider, cache_dir):
+    try:
+        picture.set_paintable(None)
+    except Exception:
+        pass
+
+    def task():
+        try:
+            url = url_provider() if callable(url_provider) else url_provider
+            if not url:
+                return
+            if isinstance(url, str) and os.path.exists(url):
+                f_path = url
+            else:
+                f_path = utils.download_to_cache(str(url), cache_dir)
+            if not f_path:
+                return
+
+            def apply():
+                try:
+                    if hasattr(picture, "set_filename"):
+                        picture.set_filename(f_path)
+                    else:
+                        texture = Gdk.Texture.new_from_filename(f_path)
+                        picture.set_paintable(texture)
+                except Exception:
+                    pass
+                return False
+
+            GLib.idle_add(apply)
+        except Exception:
+            logger.debug("Artist hero image load failed", exc_info=True)
+
+    Thread(target=task, daemon=True).start()
+
+
+def _artist_release_initial_visible_count(app):
+    available_width = 0
+    try:
+        if getattr(app, "alb_scroll", None) is not None:
+            available_width = int(app.alb_scroll.get_width() or 0)
+    except Exception:
+        available_width = 0
+
+    if available_width <= 0:
+        try:
+            win = getattr(app, "win", None)
+            if win is not None:
+                available_width = int(win.get_width() or 0)
+        except Exception:
+            available_width = 0
+
+    if available_width <= 0:
+        try:
+            base_width = int(getattr(app, "saved_width", 0) or 0)
+        except Exception:
+            base_width = 0
+        if base_width <= 0:
+            base_width = int(getattr(ui_config, "WINDOW_WIDTH", 1250) or 1250)
+        sidebar_width = max(int(base_width * float(getattr(ui_config, "SIDEBAR_RATIO", 0.15))), 120)
+        available_width = max(320, base_width - sidebar_width - 64)
+
+    # Card width is dominated by cover size plus padding/gap.
+    item_width = max(150, int(getattr(utils, "COVER_SIZE", 170) or 170) + 20)
+    gap = 24
+    columns = max(1, min(8, int((available_width + gap) // (item_width + gap)) or 1))
+    return max(1, columns * 2)
+
+
+def _artist_detail_available_width(app):
+    available_width = 0
+    try:
+        if getattr(app, "alb_scroll", None) is not None:
+            available_width = int(app.alb_scroll.get_width() or 0)
+    except Exception:
+        available_width = 0
+
+    if available_width <= 0:
+        try:
+            content_box = getattr(app, "collection_content_box", None)
+            if content_box is not None:
+                available_width = int(content_box.get_width() or 0)
+        except Exception:
+            available_width = 0
+
+    if available_width <= 0:
+        try:
+            overlay = getattr(app, "content_overlay", None)
+            if overlay is not None:
+                available_width = int(overlay.get_width() or 0)
+        except Exception:
+            available_width = 0
+
+    if available_width <= 0:
+        try:
+            overlay = getattr(app, "body_overlay", None)
+            if overlay is not None:
+                available_width = int(overlay.get_width() or 0)
+        except Exception:
+            available_width = 0
+
+    if available_width <= 0:
+        try:
+            win = getattr(app, "win", None)
+            if win is not None:
+                available_width = int(win.get_width() or 0)
+        except Exception:
+            available_width = 0
+
+    if available_width <= 0:
+        try:
+            base_width = int(getattr(app, "saved_width", 0) or 0)
+        except Exception:
+            base_width = 0
+        if base_width <= 0:
+            base_width = int(getattr(ui_config, "WINDOW_WIDTH", 1250) or 1250)
+        sidebar_width = max(int(base_width * float(getattr(ui_config, "SIDEBAR_RATIO", 0.15))), 120)
+        available_width = max(320, base_width - sidebar_width)
+
+    return max(320, int(available_width))
+
+
+def _artist_detail_available_height(app):
+    available_height = 0
+    try:
+        overlay = getattr(app, "body_overlay", None)
+        if overlay is not None:
+            available_height = int(overlay.get_height() or 0)
+    except Exception:
+        available_height = 0
+
+    if available_height <= 0:
+        try:
+            overlay = getattr(app, "content_overlay", None)
+            if overlay is not None:
+                available_height = int(overlay.get_height() or 0)
+        except Exception:
+            available_height = 0
+
+    if available_height <= 0:
+        try:
+            win = getattr(app, "win", None)
+            if win is not None:
+                available_height = int(win.get_height() or 0)
+        except Exception:
+            available_height = 0
+
+    if available_height <= 0:
+        available_height = int(getattr(ui_config, "WINDOW_HEIGHT", 800) or 800)
+
+    return max(240, int(available_height))
+
+
+def _artist_detail_column_width(app):
+    return max(1, int(_artist_detail_available_width(app) // 3))
+
+
+def _artist_detail_hero_height(app):
+    return _artist_detail_column_width(app)
+
+
+def _artist_detail_center_width(app):
+    return _artist_detail_column_width(app)
+
+
+def render_artist_detail(app, artist, render_token=None):
+    token = int(render_token if render_token is not None else getattr(app, "_artist_albums_render_token", 0) or 0)
+    detail_t0 = time.monotonic()
+    _clear_container(app.collection_content_box)
+    app.playlist_track_list = None
+    app.queue_track_list = None
+    try:
+        app.collection_content_box.set_margin_start(0)
+        app.collection_content_box.set_margin_end(0)
+        app.collection_content_box.set_margin_bottom(int(getattr(app, "collection_base_margin_bottom", 32) or 32))
+    except Exception:
+        pass
+
+    hero = Gtk.Overlay(css_classes=["artist-detail-hero"], hexpand=True)
+    hero.set_size_request(-1, _artist_detail_hero_height(app))
+    hero_strip = Gtk.Box(
+        orientation=Gtk.Orientation.HORIZONTAL,
+        homogeneous=True,
+        hexpand=True,
+        vexpand=True,
+        css_classes=["artist-detail-hero-strip"],
+    )
+
+    def _build_side_panel(extra_class):
+        panel = Gtk.Overlay(css_classes=["artist-detail-hero-panel", extra_class], hexpand=True, vexpand=True)
+        pic = Gtk.Picture(css_classes=["artist-detail-hero-image", "artist-detail-hero-side-image"])
+        pic.set_can_shrink(True)
+        pic.set_size_request(-1, _artist_detail_hero_height(app))
+        panel.set_child(pic)
+        dim = Gtk.Box(css_classes=["artist-detail-hero-side-dim"])
+        dim.set_hexpand(True)
+        dim.set_vexpand(True)
+        panel.add_overlay(dim)
+        return panel, pic
+
+    left_panel, left_pic = _build_side_panel("artist-detail-hero-left")
+    center_panel = Gtk.Overlay(css_classes=["artist-detail-hero-panel", "artist-detail-hero-center"], hexpand=False, vexpand=True)
+    center_pic = Gtk.Picture(css_classes=["artist-detail-hero-image", "artist-detail-hero-center-image"])
+    try:
+        center_pic.set_content_fit(Gtk.ContentFit.CONTAIN)
+    except Exception:
+        pass
+    center_pic.set_can_shrink(True)
+    center_pic.set_size_request(_artist_detail_center_width(app), _artist_detail_hero_height(app))
+    _load_picture_cover_async(center_pic, lambda a=artist: app.backend.get_artist_artwork_url(a, 750), app.cache_dir)
+    center_panel.set_child(center_pic)
+    center_fade = Gtk.Box(css_classes=["artist-detail-hero-center-fade"])
+    center_fade.set_hexpand(True)
+    center_fade.set_vexpand(True)
+    center_panel.add_overlay(center_fade)
+    right_panel, right_pic = _build_side_panel("artist-detail-hero-right")
+
+    hero_strip.append(left_panel)
+    hero_strip.append(center_panel)
+    hero_strip.append(right_panel)
+    hero.set_child(hero_strip)
+
+    scrim = Gtk.Box(css_classes=["artist-detail-hero-scrim"])
+    scrim.set_hexpand(True)
+    scrim.set_vexpand(True)
+    hero.add_overlay(scrim)
+
+    hero_fav_btn = Gtk.Button(
+        icon_name="hiresti-favorite-outline-symbolic",
+        css_classes=["flat", "circular", "artist-detail-fav-btn"],
+        valign=Gtk.Align.CENTER,
+    )
+    hero_fav_btn.set_tooltip_text("Favorite Artist")
+    hero_fav_btn.connect("clicked", app.on_artist_fav_clicked)
+
+    hero_content = Gtk.Box(
+        orientation=Gtk.Orientation.VERTICAL,
+        spacing=8,
+        css_classes=["artist-detail-hero-content"],
+        valign=Gtk.Align.END,
+        halign=Gtk.Align.START,
+    )
+    hero_content.set_hexpand(True)
+    hero_content.append(Gtk.Label(label="Artist", xalign=0, css_classes=["artist-detail-kicker"]))
+    hero_title_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12, hexpand=True)
+    hero_title = Gtk.Label(
+        label=str(getattr(artist, "name", "") or "Unknown Artist"),
+        xalign=0,
+        wrap=True,
+        css_classes=["artist-detail-title"],
+    )
+    hero_title.set_max_width_chars(28)
+    hero_title.set_hexpand(True)
+    hero_title.set_halign(Gtk.Align.START)
+    hero_title_row.append(hero_title)
+    hero_title_row.append(hero_fav_btn)
+    hero_content.append(hero_title_row)
+    hero_content.append(Gtk.Label(label=_artist_fans_text(artist), xalign=0, css_classes=["artist-detail-meta"]))
+    hero.add_overlay(hero_content)
+    app._update_fav_icon(hero_fav_btn, app.backend.is_artist_favorite(getattr(artist, "id", None)))
+    app.collection_content_box.append(hero)
+
+    def _apply_hero_size(source="unknown"):
+        live_width = 0
+        try:
+            live_width = int(hero.get_width() or 0)
+        except Exception:
+            live_width = 0
+        try:
+            content_w = int(getattr(app, "collection_content_box", None).get_width() or 0) if getattr(app, "collection_content_box", None) is not None else 0
+        except Exception:
+            content_w = 0
+        try:
+            scroll_w = int(getattr(app, "alb_scroll", None).get_width() or 0) if getattr(app, "alb_scroll", None) is not None else 0
+        except Exception:
+            scroll_w = 0
+        try:
+            content_overlay_w = int(getattr(app, "content_overlay", None).get_width() or 0) if getattr(app, "content_overlay", None) is not None else 0
+        except Exception:
+            content_overlay_w = 0
+        try:
+            body_overlay_w = int(getattr(app, "body_overlay", None).get_width() or 0) if getattr(app, "body_overlay", None) is not None else 0
+        except Exception:
+            body_overlay_w = 0
+        try:
+            win_w = int(getattr(app, "win", None).get_width() or 0) if getattr(app, "win", None) is not None else 0
+        except Exception:
+            win_w = 0
+        width_source = _artist_detail_available_width(app)
+        center_w = max(1, int(width_source // 3))
+        side = center_w
+        side_target = center_w
+        sig = (str(source), live_width, content_w, scroll_w, content_overlay_w, body_overlay_w, win_w, width_source, side, center_w)
+        if sig != getattr(app, "_artist_detail_last_layout_log", None):
+            app._artist_detail_last_layout_log = sig
+            logger.info(
+                "ARTIST HERO LAYOUT source=%s hero_w=%s content_w=%s scroll_w=%s content_overlay_w=%s body_overlay_w=%s win_w=%s width_source=%s side=%s center_w=%s",
+                str(source),
+                int(live_width),
+                int(content_w),
+                int(scroll_w),
+                int(content_overlay_w),
+                int(body_overlay_w),
+                int(win_w),
+                int(width_source),
+                int(side),
+                int(center_w),
+            )
+        try:
+            hero.set_size_request(-1, side)
+            left_panel.set_size_request(side_target, side)
+            center_panel.set_size_request(center_w, side)
+            center_pic.set_size_request(center_w, side)
+            right_panel.set_size_request(side_target, side)
+        except Exception:
+            pass
+        utils.load_picture_cover_crop(
+            left_pic,
+            lambda a=artist: app.backend.get_artist_artwork_url(a, 750),
+            app.cache_dir,
+            target_width=side_target,
+            target_height=side,
+            anchor_x=1.0,
+            anchor_y=0.5,
+        )
+        utils.load_picture_cover_crop(
+            right_pic,
+            lambda a=artist: app.backend.get_artist_artwork_url(a, 750),
+            app.cache_dir,
+            target_width=side_target,
+            target_height=side,
+            anchor_x=0.0,
+            anchor_y=0.5,
+        )
+        return False
+
+    def _schedule_hero_size():
+        """Debounce hero layout recalculations: coalesce rapid resize signals into one call."""
+        pending = int(getattr(app, "_artist_hero_layout_pending_src", 0) or 0)
+        if pending:
+            try:
+                GLib.source_remove(pending)
+            except Exception:
+                pass
+        def _do():
+            app._artist_hero_layout_pending_src = 0
+            _apply_hero_size("resize")
+            return False
+        app._artist_hero_layout_pending_src = GLib.timeout_add(30, _do)
+
+    app._artist_detail_layout_refresh = lambda: _apply_hero_size("layout-proportions")
+    _layout_handler_ids = []
+    hero.connect("notify::width", lambda *_args: _schedule_hero_size())
+    if getattr(app, "collection_content_box", None) is not None:
+        try:
+            _layout_handler_ids.append((app.collection_content_box, app.collection_content_box.connect("notify::width", lambda *_args: _schedule_hero_size())))
+        except Exception:
+            pass
+    if getattr(app, "alb_scroll", None) is not None:
+        try:
+            _layout_handler_ids.append((app.alb_scroll, app.alb_scroll.connect("notify::width", lambda *_args: _schedule_hero_size())))
+            _layout_handler_ids.append((app.alb_scroll, app.alb_scroll.connect("notify::height", lambda *_args: _schedule_hero_size())))
+        except Exception:
+            pass
+    if getattr(app, "content_overlay", None) is not None:
+        try:
+            _layout_handler_ids.append((app.content_overlay, app.content_overlay.connect("notify::width", lambda *_args: _schedule_hero_size())))
+        except Exception:
+            pass
+    if getattr(app, "win", None) is not None:
+        try:
+            _layout_handler_ids.append((app.win, app.win.connect("notify::width", lambda *_args: _schedule_hero_size())))
+            _layout_handler_ids.append((app.win, app.win.connect("notify::height", lambda *_args: _schedule_hero_size())))
+        except Exception:
+            pass
+    if getattr(app, "body_overlay", None) is not None:
+        try:
+            _layout_handler_ids.append((app.body_overlay, app.body_overlay.connect("notify::width", lambda *_args: _schedule_hero_size())))
+            _layout_handler_ids.append((app.body_overlay, app.body_overlay.connect("notify::height", lambda *_args: _schedule_hero_size())))
+        except Exception:
+            pass
+    app._artist_detail_layout_handler_ids = _layout_handler_ids
+    GLib.idle_add(_apply_hero_size, "initial")
+
+    body_box = Gtk.Box(
+        orientation=Gtk.Orientation.VERTICAL,
+        spacing=20,
+        margin_start=int(getattr(app, "collection_base_margin_start", 20) or 20),
+        margin_end=int(getattr(app, "collection_base_margin_end", 20) or 20),
+    )
+    app.collection_content_box.append(body_box)
+
+    def _append_section_header(title, count=0):
+        section = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, css_classes=["home-section", "artist-detail-section"])
+        head = Gtk.Box(spacing=8, css_classes=["home-section-head"], margin_start=6, margin_end=6, margin_bottom=8)
+        head.append(Gtk.Label(label=title, xalign=0, hexpand=True, css_classes=["home-section-title"]))
+        section.append(head)
+        body_box.append(section)
+        return section
+
+    top_section = _append_section_header("Top Tracks", 0)
+    top_grid = Gtk.Grid(column_spacing=16, row_spacing=8, hexpand=True)
+    top_section.append(top_grid)
+    top_loading = Gtk.Label(
+        label="Loading top tracks...",
+        xalign=0,
+        css_classes=["dim-label"],
+        margin_start=8,
+        margin_top=8,
+    )
+    top_section.append(top_loading)
+
+    albums_section = _append_section_header("Albums", 0)
+    albums_flow = Gtk.FlowBox(
+        valign=Gtk.Align.START,
+        max_children_per_line=30,
+        selection_mode=Gtk.SelectionMode.NONE,
+        column_spacing=24,
+        row_spacing=28,
+        css_classes=["home-flow"],
+    )
+    albums_flow.connect("child-activated", app.on_grid_item_activated)
+    albums_section.append(albums_flow)
+    albums_action_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    albums_action_row.append(Gtk.Box(hexpand=True))
+    albums_more_btn = Gtk.Button(label="Show more", css_classes=["flat", "liked-action-btn"])
+    albums_action_row.append(albums_more_btn)
+    albums_section.append(albums_action_row)
+    albums_loading = Gtk.Label(
+        label="Loading albums...",
+        xalign=0,
+        css_classes=["dim-label"],
+        margin_start=8,
+        margin_top=8,
+    )
+    albums_section.append(albums_loading)
+
+    eps_section = _append_section_header("EP & Singles", 0)
+    eps_flow = Gtk.FlowBox(
+        valign=Gtk.Align.START,
+        max_children_per_line=30,
+        selection_mode=Gtk.SelectionMode.NONE,
+        column_spacing=24,
+        row_spacing=28,
+        css_classes=["home-flow"],
+    )
+    eps_flow.connect("child-activated", app.on_grid_item_activated)
+    eps_section.append(eps_flow)
+    eps_action_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    eps_action_row.append(Gtk.Box(hexpand=True))
+    eps_more_btn = Gtk.Button(label="Show more", css_classes=["flat", "liked-action-btn"])
+    eps_action_row.append(eps_more_btn)
+    eps_section.append(eps_action_row)
+    eps_loading = Gtk.Label(
+        label="Loading EPs & singles...",
+        xalign=0,
+        css_classes=["dim-label"],
+        margin_start=8,
+        margin_top=8,
+    )
+    eps_section.append(eps_loading)
+
+    def _render_track_rows(tracks):
+        _clear_container(top_grid)
+        if top_loading.get_parent() is not None:
+            top_section.remove(top_loading)
+        if not tracks:
+            hint = Gtk.Label(
+                label="No top tracks available for this artist.",
+                xalign=0,
+                css_classes=["dim-label"],
+                margin_start=8,
+                margin_top=8,
+            )
+            top_section.append(hint)
+            return
+
+        playing_id = str(getattr(app, "playing_track_id", "") or "").strip()
+
+        def _build_top_track_btn(track, rank_idx, all_tracks):
+            is_playing = bool(playing_id and str(getattr(track, "id", "") or "").strip() == playing_id)
+            row_box = Gtk.Box(spacing=10, margin_start=6, margin_end=6, margin_top=4, margin_bottom=4)
+            rank_classes = ["history-rank-chip"]
+            if rank_idx == 0:
+                rank_classes.append("history-rank-top1")
+            elif rank_idx == 1:
+                rank_classes.append("history-rank-top2")
+            elif rank_idx == 2:
+                rank_classes.append("history-rank-top3")
+            rank_label = Gtk.Label(label=f"{rank_idx + 1:02d}", xalign=0.5, css_classes=rank_classes)
+            rank_label.set_size_request(24, 24)
+            rank_label.set_valign(Gtk.Align.CENTER)
+            row_box.append(rank_label)
+
+            img = Gtk.Image(pixel_size=DASHBOARD_TRACK_COVER_SIZE, css_classes=["album-cover-img"])
+            cover = app.backend.get_artwork_url(track, 320)
+            if not cover:
+                cover = getattr(track, "cover", None) or getattr(getattr(track, "album", None), "cover", None)
+            if cover:
+                utils.load_img(img, cover, app.cache_dir, DASHBOARD_TRACK_COVER_SIZE)
+            else:
+                img.set_from_icon_name("audio-x-generic-symbolic")
+            row_box.append(_build_feed_media_overlay(img, DASHBOARD_TRACK_COVER_SIZE, "album-cover-img"))
+
+            text_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True, valign=Gtk.Align.CENTER)
+            track_name = str(getattr(track, "name", "") or "Unknown Track")
+            album_name = str(getattr(getattr(track, "album", None), "name", "") or "")
+            title = Gtk.Label(label=track_name, xalign=0, ellipsize=3, max_width_chars=26, css_classes=["home-card-title"])
+            text_box.append(title)
+            if album_name:
+                subtitle = Gtk.Label(label=album_name, xalign=0, ellipsize=3, max_width_chars=28, css_classes=["dim-label", "home-card-subtitle"])
+                text_box.append(subtitle)
+            row_box.append(text_box)
+
+            duration_txt = _format_track_duration_label(track)
+            if duration_txt:
+                dur_lbl = Gtk.Label(label=duration_txt, xalign=1.0, css_classes=["dim-label", "home-card-subtitle"])
+                dur_lbl.set_halign(Gtk.Align.END)
+                dur_lbl.set_size_request(42, -1)
+                row_box.append(dur_lbl)
+
+            playing_icon = Gtk.Image(icon_name="media-playback-start-symbolic", pixel_size=14)
+            playing_icon.set_halign(Gtk.Align.END)
+            playing_icon.set_valign(Gtk.Align.CENTER)
+            playing_icon.add_css_class("track-row-playing-icon")
+            playing_icon.set_visible(is_playing)
+            row_box.append(playing_icon)
+
+            btn = Gtk.Button(css_classes=_dashboard_track_row_button_classes(is_playing))
+            btn.set_hexpand(True)
+            btn.set_halign(Gtk.Align.FILL)
+            btn._dashboard_track_id = str(getattr(track, "id", "") or "").strip()
+            btn._dashboard_playing_icon = playing_icon
+            btn.set_child(row_box)
+            btn.connect(
+                "clicked",
+                lambda _b, arr=list(all_tracks), idx=rank_idx: (
+                    setattr(app, "current_track_list", list(arr)),
+                    app._set_play_queue(list(arr)),
+                    app.play_track(idx),
+                ),
+            )
+            return btn
+
+        total = len(tracks)
+        left_count = (total + 1) // 2
+        right_count = total - left_count
+        for row in range(left_count):
+            left_idx = row
+            top_grid.attach(_build_top_track_btn(tracks[left_idx], left_idx, tracks), 0, row, 1, 1)
+            if row < right_count:
+                right_idx = left_count + row
+                top_grid.attach(_build_top_track_btn(tracks[right_idx], right_idx, tracks), 1, row, 1, 1)
+
+    def _render_expandable_album_section(items, flow, more_btn, action_row, local_token):
+        _clear_container(flow)
+        total = len(items)
+        if total <= 0:
+            more_btn.set_visible(False)
+            action_row.set_visible(False)
+            return
+
+        initial_count = min(total, _artist_release_initial_visible_count(app))
+        visible = list(items[:initial_count])
+        remaining = list(items[initial_count:])
+        app.batch_load_albums(
+            visible,
+            _flow=flow,
+            _token=local_token,
+            _token_attr="_artist_albums_render_token",
+        )
+
+        if not remaining:
+            more_btn.set_visible(False)
+            action_row.set_visible(False)
+            return
+
+        action_row.set_visible(True)
+        more_btn.set_visible(True)
+        more_btn.set_label(f"Show more ({len(remaining)})")
+
+        def _on_more(_btn, rem=list(remaining), target_flow=flow, target_token=local_token, btn_ref=more_btn, row_ref=action_row):
+            if int(getattr(app, "_artist_albums_render_token", 0) or 0) != target_token:
+                return
+            btn_ref.set_sensitive(False)
+            app.batch_load_albums(
+                rem,
+                _flow=target_flow,
+                _token=target_token,
+                _token_attr="_artist_albums_render_token",
+            )
+            row_ref.set_visible(False)
+            btn_ref.set_visible(False)
+
+        more_btn.connect("clicked", _on_more)
+
+    def _append_empty_hint(section, loading_label, text):
+        if loading_label.get_parent() is not None:
+            section.remove(loading_label)
+        section.append(
+            Gtk.Label(
+                label=text,
+                xalign=0,
+                css_classes=["dim-label"],
+                margin_start=8,
+                margin_top=8,
+            )
+        )
+
+    def _load_top_tracks(local_token=token):
+        started = time.monotonic()
+        top_tracks = list(app.backend.get_artist_top_tracks(artist, limit=10) or [])
+
+        def apply():
+            if int(getattr(app, "_artist_albums_render_token", 0) or 0) != local_token:
+                return False
+            logger.info(
+                "ARTIST DETAIL section=top_tracks artist=%s count=%s elapsed_ms=%.1f total_since_open_ms=%.1f",
+                getattr(artist, "name", "Unknown"),
+                len(top_tracks),
+                (time.monotonic() - started) * 1000.0,
+                (time.monotonic() - detail_t0) * 1000.0,
+            )
+            _render_track_rows(top_tracks)
+            return False
+
+        GLib.idle_add(apply)
+
+    def _load_albums(local_token=token):
+        started = time.monotonic()
+        albums = _sort_artist_release_groups(app.backend.get_artist_albums_all(artist, limit=2000) or [])
+
+        def apply():
+            if int(getattr(app, "_artist_albums_render_token", 0) or 0) != local_token:
+                return False
+            logger.info(
+                "ARTIST DETAIL section=albums artist=%s count=%s elapsed_ms=%.1f total_since_open_ms=%.1f",
+                getattr(artist, "name", "Unknown"),
+                len(albums),
+                (time.monotonic() - started) * 1000.0,
+                (time.monotonic() - detail_t0) * 1000.0,
+            )
+            if albums_loading.get_parent() is not None:
+                albums_section.remove(albums_loading)
+            _render_expandable_album_section(albums, albums_flow, albums_more_btn, albums_action_row, local_token)
+            if not albums:
+                albums_action_row.set_visible(False)
+                _append_empty_hint(albums_section, albums_loading, "No albums available.")
+            return False
+
+        GLib.idle_add(apply)
+
+    def _load_eps(local_token=token):
+        started = time.monotonic()
+        eps = _sort_artist_release_groups(app.backend.get_artist_ep_singles_all(artist, limit=2000) or [])
+
+        def apply():
+            if int(getattr(app, "_artist_albums_render_token", 0) or 0) != local_token:
+                return False
+            logger.info(
+                "ARTIST DETAIL section=eps artist=%s count=%s elapsed_ms=%.1f total_since_open_ms=%.1f",
+                getattr(artist, "name", "Unknown"),
+                len(eps),
+                (time.monotonic() - started) * 1000.0,
+                (time.monotonic() - detail_t0) * 1000.0,
+            )
+            if eps:
+                if eps_loading.get_parent() is not None:
+                    eps_section.remove(eps_loading)
+                eps_section.set_visible(True)
+                _render_expandable_album_section(eps, eps_flow, eps_more_btn, eps_action_row, local_token)
+            else:
+                eps_section.set_visible(False)
+            return False
+
+        GLib.idle_add(apply)
+
+    Thread(target=_load_top_tracks, daemon=True).start()
+    Thread(target=_load_albums, daemon=True).start()
+    Thread(target=_load_eps, daemon=True).start()
 
 
 def batch_load_home(app, sections):
@@ -3008,9 +4126,7 @@ def render_queue_dashboard(app):
 def render_liked_songs_dashboard(app, tracks=None):
     all_tracks = list(tracks or [])
     n = len(all_tracks)
-    first_id = str(getattr(all_tracks[0], "id", None)) if n > 0 else None
-    last_id = str(getattr(all_tracks[-1], "id", None)) if n > 0 else None
-    curr_sig = (n, first_id, last_id)
+    curr_sig = _liked_tracks_signature(all_tracks)
 
     # Fast path: track list identical — skip full widget rebuild, only re-apply filters.
     prev_sig = getattr(app, "_liked_tracks_view_sig", None)

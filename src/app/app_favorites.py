@@ -79,6 +79,7 @@ def create_track_fav_button(self, track, css_classes=None):
     btn._is_track_fav_btn = True
     track_id = getattr(track, "id", None)
     btn._track_fav_id = str(track_id) if track_id is not None else None
+    btn._track_fav_track = track
     btn.connect("clicked", self.on_track_row_fav_clicked)
     self._refresh_track_fav_button(btn)
     return btn
@@ -98,8 +99,47 @@ def _refresh_track_fav_button(self, btn):
     btn.set_sensitive(True)
 
 
+def _optimistically_remove_liked_track(self, track_id):
+    track_key = str(track_id or "").strip()
+    if not track_key:
+        return
+    cached = list(getattr(self, "liked_tracks_data", []) or [])
+    if not cached:
+        return
+    pruned = [
+        track
+        for track in cached
+        if str(getattr(track, "id", "") or "").strip() != track_key
+    ]
+    if len(pruned) == len(cached):
+        return
+    self.liked_tracks_data = pruned
+    row = self.nav_list.get_selected_row() if getattr(self, "nav_list", None) is not None else None
+    if row is not None and getattr(row, "nav_id", None) == "liked_songs":
+        self.render_liked_songs_dashboard(pruned)
+
+
+def _optimistically_add_liked_track(self, track):
+    track_obj = track
+    track_key = str(getattr(track_obj, "id", "") or "").strip()
+    if not track_key:
+        return
+    cached = list(getattr(self, "liked_tracks_data", []) or [])
+    updated = [track_obj]
+    updated.extend(
+        item
+        for item in cached
+        if str(getattr(item, "id", "") or "").strip() != track_key
+    )
+    self.liked_tracks_data = updated
+    row = self.nav_list.get_selected_row() if getattr(self, "nav_list", None) is not None else None
+    if row is not None and getattr(row, "nav_id", None) == "liked_songs":
+        self.render_liked_songs_dashboard(updated)
+
+
 def on_track_row_fav_clicked(self, btn):
     track_id = getattr(btn, "_track_fav_id", None)
+    track_obj = getattr(btn, "_track_fav_track", None)
     if not track_id or not getattr(self.backend, "user", None):
         return
 
@@ -118,6 +158,10 @@ def on_track_row_fav_clicked(self, btn):
                 if str(getattr(getattr(self, "playing_track", None), "id", "")) == track_id:
                     self.refresh_current_track_favorite_state()
                 self.refresh_visible_track_fav_buttons()
+                if is_add:
+                    _optimistically_add_liked_track(self, track_obj)
+                else:
+                    _optimistically_remove_liked_track(self, track_id)
                 self.refresh_liked_songs_dashboard(force=True)
             btn.set_sensitive(True)
             return False
@@ -174,6 +218,10 @@ def on_track_fav_clicked(self, btn):
             if ok:
                 self.refresh_current_track_favorite_state()
                 self.refresh_visible_track_fav_buttons()
+                if is_add:
+                    _optimistically_add_liked_track(self, track)
+                else:
+                    _optimistically_remove_liked_track(self, track_id)
                 self.refresh_liked_songs_dashboard(force=True)
             else:
                 for target in _current_track_fav_buttons(self):

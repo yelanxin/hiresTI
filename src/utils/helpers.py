@@ -5,9 +5,10 @@ import requests
 import hashlib
 import logging
 import time
+import tempfile
 import cairo
 from pathlib import Path
-from threading import Thread
+from threading import Thread, Lock
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Callable, Any
 from gi.repository import GLib, GdkPixbuf, Gdk
@@ -18,6 +19,8 @@ logger = logging.getLogger(__name__)
 
 # Bounded thread pool for image loading — prevents thread explosion on large pages.
 _IMG_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="img-load")
+_CACHE_LOCK_GUARD = Lock()
+_CACHE_FILE_LOCKS: dict[str, Lock] = {}
 
 # Unified cover/artwork display size (px) — change here to resize all non-track/non-artist covers.
 # This value is updated at startup by set_ui_scale() based on the display scale factor.
@@ -47,6 +50,91 @@ _TIDAL_IMAGE_HEADERS = {
 }
 
 
+def _cache_file_lock(path: str) -> Lock:
+    key = str(path or "")
+    with _CACHE_LOCK_GUARD:
+        lock = _CACHE_FILE_LOCKS.get(key)
+        if lock is None:
+            lock = Lock()
+            _CACHE_FILE_LOCKS[key] = lock
+        return lock
+
+
+def _has_cached_file(path: str) -> bool:
+    try:
+        return os.path.isfile(path) and os.path.getsize(path) > 0
+    except OSError:
+        return False
+
+
+def _download_bytes(url: str, headers: dict | None = None, timeout: int = 10) -> bytes:
+    sess = get_global_session()
+    req_headers = dict(headers or {})
+    if "resources.tidal.com/" in url:
+        req_headers = {**_TIDAL_IMAGE_HEADERS, **req_headers}
+    r = sess.get(url, timeout=timeout, headers=req_headers)
+    r.raise_for_status()
+    data = bytes(r.content or b"")
+    if not data:
+        raise ValueError(f"downloaded empty payload for {url}")
+    return data
+
+
+def _write_atomic_bytes(path: str, data: bytes) -> None:
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=f".{os.path.basename(path)}.", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _cover_crop_rect(
+    src_w: int,
+    src_h: int,
+    target_w: int,
+    target_h: int,
+    *,
+    anchor_x: float = 0.5,
+    anchor_y: float = 0.5,
+) -> tuple[int, int, int, int]:
+    src_w = max(1, int(src_w or 0))
+    src_h = max(1, int(src_h or 0))
+    target_w = max(1, int(target_w or 0))
+    target_h = max(1, int(target_h or 0))
+    ax = max(0.0, min(1.0, float(anchor_x)))
+    ay = max(0.0, min(1.0, float(anchor_y)))
+
+    src_ratio = float(src_w) / float(src_h)
+    target_ratio = float(target_w) / float(target_h)
+
+    if src_ratio > target_ratio:
+        crop_w = max(1, min(src_w, int(round(src_h * target_ratio))))
+        crop_h = src_h
+        max_x = max(0, src_w - crop_w)
+        x = int(round(max_x * ax))
+        y = 0
+    else:
+        crop_w = src_w
+        crop_h = max(1, min(src_h, int(round(src_w / target_ratio))))
+        max_y = max(0, src_h - crop_h)
+        x = 0
+        y = int(round(max_y * ay))
+
+    x = max(0, min(x, max(0, src_w - crop_w)))
+    y = max(0, min(y, max(0, src_h - crop_h)))
+    return x, y, crop_w, crop_h
+
+
 def download_to_cache(url: str, cache_dir: str, filename: str = None, headers: dict = None, timeout: int = 10) -> str | None:
     """
     Download a file to cache directory.
@@ -70,23 +158,25 @@ def download_to_cache(url: str, cache_dir: str, filename: str = None, headers: d
         filename = hashlib.md5(url.encode()).hexdigest()
     f_path = os.path.join(cache_dir, filename)
 
-    if os.path.exists(f_path):
+    if _has_cached_file(f_path):
         return f_path
 
-    try:
-        sess = get_global_session()
-        req_headers = headers or {}
-        # Auto-add Tidal headers for Tidal URLs
-        if "resources.tidal.com/" in url:
-            req_headers = {**_TIDAL_IMAGE_HEADERS, **req_headers}
-        r = sess.get(url, timeout=timeout, headers=req_headers)
-        r.raise_for_status()
-        with open(f_path, "wb") as f:
-            f.write(r.content)
-        return f_path
-    except requests.RequestException as e:
-        logger.debug("download_to_cache failed (url=%s): %s", url, e)
-        return None
+    with _cache_file_lock(f_path):
+        if _has_cached_file(f_path):
+            return f_path
+        try:
+            if os.path.exists(f_path):
+                os.remove(f_path)
+        except OSError:
+            pass
+
+        try:
+            data = _download_bytes(url, headers=headers, timeout=timeout)
+            _write_atomic_bytes(f_path, data)
+            return f_path
+        except (requests.RequestException, ValueError, OSError) as e:
+            logger.debug("download_to_cache failed (url=%s): %s", url, e)
+            return None
 
 
 def prune_image_cache(cache_dir: str, max_bytes: int = 300 * 1024 * 1024, max_age_days: int = 30) -> None:
@@ -199,26 +289,13 @@ def load_img(widget: Any, url_provider: Callable[[], str] | str, cache_dir: str,
             f_path = u if (isinstance(u, str) and os.path.exists(u)) else None
             if f_path is None:
                 f_name = hashlib.md5(str(u).encode()).hexdigest()
-                f_path = os.path.join(cache_dir, f_name)
-
-            if not os.path.exists(f_path):
-                try:
-                    sess = get_global_session()
-                    headers = _TIDAL_IMAGE_HEADERS if "resources.tidal.com/" in u else {}
-                    r = sess.get(u, timeout=10, headers=headers)
-                    r.raise_for_status()
-                    with open(f_path, 'wb') as f:
-                        f.write(r.content)
-                except requests.RequestException:
-                    try:
-                        sess = get_global_session()
-                        r = sess.get(u, timeout=10, headers=_TIDAL_IMAGE_HEADERS)
-                        r.raise_for_status()
-                        with open(f_path, 'wb') as f:
-                            f.write(r.content)
-                    except requests.RequestException as e:
-                        logger.warning("load_img: download failed (url=%s): %s", u, e)
-                        return
+                f_path = download_to_cache(str(u), cache_dir, filename=f_name, timeout=10)
+                if not f_path:
+                    logger.warning("load_img: download failed (url=%s): cache path unavailable", u)
+                    return
+            elif not _has_cached_file(f_path):
+                logger.warning("load_img: cache file is empty or unreadable (path=%s)", f_path)
+                return
 
             w_type = type(widget).__name__
             classes = set(widget.get_css_classes()) if hasattr(widget, "get_css_classes") else set()
@@ -253,6 +330,71 @@ def load_img(widget: Any, url_provider: Callable[[], str] | str, cache_dir: str,
 
         except Exception as e:
             logger.warning("load_img: unexpected error: %s", e)
+
+    _IMG_EXECUTOR.submit(fetch)
+
+
+def load_picture_cover_crop(
+    picture: Any,
+    url_provider: Callable[[], str] | str,
+    cache_dir: str,
+    *,
+    target_width: int,
+    target_height: int,
+    anchor_x: float = 0.5,
+    anchor_y: float = 0.5,
+) -> None:
+    if hasattr(picture, "set_paintable"):
+        picture.set_paintable(None)
+
+    def fetch():
+        try:
+            u = url_provider() if callable(url_provider) else url_provider
+            if not u:
+                return
+
+            picture._target_url = u
+            f_path = u if (isinstance(u, str) and _has_cached_file(u)) else None
+            if f_path is None:
+                f_name = hashlib.md5(str(u).encode()).hexdigest()
+                f_path = download_to_cache(str(u), cache_dir, filename=f_name, timeout=10)
+                if not f_path:
+                    return
+
+            pb = GdkPixbuf.Pixbuf.new_from_file(f_path)
+            if not pb:
+                return
+
+            crop_x, crop_y, crop_w, crop_h = _cover_crop_rect(
+                pb.get_width(),
+                pb.get_height(),
+                target_width,
+                target_height,
+                anchor_x=anchor_x,
+                anchor_y=anchor_y,
+            )
+            cropped = pb.new_subpixbuf(crop_x, crop_y, crop_w, crop_h)
+            scaled = cropped.scale_simple(
+                max(1, int(target_width)),
+                max(1, int(target_height)),
+                GdkPixbuf.InterpType.BILINEAR,
+            )
+            texture = Gdk.Texture.new_for_pixbuf(scaled or cropped)
+
+            def apply():
+                if getattr(picture, "_target_url", None) != u:
+                    return False
+                try:
+                    picture.set_size_request(int(target_width), int(target_height))
+                except Exception:
+                    pass
+                picture.set_paintable(texture)
+                picture._loaded_pixbuf = scaled or cropped
+                return False
+
+            GLib.idle_add(apply)
+        except Exception as e:
+            logger.warning("load_picture_cover_crop: failed (target=%sx%s): %s", target_width, target_height, e)
 
     _IMG_EXECUTOR.submit(fetch)
 

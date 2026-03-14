@@ -1046,6 +1046,87 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
 .album-title-large { font-size: 28px; font-weight: 800; margin-bottom: 4px; }
 .album-artist-medium { font-size: 16px; font-weight: 600; color: @accent_color; margin-bottom: 8px; }
 .album-meta { font-size: 13px; opacity: 0.7; }
+.artist-detail-hero {
+    margin: 0 0 18px 0;
+}
+.artist-detail-hero-image,
+.artist-detail-hero-scrim {
+    border-radius: 0;
+}
+.artist-detail-hero-strip,
+.artist-detail-hero-panel,
+.artist-detail-hero-side-image,
+.artist-detail-hero-center-image,
+.artist-detail-hero-side-dim,
+.artist-detail-hero-center-fade {
+    border-radius: 0;
+}
+.artist-detail-hero-side-image {
+    opacity: 0.72;
+}
+.artist-detail-hero-side-dim {
+    background-image:
+        linear-gradient(90deg, alpha(black, 0.48), alpha(black, 0.34));
+}
+.artist-detail-hero-center-image {
+    opacity: 1.0;
+}
+.artist-detail-hero-center-fade {
+    background-image:
+        linear-gradient(90deg,
+            alpha(black, 0.20) 0%,
+            transparent 12%,
+            transparent 88%,
+            alpha(black, 0.20) 100%);
+}
+.artist-detail-hero-scrim {
+    background-image:
+        linear-gradient(180deg, alpha(black, 0.18), alpha(black, 0.42) 42%, alpha(black, 0.68) 100%);
+}
+.artist-detail-hero-top {
+    padding: 0 18px 18px 18px;
+}
+.artist-detail-fav-btn {
+    min-width: 38px;
+    min-height: 38px;
+    padding: 0;
+    border-radius: 999px;
+    border: 1px solid alpha(white, 0.12);
+    background-color: alpha(black, 0.28);
+    color: alpha(white, 0.96);
+}
+.artist-detail-fav-btn:hover {
+    background-color: alpha(black, 0.36);
+}
+.artist-detail-fav-btn.active {
+    color: #ff3f7f;
+}
+.artist-detail-hero-content {
+    padding: 28px;
+}
+.artist-detail-kicker {
+    font-size: 12px;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    color: alpha(white, 0.84);
+    text-transform: uppercase;
+    text-shadow: 0 2px 12px alpha(black, 0.38);
+}
+.artist-detail-title {
+    font-size: 34px;
+    font-weight: 900;
+    color: white;
+    text-shadow: 0 3px 18px alpha(black, 0.42);
+}
+.artist-detail-meta {
+    font-size: 14px;
+    font-weight: 600;
+    color: alpha(white, 0.82);
+    text-shadow: 0 2px 12px alpha(black, 0.36);
+}
+.artist-detail-section {
+    margin-bottom: 12px;
+}
 .home-subtitle,
 .album-artist-medium,
 .album-meta,

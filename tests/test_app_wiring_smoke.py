@@ -23,6 +23,7 @@ def test_wire_tidal_app_binds_core_methods():
         "_build_body",
         "_build_grid_view",
         "_build_settings_page",
+        "_queue_rebuild_dsp_overview_chain",
         "_schedule_output_status_loop",
         "update_tech_label",
         "_restore_session_async",

@@ -8,10 +8,161 @@ from actions import ui_actions
 logger = logging.getLogger(__name__)
 
 
+def _artists_nav_is_selected(app):
+    nav_list = getattr(app, "nav_list", None)
+    row = nav_list.get_selected_row() if nav_list is not None and hasattr(nav_list, "get_selected_row") else None
+    return str(getattr(row, "nav_id", "") or "") == "artists"
+
+
+def _cancel_artist_albums_view(app, clear_selected=True):
+    try:
+        old_vadj = getattr(app, "_artist_albums_vadj", None)
+        old_hid = int(getattr(app, "_artist_albums_vadj_handler_id", 0) or 0)
+        if old_vadj is not None and old_hid:
+            old_vadj.disconnect(old_hid)
+    except Exception:
+        pass
+    try:
+        src = int(getattr(app, "_artist_detail_layout_sync_source", 0) or 0)
+        if src:
+            GLib.source_remove(src)
+    except Exception:
+        pass
+    for widget, hid in list(getattr(app, "_artist_detail_layout_handler_ids", []) or []):
+        try:
+            widget.disconnect(hid)
+        except Exception:
+            pass
+    app._artist_detail_layout_handler_ids = []
+    pending_src = int(getattr(app, "_artist_hero_layout_pending_src", 0) or 0)
+    if pending_src:
+        try:
+            GLib.source_remove(pending_src)
+        except Exception:
+            pass
+    app._artist_hero_layout_pending_src = 0
+    app._artist_detail_layout_sync_source = 0
+    app._artist_detail_layout_refresh = None
+    app._artist_albums_vadj = None
+    app._artist_albums_vadj_handler_id = 0
+    app._artist_albums_render_token = int(getattr(app, "_artist_albums_render_token", 0) or 0) + 1
+    if clear_selected:
+        app.current_selected_artist = None
+
+
+def _restore_collection_content_margins(app):
+    content_box = getattr(app, "collection_content_box", None)
+    if content_box is None:
+        return
+    try:
+        content_box.set_margin_start(int(getattr(app, "collection_base_margin_start", 20) or 20))
+        content_box.set_margin_end(int(getattr(app, "collection_base_margin_end", 20) or 20))
+        content_box.set_margin_bottom(int(getattr(app, "collection_base_margin_bottom", 32) or 32))
+    except Exception:
+        pass
+
+
+def _capture_artists_page_state(app):
+    if not _artists_nav_is_selected(app):
+        return
+    content_box = getattr(app, "collection_content_box", None)
+    if content_box is None or not hasattr(content_box, "get_first_child"):
+        return
+
+    children = []
+    child = content_box.get_first_child()
+    while child:
+        children.append(child)
+        child = child.get_next_sibling()
+    if not children:
+        return
+
+    scroll_y = 0.0
+    try:
+        vadj = app.alb_scroll.get_vadjustment() if getattr(app, "alb_scroll", None) else None
+        if vadj is not None:
+            scroll_y = float(vadj.get_value())
+    except Exception:
+        scroll_y = 0.0
+
+    title = ""
+    if hasattr(app, "grid_title_label") and app.grid_title_label is not None and hasattr(app.grid_title_label, "get_text"):
+        title = str(app.grid_title_label.get_text() or "")
+    subtitle = ""
+    if hasattr(app, "grid_subtitle_label") and app.grid_subtitle_label is not None and hasattr(app.grid_subtitle_label, "get_text"):
+        subtitle = str(app.grid_subtitle_label.get_text() or "")
+
+    app._artists_page_state = {
+        "children": children,
+        "main_flow": getattr(app, "main_flow", None),
+        "scroll_y": scroll_y,
+        "title": title,
+        "subtitle": subtitle,
+        "margin_start": int(getattr(content_box, "get_margin_start", lambda: getattr(app, "collection_base_margin_start", 20))() or 0),
+        "margin_end": int(getattr(content_box, "get_margin_end", lambda: getattr(app, "collection_base_margin_end", 20))() or 0),
+        "margin_bottom": int(getattr(content_box, "get_margin_bottom", lambda: getattr(app, "collection_base_margin_bottom", 32))() or 0),
+    }
+
+
+def _restore_artists_page_state(app):
+    state = getattr(app, "_artists_page_state", None)
+    if not isinstance(state, dict):
+        return False
+    children = list(state.get("children") or [])
+    content_box = getattr(app, "collection_content_box", None)
+    if content_box is None or not children:
+        return False
+
+    while c := content_box.get_first_child():
+        content_box.remove(c)
+    for child in children:
+        content_box.append(child)
+
+    try:
+        content_box.set_margin_start(int(state.get("margin_start", getattr(app, "collection_base_margin_start", 20)) or 0))
+        content_box.set_margin_end(int(state.get("margin_end", getattr(app, "collection_base_margin_end", 20)) or 0))
+        content_box.set_margin_bottom(int(state.get("margin_bottom", getattr(app, "collection_base_margin_bottom", 32)) or 0))
+    except Exception:
+        pass
+
+    app.main_flow = state.get("main_flow")
+    if hasattr(app, "grid_title_box") and app.grid_title_box is not None and hasattr(app.grid_title_box, "set_visible"):
+        app.grid_title_box.set_visible(True)
+    if hasattr(app, "grid_title_label") and app.grid_title_label is not None and hasattr(app.grid_title_label, "set_visible"):
+        app.grid_title_label.set_visible(True)
+    if hasattr(app, "grid_subtitle_label") and app.grid_subtitle_label is not None and hasattr(app.grid_subtitle_label, "set_visible"):
+        app.grid_subtitle_label.set_visible(True)
+
+    if hasattr(app, "grid_title_label") and app.grid_title_label is not None:
+        app.grid_title_label.set_text(str(state.get("title") or "Favorite Artists"))
+    if hasattr(app, "grid_subtitle_label") and app.grid_subtitle_label is not None:
+        app.grid_subtitle_label.set_text(str(state.get("subtitle") or "Artists you follow and love"))
+
+    scroll_y = float(state.get("scroll_y", 0.0) or 0.0)
+
+    def _apply_scroll():
+        try:
+            vadj = app.alb_scroll.get_vadjustment() if getattr(app, "alb_scroll", None) else None
+            if vadj is None:
+                return False
+            max_value = max(0.0, float(vadj.get_upper()) - float(vadj.get_page_size()))
+            vadj.set_value(max(0.0, min(scroll_y, max_value)))
+        except Exception:
+            pass
+        return False
+
+    GLib.idle_add(_apply_scroll)
+    return True
+
+
 def on_nav_selected(app, box, row):
     if not row:
         return
 
+    _cancel_artist_albums_view(app)
+    _restore_collection_content_margins(app)
+    app._artists_dashboard_token = int(getattr(app, "_artists_dashboard_token", 0) or 0) + 1
+    app._artists_page_state = None
     if hasattr(row, "nav_id") and hasattr(app, "_remember_last_nav"):
         app._remember_last_nav(row.nav_id)
 
@@ -19,6 +170,8 @@ def on_nav_selected(app, box, row):
         app.grid_title_label.set_visible(True)
     if hasattr(app, "grid_subtitle_label") and app.grid_subtitle_label is not None:
         app.grid_subtitle_label.set_visible(True)
+    if hasattr(app, "grid_title_box") and app.grid_title_box is not None:
+        app.grid_title_box.set_visible(True)
 
     app.nav_history.clear()
     app.artist_fav_btn.set_visible(False)
@@ -211,118 +364,33 @@ def on_nav_selected(app, box, row):
         app.grid_title_label.set_text("Favorite Artists")
         if hasattr(app, "grid_subtitle_label") and app.grid_subtitle_label is not None:
             app.grid_subtitle_label.set_text("Artists you follow and love")
-        app.create_album_flow()
-        render_token = int(getattr(app, "_artists_render_token", 0) or 0) + 1
-        app._artists_render_token = render_token
-        if app.backend.user:
-            def task(token=render_token):
-                artists = list(app.backend.get_favorites() or [])
-                artists = ui_actions.sort_objects_by_name_fast(artists, context="favorite_artists")
-                logger.info("Artists page prepared: total=%s", len(artists))
-                GLib.idle_add(app.batch_load_artists, artists, 10, token)
-
-            Thread(target=task, daemon=True).start()
+        ui_actions.render_artists_dashboard(app)
+        return
 
 
 def on_artist_clicked(app, artist):
-    if hasattr(app, "grid_title_label") and app.grid_title_label is not None:
-        app.grid_title_label.set_visible(True)
-    if hasattr(app, "grid_subtitle_label") and app.grid_subtitle_label is not None:
-        app.grid_subtitle_label.set_visible(True)
-
     current_view = app.right_stack.get_visible_child_name()
     if current_view:
         app.nav_history.append(current_view)
+    _capture_artists_page_state(app)
 
     app.current_selected_artist = artist
     app.right_stack.set_visible_child_name("grid_view")
     if hasattr(app, "_remember_last_view"):
         app._remember_last_view("grid_view")
-    app.grid_title_label.set_text(f"Albums by {artist.name}")
+    if hasattr(app, "grid_title_box") and app.grid_title_box is not None:
+        app.grid_title_box.set_visible(False)
+    app.grid_title_label.set_text(str(getattr(artist, "name", "") or "Artist"))
     if hasattr(app, "grid_subtitle_label") and app.grid_subtitle_label is not None:
-        app.grid_subtitle_label.set_text("Discography and related releases")
+        app.grid_subtitle_label.set_text("Top tracks, albums and EP & singles")
     app.back_btn.set_sensitive(True)
-    app.artist_fav_btn.set_visible(True)
+    app.artist_fav_btn.set_visible(False)
 
-    is_fav = app.backend.is_artist_favorite(artist.id)
-    app._update_fav_icon(app.artist_fav_btn, is_fav)
-
-    while c := app.collection_content_box.get_first_child():
-        app.collection_content_box.remove(c)
-
-    # Disconnect previous artist scroll hook
-    try:
-        old_vadj = getattr(app, "_artist_albums_vadj", None)
-        old_hid  = int(getattr(app, "_artist_albums_vadj_handler_id", 0) or 0)
-        if old_vadj is not None and old_hid:
-            old_vadj.disconnect(old_hid)
-    except Exception:
-        pass
-    app._artist_albums_vadj = None
-    app._artist_albums_vadj_handler_id = 0
+    _cancel_artist_albums_view(app, clear_selected=False)
 
     render_token = int(getattr(app, "_artist_albums_render_token", 0) or 0) + 1
     app._artist_albums_render_token = render_token
-
-    app.create_album_flow()
-
-    PAGE_SIZE = 50
-    state = {"offset": 0, "loading": False, "has_more": True}
-
-    def _ensure_scroll_hook():
-        if getattr(app, "_artist_albums_vadj_handler_id", 0):
-            return
-        vadj = app.alb_scroll.get_vadjustment() if getattr(app, "alb_scroll", None) else None
-        if vadj is None:
-            return
-        app._artist_albums_vadj = vadj
-        app._artist_albums_vadj_handler_id = vadj.connect("value-changed", _maybe_load_more)
-
-    def _maybe_load_more(_adj=None):
-        if int(getattr(app, "_artist_albums_render_token", 0) or 0) != render_token:
-            return
-        if state["loading"] or not state["has_more"]:
-            return
-        vadj = getattr(app, "_artist_albums_vadj", None)
-        if vadj is None:
-            return
-        remain = float(vadj.get_upper()) - (float(vadj.get_value()) + float(vadj.get_page_size()))
-        if remain <= 320:
-            _load_next_page()
-
-    def _load_next_page():
-        if state["loading"] or not state["has_more"]:
-            return
-        if int(getattr(app, "_artist_albums_render_token", 0) or 0) != render_token:
-            return
-        state["loading"] = True
-        offset = state["offset"]
-
-        def task():
-            page = list(app.backend.get_albums_page(artist, limit=PAGE_SIZE, offset=offset) or [])
-
-            def apply():
-                if int(getattr(app, "_artist_albums_render_token", 0) or 0) != render_token:
-                    return False
-                state["loading"] = False
-                if not page:
-                    state["has_more"] = False
-                    return False
-                state["offset"] += len(page)
-                if len(page) < PAGE_SIZE:
-                    state["has_more"] = False
-                logger.info("Artist albums page loaded: artist=%s offset=%s count=%s",
-                            getattr(artist, "name", "Unknown"), offset, len(page))
-                app.batch_load_albums(page)
-                if state["has_more"]:
-                    _ensure_scroll_hook()
-                return False
-
-            GLib.idle_add(apply)
-
-        Thread(target=task, daemon=True).start()
-
-    _load_next_page()  # load first page immediately
+    ui_actions.render_artist_detail(app, artist, render_token=render_token)
 
 
 def on_back_clicked(app, btn):
@@ -392,6 +460,9 @@ def on_back_clicked(app, btn):
         if not app.nav_history and target_view == "grid_view":
             btn.set_sensitive(False)
             app.artist_fav_btn.set_visible(False)
+            _cancel_artist_albums_view(app)
+            if _artists_nav_is_selected(app) and _restore_artists_page_state(app):
+                return
             selected = app.nav_list.get_selected_row()
             if selected:
                 app.on_nav_selected(None, selected)

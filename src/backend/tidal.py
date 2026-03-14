@@ -1,4 +1,5 @@
 import tidalapi
+import tidalapi.user as tidal_user
 import logging
 import os
 import json
@@ -34,6 +35,7 @@ class TidalBackend:
         self._cached_albums = []
         self._cached_albums_ts = 0.0
         self._albums_cache_ttl = 0.0
+        self._favorite_artists_index_dirty = False
         self._artist_artwork_cache = {}  # LRU cache using dict (ordered in Python 3.7+)
         self.max_artist_artwork_cache = 500  # Limit cache size to prevent memory leak
         self._artist_placeholder_uuids = {
@@ -51,6 +53,9 @@ class TidalBackend:
         # Circuit breaker for unstable mix endpoint.
         self._mix_fail_until = {}
         self._session_recovery_lock = threading.Lock()
+        # Set to (old_id_str, alt_track) when album fallback succeeds in get_stream_url.
+        # Consumed by the app layer to update liked_tracks_data / fav_track_ids.
+        self._last_track_redirect = None
 
     def _default_ca_bundle_candidates(self):
         candidates = [
@@ -570,6 +575,7 @@ class TidalBackend:
             else:
                 self.user.favorites.remove_artist(artist_id)
                 self.fav_artist_ids.discard(str(artist_id))
+            self._favorite_artists_index_dirty = True
             return True
         except Exception as e:
             logger.warning("Failed to toggle artist favorite for %s (add=%s): %s", artist_id, add, e)
@@ -599,13 +605,24 @@ class TidalBackend:
             logger.warning("Failed to toggle track favorite for %s (add=%s): %s", track_id, add, e)
             return False
 
-    def _paginate_favorites_api(self, api_callable, limit=1000, page_size=100):
+    def _paginate_favorites_api(self, api_callable, limit=1000, page_size=100, count_callable=None):
         if not callable(api_callable):
             return []
 
         target = max(0, int(limit or 0))
         if target <= 0:
             return []
+
+        if callable(count_callable):
+            try:
+                total = max(0, int(count_callable() or 0))
+            except Exception as e:
+                logger.debug("Failed to fetch favorites count: %s", e)
+            else:
+                if total > 0:
+                    target = min(target, total)
+                    if target <= 0:
+                        return []
 
         def _normalize(seq):
             if isinstance(seq, list):
@@ -654,8 +671,6 @@ class TidalBackend:
 
             if "offset" not in used_kwargs or new_added == 0:
                 break
-            if len(page) < size:
-                break
 
             offset += len(page)
             if offset > 100000:
@@ -663,18 +678,127 @@ class TidalBackend:
 
         return merged[:target]
 
+    def _fetch_favorites_collection(
+        self,
+        fav,
+        *,
+        paginated_attr,
+        api_attr,
+        count_attr=None,
+        limit=1000,
+        page_size=100,
+    ):
+        target = max(0, int(limit or 0))
+        if fav is None or target <= 0:
+            return []
+
+        paginated_api = getattr(fav, paginated_attr, None)
+        if callable(paginated_api):
+            try:
+                items = paginated_api()
+                items = items() if callable(items) else items
+                return list(items or [])[:target]
+            except Exception as e:
+                logger.debug(
+                    "Failed to fetch %s via paginated API; falling back to manual pagination: %s",
+                    paginated_attr,
+                    e,
+                )
+
+        api_callable = getattr(fav, api_attr, None)
+        count_callable = getattr(fav, count_attr, None) if count_attr else None
+        return self._paginate_favorites_api(
+            api_callable,
+            limit=target,
+            page_size=page_size,
+            count_callable=count_callable,
+        )
+
     def get_favorites(self, limit=20000):
         try: 
             def _fetch():
                 if not self.user:
                     return []
                 fav = getattr(self.user, "favorites", None)
-                artists_api = getattr(fav, "artists", None)
-                return self._paginate_favorites_api(artists_api, limit=limit, page_size=100)
+                return self._fetch_favorites_collection(
+                    fav,
+                    paginated_attr="artists_paginated",
+                    api_attr="artists",
+                    count_attr="get_artists_count",
+                    limit=limit,
+                    page_size=100,
+                )
 
             return self._call_with_session_recovery(_fetch, context="favorite artists")
         except Exception as e:
             logger.warning("Failed to fetch favorite artists: %s", e)
+            return []
+
+    def get_favorite_artists_count(self):
+        try:
+            def _fetch():
+                if not self.user:
+                    return 0
+                fav = getattr(self.user, "favorites", None)
+                count_api = getattr(fav, "get_artists_count", None)
+                if callable(count_api):
+                    return max(0, int(count_api() or 0))
+                # API doesn't expose a count endpoint; return 0 and let the caller
+                # derive the total from page results (offset + len(items)).
+                return 0
+
+            return max(0, int(self._call_with_session_recovery(_fetch, context="favorite artists count") or 0))
+        except Exception as e:
+            logger.warning("Failed to fetch favorite artists count: %s", e)
+            return 0
+
+    def get_favorite_artists_page(self, limit=50, offset=0, sort="name_asc"):
+        page_size = max(1, int(limit or 50))
+        page_offset = max(0, int(offset or 0))
+        sort_key = str(sort or "name_asc").strip().lower()
+
+        order = None
+        order_direction = None
+        if sort_key.startswith("name"):
+            order = getattr(tidal_user.ArtistOrder, "Name", None)
+            order_direction = (
+                getattr(tidal_user.OrderDirection, "Descending", None)
+                if sort_key.endswith("_desc")
+                else getattr(tidal_user.OrderDirection, "Ascending", None)
+            )
+        else:
+            order = getattr(tidal_user.ArtistOrder, "DateAdded", None)
+            order_direction = (
+                getattr(tidal_user.OrderDirection, "Ascending", None)
+                if sort_key.endswith("_asc")
+                else getattr(tidal_user.OrderDirection, "Descending", None)
+            )
+
+        try:
+            def _fetch():
+                if not self.user:
+                    return []
+                fav = getattr(self.user, "favorites", None)
+                artists_api = getattr(fav, "artists", None)
+                if not callable(artists_api):
+                    return []
+                kwargs = {"limit": page_size, "offset": page_offset}
+                if order is not None:
+                    kwargs["order"] = order
+                if order_direction is not None:
+                    kwargs["order_direction"] = order_direction
+                res = artists_api(**kwargs)
+                return list((res() if callable(res) else res) or [])
+
+            return list(self._call_with_session_recovery(_fetch, context="favorite artists page") or [])
+        except Exception as e:
+            logger.warning(
+                "Failed to fetch favorite artists page offset=%s limit=%s sort=%s: %s",
+                page_offset,
+                page_size,
+                sort_key,
+                e,
+            )
             return []
 
     def get_recent_albums(self, limit=20000):
@@ -683,8 +807,14 @@ class TidalBackend:
                 if not self.user:
                     return []
                 fav = getattr(self.user, "favorites", None)
-                albums_api = getattr(fav, "albums", None)
-                return self._paginate_favorites_api(albums_api, limit=limit, page_size=1000)
+                return self._fetch_favorites_collection(
+                    fav,
+                    paginated_attr="albums_paginated",
+                    api_attr="albums",
+                    count_attr="get_albums_count",
+                    limit=limit,
+                    page_size=1000,
+                )
 
             result = self._call_with_session_recovery(_fetch, context="recent albums")
             # Populate cache and fav_album_ids so callers can avoid re-fetching.
@@ -711,8 +841,14 @@ class TidalBackend:
                 if not self.user:
                     return []
                 fav = getattr(self.user, "favorites", None)
-                tracks_api = getattr(fav, "tracks", None)
-                return self._paginate_favorites_api(tracks_api, limit=limit, page_size=1000)
+                return self._fetch_favorites_collection(
+                    fav,
+                    paginated_attr="tracks_paginated",
+                    api_attr="tracks",
+                    count_attr="get_tracks_count",
+                    limit=limit,
+                    page_size=1000,
+                )
 
             return self._call_with_session_recovery(_fetch, context="favorite tracks")
         except Exception as e:
@@ -1311,6 +1447,85 @@ class TidalBackend:
             return self._call_with_session_recovery(_fetch, context="artist albums")
         except Exception as e:
             logger.warning("Failed to fetch albums for artist %s: %s", getattr(art, "id", "unknown"), e)
+            return []
+
+    def get_artist_top_tracks(self, art, limit=20, offset=0):
+        page_size = max(1, int(limit or 20))
+        page_offset = max(0, int(offset or 0))
+
+        def _fetch():
+            a = art
+            if isinstance(a, (int, str)):
+                a = self.session.artist(a)
+            elif hasattr(a, "id") and not hasattr(a, "get_top_tracks"):
+                a = self.session.artist(getattr(a, "id"))
+            fetcher = getattr(a, "get_top_tracks", None)
+            if not callable(fetcher):
+                return []
+            res = fetcher(limit=page_size, offset=page_offset)
+            return list((res() if callable(res) else res) or [])
+
+        try:
+            return list(self._call_with_session_recovery(_fetch, context="artist top tracks") or [])
+        except Exception as e:
+            logger.warning(
+                "Failed to fetch top tracks for artist %s limit=%s offset=%s: %s",
+                getattr(art, "id", "unknown"),
+                page_size,
+                page_offset,
+                e,
+            )
+            return []
+
+    def _get_artist_album_collection(self, art, method_name, limit=2000, page_size=100):
+        target = max(0, int(limit or 0))
+        if target <= 0:
+            return []
+
+        def _fetch():
+            a = art
+            if isinstance(a, (int, str)):
+                a = self.session.artist(a)
+            elif hasattr(a, "id") and not hasattr(a, method_name):
+                a = self.session.artist(getattr(a, "id"))
+            fetcher = getattr(a, method_name, None)
+            if not callable(fetcher):
+                return []
+
+            merged = []
+            offset = 0
+            size = min(max(1, int(page_size or 100)), target)
+            while len(merged) < target:
+                page = fetcher(limit=size, offset=offset)
+                page = list((page() if callable(page) else page) or [])
+                if not page:
+                    break
+                merged.extend(page)
+                offset += len(page)
+            return merged[:target]
+
+        return list(self._call_with_session_recovery(_fetch, context=f"artist {method_name}") or [])
+
+    def get_artist_albums_all(self, art, limit=2000):
+        try:
+            return self._get_artist_album_collection(art, "get_albums", limit=limit, page_size=100)
+        except Exception as e:
+            logger.warning("Failed to fetch all albums for artist %s: %s", getattr(art, "id", "unknown"), e)
+            return []
+
+    def get_artist_ep_singles_all(self, art, limit=2000):
+        try:
+            artist_obj = art
+            if isinstance(artist_obj, (int, str)):
+                artist_obj = self.session.artist(artist_obj)
+            elif hasattr(artist_obj, "id") and not hasattr(artist_obj, "get_ep_singles") and not hasattr(artist_obj, "get_albums_ep_singles"):
+                artist_obj = self.session.artist(getattr(artist_obj, "id"))
+
+            if callable(getattr(artist_obj, "get_ep_singles", None)):
+                return self._get_artist_album_collection(artist_obj, "get_ep_singles", limit=limit, page_size=100)
+            return self._get_artist_album_collection(artist_obj, "get_albums_ep_singles", limit=limit, page_size=100)
+        except Exception as e:
+            logger.warning("Failed to fetch all EPs/singles for artist %s: %s", getattr(art, "id", "unknown"), e)
             return []
 
     def get_albums_page(self, art, limit=50, offset=0):
@@ -2450,6 +2665,10 @@ class TidalBackend:
                                     album_id,
                                     alt_track.id,
                                     getattr(track, "name", ""),
+                                )
+                                self._last_track_redirect = (
+                                    str(getattr(track, "id", "") or ""),
+                                    alt_track,
                                 )
                                 return self.get_stream_url(alt_track)
                         except Exception as fb_exc:
