@@ -113,3 +113,13 @@ def test_mpris_property_setters_update_play_mode_and_volume():
     svc._apply_volume(0.35)
     assert int(round(app.settings.get("volume", 0))) == 35
 
+
+def test_mpris_volume_setter_is_ignored_while_bit_perfect_is_enabled():
+    app = _make_app()
+    app.settings["bit_perfect"] = True
+    svc = MPRISService(app)
+
+    svc._apply_volume(0.35)
+
+    assert app.player._vol == 0.8
+    assert app.settings.get("volume") is None

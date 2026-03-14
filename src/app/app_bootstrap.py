@@ -261,11 +261,11 @@ def do_activate(self):
     is_ex = self.settings.get("exclusive_lock", False)
 
     # 1. 应用 Bit-Perfect 和 独占状态
-    self.player.toggle_bit_perfect(is_bp, exclusive_lock=is_ex)
     if is_bp:
         if self.bp_label is not None:
             self.bp_label.set_visible(True)
         self._lock_volume_controls(True)
+    self.player.toggle_bit_perfect(is_bp, exclusive_lock=is_ex)
     _startup_mark("bit-perfect")
 
     # 2. 应用 Latency

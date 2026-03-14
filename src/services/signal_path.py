@@ -3,7 +3,6 @@ gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
 from gi.repository import Gtk, Adw, GLib, Pango, Gdk
 import time
-import subprocess
 import re
 import logging
 import glob
@@ -11,6 +10,7 @@ import glob
 logger = logging.getLogger("signal_path")
 
 class AudioSignalPathWindow(Adw.Window):
+    _PW_RUNTIME_CACHE_TTL_SEC = 1.5
     _TERMINAL_CSS = """
     .signal-terminal-window,
     .signal-terminal-window:backdrop,
@@ -177,7 +177,8 @@ class AudioSignalPathWindow(Adw.Window):
         super().__init__(transient_for=parent_app.win, modal=True)
         self._ensure_terminal_css()
         # [修复 1] 先初始化变量，防止 AttributeError
-        self.timer_id = None 
+        self.timer_id = None
+        self._closed = False
         
         self.set_default_size(550, 760)
         self.set_title("Audio Signal Path")
@@ -289,7 +290,7 @@ class AudioSignalPathWindow(Adw.Window):
                 root.add_css_class(cls)
 
     def on_close(self, *args):
-        # 这里的检查现在是安全的，因为 __init__ 里已经设为 None 了
+        self._closed = True
         if self.timer_id:
             GLib.source_remove(self.timer_id)
             self.timer_id = None
@@ -367,7 +368,6 @@ class AudioSignalPathWindow(Adw.Window):
             card.content_box.append(row)
 
     def _build_bitperfect_verdict_help_text(self):
-        driver = self._get_current_driver()
         lines = [
             "Bit-Perfect Verdict\n\n",
             "A Yes verdict means these checks passed:\n",
@@ -376,8 +376,6 @@ class AudioSignalPathWindow(Adw.Window):
             "- Source and output sample rates match\n",
             "- Output bit depth is not lower than the source\n",
         ]
-        if driver in ("ALSA", "ALSA（auto）", "ALSA (mmap)", "ALSA（mmap）"):
-            lines.append("- ALSA also requires Exclusive mode\n")
         lines.append("\n")
         lines.append(
             "PipeWire note: Even when playback follows the music sample rate, "
@@ -386,8 +384,9 @@ class AudioSignalPathWindow(Adw.Window):
             "playback.\n\n"
         )
         lines.append(
-            "Use ALSA（auto）/ALSA（mmap） + Exclusive if you need the system mixer and system volume "
-            "path fully bypassed."
+            "ALSA note: this player's ALSA path opens the selected hw:* device directly, "
+            "so the verdict checks source/output format alignment without requiring the "
+            "Exclusive toggle."
         )
         return "".join(lines)
 
@@ -444,6 +443,109 @@ class AudioSignalPathWindow(Adw.Window):
         if lbl is not None:
             lbl.set_text(self._build_bitperfect_verdict_help_text())
 
+    def _build_dsp_snapshot(self):
+        player = getattr(self, "player", None)
+        app_settings = getattr(self.app, "settings", {}) or {}
+        dsp_enabled = bool(getattr(player, "dsp_enabled", app_settings.get("dsp_enabled", True)))
+        bit_perfect_locked = bool(getattr(player, "bit_perfect_mode", app_settings.get("bit_perfect", False)))
+        return {
+            "dsp_enabled": dsp_enabled,
+            "bit_perfect_locked": bit_perfect_locked,
+            "master_active": bool(dsp_enabled and not bit_perfect_locked),
+            "master_state": "Active" if (dsp_enabled and not bit_perfect_locked) else "Inactive",
+            "master_style": "ok" if (dsp_enabled and not bit_perfect_locked) else "warn",
+        }
+
+    def _display_output_rate(self, runtime_rate):
+        rate_text = str(runtime_rate or "").strip()
+        player = getattr(self, "player", None)
+        if player is None:
+            return rate_text
+        try:
+            info = dict(getattr(player, "stream_info", {}) or {})
+        except Exception:
+            info = {}
+
+        def _fallback_rate():
+            if rate_text not in ("", "Unknown", "Server Controlled"):
+                return rate_text
+            out_rate = int(info.get("output_rate", 0) or 0)
+            if out_rate > 0:
+                return self._format_rate_hz(out_rate) or rate_text
+            src_rate = int(info.get("source_rate", 0) or info.get("rate", 0) or 0)
+            if src_rate > 0:
+                return self._format_rate_hz(src_rate) or rate_text
+            return rate_text
+
+        dsp_snapshot = self._build_dsp_snapshot()
+        if not bool(dsp_snapshot.get("master_active", False)):
+            return _fallback_rate()
+        if not bool(getattr(player, "resampler_enabled", False)):
+            return _fallback_rate()
+        try:
+            target_rate = int(getattr(player, "resampler_target_rate", 0) or 0)
+        except Exception:
+            target_rate = 0
+        if target_rate <= 0:
+            return _fallback_rate()
+        return self._format_rate_hz(target_rate) or rate_text
+
+    def _display_output_depth(self, runtime_depth):
+        depth_text = str(runtime_depth or "").strip()
+        player = getattr(self, "player", None)
+        if player is None:
+            return depth_text
+        if depth_text not in ("", "Unknown", "16/32 bit (Float)"):
+            return depth_text
+        try:
+            info = dict(getattr(player, "stream_info", {}) or {})
+        except Exception:
+            info = {}
+        out_depth = int(info.get("output_depth", 0) or 0)
+        if out_depth > 0:
+            return self._parse_pw_depth(f"S{out_depth}LE") or depth_text
+        src_depth = int(info.get("source_depth", 0) or info.get("depth", 0) or 0)
+        if src_depth > 0:
+            return f"{src_depth}-bit"
+        return "Unknown"
+
+    @staticmethod
+    def _truncate_middle(text, max_chars=56):
+        raw = str(text or "").strip()
+        limit = max(8, int(max_chars or 0))
+        if len(raw) <= limit:
+            return raw
+        keep_left = max(3, (limit - 1) // 2)
+        keep_right = max(3, limit - keep_left - 1)
+        return f"{raw[:keep_left]}…{raw[-keep_right:]}"
+
+    def _format_target_output(self, req_driver, req_dev, max_chars=28):
+        driver_text = str(req_driver or "").strip()
+        device_text = str(req_dev or "").strip()
+        if not driver_text:
+            return self._truncate_middle(device_text, max_chars=max_chars)
+        if not device_text:
+            return driver_text
+        return self._truncate_middle(f"{driver_text} / {device_text}", max_chars=max_chars)
+
+    @staticmethod
+    def _display_output_path(driver_name, is_exclusive, device_id=""):
+        if bool(is_exclusive):
+            return "Direct ALSA Hardware"
+        driver = str(driver_name or "").strip()
+        dev = str(device_id or "").strip().lower()
+        if driver == "PipeWire":
+            return "PipeWire Shared Graph"
+        if driver == "PulseAudio":
+            return "PulseAudio Shared Server"
+        if driver in ("ALSA", "ALSA（auto）", "ALSA (mmap)", "ALSA（mmap）"):
+            if dev.startswith("hw:"):
+                return "Direct ALSA Hardware"
+            return "ALSA Shared Mixer"
+        if driver and driver not in ("Auto", "Auto (Default)"):
+            return f"{driver} Shared Path"
+        return "System Controlled"
+
     def _summary_rows_signature(self, rows):
         return tuple((str(key), str(value), str(style)) for key, value, style in rows)
 
@@ -452,11 +554,15 @@ class AudioSignalPathWindow(Adw.Window):
             self.summary_rows.remove(child)
 
         for key, value, style in rows:
-            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
             row.add_css_class("signal-terminal-row")
             lbl_key = Gtk.Label(label=key, xalign=0, css_classes=["signal-terminal-key"])
             lbl_val = Gtk.Label(label=value, xalign=1, hexpand=True, css_classes=["signal-terminal-value"])
             lbl_val.set_wrap(True)
+            if key == "Target Output":
+                lbl_val.set_wrap(False)
+                lbl_val.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+                lbl_val.set_tooltip_text(str(value))
             if style == "ok":
                 lbl_val.add_css_class("success-text")
             elif style == "warn":
@@ -478,32 +584,20 @@ class AudioSignalPathWindow(Adw.Window):
             self.summary_rows.append(row)
 
     def update_info(self):
-        # 确保定时器安全
-        # if not self.timer_id: return True # (已由 on_close 处理，这里可省略)
+        if self._closed:
+            return False
 
         snap = self._read_runtime_snapshot_safe()
         snap_src = snap.get("source", {}) if isinstance(snap, dict) else {}
-        if not isinstance(snap_src, dict):
-            snap_src = {}
         snap_out = snap.get("output", {}) if isinstance(snap, dict) else {}
-        if not isinstance(snap_out, dict):
-            snap_out = {}
-        self._update_summary()
+        dsp_snapshot = self._build_dsp_snapshot()
+        self._update_summary(dsp_snapshot=dsp_snapshot)
         self._update_recent_events()
 
         # --- 1. Source Data (Rust snapshot only) ---
         codec = self._normalize_codec_display(str(snap_src.get("codec", "") or "-"))
         bitrate = int(snap_src.get("bitrate", 0) or 0)
-
-        sample_rate = "Unknown"
-        bit_depth = "Unknown"
-        _si = getattr(self.player, "stream_info", {}) or {}
-        src_rate = int(_si.get("source_rate", 0) or snap_src.get("rate", 0) or 0)
-        src_depth = int(_si.get("source_depth", 0) or snap_src.get("depth", 0) or 0)
-        if src_rate > 0:
-            sample_rate = f"{src_rate/1000.0:g}kHz"
-        if src_depth > 0:
-            bit_depth = f"{src_depth}-bit"
+        sample_rate, bit_depth = self._extract_source_format(snap_src)
 
         source_rows = [
             ("Format", codec, False),
@@ -518,14 +612,7 @@ class AudioSignalPathWindow(Adw.Window):
         is_bp = self.player.bit_perfect_mode
         current_driver = self._get_current_driver()
         pw_force_rate, _pw_allowed = self._get_pipewire_clock_state()
-        pw_runtime = self._get_pipewire_runtime_formats()
-        if current_driver == "PipeWire":
-            # Kernel-level fallback for final hardware params (e.g. S32_LE).
-            hw_fallback = self._get_kernel_hw_runtime()
-            if hw_fallback.get("hardware_depth") and not pw_runtime.get("hardware_depth"):
-                pw_runtime["hardware_depth"] = hw_fallback.get("hardware_depth")
-            if hw_fallback.get("hardware_rate") and not pw_runtime.get("hardware_rate"):
-                pw_runtime["hardware_rate"] = hw_fallback.get("hardware_rate")
+        pw_runtime = self._merge_pw_runtime_with_fallback(current_driver)
         
         engine_rows = []
         if is_exclusive:
@@ -549,15 +636,16 @@ class AudioSignalPathWindow(Adw.Window):
                 engine_rows.append(("Software Mixer", "Active", False))
                 
             engine_rows.append(("Resampler", "System Default", False))
+
+        engine_rows.append(("DSP Master", dsp_snapshot["master_state"], dsp_snapshot["master_active"]))
             
         self.set_card_rows(self.card_engine, engine_rows)
 
         # --- 3. Output Data (优化显示) ---
         output_rows = []
         
-        dev_name = self.app.current_device_name
-        # 截断过长的设备名
-        display_dev = dev_name[:25]+".." if len(dev_name)>25 else dev_name
+        dev_name = str(getattr(self.app, "current_device_name", "") or "Default")
+        display_dev = dev_name[:25] + ".." if len(dev_name) > 25 else dev_name
         output_rows.append(("Device", display_dev, False))
 
         latency_sec = self.player.get_latency()
@@ -613,11 +701,18 @@ class AudioSignalPathWindow(Adw.Window):
                 output_depth = "Unknown"
             if not output_rate:
                 output_rate = "Unknown"
+            output_rate = self._display_output_rate(output_rate)
             output_rows.append(("Output Depth", output_depth, True))
             output_rows.append(("Output Rate", output_rate, True))
-            output_rows.append(("Output Path", "Direct ALSA Hardware", True))
+            output_rows.append(
+                (
+                    "Output Path",
+                    self._display_output_path(current_driver, is_exclusive, getattr(self.player, "current_device_id", "")),
+                    True,
+                )
+            )
         else:
-            output_depth = "16/32 bit (Float)"
+            output_depth = "Unknown"
             output_rate = "Server Controlled"
             if current_driver == "PipeWire" and pw_force_rate > 0:
                 output_rate = f"{pw_force_rate/1000.0:g}kHz"
@@ -641,16 +736,17 @@ class AudioSignalPathWindow(Adw.Window):
                     output_rows.append(("Stream Depth", sess_depth, False))
                 if sess_rate:
                     output_rows.append(("Stream Rate", sess_rate, False))
+            output_rate = self._display_output_rate(output_rate)
+            output_depth = self._display_output_depth(output_depth)
             output_rows.append(("Output Depth", output_depth, current_driver == "PipeWire" and bool(pw_runtime.get("hardware_depth"))))
             output_rows.append(("Output Rate", output_rate, current_driver == "PipeWire" and bool(pw_runtime.get("hardware_rate"))))
-            
-            # [优化] 明确显示是通过哪个服务输出的
-            if current_driver == "PipeWire":
-                output_rows.append(("Output Path", "PipeWire Multimedia", True)) # 绿色高亮
-            elif current_driver == "PulseAudio":
-                output_rows.append(("Output Path", "PulseAudio Server", False))
-            else:
-                output_rows.append(("Output Path", "System Shared", False))
+            output_rows.append(
+                (
+                    "Output Path",
+                    self._display_output_path(current_driver, is_exclusive, getattr(self.player, "current_device_id", "")),
+                    current_driver == "PipeWire",
+                )
+            )
 
         # Source vs Output compare.
         source_pair = f"{sample_rate} / {bit_depth}"
@@ -668,10 +764,12 @@ class AudioSignalPathWindow(Adw.Window):
 
         return True
 
-    def _update_summary(self):
+    def _update_summary(self, dsp_snapshot=None):
         pop = getattr(self, "bitperfect_verdict_help_pop", None)
         if pop is not None and pop.get_visible():
             return
+        if dsp_snapshot is None:
+            dsp_snapshot = self._build_dsp_snapshot()
 
         state = getattr(self.player, "output_state", "idle")
         err = getattr(self.player, "output_error", None)
@@ -682,32 +780,37 @@ class AudioSignalPathWindow(Adw.Window):
         exclusive = self.player.exclusive_lock_mode
         driver = self._get_current_driver()
         pw_force_rate, _pw_allowed = self._get_pipewire_clock_state()
+        pw_runtime = self._merge_pw_runtime_with_fallback(driver)
         snap = self._read_runtime_snapshot_safe()
         snap_src = snap.get("source", {}) if isinstance(snap, dict) else {}
-        if not isinstance(snap_src, dict):
-            snap_src = {}
         snap_out = snap.get("output", {}) if isinstance(snap, dict) else {}
-        if not isinstance(snap_out, dict):
-            snap_out = {}
-        sample_rate = "Unknown"
-        bit_depth = "Unknown"
-        _si = getattr(self.player, "stream_info", {}) or {}
-        src_rate = int(_si.get("source_rate", 0) or snap_src.get("rate", 0) or 0)
-        src_depth = int(_si.get("source_depth", 0) or snap_src.get("depth", 0) or 0)
-        if src_rate > 0:
-            sample_rate = f"{src_rate/1000.0:g}kHz"
-        if src_depth > 0:
-            bit_depth = f"{src_depth}-bit"
+        sample_rate, bit_depth = self._extract_source_format(snap_src)
 
-        output_rate = "Server Controlled"
-        output_depth = "16/32 bit (Float)"
+        output_rate = "Unknown"
+        output_depth = "Unknown"
         if exclusive:
             hw_rate = int(snap_out.get("hardware_rate", 0) or 0)
             hw_depth = int(snap_out.get("hardware_depth", 0) or 0)
             output_rate = self._format_rate_hz(hw_rate) if hw_rate > 0 else "Unknown"
             output_depth = self._parse_pw_depth(f"S{hw_depth}LE") if hw_depth > 0 else "Unknown"
-        if driver == "PipeWire" and pw_force_rate > 0 and not exclusive:
-            output_rate = f"{pw_force_rate/1000.0:g}kHz"
+        else:
+            if driver == "PipeWire" and pw_force_rate > 0:
+                output_rate = f"{pw_force_rate/1000.0:g}kHz"
+            if driver == "PipeWire":
+                sess_depth = pw_runtime.get("session_depth")
+                sess_rate = pw_runtime.get("session_rate")
+                if sess_depth:
+                    output_depth = sess_depth
+                if sess_rate:
+                    output_rate = sess_rate
+                hw_depth = pw_runtime.get("hardware_depth")
+                hw_rate = pw_runtime.get("hardware_rate")
+                if hw_depth:
+                    output_depth = hw_depth
+                if hw_rate:
+                    output_rate = hw_rate
+        output_rate = self._display_output_rate(output_rate)
+        output_depth = self._display_output_depth(output_depth)
         rate_match = self._rate_only_match(sample_rate, output_rate)
         format_match = self._compute_format_match(driver, sample_rate, bit_depth, output_rate, output_depth)
 
@@ -718,8 +821,9 @@ class AudioSignalPathWindow(Adw.Window):
             ("Exclusive", "Yes" if exclusive else "No", "ok" if exclusive else "warn"),
             ("Output State", state.capitalize(), "ok" if state == "active" else "warn"),
         ]
+        rows.append(("DSP Master", dsp_snapshot["master_state"], dsp_snapshot["master_style"]))
         if req_driver:
-            target = f"{req_driver}" if not req_dev else f"{req_driver} / {req_dev}"
+            target = self._format_target_output(req_driver, req_dev)
             rows.append(("Target Output", target, False))
         if err:
             rows.append(("Last Error", err, False))
@@ -737,7 +841,7 @@ class AudioSignalPathWindow(Adw.Window):
         reasons = []
         driver = self._get_current_driver()
         bit_perfect = bool(getattr(self.player, "bit_perfect_mode", False))
-        exclusive = bool(getattr(self.player, "exclusive_lock_mode", False))
+        supported_driver = driver in ("ALSA", "ALSA（auto）", "ALSA (mmap)", "ALSA（mmap）", "PipeWire")
 
         if not bit_perfect:
             reasons.append("Bit-Perfect mode disabled")
@@ -746,21 +850,13 @@ class AudioSignalPathWindow(Adw.Window):
             reasons.append(f"Output state is {output_state}")
 
         rate_match = self._rate_only_match(sample_rate, output_rate)
-        if self._uses_lossless_container_match(driver, exclusive):
-            depth_match = self._depth_container_match(bit_depth, output_depth)
-        else:
-            depth_match = self._depth_only_match(bit_depth, output_depth)
+        depth_match = self._depth_container_match(bit_depth, output_depth)
         format_match = bool(rate_match and depth_match)
 
-        # ALSA exclusive and PipeWire now share the same source-vs-output
-        # format rule here: keep the original sample rate and allow only
-        # lossless container widening such as 16-bit PCM -> 32-bit PCM.
         if driver in ("ALSA", "ALSA（auto）", "ALSA (mmap)", "ALSA（mmap）"):
-            if not exclusive:
-                reasons.append("Not in exclusive mode")
-            if exclusive and not rate_match:
+            if not rate_match:
                 reasons.append("Sample-rate mismatch")
-            if exclusive and not depth_match:
+            if not depth_match:
                 reasons.append("Output bit depth narrower than source")
         elif driver == "PipeWire":
             if bool(getattr(self.player, "_pipewire_rate_blocked", False)):
@@ -776,7 +872,7 @@ class AudioSignalPathWindow(Adw.Window):
             bit_perfect
             and output_state == "active"
             and format_match
-            and (driver not in ("ALSA", "ALSA（auto）", "ALSA (mmap)", "ALSA（mmap）") or exclusive)
+            and supported_driver
         )
         return (verdict_ok, "ok" if verdict_ok else "warn", reasons)
 
@@ -784,17 +880,36 @@ class AudioSignalPathWindow(Adw.Window):
         drv = getattr(self.player, "current_driver", None) or self.app.settings.get("driver", "Auto")
         return str(drv or "Auto")
 
+    def _extract_source_format(self, snap_src):
+        """Return (sample_rate_str, bit_depth_str) from stream_info + rust snapshot."""
+        _si = getattr(self.player, "stream_info", {}) or {}
+        src_rate = int(_si.get("source_rate", 0) or snap_src.get("rate", 0) or 0)
+        src_depth = int(_si.get("source_depth", 0) or snap_src.get("depth", 0) or 0)
+        sample_rate = f"{src_rate / 1000.0:g}kHz" if src_rate > 0 else "Unknown"
+        bit_depth = f"{src_depth}-bit" if src_depth > 0 else "Unknown"
+        return sample_rate, bit_depth
+
+    def _merge_pw_runtime_with_fallback(self, driver):
+        """Get PipeWire runtime formats, filling missing hardware fields from kernel hw_params."""
+        pw_runtime = self._get_pipewire_runtime_formats()
+        if driver == "PipeWire":
+            hw_fallback = self._get_kernel_hw_runtime()
+            if hw_fallback.get("hardware_depth") and not pw_runtime.get("hardware_depth"):
+                pw_runtime["hardware_depth"] = hw_fallback["hardware_depth"]
+            if hw_fallback.get("hardware_rate") and not pw_runtime.get("hardware_rate"):
+                pw_runtime["hardware_rate"] = hw_fallback["hardware_rate"]
+        return pw_runtime
+
     def _read_runtime_snapshot_safe(self):
         fn = getattr(self.player, "_read_runtime_snapshot", None)
         if not callable(fn):
             return {}
         try:
             snap = fn() or {}
-            if isinstance(snap, dict):
-                return snap
-        except Exception:
+            return snap if isinstance(snap, dict) else {}
+        except Exception as e:
+            logger.debug("Failed to read runtime snapshot: %s", e)
             return {}
-        return {}
 
     def _get_pipewire_clock_state(self):
         force_rate = 0
@@ -847,9 +962,7 @@ class AudioSignalPathWindow(Adw.Window):
             return False
         if sample_rate == "Unknown" or bit_depth == "Unknown":
             return False
-        if self._uses_lossless_container_match(driver, self.player.exclusive_lock_mode):
-            return self._rate_only_match(sample_rate, output_rate) and self._depth_container_match(bit_depth, output_depth)
-        return False
+        return self._rate_only_match(sample_rate, output_rate) and self._depth_container_match(bit_depth, output_depth)
 
     @staticmethod
     def _uses_lossless_container_match(driver, exclusive):
@@ -986,8 +1099,8 @@ class AudioSignalPathWindow(Adw.Window):
 
     def _get_pipewire_runtime_formats(self):
         now = time.monotonic()
-        if (now - float(self._pw_runtime_cache_ts or 0.0)) < 1.5:
-            return dict(self._pw_runtime_cache or {})
+        if (now - float(getattr(self, "_pw_runtime_cache_ts", 0.0) or 0.0)) < self._PW_RUNTIME_CACHE_TTL_SEC:
+            return getattr(self, "_pw_runtime_cache", {})
 
         data = {}
         driver = self._get_current_driver()
@@ -1031,9 +1144,9 @@ class AudioSignalPathWindow(Adw.Window):
             except Exception:
                 pass
 
-        self._pw_runtime_cache_ts = now
         self._pw_runtime_cache = data
-        return dict(data)
+        self._pw_runtime_cache_ts = now
+        return data
 
     def _get_kernel_hw_runtime(self):
         """
@@ -1092,10 +1205,7 @@ class AudioSignalPathWindow(Adw.Window):
         err = getattr(self.player, "output_error", None)
         driver = self._get_current_driver()
         dev = getattr(self.app, "current_device_name", "Default")
-        format_match = self._compute_format_match(driver, sample_rate, bit_depth, output_rate, output_depth)
-        verdict_ok, _verdict_style, reasons = self._compute_bitperfect_verdict(
-            state, sample_rate, bit_depth, output_rate, output_depth
-        )
+        dsp_snapshot = self._build_dsp_snapshot()
         sample_rate = "Unknown"
         bit_depth = "Unknown"
         _si = getattr(self.player, "stream_info", {}) or {}
@@ -1118,20 +1228,29 @@ class AudioSignalPathWindow(Adw.Window):
                 output_rate = f"{force_rate/1000.0:g}kHz"
         else:
             force_rate, allowed_raw = (0, "")
+        output_rate = self._display_output_rate(output_rate)
+        output_depth = self._display_output_depth(output_depth)
+        rate_match = self._rate_only_match(sample_rate, output_rate)
         format_match = self._compute_format_match(driver, sample_rate, bit_depth, output_rate, output_depth)
+        verdict_ok, _verdict_style, reasons = self._compute_bitperfect_verdict(
+            state, sample_rate, bit_depth, output_rate, output_depth
+        )
 
         lines = [
             f"Bit-Perfect Verdict: {'Yes' if verdict_ok else 'No'}",
-            f"Rate Match: {'Yes' if format_match else 'No'}",
+            f"Rate Match: {'Yes' if rate_match else 'No'}",
+            f"Format Match: {'Yes' if format_match else 'No'}",
             f"Bit-Perfect Mode: {'On' if self.player.bit_perfect_mode else 'Off'}",
             f"Exclusive Mode: {'On' if self.player.exclusive_lock_mode else 'Off'}",
             f"Driver: {driver}",
             f"Device: {dev}",
             f"Output State: {state}",
             f"Source Codec: {codec}",
-            f"Source Format: {codec}",
+            f"Source Format: {sample_rate} / {bit_depth}",
             f"Source Bitrate: {bitrate // 1000 if bitrate else 0} kbps",
+            f"Output Format: {output_rate} / {output_depth}",
         ]
+        lines.append(f"DSP Master: {dsp_snapshot['master_state']}")
         if driver == "PipeWire":
             lines.append(f"PipeWire Force Rate: {force_rate if force_rate else '0'} Hz")
             if allowed_raw:
@@ -1163,8 +1282,6 @@ class AudioSignalPathWindow(Adw.Window):
         driver = self._get_current_driver()
         if not self.player.bit_perfect_mode:
             suggestions.append("Enable Bit-Perfect mode")
-        if driver in ("ALSA", "ALSA（auto）", "ALSA (mmap)", "ALSA（mmap）") and not self.player.exclusive_lock_mode:
-            suggestions.append("Enable Exclusive mode")
         if driver == "PipeWire":
             force_rate, _allowed = self._get_pipewire_clock_state()
             if force_rate <= 0:

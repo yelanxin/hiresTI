@@ -38,7 +38,9 @@
   </categories>
   <content_rating type="oars-1.1"/>
   <releases>
-    <release version="1.6.7" date="2026-03-13">
+    <release version="1.6.8" date="2026-03-14"/>
+    <release version="1.6.7.1" date="2026-03-14"/>
+    <release version="1.6.7" date="2026-03-13"/>
       <description>
         <ul>
           <li>Fix artist cover images failing to load on artist detail pages — requests were using size 1280 which is not supported by TIDAL; now capped at 750 (the maximum valid size for artist images)</li>

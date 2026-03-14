@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.6.8 - 2026-03-14
+Signal Path + ALSA behavior polish release: more accurate runtime reporting in the tech window, ALSA latency controls that match the actual output path, and a harder Bit-Perfect volume lock.
+
+### Changed
+- `Output Latency` is now available whenever an `ALSA` driver is selected, not only when the `Exclusive` toggle is enabled. Changing the latency profile on `ALSA（auto）` / `ALSA（mmap）` now immediately rebuilds the output path so the new buffer/latency values take effect right away.
+- `Bit-Perfect Mode` now hard-locks the player's own volume to unity gain instead of only graying out the UI. Enabling Bit-Perfect forces backend volume to `100%`; disabling it restores the saved user volume.
+- Signal Path `Bit-Perfect Verdict` for `ALSA` no longer requires the `Exclusive` toggle. The verdict now follows the actual `ALSA hw:*` path used by playback and checks Bit-Perfect mode, active output state, sample-rate match, and non-narrowing output depth.
+- Signal Path help text now reflects the real ALSA implementation: the selected `hw:*` device is opened directly, so verdict rules are based on source/output format alignment instead of the UI-exclusive toggle.
+- Signal Path `Target Output` rows are now truncated more aggressively and rendered with single-line ellipsis so long device identifiers no longer break the summary layout.
+- Signal Path `Output Path` labels now report the actual shared/direct route more clearly, including treating `ALSA` + `hw:*` as `Direct ALSA Hardware` even when the `Exclusive` toggle is off.
+- Signal Path `DSP` reporting has been simplified to only show whether `DSP Master` is `Active` or `Inactive`, removing plugin/module-level clutter from the tech window.
+- `History` page presentation has been simplified: `Most Played Tracks` / `Recently Played Albums` section titles and their right-side count labels are now removed, leaving the tab labels as the primary navigation chrome.
+- `Liked Songs` toolbar pagination has been simplified: `Prev` / `Next` now sit on the main search/action row, the inline `Page x/y` status text has been removed, and the artist-filter scroll arrows now sit at the far left/right edges of the artist row.
+- `Liked Songs` artist filters have been enlarged to `96x96` artwork chips for clearer artwork recognition and easier target selection.
+
+### Fixed
+- Fixed Signal Path `Output Rate` showing placeholders like `Server Controlled` after playback was already active. The page now prefers the real negotiated output rate, and when the built-in resampler is active it shows the resampled target rate.
+- Fixed Signal Path `Output Depth` showing vague placeholders like `16/32 bit (Float)` in non-exclusive playback. The page now prefers the real runtime output depth and only falls back to source depth or `Unknown` when runtime data is unavailable.
+- Fixed Signal Path `Format Match` reporting `No` even when source and output were effectively aligned. It now treats `output depth >= source depth` as a valid match and keeps the summary `Rate Match` / `Reasons` rows consistent with the output card.
+- Fixed `Target Output` summary rows growing too wide and visually colliding with the row label when long PipeWire/ALSA node names were present.
+- Fixed startup Bit-Perfect restore leaving the backend volume at the previously saved user value: startup now locks the player to unity gain before entering Bit-Perfect mode.
+- Fixed non-UI volume entry points bypassing the Bit-Perfect lock. MPRIS volume writes and direct backend `set_volume()` calls are now ignored while Bit-Perfect is active.
+
+### Tests
+- Verified with:
+  - `pytest -q tests/test_audio_settings_actions.py tests/test_signal_path_bitperfect.py tests/test_mpris_helpers.py tests/test_rust_audio_eq.py tests/test_app_builders_shortcuts.py`
+  - `python -m py_compile src/actions/audio_settings_actions.py src/app/app_builders.py src/app/app_handlers.py src/services/mpris.py src/_rust/audio.py src/app/app_bootstrap.py src/ui/views_builders.py src/services/signal_path.py`
+
 ## 1.6.7 - 2026-03-13
 Artists/artist-detail follow-up release: paged favorite-artist browsing, a redesigned artist hero/detail page, faster progressive section loading, and stronger liked-songs consistency after favorite toggles.
 

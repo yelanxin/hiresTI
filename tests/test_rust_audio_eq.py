@@ -76,6 +76,10 @@ class _FakeRust:
         self.calls.append(("dsp", enabled))
         return self.dsp_rc
 
+    def set_volume(self, vol):
+        self.calls.append(("volume", float(vol)))
+        return 0
+
     def set_peq_enabled(self, enabled):
         self.calls.append(("peq", enabled))
         return self.peq_rc
@@ -516,3 +520,18 @@ def test_set_widener_bass_mono_controls_forward_to_rust():
     assert adapter.output_error is None
     assert adapter.widener_bass_mono_freq == 90
     assert adapter.widener_bass_mono_amount == 75
+
+
+def test_set_volume_is_ignored_while_bit_perfect_mode_is_active():
+    adapter = object.__new__(rust_audio.RustAudioPlayerAdapter)
+    adapter._rust = _FakeRust()
+    adapter.output_error = "boom"
+    adapter.bit_perfect_mode = True
+    mark_calls = []
+    adapter._mark_transport_error = lambda *args, **kwargs: mark_calls.append((args, kwargs))
+
+    adapter.set_volume(0.35)
+
+    assert adapter._rust.calls == []
+    assert mark_calls == []
+    assert adapter.output_error is None

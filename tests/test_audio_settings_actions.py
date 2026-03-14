@@ -91,6 +91,9 @@ class _Player:
         self.set_output_calls = []
         self.output_format_pref_calls = []
         self.realtime_priority_calls = []
+        self.alsa_buffer_time = 100000
+        self.alsa_latency_time = 10000
+        self.set_volume_calls = []
 
     def toggle_bit_perfect(self, enabled, exclusive_lock=False):
         self.toggle_calls.append((bool(enabled), bool(exclusive_lock)))
@@ -110,6 +113,15 @@ class _Player:
 
     def set_alsa_mmap_realtime_priority(self, priority):
         self.realtime_priority_calls.append(int(priority))
+        return True
+
+    def set_alsa_latency(self, buffer_ms, latency_ms):
+        self.alsa_buffer_time = int(float(buffer_ms or 0.0) * 1000.0)
+        self.alsa_latency_time = int(float(latency_ms or 0.0) * 1000.0)
+        return True
+
+    def set_volume(self, vol):
+        self.set_volume_calls.append(float(vol))
         return True
 
     def get_drivers(self):
@@ -186,6 +198,59 @@ def test_on_bit_perfect_toggled_disables_dsp_and_shows_notice():
     assert app.settings["dsp_enabled"] is False
     assert saved == [True, True]
     assert notices == [("DSP disabled: Bit-Perfect mode enabled", "info", 2600)]
+
+
+def test_on_latency_changed_restarts_output_for_alsa_even_without_exclusive():
+    saved = []
+    restarted = []
+    player = _Player()
+    driver_dd = _DriverDropdown()
+    driver_dd.set_model(["ALSA（mmap）"])
+    driver_dd.set_selected(0)
+    dd = _ModelDropdown()
+    dd.set_model(["Low Latency (40ms)"])
+    dd.set_selected(0)
+    app = SimpleNamespace(
+        settings={},
+        save_settings=lambda: saved.append(True),
+        LATENCY_MAP={"Low Latency (40ms)": (40, 10)},
+        player=player,
+        driver_dd=driver_dd,
+        ex_switch=_Switch(active=False),
+        on_driver_changed=lambda *_args: restarted.append(True),
+    )
+
+    audio_settings_actions.on_latency_changed(app, dd, None)
+
+    assert app.settings["latency_profile"] == "Low Latency (40ms)"
+    assert player.alsa_buffer_time == 40_000
+    assert player.alsa_latency_time == 10_000
+    assert restarted == [True]
+    assert saved == [True]
+
+
+def test_on_exclusive_toggled_keeps_latency_enabled_for_alsa_driver(monkeypatch):
+    player = _Player()
+    driver_dd = _DriverDropdown()
+    driver_dd.set_model(["ALSA（mmap）"])
+    driver_dd.set_selected(0)
+    latency_dd = _ModelDropdown()
+    app = SimpleNamespace(
+        settings={},
+        save_settings=lambda: None,
+        player=player,
+        driver_dd=driver_dd,
+        device_dd=object(),
+        latency_dd=latency_dd,
+        _sync_playback_status_icon=lambda: None,
+        on_device_changed=lambda *_args: None,
+    )
+
+    monkeypatch.setattr(audio_settings_actions, "_refresh_driver_dropdown_options", lambda *_args, **_kwargs: None)
+
+    audio_settings_actions.on_exclusive_toggled(app, None, False)
+
+    assert latency_dd.sensitive_calls[-1] is True
 
 
 def test_on_device_changed_rolls_back_selection_when_output_switch_fails(monkeypatch):

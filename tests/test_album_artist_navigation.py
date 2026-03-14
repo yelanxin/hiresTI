@@ -473,6 +473,281 @@ def test_batch_load_artists_uses_explicit_flow_target(monkeypatch):
     assert wrong_flow.children == []
 
 
+def test_render_artists_dashboard_places_prev_next_in_search_toolbar(monkeypatch):
+    class _FakeGtkBox(_Container):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            self.css_classes = list(kwargs.get("css_classes", []))
+            self.visible = True
+
+        def set_visible(self, value):
+            self.visible = bool(value)
+
+    class _FakeGtkEntry:
+        def __init__(self, *args, **kwargs):
+            self.css_classes = list(kwargs.get("css_classes", []))
+            self.hexpand = bool(kwargs.get("hexpand", False))
+            self.placeholder_text = kwargs.get("placeholder_text")
+            self.text = ""
+
+        def set_placeholder_text(self, value):
+            self.placeholder_text = value
+
+        def set_text(self, value):
+            self.text = str(value)
+
+        def get_text(self):
+            return self.text
+
+        def connect(self, *_args, **_kwargs):
+            return None
+
+    class _FakeGtkLabel:
+        def __init__(self, *args, **kwargs):
+            self.css_classes = list(kwargs.get("css_classes", []))
+            self.label = str(kwargs.get("label", ""))
+            self.text = self.label
+            self.hexpand = bool(kwargs.get("hexpand", False))
+
+        def set_text(self, value):
+            self.text = str(value)
+
+        def get_text(self):
+            return self.text
+
+        def set_hexpand(self, value):
+            self.hexpand = bool(value)
+
+    class _FakeGtkDropDown:
+        def __init__(self, *args, **kwargs):
+            self.css_classes = list(kwargs.get("css_classes", []))
+            self.model = kwargs.get("model")
+            self.selected = 0
+            self.tooltip = None
+            self.size_request = None
+
+        def set_selected(self, value):
+            self.selected = int(value)
+
+        def get_selected(self):
+            return self.selected
+
+        def set_tooltip_text(self, value):
+            self.tooltip = value
+
+        def set_size_request(self, width, height):
+            self.size_request = (width, height)
+
+        def connect(self, *_args, **_kwargs):
+            return None
+
+    class _FakeGtkButton:
+        def __init__(self, *args, **kwargs):
+            self.css_classes = list(kwargs.get("css_classes", []))
+            self.label = str(kwargs.get("label", ""))
+            self.tooltip = None
+            self.sensitive = None
+
+        def set_tooltip_text(self, value):
+            self.tooltip = value
+
+        def set_sensitive(self, value):
+            self.sensitive = bool(value)
+
+        def connect(self, *_args, **_kwargs):
+            return None
+
+    class _FakeGtkStringList:
+        @staticmethod
+        def new(values):
+            return list(values)
+
+    monkeypatch.setattr(
+        ui_actions,
+        "Gtk",
+        SimpleNamespace(
+            Box=_FakeGtkBox,
+            Entry=_FakeGtkEntry,
+            Label=_FakeGtkLabel,
+            DropDown=_FakeGtkDropDown,
+            Button=_FakeGtkButton,
+            StringList=_FakeGtkStringList,
+            Align=SimpleNamespace(CENTER="center"),
+        ),
+    )
+    monkeypatch.setattr(ui_actions, "Thread", _ImmediateThread)
+
+    content = _Container()
+    app = SimpleNamespace(
+        collection_content_box=content,
+        backend=SimpleNamespace(user=None),
+        grid_subtitle_label=_Label("Artists you follow and love"),
+        artists_query="",
+        artists_sort="name_asc",
+        artists_page=0,
+        artists_page_size=50,
+        playlist_track_list=object(),
+        queue_track_list=object(),
+        batch_load_artists=lambda *_args, **_kwargs: None,
+    )
+
+    def _create_album_flow():
+        app.main_flow = _Container()
+        section = _Container([app.main_flow])
+        app.collection_content_box.append(section)
+
+    app.create_album_flow = _create_album_flow
+
+    ui_actions.render_artists_dashboard(app)
+
+    toolbar = content.children[0]
+    pager_bar = content.children[1]
+
+    assert toolbar.css_classes == ["search-bar"]
+    assert toolbar.children[0].css_classes == ["search-entry"]
+    assert toolbar.children[1].css_classes == ["sort-dropdown"]
+    assert [child.label for child in toolbar.children[2:4]] == ["Prev", "Next"]
+    assert len(pager_bar.children) == 1
+    assert not any(isinstance(child, _FakeGtkButton) for child in pager_bar.children)
+
+
+def test_render_artists_dashboard_moves_total_count_to_grid_subtitle(monkeypatch):
+    class _RunThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+            self.daemon = bool(daemon)
+
+        def start(self):
+            if self._target is not None:
+                self._target()
+
+    class _FakeGtkBox(_Container):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            self.css_classes = list(kwargs.get("css_classes", []))
+            self.visible = True
+
+        def set_visible(self, value):
+            self.visible = bool(value)
+
+    class _FakeGtkEntry:
+        def __init__(self, *args, **kwargs):
+            self.css_classes = list(kwargs.get("css_classes", []))
+            self.text = ""
+
+        def set_placeholder_text(self, _value):
+            return None
+
+        def set_text(self, value):
+            self.text = str(value)
+
+        def get_text(self):
+            return self.text
+
+        def connect(self, *_args, **_kwargs):
+            return None
+
+    class _FakeGtkLabel:
+        def __init__(self, *args, **kwargs):
+            self.text = str(kwargs.get("label", ""))
+            self.css_classes = list(kwargs.get("css_classes", []))
+            self.hexpand = bool(kwargs.get("hexpand", False))
+
+        def set_text(self, value):
+            self.text = str(value)
+
+        def get_text(self):
+            return self.text
+
+        def set_hexpand(self, value):
+            self.hexpand = bool(value)
+
+    class _FakeGtkDropDown:
+        def __init__(self, *args, **kwargs):
+            self.selected = 0
+            self.css_classes = list(kwargs.get("css_classes", []))
+
+        def set_selected(self, value):
+            self.selected = int(value)
+
+        def get_selected(self):
+            return self.selected
+
+        def set_tooltip_text(self, _value):
+            return None
+
+        def set_size_request(self, _width, _height):
+            return None
+
+        def connect(self, *_args, **_kwargs):
+            return None
+
+    class _FakeGtkButton:
+        def __init__(self, *args, **kwargs):
+            self.label = str(kwargs.get("label", ""))
+            self.sensitive = None
+
+        def set_tooltip_text(self, _value):
+            return None
+
+        def set_sensitive(self, value):
+            self.sensitive = bool(value)
+
+        def connect(self, *_args, **_kwargs):
+            return None
+
+    class _FakeGtkStringList:
+        @staticmethod
+        def new(values):
+            return list(values)
+
+    monkeypatch.setattr(
+        ui_actions,
+        "Gtk",
+        SimpleNamespace(
+            Box=_FakeGtkBox,
+            Entry=_FakeGtkEntry,
+            Label=_FakeGtkLabel,
+            DropDown=_FakeGtkDropDown,
+            Button=_FakeGtkButton,
+            StringList=_FakeGtkStringList,
+            Align=SimpleNamespace(CENTER="center"),
+        ),
+    )
+    monkeypatch.setattr(ui_actions, "Thread", _RunThread)
+    monkeypatch.setattr(ui_actions.GLib, "idle_add", lambda fn, *args: fn(*args))
+
+    content = _Container()
+    app = SimpleNamespace(
+        collection_content_box=content,
+        backend=SimpleNamespace(
+            user=None,
+            get_favorite_artists_count=lambda: 100,
+            get_favorite_artists_page=lambda **_kwargs: [SimpleNamespace(id="artist-1", name="Artist One")],
+        ),
+        grid_subtitle_label=_Label("Artists you follow and love"),
+        artists_query="",
+        artists_sort="name_asc",
+        artists_page=0,
+        artists_page_size=50,
+        playlist_track_list=object(),
+        queue_track_list=object(),
+        batch_load_artists=lambda *_args, **_kwargs: None,
+    )
+
+    def _create_album_flow():
+        app.main_flow = _Container()
+        section = _Container([app.main_flow])
+        app.collection_content_box.append(section)
+
+    app.create_album_flow = _create_album_flow
+
+    ui_actions.render_artists_dashboard(app)
+
+    assert app.grid_subtitle_label.text == "100 Artists you follow and love"
+    assert content.children[1].visible is False
+
+
 def test_artist_detail_hero_height_tracks_three_equal_columns():
     content_box = _Container()
     content_box._width = 1080

@@ -1,5 +1,6 @@
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -103,3 +104,85 @@ def test_artist_card_classes_keep_media_only_hover_override():
     classes = ui_actions._artist_card_classes()
 
     assert classes == ["card", "home-card", "home-feed-card", "artist-feed-card"]
+
+
+def test_render_history_dashboard_omits_section_titles_and_count_labels(monkeypatch):
+    class _FakeWidget:
+        def __init__(self, *args, **kwargs):
+            self.children = []
+            self.label = str(kwargs.get("label", ""))
+            self.css_classes = list(kwargs.get("css_classes", []))
+            self.hexpand = bool(kwargs.get("hexpand", False))
+            self.visible_child_name = ""
+
+        def append(self, child):
+            self.children.append(child)
+
+        def connect(self, *_args, **_kwargs):
+            return None
+
+        def set_hhomogeneous(self, *_args, **_kwargs):
+            return None
+
+        def set_vhomogeneous(self, *_args, **_kwargs):
+            return None
+
+        def set_halign(self, *_args, **_kwargs):
+            return None
+
+        def set_hexpand(self, value):
+            self.hexpand = bool(value)
+
+        def set_visible_child_name(self, value):
+            self.visible_child_name = str(value)
+
+        def get_visible_child_name(self):
+            return self.visible_child_name
+
+        def add_titled(self, child, *_args, **_kwargs):
+            self.children.append(child)
+
+        def attach(self, child, *_args, **_kwargs):
+            self.children.append(child)
+
+    class _FakeFlowBoxChild:
+        def __init__(self):
+            self.child = None
+
+        def set_child(self, child):
+            self.child = child
+
+    fake_gtk = SimpleNamespace(
+        Box=_FakeWidget,
+        Stack=_FakeWidget,
+        StackSwitcher=_FakeWidget,
+        Label=_FakeWidget,
+        Grid=_FakeWidget,
+        FlowBox=_FakeWidget,
+        FlowBoxChild=_FakeFlowBoxChild,
+        StackTransitionType=SimpleNamespace(CROSSFADE="crossfade"),
+        Align=SimpleNamespace(START="start", CENTER="center", END="end", FILL="fill"),
+        SelectionMode=SimpleNamespace(NONE="none"),
+        Orientation=SimpleNamespace(VERTICAL="vertical", HORIZONTAL="horizontal"),
+    )
+    monkeypatch.setattr(ui_actions, "Gtk", fake_gtk)
+    monkeypatch.setattr(ui_actions, "_clear_container", lambda container: container.children.clear())
+
+    app = SimpleNamespace(
+        collection_content_box=_FakeWidget(),
+        history_mgr=SimpleNamespace(
+            get_albums=lambda: [SimpleNamespace(name="Album One", artist=SimpleNamespace(name="Artist"))],
+            get_top_tracks=lambda limit=20: [],
+        ),
+    )
+
+    ui_actions.render_history_dashboard(app)
+
+    tabs_box = app.collection_content_box.children[0]
+    history_stack = tabs_box.children[1]
+    sec_top = history_stack.children[0]
+    sec_recent = history_stack.children[1]
+
+    assert len(sec_top.children) == 1
+    assert len(sec_recent.children) == 1
+

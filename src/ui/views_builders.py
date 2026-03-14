@@ -435,7 +435,7 @@ def build_settings_page(app):
     lat_info.append(Gtk.Label(label="Output Latency", xalign=0, css_classes=["settings-label"]))
     lat_info.append(
         Gtk.Label(
-            label="Target buffer size (Effective in Exclusive Mode)",
+            label="Target buffer size (Effective on ALSA output)",
             xalign=0,
             css_classes=["dim-label"],
         )
@@ -444,7 +444,8 @@ def build_settings_page(app):
     row_lat.append(Gtk.Box(hexpand=True))
     app.latency_dd = Gtk.DropDown(model=Gtk.StringList.new(app.LATENCY_OPTIONS))
     app.latency_dd.set_valign(Gtk.Align.CENTER)
-    app.latency_dd.set_sensitive(app.settings.get("exclusive_lock", False))
+    saved_driver = str(app.settings.get("driver", "") or "")
+    app.latency_dd.set_sensitive(saved_driver in ("ALSA", "ALSA（auto）", "ALSA (mmap)", "ALSA（mmap）"))
 
     saved_profile = app.settings.get("latency_profile", "Standard (100ms)")
     if saved_profile not in app.LATENCY_OPTIONS:

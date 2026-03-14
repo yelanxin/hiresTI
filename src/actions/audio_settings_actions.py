@@ -863,7 +863,7 @@ def on_latency_changed(app, dd, p):
             profile_name,
         )
 
-        if app.ex_switch.get_active():
+        if _driver_is_alsa_family(_selected_driver_name(app)):
             logger.info("Latency changed, restarting output")
             app.on_driver_changed(app.driver_dd, None)
 
@@ -977,6 +977,8 @@ def on_driver_changed(app, dd, p):
             app.device_dd.set_sensitive(len(devices) > 1)
             if hasattr(app, "mmap_realtime_priority_dd"):
                 app.mmap_realtime_priority_dd.set_sensitive(driver_name == DRIVER_ALSA_MMAP)
+            if hasattr(app, "latency_dd"):
+                app.latency_dd.set_sensitive(_driver_is_alsa_family(driver_name))
 
             if sel_idx < len(devices):
                 app.device_dd.set_selected(sel_idx)
@@ -1451,11 +1453,16 @@ def on_bit_perfect_toggled(self, switch, state):
                 self._lv2_restart_playback_for_graph_rebind(reason="bit-perfect-toggle")
             except Exception:
                 logger.debug("bit-perfect lv2 rebind failed", exc_info=True)
-    self._lock_volume_controls(state)
     self.ex_switch.set_sensitive(state)
-    if not state: self.ex_switch.set_active(False)
+    if not state:
+        self.ex_switch.set_active(False)
     is_ex = self.ex_switch.get_active()
-    self.player.toggle_bit_perfect(state, exclusive_lock=is_ex)
+    if state:
+        self._lock_volume_controls(True)
+        self.player.toggle_bit_perfect(True, exclusive_lock=is_ex)
+    else:
+        self.player.toggle_bit_perfect(False, exclusive_lock=is_ex)
+        self._lock_volume_controls(False)
     logger.info(
         "Bit-perfect toggle applied state=%s player_dsp_enabled=%s player_bit_perfect=%s",
         bool(state),
@@ -1531,8 +1538,6 @@ def on_exclusive_toggled(self, switch, state):
     if hasattr(self, "_sync_playback_status_icon"):
         self._sync_playback_status_icon()
 
-    self.latency_dd.set_sensitive(state)
-
     if state:
         # 开启独占：允许在 ALSA（auto） / ALSA（mmap）之间切换。
         prev_driver = _selected_driver_name(self)
@@ -1552,6 +1557,8 @@ def on_exclusive_toggled(self, switch, state):
         self.driver_dd.set_sensitive(True)
         # 刷新一下非独占状态下的设备列表
         self.on_device_changed(self.device_dd, None)
+    if hasattr(self, "latency_dd") and self.latency_dd is not None:
+        self.latency_dd.set_sensitive(_driver_is_alsa_family(_selected_driver_name(self)))
 
 
 def on_auto_rebind_once_toggled(self, switch, state):

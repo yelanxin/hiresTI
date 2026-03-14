@@ -3118,9 +3118,29 @@ def _build_eq_popover(self, sliders_attr="sliders"):
 
 
 def _lock_volume_controls(self, locked):
+    target_volume = 100.0 if locked else float(getattr(self, "settings", {}).get("volume", 80) or 80)
+    target_volume = max(0.0, min(100.0, target_volume))
+    sync_fn = getattr(self, "_sync_volume_ui_state", None)
+    if callable(sync_fn):
+        sync_fn(value=target_volume)
+    else:
+        volume_syncing = bool(getattr(self, "_volume_ui_syncing", False))
+        self._volume_ui_syncing = True
+        try:
+            for scale in (getattr(self, "vol_scale", None), getattr(self, "now_playing_vol_scale", None)):
+                if scale is not None:
+                    scale.set_value(target_volume)
+        finally:
+            self._volume_ui_syncing = volume_syncing
+
+    player = getattr(self, "player", None)
+    if player is not None and hasattr(player, "set_volume"):
+        try:
+            player.set_volume(1.0 if locked else (target_volume / 100.0))
+        except Exception:
+            logger.debug("volume lock sync failed", exc_info=True)
+
     for scale in (getattr(self, "vol_scale", None), getattr(self, "now_playing_vol_scale", None)):
-        if scale is not None and locked:
-            scale.set_value(100)
         if scale is not None:
             scale.set_sensitive(not locked)
 

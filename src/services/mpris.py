@@ -631,6 +631,9 @@ class MPRISService:
         return 0.8
 
     def _apply_volume(self, normalized):
+        if bool(getattr(getattr(self.app, "settings", None), "get", lambda *_args, **_kwargs: False)("bit_perfect", False)):
+            self.sync_volume()
+            return
         vol = max(0.0, min(1.0, _safe_float(normalized, self._volume())))
         scale = getattr(self.app, "vol_scale", None)
         if scale is not None:

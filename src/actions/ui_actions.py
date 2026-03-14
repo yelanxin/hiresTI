@@ -1803,6 +1803,7 @@ def render_artists_dashboard(app):
     current_user_id = str(getattr(getattr(app.backend, "user", None), "id", "") or "")
     if current_user_id != str(getattr(app, "_artists_index_user_id", "") or ""):
         app._artists_total_count = 0
+        app._artists_total_count_known = False
         app._artists_index_entries = []
         app._artists_index_ready = False
         app._artists_index_building = False
@@ -1810,6 +1811,7 @@ def render_artists_dashboard(app):
 
     if bool(getattr(app.backend, "_favorite_artists_index_dirty", False)):
         app._artists_total_count = 0
+        app._artists_total_count_known = False
         app._artists_index_entries = []
         app._artists_index_ready = False
         app._artists_index_building = False
@@ -1817,35 +1819,47 @@ def render_artists_dashboard(app):
     dashboard_token = int(getattr(app, "_artists_dashboard_token", 0) or 0) + 1
     app._artists_dashboard_token = dashboard_token
 
-    toolbar = Gtk.Box(spacing=8, margin_start=0, margin_end=0, margin_top=6, margin_bottom=8)
-    search_entry = Gtk.Entry(hexpand=True)
+    toolbar = Gtk.Box(
+        spacing=8,
+        margin_start=0,
+        margin_end=0,
+        margin_top=6,
+        margin_bottom=8,
+        css_classes=["search-bar"],
+    )
+    search_entry = Gtk.Entry(hexpand=True, css_classes=["search-entry"])
     search_entry.set_placeholder_text("Search favorite artists")
     search_entry.set_text(app.artists_query)
     toolbar.append(search_entry)
-    sort_label = Gtk.Label(label="Sort by", css_classes=["dim-label"], valign=Gtk.Align.CENTER)
-    toolbar.append(sort_label)
     sort_options = [
         ("name_asc", "Name (A-Z)"),
         ("name_desc", "Name (Z-A)"),
         ("date_desc", "Recently Added"),
         ("date_asc", "Oldest Added"),
     ]
-    sort_dd = Gtk.DropDown(model=Gtk.StringList.new([label for _key, label in sort_options]))
+    sort_dd = Gtk.DropDown(
+        model=Gtk.StringList.new([label for _key, label in sort_options]),
+        css_classes=["sort-dropdown"],
+    )
+    sort_dd.set_tooltip_text("Sort artists")
+    sort_dd.set_size_request(150, -1)
     sort_lookup = {key: idx for idx, (key, _label) in enumerate(sort_options)}
     sort_dd.set_selected(sort_lookup.get(app.artists_sort, 0))
     toolbar.append(sort_dd)
+    prev_btn = Gtk.Button(label="Prev", css_classes=["flat", "liked-action-btn"])
+    next_btn = Gtk.Button(label="Next", css_classes=["flat", "liked-action-btn"])
+    prev_btn.set_tooltip_text("Previous page")
+    next_btn.set_tooltip_text("Next page")
+    toolbar.append(prev_btn)
+    toolbar.append(next_btn)
     app.collection_content_box.append(toolbar)
 
     pager_bar = Gtk.Box(spacing=8, margin_start=0, margin_end=0, margin_bottom=8)
-    prev_btn = Gtk.Button(label="Prev", css_classes=["flat", "liked-action-btn"])
-    next_btn = Gtk.Button(label="Next", css_classes=["flat", "liked-action-btn"])
-    page_info_lbl = Gtk.Label(label="", css_classes=["dim-label"], xalign=0)
     status_lbl = Gtk.Label(label="", css_classes=["dim-label"], xalign=1)
     status_lbl.set_hexpand(True)
-    pager_bar.append(prev_btn)
-    pager_bar.append(next_btn)
-    pager_bar.append(page_info_lbl)
     pager_bar.append(status_lbl)
+    if hasattr(pager_bar, "set_visible"):
+        pager_bar.set_visible(False)
     app.collection_content_box.append(pager_bar)
 
     app.create_album_flow()
@@ -1859,21 +1873,34 @@ def render_artists_dashboard(app):
             app.batch_load_artists(items, 10, render_token, flow)
 
     def _set_status(message):
-        status_lbl.set_text(str(message or ""))
+        text = str(message or "")
+        status_lbl.set_text(text)
+        if hasattr(pager_bar, "set_visible"):
+            pager_bar.set_visible(bool(text))
 
-    def _update_pager(total_count, page_count, status_message=""):
+    def _set_subtitle(total_count=None):
+        subtitle_label = getattr(app, "grid_subtitle_label", None)
+        if subtitle_label is None:
+            return
+        if total_count is None:
+            subtitle_label.set_text("Artists you follow and love")
+            return
         total = max(0, int(total_count or 0))
+        noun = "Artist" if total == 1 else "Artists"
+        subtitle_label.set_text(f"{total} {noun} you follow and love")
+
+    def _update_pager(total_count, page_count, status_message="", subtitle_total_count=None):
         pages = max(0, int(page_count or 0))
         prev_btn.set_sensitive(app.artists_page > 0)
         next_btn.set_sensitive(pages > 0 and app.artists_page < pages - 1)
-        if pages > 0:
-            noun = "match" if app.artists_query.strip() else "artist"
-            suffix = "es" if total != 1 and noun == "match" else "s" if total != 1 and noun == "artist" else ""
-            page_info_lbl.set_text(f"Page {app.artists_page + 1} of {pages} ({total} {noun}{suffix})")
-        elif total > 0:
-            page_info_lbl.set_text(f"{total} artist{'s' if total != 1 else ''}")
+        if subtitle_total_count is not None:
+            app._artists_total_count = max(0, int(subtitle_total_count or 0))
+            app._artists_total_count_known = True
+            _set_subtitle(app._artists_total_count)
+        elif bool(getattr(app, "_artists_total_count_known", False)):
+            _set_subtitle(getattr(app, "_artists_total_count", 0))
         else:
-            page_info_lbl.set_text("0 artists")
+            _set_subtitle(None)
         _set_status(status_message)
 
     def _update_from_local_index():
@@ -1887,9 +1914,11 @@ def render_artists_dashboard(app):
             next_btn.set_sensitive(False)
             return True
 
-        filtered = _filter_artist_index_entries(getattr(app, "_artists_index_entries", []), query)
+        index_entries = getattr(app, "_artists_index_entries", [])
+        filtered = _filter_artist_index_entries(index_entries, query)
         filtered = _sort_artist_index_entries(filtered, app.artists_sort)
         total = len(filtered)
+        library_total = len(index_entries)
         page_size = app.artists_page_size
         total_pages = (total + page_size - 1) // page_size if total > 0 else 0
         if total_pages > 0 and app.artists_page >= total_pages:
@@ -1901,9 +1930,9 @@ def render_artists_dashboard(app):
         page_items = [_artist_obj_from_index_entry(entry) for entry in filtered[start:end]]
         _render_items(page_items)
         if total == 0:
-            _update_pager(0, 0, "No artists match this search.")
+            _update_pager(0, 0, "No artists match this search.", subtitle_total_count=library_total)
         else:
-            _update_pager(total, total_pages, "")
+            _update_pager(total, total_pages, "", subtitle_total_count=library_total)
         return True
 
     def _load_remote_page():
@@ -1912,8 +1941,9 @@ def render_artists_dashboard(app):
         requested_page = int(app.artists_page)
         sort_key = str(app.artists_sort or "name_asc")
         known_total = max(0, int(getattr(app, "_artists_total_count", 0) or 0))
+        known_total_for_subtitle = known_total if bool(getattr(app, "_artists_total_count_known", False)) else None
         _render_items([])
-        _update_pager(known_total, 0, "Loading artists...")
+        _update_pager(known_total, 0, "Loading artists...", subtitle_total_count=known_total_for_subtitle)
         prev_btn.set_sensitive(False)
         next_btn.set_sensitive(False)
 
@@ -1941,6 +1971,7 @@ def render_artists_dashboard(app):
                 if total_count <= 0 and items:
                     total_count = (page * app.artists_page_size) + len(items)
                 app._artists_total_count = total_count
+                app._artists_total_count_known = True
                 total_pages = (total_count + app.artists_page_size - 1) // app.artists_page_size if total_count > 0 else 0
                 if total_pages > 0 and app.artists_page >= total_pages:
                     app.artists_page = total_pages - 1
@@ -1948,10 +1979,10 @@ def render_artists_dashboard(app):
                     return False
                 _render_items(items)
                 if total_count == 0:
-                    _update_pager(0, 0, "No favorite artists yet.")
+                    _update_pager(0, 0, "No favorite artists yet.", subtitle_total_count=total_count)
                 else:
                     status = "Building artist search index..." if getattr(app, "_artists_index_building", False) else ""
-                    _update_pager(total_count, total_pages, status)
+                    _update_pager(total_count, total_pages, status, subtitle_total_count=total_count)
                 if total_count > 0 and total_pages == 0:
                     prev_btn.set_sensitive(app.artists_page > 0)
                     next_btn.set_sensitive(bool(items) and len(items) >= app.artists_page_size)
@@ -2003,13 +2034,16 @@ def render_artists_dashboard(app):
                 app._artists_index_building = False
                 app._artists_index_user_id = user_id
                 app._artists_total_count = max(int(getattr(app, "_artists_total_count", 0) or 0), len(entries))
+                app._artists_total_count_known = True
                 app.backend._favorite_artists_index_dirty = False
                 if int(getattr(app, "_artists_dashboard_token", 0) or 0) != dashboard:
                     return False
                 if app.artists_query.strip():
                     _refresh_view()
-                elif status_lbl.get_text() == "Building artist search index...":
-                    _set_status("")
+                else:
+                    _set_subtitle(app._artists_total_count)
+                    if status_lbl.get_text() == "Building artist search index...":
+                        _set_status("")
                 return False
 
             GLib.idle_add(apply)
@@ -2949,20 +2983,12 @@ def render_history_dashboard(app):
 
     # --- Tab 1: Top 20 (shell + header) ---
     sec_top = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, css_classes=["home-section", "history-section"])
-    top_head = Gtk.Box(spacing=8, css_classes=["home-section-head"])
-    top_head.append(Gtk.Label(label="Top 20 Most Played Tracks", xalign=0, hexpand=True, css_classes=["home-section-title"]))
-    top_head.append(Gtk.Label(label=f"{len(top_tracks)} tracks", css_classes=["home-section-count"]))
-    sec_top.append(top_head)
     top_grid = Gtk.Grid(column_spacing=16, row_spacing=8, hexpand=True)
     sec_top.append(top_grid)
     history_stack.add_titled(sec_top, "history-top20", "Top 20")
 
     # --- Tab 2: Recent Albums (shell + header only, content populated lazily) ---
     sec_recent = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, css_classes=["home-section", "history-section"])
-    recent_head = Gtk.Box(spacing=8, css_classes=["home-section-head"])
-    recent_head.append(Gtk.Label(label="Recently Played Albums", xalign=0, hexpand=True, css_classes=["home-section-title"]))
-    recent_head.append(Gtk.Label(label=f"{len(recent_albums)} items", css_classes=["home-section-count"]))
-    sec_recent.append(recent_head)
     flow_recent = Gtk.FlowBox(
         homogeneous=True,
         min_children_per_line=1,
@@ -4185,15 +4211,14 @@ def render_liked_songs_dashboard(app, tracks=None):
     shuffle_btn = Gtk.Button(label="Shuffle", css_classes=["flat", "liked-action-btn"])
     shuffle_btn.set_tooltip_text("Shuffle current liked songs and play")
     toolbar.append(shuffle_btn)
-    play_next_btn = Gtk.Button(label="Play next", css_classes=["flat", "liked-action-btn"])
-    play_next_btn.set_tooltip_text("Queue current liked songs to play next")
-    toolbar.append(play_next_btn)
-    app.collection_content_box.append(toolbar)
-
-    pager_bar = Gtk.Box(spacing=8, margin_start=0, margin_end=0, margin_bottom=8)
     prev_page_btn = Gtk.Button(label="Prev", css_classes=["flat", "liked-action-btn"])
     next_page_btn = Gtk.Button(label="Next", css_classes=["flat", "liked-action-btn"])
-    page_info_lbl = Gtk.Label(label="", css_classes=["dim-label"], xalign=0)
+    prev_page_btn.set_tooltip_text("Previous page")
+    next_page_btn.set_tooltip_text("Next page")
+    toolbar.append(prev_page_btn)
+    toolbar.append(next_page_btn)
+    app.collection_content_box.append(toolbar)
+
     artist_scroll_prev_btn = Gtk.Button(
         icon_name="go-previous-symbolic",
         css_classes=["flat", "circular", "liked-artist-scroll-btn"],
@@ -4206,13 +4231,6 @@ def render_liked_songs_dashboard(app, tracks=None):
         valign=Gtk.Align.CENTER,
     )
     artist_scroll_next_btn.set_tooltip_text("Scroll artists right")
-    pager_bar.append(prev_page_btn)
-    pager_bar.append(next_page_btn)
-    pager_bar.append(page_info_lbl)
-    pager_bar.append(Gtk.Box(hexpand=True))
-    pager_bar.append(artist_scroll_prev_btn)
-    pager_bar.append(artist_scroll_next_btn)
-    app.collection_content_box.append(pager_bar)
 
     def _artist_key_and_u64(artist_obj):
         aid = getattr(artist_obj, "id", None)
@@ -4320,7 +4338,7 @@ def render_liked_songs_dashboard(app, tracks=None):
     max_artist_filters = 120
     artist_items = artist_items[:max_artist_filters]
 
-    artist_filter_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+    artist_filter_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, margin_bottom=8)
     artist_filter_scroll = Gtk.ScrolledWindow(hexpand=True, vexpand=False, css_classes=["liked-artist-filter-scroll"])
     artist_filter_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
     artist_filter_scroll.set_min_content_height(90)
@@ -4331,7 +4349,9 @@ def render_liked_songs_dashboard(app, tracks=None):
     )
     artist_filter_scroll.set_child(artist_filter_flow)
 
+    artist_filter_row.append(artist_scroll_prev_btn)
     artist_filter_row.append(artist_filter_scroll)
+    artist_filter_row.append(artist_scroll_next_btn)
     app.collection_content_box.append(artist_filter_row)
 
     app.liked_artist_filter_buttons = {}
@@ -4360,8 +4380,8 @@ def render_liked_songs_dashboard(app, tracks=None):
         card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, halign=Gtk.Align.CENTER)
         overlay = Gtk.Overlay()
         img = Gtk.Image(css_classes=["circular-avatar", "liked-artist-filter-img"])
-        img.set_size_request(60, 60)
-        img.set_pixel_size(60)
+        img.set_size_request(96, 96)
+        img.set_pixel_size(96)
         img.set_from_icon_name("avatar-default-symbolic")
         if artist_obj is not None:
             utils.load_img(
@@ -4370,7 +4390,7 @@ def render_liked_songs_dashboard(app, tracks=None):
                 # including album-art fallback when artist artwork is unavailable.
                 lambda a=artist_obj: app.backend.get_artist_artwork_url(a, 320),
                 app.cache_dir,
-                60,
+                96,
             )
         overlay.set_child(img)
 
@@ -4490,7 +4510,6 @@ def render_liked_songs_dashboard(app, tracks=None):
 
     play_all_btn.connect("clicked", lambda _b: _play_liked_tracks(getattr(list_box, "liked_tracks", []), shuffle=False))
     shuffle_btn.connect("clicked", lambda _b: _play_liked_tracks(getattr(list_box, "liked_tracks", []), shuffle=True))
-    play_next_btn.connect("clicked", lambda _b: _queue_liked_tracks_next(getattr(list_box, "liked_tracks", [])))
 
     def _apply_filters():
         q = str(getattr(app, "liked_tracks_query", "") or "").strip().lower()
@@ -4601,13 +4620,8 @@ def render_liked_songs_dashboard(app, tracks=None):
 
         play_all_btn.set_sensitive(bool(filtered))
         shuffle_btn.set_sensitive(bool(filtered))
-        play_next_btn.set_sensitive(bool(filtered))
         prev_page_btn.set_sensitive(page > 0)
         next_page_btn.set_sensitive(page < (total_pages - 1))
-        if total > 0:
-            page_info_lbl.set_text(f"Page {page + 1}/{total_pages}  ({start + 1}-{end} of {total})")
-        else:
-            page_info_lbl.set_text("Page 1/1  (0 songs)")
 
         if not page_items:
             row = Gtk.ListBoxRow()
