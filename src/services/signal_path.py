@@ -509,6 +509,32 @@ class AudioSignalPathWindow(Adw.Window):
             return f"{src_depth}-bit"
         return "Unknown"
 
+    def _display_latency(self, driver_name, is_exclusive, latency_sec, pw_latency_ms, is_playing):
+        driver = str(driver_name or "").strip()
+        if driver in ("ALSA", "ALSA（auto）", "ALSA (mmap)", "ALSA（mmap）"):
+            try:
+                cfg_buf_us = int(getattr(self.player, "alsa_buffer_time", 0) or 0)
+            except Exception:
+                cfg_buf_us = 0
+            if cfg_buf_us > 0:
+                latency_ms = cfg_buf_us / 1000.0
+                return f"{latency_ms:.1f} ms", latency_ms
+            if latency_sec > 0:
+                latency_ms = latency_sec * 1000.0
+                return f"{latency_ms:.1f} ms", latency_ms
+            return "N/A", None
+        if driver == "PipeWire" and pw_latency_ms is not None:
+            return f"{pw_latency_ms:.1f} ms (PipeWire Node)", float(pw_latency_ms)
+        if driver == "PipeWire" and latency_sec > 0:
+            latency_ms = latency_sec * 1000.0
+            return f"{latency_ms:.1f} ms (GStreamer)", latency_ms
+        if latency_sec > 0:
+            latency_ms = latency_sec * 1000.0
+            return f"{latency_ms:.1f} ms", latency_ms
+        if is_playing and driver == "PipeWire":
+            return "N/A (PipeWire Node unavailable)", None
+        return "N/A", None
+
     @staticmethod
     def _truncate_middle(text, max_chars=56):
         raw = str(text or "").strip()
@@ -665,40 +691,14 @@ class AudioSignalPathWindow(Adw.Window):
         latency_sec = self.player.get_latency()
         pw_latency_ms = self._get_pipewire_runtime_latency_ms()
         is_playing = self.player.is_playing()
-
-        # 延迟数值显示
-        if is_exclusive:
-            # In exclusive mode, align UI with configured target buffer size.
-            try:
-                cfg_buf_us = int(getattr(self.player, "alsa_buffer_time", 0) or 0)
-            except Exception:
-                cfg_buf_us = 0
-            if cfg_buf_us > 0:
-                lat_str = f"{(cfg_buf_us / 1000.0):.1f} ms"
-            else:
-                lat_str = "N/A"
-        elif current_driver == "PipeWire" and pw_latency_ms is not None:
-            lat_str = f"{pw_latency_ms:.1f} ms (PipeWire Node)"
-        elif current_driver == "PipeWire" and latency_sec > 0:
-            # Fallback to real GStreamer-reported latency (no guessed value).
-            latency_ms = latency_sec * 1000
-            lat_str = f"{latency_ms:.1f} ms (GStreamer)"
-        elif latency_sec > 0:
-            latency_ms = latency_sec * 1000
-            # [优化] 对于极低延迟 (<10ms) 显示绿色高亮
-            lat_str = f"{latency_ms:.1f} ms"
-        elif is_playing:
-            if is_exclusive:
-                lat_str = "< 5.0 ms (Direct)"
-            elif current_driver == "PipeWire":
-                # Do not show guessed values in PipeWire mode.
-                lat_str = "N/A (PipeWire Node unavailable)"
-            else:
-                lat_str = "~ 40 ms (Shared)"
-        else:
-            lat_str = "N/A"
-            
-        output_rows.append(("Latency", lat_str, latency_sec > 0 and latency_sec < 0.015)) # <15ms 高亮
+        lat_str, latency_ms_value = self._display_latency(
+            current_driver,
+            is_exclusive,
+            latency_sec,
+            pw_latency_ms,
+            is_playing,
+        )
+        output_rows.append(("Latency", lat_str, bool(latency_ms_value is not None and latency_ms_value < 15.0)))
 
         # 输出路径描述
         if is_exclusive:

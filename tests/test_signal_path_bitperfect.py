@@ -310,6 +310,16 @@ def test_apply_alsa_hw_runtime_override_prefers_kernel_hw_params_over_stream_con
     assert depth == "16-bit"
 
 
+def test_display_latency_prefers_configured_alsa_buffer_time():
+    win = _make_window("ALSA", exclusive=False, bit_perfect=False)
+    win.player.alsa_buffer_time = 40_000
+
+    text, latency_ms = win._display_latency("ALSA（mmap）", False, 0.0, None, True)
+
+    assert text == "40.0 ms"
+    assert latency_ms == 40.0
+
+
 def test_format_target_output_truncates_long_device_name():
     win = _make_window("PipeWire", exclusive=False, bit_perfect=False)
 
