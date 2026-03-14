@@ -13,6 +13,39 @@ PREFETCH_URL_TTL_SECONDS = 20 * 60
 NO_LYRICS_BOTTOM_HINT = "No usable lyrics for this track."
 
 
+def _apply_track_redirect(app, original_track):
+    """If get_stream_url used an album fallback, update liked_tracks_data and fav_track_ids.
+
+    Called from a daemon thread immediately after get_stream_url returns.
+    """
+    redirect = getattr(app.backend, "_last_track_redirect", None)
+    if not redirect:
+        return
+    app.backend._last_track_redirect = None
+    old_id_str, alt_track = redirect
+    if str(getattr(original_track, "id", "") or "") != old_id_str:
+        return
+    new_id_str = str(getattr(alt_track, "id", "") or "")
+    if not new_id_str:
+        return
+
+    try:
+        app.backend.fav_track_ids.discard(old_id_str)
+        app.backend.fav_track_ids.add(new_id_str)
+    except Exception:
+        pass
+
+    def _update_liked_cache():
+        cached = list(getattr(app, "liked_tracks_data", []) or [])
+        updated = [alt_track if str(getattr(t, "id", "") or "") == old_id_str else t for t in cached]
+        if updated != cached:
+            app.liked_tracks_data = updated
+            logger.info("Liked cache redirect: %s → %s (%r)", old_id_str, new_id_str, getattr(alt_track, "name", ""))
+        return False
+
+    GLib.idle_add(_update_liked_cache)
+
+
 def _split_bilingual_line(text):
     if not text:
         return "", ""
@@ -74,6 +107,7 @@ def _prefetch_next_track(app, current_index):
             return
 
         prefetch_url = app.backend.get_stream_url(next_track)
+        _apply_track_redirect(app, next_track)
         if not prefetch_url:
             return
 
@@ -322,6 +356,7 @@ def play_track(app, index):
                 logger.debug("Using prefetched stream url for track: %s (age %.0fs)", track.id, url_age)
             else:
                 url = app.backend.get_stream_url(track)
+                _apply_track_redirect(app, track)
                 bit_depth = int(getattr(app.backend, "_last_stream_bit_depth", 0) or 0)
                 sample_rate = int(getattr(app.backend, "_last_stream_sample_rate", 0) or 0)
 

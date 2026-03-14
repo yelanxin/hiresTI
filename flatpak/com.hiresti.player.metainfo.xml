@@ -38,6 +38,18 @@
   </categories>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.6.7" date="2026-03-13">
+      <description>
+        <ul>
+          <li>Fix artist cover images failing to load on artist detail pages — requests were using size 1280 which is not supported by TIDAL; now capped at 750 (the maximum valid size for artist images)</li>
+          <li>Fix signal handler leak in artist detail hero: resize handlers connected to persistent widgets (window, scroll, overlays) are now properly disconnected when leaving the artist page, preventing handler accumulation and unnecessary CPU work on window resize</li>
+          <li>Add debounce to artist detail hero layout recalculation — rapid resize events are now coalesced into a single update instead of queuing multiple redraws</li>
+          <li>Fix deprecated TIDAL track IDs in Liked Songs: when album fallback succeeds during playback, the local liked tracks cache and favorite ID set are now updated asynchronously so subsequent plays of the same song skip the redundant 404 round-trip</li>
+          <li>Reduce redundant API calls on the Artists page: skip the separate artist count request while the search index is already being built, and remove the incorrect get_favorites(limit=1) fallback in the count API path</li>
+        </ul>
+      </description>
+    </release>
+    <release version="1.6.6" date="2026-03-12"/>
     <release version="1.6.5" date="2026-03-11"/>
     <release version="1.6.0" date="2026-03-07"/>
     <release version="1.5.3" date="2026-03-05"/>
