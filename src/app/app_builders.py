@@ -2352,6 +2352,52 @@ def _build_dsp_workspace(self):
     self._refresh_dsp_order_edit_ui()
     chain_card.append(chain_flow)
     overview_page.append(chain_card)
+
+    # --- DSP Presets card ---
+    preset_card = Gtk.Box(
+        orientation=Gtk.Orientation.VERTICAL,
+        spacing=10,
+        margin_top=0,
+        margin_bottom=12,
+        margin_start=12,
+        margin_end=12,
+        css_classes=["dsp-detail-card", "dsp-chain-card"],
+    )
+    preset_title_row = Gtk.Box(spacing=12)
+    preset_title_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, hexpand=True)
+    preset_title_box.append(Gtk.Label(label="DSP Presets", xalign=0, css_classes=["title-4"]))
+    preset_title_box.append(
+        Gtk.Label(
+            label="Save and restore complete DSP chain configurations",
+            xalign=0,
+            wrap=True,
+            css_classes=["dim-label"],
+        )
+    )
+    preset_title_row.append(preset_title_box)
+    preset_card.append(preset_title_row)
+
+    preset_controls_row = Gtk.Box(spacing=8, margin_top=4)
+    self.dsp_preset_dd = Gtk.DropDown(model=Gtk.StringList.new(["(no presets)"]))
+    self.dsp_preset_dd.set_sensitive(False)
+    self.dsp_preset_dd.set_hexpand(True)
+    preset_controls_row.append(self.dsp_preset_dd)
+    self.dsp_preset_load_btn = Gtk.Button(label="Load", css_classes=["flat"])
+    self.dsp_preset_load_btn.set_sensitive(False)
+    self.dsp_preset_load_btn.connect("clicked", self.on_dsp_preset_load_clicked)
+    preset_controls_row.append(self.dsp_preset_load_btn)
+    self.dsp_preset_save_btn = Gtk.Button(label="Save As…", css_classes=["flat"])
+    self.dsp_preset_save_btn.connect("clicked", self.on_dsp_preset_save_clicked)
+    preset_controls_row.append(self.dsp_preset_save_btn)
+    self.dsp_preset_delete_btn = Gtk.Button(label="Delete", css_classes=["flat", "destructive-action"])
+    self.dsp_preset_delete_btn.set_sensitive(False)
+    self.dsp_preset_delete_btn.connect("clicked", self.on_dsp_preset_delete_clicked)
+    preset_controls_row.append(self.dsp_preset_delete_btn)
+    preset_card.append(preset_controls_row)
+    overview_page.append(preset_card)
+    if hasattr(self, "refresh_dsp_preset_list"):
+        self.refresh_dsp_preset_list()
+
     overview_scroll = _build_dsp_scroll_area(overview_page)
     self.dsp_workspace_stack.add_titled(overview_scroll, "overview", "Overview")
 

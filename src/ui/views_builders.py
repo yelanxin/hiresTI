@@ -710,41 +710,6 @@ def build_settings_page(app):
 
     settings_vbox.append(group_remote)
 
-    # ---- DSP Presets section ----
-    settings_vbox.append(Gtk.Label(label="DSP Presets", xalign=0, css_classes=["section-title"], margin_top=10))
-    group_dsp_presets = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["settings-group"])
-
-    row_presets = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
-    preset_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
-    preset_info.append(Gtk.Label(label="Saved Presets", xalign=0, css_classes=["settings-label"]))
-    preset_info.append(
-        Gtk.Label(
-            label="Save and restore complete DSP chain configurations",
-            xalign=0,
-            css_classes=["dim-label"],
-        )
-    )
-    row_presets.append(preset_info)
-    preset_controls = Gtk.Box(spacing=6, hexpand=True, halign=Gtk.Align.END, valign=Gtk.Align.CENTER)
-    app.dsp_preset_dd = Gtk.DropDown(model=Gtk.StringList.new(["(no presets)"]))
-    app.dsp_preset_dd.set_sensitive(False)
-    app.dsp_preset_dd.set_valign(Gtk.Align.CENTER)
-    preset_controls.append(app.dsp_preset_dd)
-    app.dsp_preset_load_btn = Gtk.Button(label="Load", css_classes=["flat"])
-    app.dsp_preset_load_btn.set_sensitive(False)
-    app.dsp_preset_load_btn.connect("clicked", app.on_dsp_preset_load_clicked)
-    preset_controls.append(app.dsp_preset_load_btn)
-    app.dsp_preset_save_btn = Gtk.Button(label="Save As…", css_classes=["flat"])
-    app.dsp_preset_save_btn.connect("clicked", app.on_dsp_preset_save_clicked)
-    preset_controls.append(app.dsp_preset_save_btn)
-    app.dsp_preset_delete_btn = Gtk.Button(label="Delete", css_classes=["flat", "destructive-action"])
-    app.dsp_preset_delete_btn.set_sensitive(False)
-    app.dsp_preset_delete_btn.connect("clicked", app.on_dsp_preset_delete_clicked)
-    preset_controls.append(app.dsp_preset_delete_btn)
-    row_presets.append(preset_controls)
-    group_dsp_presets.append(row_presets)
-    settings_vbox.append(group_dsp_presets)
-
     # ---- Scrobbling section ----
     settings_vbox.append(Gtk.Label(label="Scrobbling", xalign=0, css_classes=["section-title"], margin_top=10))
     group_scrobble = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["settings-group"])
@@ -822,9 +787,7 @@ def build_settings_page(app):
 
     settings_vbox.append(group_scrobble)
 
-    # Populate preset list and sync scrobble UI
-    if hasattr(app, "refresh_dsp_preset_list"):
-        app.refresh_dsp_preset_list()
+    # Sync scrobble UI to current settings
     if hasattr(app, "_init_scrobble_settings_ui"):
         app._init_scrobble_settings_ui()
 
