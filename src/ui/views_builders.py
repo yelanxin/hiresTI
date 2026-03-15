@@ -169,6 +169,7 @@ def toggle_login_view(app, logged_in):
 def build_tracks_view(app):
     trk_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["tracks-view"])
     trk_scroll = Gtk.ScrolledWindow(vexpand=True)
+    app.trk_scroll = trk_scroll
     trk_content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, margin_start=32, margin_end=32)
 
     app.album_header_box = Gtk.Box(spacing=24, css_classes=["album-header-box"])
@@ -295,6 +296,34 @@ def build_tracks_view(app):
     app.track_list_base_margin_bottom = 32
     app.track_list.connect("row-activated", app.on_track_selected)
     trk_content.append(app.track_list)
+
+    # Similar albums section (populated async in show_album_details)
+    app.similar_albums_box = Gtk.Box(
+        orientation=Gtk.Orientation.VERTICAL,
+        spacing=12,
+        margin_top=8,
+        margin_bottom=32,
+        visible=False,
+        css_classes=["home-section", "home-generic-section"],
+    )
+    app.similar_albums_label = Gtk.Label(label="More by this Artist", xalign=0, css_classes=["home-section-title"])
+    app.similar_albums_box.append(app.similar_albums_label)
+    app.similar_albums_flow = Gtk.FlowBox(
+        valign=Gtk.Align.START,
+        max_children_per_line=30,
+        selection_mode=Gtk.SelectionMode.NONE,
+        column_spacing=24,
+        row_spacing=28,
+        css_classes=["home-flow"],
+    )
+    app.similar_albums_box.append(app.similar_albums_flow)
+    app.similar_albums_more_row = Gtk.Box(
+        orientation=Gtk.Orientation.HORIZONTAL,
+        spacing=8,
+        visible=False,
+    )
+    app.similar_albums_box.append(app.similar_albums_more_row)
+    trk_content.append(app.similar_albums_box)
 
     trk_scroll.set_child(trk_content)
     trk_vbox.append(trk_scroll)
@@ -728,20 +757,6 @@ def build_settings_page(app):
     row_lfm_enable.append(app.scrobble_lastfm_switch)
     group_scrobble.append(row_lfm_enable)
 
-    # Last.fm API Key
-    row_lfm_key = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=4, margin_bottom=4)
-    row_lfm_key.append(Gtk.Label(label="API Key", xalign=0, css_classes=["dim-label"], width_chars=12))
-    app.scrobble_lastfm_key_entry = Gtk.Entry(hexpand=True, placeholder_text="Get yours at last.fm/api/account/create")
-    row_lfm_key.append(app.scrobble_lastfm_key_entry)
-    group_scrobble.append(row_lfm_key)
-
-    # Last.fm API Secret
-    row_lfm_secret = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=4, margin_bottom=4)
-    row_lfm_secret.append(Gtk.Label(label="API Secret", xalign=0, css_classes=["dim-label"], width_chars=12))
-    app.scrobble_lastfm_secret_entry = Gtk.Entry(hexpand=True, visibility=False, input_purpose=Gtk.InputPurpose.PASSWORD)
-    row_lfm_secret.append(app.scrobble_lastfm_secret_entry)
-    group_scrobble.append(row_lfm_secret)
-
     # Last.fm Connect row
     row_lfm_connect = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=4, margin_bottom=8)
     app.scrobble_lastfm_status_label = Gtk.Label(label="Not connected", xalign=0, css_classes=["dim-label"], hexpand=True)
@@ -750,9 +765,9 @@ def build_settings_page(app):
     app.scrobble_lastfm_disconnect_btn.set_sensitive(False)
     app.scrobble_lastfm_disconnect_btn.connect("clicked", app.on_lastfm_disconnect_clicked)
     row_lfm_connect.append(app.scrobble_lastfm_disconnect_btn)
-    lfm_connect_btn = Gtk.Button(label="Connect", css_classes=["flat", "suggested-action"])
-    lfm_connect_btn.connect("clicked", app.on_lastfm_connect_clicked)
-    row_lfm_connect.append(lfm_connect_btn)
+    app.scrobble_lastfm_connect_btn = Gtk.Button(label="Connect", css_classes=["flat", "suggested-action"])
+    app.scrobble_lastfm_connect_btn.connect("clicked", app.on_lastfm_connect_clicked)
+    row_lfm_connect.append(app.scrobble_lastfm_connect_btn)
     group_scrobble.append(row_lfm_connect)
 
     sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL, margin_start=12, margin_end=12)

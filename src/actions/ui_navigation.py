@@ -245,6 +245,13 @@ def on_nav_selected(app, box, row):
         app.render_top_dashboard()
         return
 
+    if row.nav_id == "hires":
+        app.grid_title_label.set_text("Hi-Res")
+        if hasattr(app, "grid_subtitle_label") and app.grid_subtitle_label is not None:
+            app.grid_subtitle_label.set_text("Studio-quality lossless audio in Hi-Res FLAC")
+        app.render_hires_dashboard()
+        return
+
     if row.nav_id == "collection":
         app.grid_title_label.set_text("My Albums")
         if app.backend.user:
@@ -405,6 +412,9 @@ def on_back_clicked(app, btn):
             btn.set_sensitive(False)
         elif nav_id == "new":
             app.render_new_dashboard(prefer_cache=True)
+            btn.set_sensitive(False)
+        elif nav_id == "hires":
+            app.render_hires_dashboard(prefer_cache=True)
             btn.set_sensitive(False)
         elif nav_id == "home":
             cached_sections = getattr(app, "_home_sections_cache", None)

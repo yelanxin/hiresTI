@@ -1515,6 +1515,20 @@ class TidalBackend:
             logger.warning("Failed to fetch all albums for artist %s: %s", getattr(art, "id", "unknown"), e)
             return []
 
+    def get_similar_artists(self, art):
+        def _fetch():
+            a = art
+            if isinstance(a, (int, str)):
+                a = self.session.artist(a)
+            elif hasattr(a, "id") and not hasattr(a, "get_similar"):
+                a = self.session.artist(getattr(a, "id"))
+            return list(a.get_similar() or [])
+        try:
+            return list(self._call_with_session_recovery(_fetch, context="similar artists") or [])
+        except Exception as e:
+            logger.warning("Failed to fetch similar artists for %s: %s", getattr(art, "id", "unknown"), e)
+            return []
+
     def get_artist_ep_singles_all(self, art, limit=2000):
         try:
             artist_obj = art
@@ -1566,7 +1580,7 @@ class TidalBackend:
             for cand in candidates:
                 if getattr(cand, "name", "").strip().lower() == target:
                     return cand
-            return candidates[0]
+            logger.debug("resolve_artist: no exact name match for %r among %s candidates", artist_name, len(candidates))
 
         return None
 
@@ -2074,6 +2088,118 @@ class TidalBackend:
             logger.warning("Get new page error [%s]: %s", classify_exception(e), e)
         return sections
 
+    def get_hires_page(self):
+        """
+        Fetch TIDAL Hi-Res page sections from /pages/hires.
+        """
+        def _norm_path(path):
+            p = str(path or "").strip()
+            if not p:
+                return None
+            return p[1:] if p.startswith("/") else p
+
+        def _image_url_from_uuid(image_id, size=320):
+            val = str(image_id or "").strip()
+            if not val:
+                return None
+            if val.startswith("http://") or val.startswith("https://"):
+                return val
+            token = val.replace("-", "/")
+            return f"https://resources.tidal.com/images/{token}/{int(size)}x{int(size)}.jpg"
+
+        def _collect_category_items(category):
+            items = list(getattr(category, "items", None) or [])
+            more = getattr(category, "_more", None)
+            more_path = _norm_path(getattr(more, "api_path", None) if more is not None else None)
+            if not more_path or not hasattr(self.session, "page") or self.session.page is None:
+                return items
+            try:
+                more_page = self.session.page.get(more_path, params={"deviceType": "BROWSER"})
+                for sub_cat in list(getattr(more_page, "categories", None) or []):
+                    sub_items = list(getattr(sub_cat, "items", None) or [])
+                    if sub_items:
+                        items.extend(sub_items)
+            except Exception as e:
+                logger.debug("Hi-Res category view-all fetch failed for %s: %s", more_path, e)
+            return items
+
+        def _process_item(item):
+            try:
+                if item is None:
+                    return None
+                if hasattr(item, "header") and hasattr(item, "type"):
+                    raw_type = str(getattr(item, "type", "") or "").strip().upper()
+                    type_map = {
+                        "TRACK": "Track", "ALBUM": "Album", "ARTIST": "Artist",
+                        "PLAYLIST": "Playlist", "MIX": "Mix",
+                    }
+                    return {
+                        "obj": item,
+                        "name": str(getattr(item, "header", "") or getattr(item, "short_header", "") or "Unknown"),
+                        "sub_title": str(getattr(item, "short_sub_header", "") or ""),
+                        "image_url": _image_url_from_uuid(getattr(item, "image_id", None)),
+                        "type": type_map.get(raw_type, "PageItem"),
+                    }
+                if hasattr(item, "title") and hasattr(item, "api_path"):
+                    return {
+                        "obj": item,
+                        "name": str(getattr(item, "title", "") or "Hi-Res"),
+                        "sub_title": "",
+                        "image_url": _image_url_from_uuid(getattr(item, "image_id", None)),
+                        "type": "PageLink",
+                    }
+            except Exception:
+                return None
+            return None
+
+        def _norm_text(v):
+            s = str(v or "").strip().lower()
+            return " ".join(ch for ch in s if ch.isalnum() or ch.isspace()).split() and " ".join(
+                ch for ch in s if ch.isalnum() or ch.isspace()
+            ) or ""
+
+        def _dedupe_items(items):
+            out, seen = [], set()
+            for it in list(items or []):
+                if not isinstance(it, dict):
+                    continue
+                obj = it.get("obj")
+                item_id = getattr(obj, "id", None) or getattr(obj, "track_id", None) if obj is not None else None
+                typ = str(it.get("type") or "")
+                key = (typ, str(item_id).strip()) if item_id is not None and str(item_id).strip() else (typ, _norm_text(it.get("name")))
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(it)
+            return out
+
+        sections = []
+        seen_titles = set()
+        try:
+            if not hasattr(self.session, "page") or self.session.page is None:
+                return sections
+            page_obj = self.session.page.get("pages/hires", params={"deviceType": "BROWSER"})
+            for category in list(getattr(page_obj, "categories", None) or []):
+                title = str(getattr(category, "title", "") or "").strip() or "Hi-Res"
+                dedupe_key = title.lower()
+                if dedupe_key in seen_titles:
+                    continue
+                seen_titles.add(dedupe_key)
+                raw_items = _collect_category_items(category)
+                sec_items = []
+                for item in raw_items:
+                    processed = _process_item(item)
+                    if not processed:
+                        processed = self._process_generic_item(item)
+                    if processed:
+                        sec_items.append(processed)
+                sec_items = _dedupe_items(sec_items)
+                if sec_items:
+                    sections.append({"title": title, "items": sec_items})
+        except Exception as e:
+            logger.warning("Get hires page error [%s]: %s", classify_exception(e), e)
+        return sections
+
     def _process_generic_item(self, item):
         try:
             # 基础信息
@@ -2509,7 +2635,11 @@ class TidalBackend:
                         target = c
                         break
                 if target is None and candidates:
-                    target = candidates[0]
+                    logger.debug(
+                        "Artist artwork name-search: no exact match for %r among %s candidates, skipping to avoid wrong-artist match",
+                        artist_name,
+                        len(candidates),
+                    )
                 if target is not None:
                     u = self.get_artwork_url(target, size) or self._scan_image_like_attrs(target, size)
                     if u and self._is_placeholder_artist_artwork_url(u):

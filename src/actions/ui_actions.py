@@ -1473,6 +1473,116 @@ def _resolve_album_artist_context(app, alb):
     return None, "Various Artists"
 
 
+def _load_similar_albums(app, alb):
+    """Fetch other albums by the same artist and populate app.similar_albums_box. Called from a background thread."""
+    try:
+        artist_obj = getattr(alb, "artist", None) or (getattr(alb, "artists", None) or [None])[0]
+        artist_id = getattr(artist_obj, "id", None)
+        current_id = getattr(alb, "id", None)
+        if not artist_id:
+            GLib.idle_add(lambda: getattr(app, "similar_albums_box", None) and app.similar_albums_box.set_visible(False))
+            return
+        artist = app.backend.session.artist(artist_id)
+        artist_name = str(getattr(artist, "name", getattr(artist_obj, "name", "")) or "")
+        all_albums = artist.get_albums()
+        similar = [a for a in (all_albums or []) if getattr(a, "id", None) != current_id]
+        logger.debug("more from artist: %d albums for artist_id=%s", len(similar), artist_id)
+    except Exception as e:
+        logger.debug("more from artist: exception %s: %s", type(e).__name__, e)
+        GLib.idle_add(lambda: getattr(app, "similar_albums_box", None) and app.similar_albums_box.set_visible(False))
+        return
+    if not similar:
+        GLib.idle_add(lambda: getattr(app, "similar_albums_box", None) and app.similar_albums_box.set_visible(False))
+        return
+
+    def _similar_initial_count():
+        available_width = 0
+        try:
+            scroll = getattr(app, "trk_scroll", None)
+            if scroll is not None:
+                available_width = int(scroll.get_width() or 0)
+        except Exception:
+            pass
+        if available_width <= 0:
+            try:
+                win = getattr(app, "win", None)
+                if win is not None:
+                    available_width = int(win.get_width() or 0)
+            except Exception:
+                pass
+        if available_width <= 0:
+            base_width = int(getattr(ui_config, "WINDOW_WIDTH", 1250) or 1250)
+            sidebar_width = max(int(base_width * float(getattr(ui_config, "SIDEBAR_RATIO", 0.15))), 120)
+            available_width = max(320, base_width - sidebar_width - 64)
+        item_width = max(150, int(getattr(utils, "COVER_SIZE", 170) or 170) + 20)
+        gap = 24
+        columns = max(1, min(8, int((available_width + gap) // (item_width + gap)) or 1))
+        return max(1, columns * 2)
+
+    initial_count = _similar_initial_count()
+
+    def _build_album_card(s_alb):
+        v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, css_classes=_feed_card_classes())
+        img = Gtk.Image(pixel_size=utils.COVER_SIZE, css_classes=["album-cover-img"])
+        utils.load_img(img, lambda a=s_alb: app.backend.get_artwork_url(a, 640), app.cache_dir, utils.COVER_SIZE)
+        v.append(_build_feed_media_overlay(img, utils.COVER_SIZE, "album-cover-img"))
+        title = str(getattr(s_alb, "title", getattr(s_alb, "name", "Unknown")) or "Unknown")
+        v.append(Gtk.Label(
+            label=title, ellipsize=3, halign=Gtk.Align.CENTER,
+            wrap=True, max_width_chars=16,
+            css_classes=["home-card-title"],
+        ))
+        v.append(Gtk.Label(
+            label=_album_year_subtitle_text(s_alb),
+            halign=Gtk.Align.CENTER, ellipsize=3, max_width_chars=18,
+            css_classes=["dim-label", "home-card-subtitle"],
+        ))
+        btn = Gtk.Button(css_classes=["flat", "history-card-btn", "home-feed-btn"])
+        btn.set_child(v)
+        btn.connect("clicked", lambda _b, a=s_alb: app.show_album_details(a))
+        return btn
+
+    def populate():
+        flow = getattr(app, "similar_albums_flow", None)
+        box = getattr(app, "similar_albums_box", None)
+        more_row = getattr(app, "similar_albums_more_row", None)
+        if flow is None or box is None:
+            return
+        lbl = getattr(app, "similar_albums_label", None)
+        if lbl is not None and artist_name:
+            lbl.set_text(f"More by {artist_name}")
+        while c := flow.get_first_child():
+            flow.remove(c)
+        if more_row is not None:
+            while c := more_row.get_first_child():
+                more_row.remove(c)
+            more_row.set_visible(False)
+
+        for s_alb in similar[:initial_count]:
+            flow.append(_build_album_card(s_alb))
+
+        remaining = similar[initial_count:]
+        if remaining and more_row is not None:
+            while c := more_row.get_first_child():
+                more_row.remove(c)
+            more_row.append(Gtk.Box(hexpand=True))
+            more_btn = Gtk.Button(
+                label=f"Show more ({len(remaining)})",
+                css_classes=["flat", "liked-action-btn"],
+            )
+            def _on_show_more(_btn, rem=remaining, f=flow, r=more_row):
+                for a in rem:
+                    f.append(_build_album_card(a))
+                r.set_visible(False)
+            more_btn.connect("clicked", _on_show_more)
+            more_row.append(more_btn)
+            more_row.set_visible(True)
+
+        box.set_visible(True)
+
+    GLib.idle_add(populate)
+
+
 def show_album_details(app, alb):
     current_view = app.right_stack.get_visible_child_name()
     if current_view and current_view != "tracks":
@@ -1516,6 +1626,8 @@ def show_album_details(app, alb):
     app.album_sort_asc = True
     if hasattr(app, "_update_album_sort_headers"):
         app._update_album_sort_headers()
+    if hasattr(app, "similar_albums_box"):
+        app.similar_albums_box.set_visible(False)
 
     def detail_task():
         ts = app.backend.get_tracks(alb)
@@ -1530,6 +1642,7 @@ def show_album_details(app, alb):
             desc += f"  •  {count} Tracks"
         GLib.idle_add(lambda: app.header_meta.set_text(desc.strip(" • ")))
         GLib.idle_add(app.load_album_tracks, ts)
+        _load_similar_albums(app, alb)
 
     Thread(target=detail_task, daemon=True).start()
 
@@ -2611,6 +2724,18 @@ def render_artist_detail(app, artist, render_token=None):
     )
     eps_section.append(eps_loading)
 
+    fans_section = _append_section_header("Fans Also Like", 0)
+    fans_flow = Gtk.FlowBox(
+        valign=Gtk.Align.START,
+        max_children_per_line=30,
+        selection_mode=Gtk.SelectionMode.NONE,
+        column_spacing=24,
+        row_spacing=28,
+        css_classes=["home-flow"],
+    )
+    fans_section.append(fans_flow)
+    fans_section.set_visible(False)
+
     def _render_track_rows(tracks):
         _clear_container(top_grid)
         if top_loading.get_parent() is not None:
@@ -2828,9 +2953,133 @@ def render_artist_detail(app, artist, render_token=None):
 
         GLib.idle_add(apply)
 
+    def _load_similar_artists(local_token=token):
+        similar = app.backend.get_similar_artists(artist)
+
+        def _build_artist_card(sim_art):
+            v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, css_classes=_artist_card_classes())
+            img = Gtk.Image(pixel_size=150, css_classes=["circular-avatar"])
+            utils.load_img(img, lambda a=sim_art: app.backend.get_artist_artwork_url(a, 320), app.cache_dir, 150)
+            v.append(_build_feed_media_overlay(img, 150, "circular-avatar"))
+            v.append(Gtk.Label(
+                label=str(getattr(sim_art, "name", "") or ""),
+                ellipsize=2, halign=Gtk.Align.CENTER,
+                wrap=True, max_width_chars=14,
+                css_classes=["heading", "home-card-title"],
+            ))
+            btn = Gtk.Button(css_classes=["flat", "history-card-btn", "home-feed-btn"])
+            btn.set_child(v)
+            btn.connect("clicked", lambda _b, a=sim_art: app.on_artist_clicked(a))
+            return btn
+
+        def apply():
+            if int(getattr(app, "_artist_albums_render_token", 0) or 0) != local_token:
+                return False
+            if not similar:
+                fans_section.set_visible(False)
+                return False
+            _clear_container(fans_flow)
+            for sim_art in similar:
+                fans_flow.append(_build_artist_card(sim_art))
+
+            fans_more_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            fans_more_row.append(Gtk.Box(hexpand=True))
+            more_btn = Gtk.Button(css_classes=["flat", "liked-action-btn"])
+            more_btn.set_visible(False)
+            fans_more_row.append(more_btn)
+            fans_more_row.set_visible(False)
+            fans_section.append(fans_more_row)
+            fans_section.set_visible(True)
+
+            expanded = [False]
+
+            def _apply_2_row_limit():
+                if expanded[0]:
+                    return False
+                if fans_flow.get_parent() is None:
+                    return False
+                if fans_flow.get_height() == 0:
+                    GLib.idle_add(_apply_2_row_limit)
+                    return False
+                children = []
+                ch = fans_flow.get_first_child()
+                while ch:
+                    children.append(ch)
+                    ch = ch.get_next_sibling()
+                if not children:
+                    return False
+                row_ys = []
+                for ch in children:
+                    try:
+                        y = ch.get_allocation().y
+                    except Exception:
+                        continue
+                    if not row_ys or y > row_ys[-1] + 10:
+                        row_ys.append(y)
+                if len(row_ys) <= 2:
+                    for ch in children:
+                        ch.set_visible(True)
+                    fans_more_row.set_visible(False)
+                    return False
+                cutoff_y = row_ys[2]
+                hidden = 0
+                for ch in children:
+                    try:
+                        visible = ch.get_allocation().y < cutoff_y
+                    except Exception:
+                        visible = True
+                    ch.set_visible(visible)
+                    if not visible:
+                        hidden += 1
+                if hidden > 0:
+                    more_btn.set_label(f"Show more ({hidden})")
+                    more_btn.set_visible(True)
+                    fans_more_row.set_visible(True)
+                else:
+                    fans_more_row.set_visible(False)
+                return False
+
+            def _on_more(_btn):
+                expanded[0] = True
+                ch = fans_flow.get_first_child()
+                while ch:
+                    ch.set_visible(True)
+                    ch = ch.get_next_sibling()
+                fans_more_row.set_visible(False)
+
+            more_btn.connect("clicked", _on_more)
+            GLib.idle_add(_apply_2_row_limit)
+
+            # Re-apply on window width change
+            scroll = getattr(app, "alb_scroll", None)
+            if scroll is not None:
+                def _on_width_changed(*_):
+                    if not expanded[0] and fans_flow.get_parent() is not None:
+                        GLib.idle_add(_apply_2_row_limit)
+                hid = scroll.connect("notify::width", _on_width_changed)
+                existing = list(getattr(app, "_artist_detail_layout_handler_ids", []) or [])
+                existing.append((scroll, hid))
+                app._artist_detail_layout_handler_ids = existing
+
+            return False
+
+        GLib.idle_add(apply)
+
     Thread(target=_load_top_tracks, daemon=True).start()
     Thread(target=_load_albums, daemon=True).start()
     Thread(target=_load_eps, daemon=True).start()
+    Thread(target=_load_similar_artists, daemon=True).start()
+
+    def _scroll_to_top():
+        try:
+            vadj = app.alb_scroll.get_vadjustment() if getattr(app, "alb_scroll", None) else None
+            if vadj is not None:
+                vadj.set_value(0.0)
+        except Exception:
+            pass
+        return False
+
+    GLib.idle_add(_scroll_to_top)
 
 
 def batch_load_home(app, sections):
@@ -3888,6 +4137,152 @@ def render_new_dashboard(app, prefer_cache=True):
 
             GLib.idle_add(lambda: (_render_sections(sections), False)[1])
 
+        Thread(target=task, daemon=True).start()
+
+
+def render_hires_dashboard(app, prefer_cache=True):
+    _clear_container(app.collection_content_box)
+
+    def _render_sections(sections):
+        _clear_container(app.collection_content_box)
+        if sections:
+            app._hires_sections_cache = list(sections)
+            app._hires_sections_cache_time = time.monotonic()
+            tabs_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+            hires_stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
+            hires_stack.set_hhomogeneous(False)
+            hires_stack.set_vhomogeneous(False)
+            hires_switcher = Gtk.StackSwitcher(stack=hires_stack)
+            hires_switcher.set_halign(Gtk.Align.START)
+            tabs_box.append(hires_switcher)
+            tabs_box.append(hires_stack)
+
+            def _open_item(item_data):
+                if not item_data:
+                    return
+                obj = item_data.get("obj")
+                typ = item_data.get("type")
+                if typ in {"PageItem", "PageLink"} and obj is not None and hasattr(obj, "get") and callable(obj.get):
+                    def task():
+                        try:
+                            resolved = obj.get()
+                        except Exception:
+                            resolved = None
+                        if resolved is None:
+                            return
+                        def apply():
+                            resolved_type = type(resolved).__name__
+                            if "Track" in resolved_type:
+                                app._play_single_track(resolved)
+                            elif "Artist" in resolved_type:
+                                app.on_artist_clicked(resolved)
+                            elif "Playlist" in resolved_type:
+                                app.on_remote_playlist_card_clicked(resolved)
+                            else:
+                                app.show_album_details(resolved)
+                            return False
+                        GLib.idle_add(apply)
+                    Thread(target=task, daemon=True).start()
+                    return
+                if typ == "Track":
+                    app._play_single_track(obj)
+                    return
+                if typ == "Artist":
+                    app.on_artist_clicked(obj)
+                    return
+                if "Playlist" in str(typ or ""):
+                    app.on_remote_playlist_card_clicked(obj)
+                    return
+                app.show_album_details(obj)
+
+            def _build_item_button(item_data):
+                return _build_feed_item_button(app, item_data, _open_item)
+
+            _tab_data = {}
+            for idx, sec in enumerate(sections):
+                page_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, css_classes=["home-section"])
+                page_box.set_valign(Gtk.Align.START)
+                page_box.set_vexpand(False)
+                title = str(sec.get("title", "") or f"Hi-Res {idx + 1}")
+                items = list(sec.get("items", []) or [])
+                tab_name = f"hires-sec-{idx}"
+                _tab_data[tab_name] = (items, page_box)
+                hires_stack.add_titled(page_box, tab_name, title)
+
+            section_names = list(_tab_data.keys())
+            selected = str(getattr(app, "_hires_selected_tab", "") or "")
+            initial_tab = selected if selected in section_names else (section_names[0] if section_names else None)
+            if initial_tab:
+                hires_stack.set_visible_child_name(initial_tab)
+
+            _populated_tabs = set()
+
+            def _populate_hires_tab(tab_name):
+                if tab_name in _populated_tabs or tab_name not in _tab_data:
+                    return
+                _populated_tabs.add(tab_name)
+                tab_items, tab_page_box = _tab_data[tab_name]
+                flow = Gtk.FlowBox(
+                    homogeneous=True,
+                    min_children_per_line=2,
+                    max_children_per_line=16,
+                    column_spacing=16,
+                    row_spacing=16,
+                    selection_mode=Gtk.SelectionMode.NONE,
+                )
+                tab_page_box.append(flow)
+                idx_state = [0]
+
+                def _build_hires_flow(flow=flow, tab_items=tab_items, idx_state=idx_state):
+                    for _ in range(8):
+                        idx = idx_state[0]
+                        if idx >= len(tab_items):
+                            return False
+                        btn = _build_item_button(tab_items[idx])
+                        child = Gtk.FlowBoxChild()
+                        child.set_child(btn)
+                        flow.append(child)
+                        idx_state[0] += 1
+                    return idx_state[0] < len(tab_items)
+
+                GLib.idle_add(_build_hires_flow)
+
+            def _on_hires_tab_changed(stack, _pspec):
+                try:
+                    name = str(stack.get_visible_child_name() or "")
+                except Exception:
+                    name = ""
+                if name:
+                    app._hires_selected_tab = name
+                    _populate_hires_tab(name)
+
+            hires_stack.connect("notify::visible-child-name", _on_hires_tab_changed)
+            app.collection_content_box.append(tabs_box)
+            if initial_tab:
+                _populate_hires_tab(initial_tab)
+        else:
+            app._hires_sections_cache = None
+            app.collection_content_box.append(
+                Gtk.Label(
+                    label="Hi-Res content is not available for your account or region.",
+                    xalign=0,
+                    css_classes=["dim-label"],
+                    margin_start=8,
+                    margin_top=8,
+                )
+            )
+
+    cached = list(getattr(app, "_hires_sections_cache", None) or [])
+    cache_age = time.monotonic() - getattr(app, "_hires_sections_cache_time", 0)
+    cache_is_fresh = bool(cached) and cache_age < 300
+
+    if prefer_cache and cached:
+        _render_sections(cached)
+
+    if not cache_is_fresh:
+        def task():
+            sections = list(app.backend.get_hires_page() or [])
+            GLib.idle_add(lambda: (_render_sections(sections), False)[1])
         Thread(target=task, daemon=True).start()
 
 

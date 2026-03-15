@@ -24,22 +24,6 @@ def on_lastfm_enabled_toggled(self, switch, state):
 
 
 def on_lastfm_connect_clicked(self, btn):
-    api_key = str(getattr(self, "scrobble_lastfm_key_entry", None) and
-                  self.scrobble_lastfm_key_entry.get_text() or "").strip()
-    api_secret = str(getattr(self, "scrobble_lastfm_secret_entry", None) and
-                     self.scrobble_lastfm_secret_entry.get_text() or "").strip()
-
-    if not api_key or not api_secret:
-        _show_scrobble_error(self, "Enter your Last.fm API Key and Secret first.")
-        return
-
-    # Save credentials immediately so the scrobbler can use them for the token request
-    self.settings["scrobble_lastfm_api_key"] = api_key
-    self.settings["scrobble_lastfm_api_secret"] = api_secret
-    self.schedule_save_settings()
-    if hasattr(self, "scrobbler"):
-        self.scrobbler.configure(self.settings)
-
     btn.set_sensitive(False)
     btn.set_label("Connecting…")
 
@@ -150,19 +134,23 @@ def _refresh_lastfm_status_ui(self):
     if session_key and enabled:
         lbl.set_text("Connected")
         lbl.remove_css_class("dim-label")
-        lbl.add_css_class("success-label")
+        lbl.add_css_class("success-text")
     elif session_key:
         lbl.set_text("Authorized (disabled)")
         lbl.add_css_class("dim-label")
-        lbl.remove_css_class("success-label")
+        lbl.remove_css_class("success-text")
     else:
         lbl.set_text("Not connected")
         lbl.add_css_class("dim-label")
-        lbl.remove_css_class("success-label")
+        lbl.remove_css_class("success-text")
 
     disconnect_btn = getattr(self, "scrobble_lastfm_disconnect_btn", None)
     if disconnect_btn is not None:
         disconnect_btn.set_sensitive(bool(session_key))
+
+    connect_btn = getattr(self, "scrobble_lastfm_connect_btn", None)
+    if connect_btn is not None:
+        connect_btn.set_visible(not bool(session_key))
 
 
 # ---- ListenBrainz ----
@@ -206,14 +194,6 @@ def init_scrobble_settings_ui(self):
     sw = getattr(self, "scrobble_lastfm_switch", None)
     if sw is not None:
         sw.set_active(bool(self.settings.get("scrobble_lastfm_enabled", False)))
-
-    key_entry = getattr(self, "scrobble_lastfm_key_entry", None)
-    if key_entry is not None:
-        key_entry.set_text(str(self.settings.get("scrobble_lastfm_api_key", "") or ""))
-
-    secret_entry = getattr(self, "scrobble_lastfm_secret_entry", None)
-    if secret_entry is not None:
-        secret_entry.set_text(str(self.settings.get("scrobble_lastfm_api_secret", "") or ""))
 
     lb_sw = getattr(self, "scrobble_lb_switch", None)
     if lb_sw is not None:
