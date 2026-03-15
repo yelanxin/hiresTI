@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.7.0 - 2026-03-15
+
+### Added
+- **Last.fm scrobbling**: Connect via OAuth browser flow, enable/disable per session. Scrobbles submit at ≥ 30 s played and ≥ min(50 % duration, 4 min). Now-playing notifications are sent on track start. Session key is saved permanently; connection persists across restarts.
+- **ListenBrainz scrobbling**: Paste a user token to enable. Same scrobble timing rules as Last.fm.
+- **DSP Presets**: Save and load complete DSP configurations (PEQ, convolver, resampler, tape, tube, widener, limiter, LV2 slots, DSP order) as named presets stored in `~/.config/hiresti/dsp_presets.json`. Preset controls (dropdown, Load, Save As…, Delete) are located on the DSP Overview tab, below the Signal Chain card. Save dialog pre-fills the next unused default name (`My Preset N`).
+
+### Fixed
+- Fixed DSP preset load applying only PEQ parameters. The master `set_dsp_enabled` switch was previously called before individual module states were applied, causing the Rust engine to reset them. Load order now mirrors the startup sequence: all module params and enabled states are applied first, master switch is toggled last. DSP workspace UI switches and overview chain button styles are refreshed after loading.
+- Fixed artist detail page sometimes displaying artwork from the wrong artist (e.g. "BEAT" showing The Beatles). When resolving artwork by name search, the fallback that unconditionally used the first search result has been removed; only an exact case-insensitive name match is accepted, otherwise the lookup proceeds to the album-cover fallback using the correct artist object.
+- Fixed artist detail page not scrolling to the top when navigating to an artist. The scroll position is now reset after GTK finishes laying out the new content, so the hero image is always visible on entry.
+
 ## 1.6.10 - 2026-03-14
 
 ### Added

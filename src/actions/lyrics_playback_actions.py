@@ -298,6 +298,9 @@ def play_track(app, index):
 
     logger.info("Playing: %s", track.name)
 
+    if hasattr(app, "scrobbler"):
+        app.scrobbler.on_track_started(track)
+
     try:
         title = getattr(track, "name", "Unknown Track")
         artist = getattr(track.artist, "name", "Unknown Artist")
@@ -595,6 +598,8 @@ def update_ui_loop(app):
             app._playback_rebind_hold_until_s = 0.0
 
     if d > 0:
+        if hasattr(app, "scrobbler"):
+            app.scrobbler.check_scrobble(float(p), float(d))
         user_interacting_seek = bool(getattr(app, "_seek_user_interacting", False))
         if not user_interacting_seek:
             scale_changed = False

@@ -8,7 +8,7 @@ from core.constants import AlsaMmapRealtimePriority, VisualizerSettings
 
 logger = logging.getLogger(__name__)
 
-CURRENT_SETTINGS_VERSION = 6
+CURRENT_SETTINGS_VERSION = 7
 DSP_REORDERABLE_MODULES = ["peq", "convolver", "tape", "tube", "widener"]
 PEQ_BAND_COUNT = 10
 
@@ -76,6 +76,12 @@ class SettingsSchema:
     remote_api_bind_host: str = "0.0.0.0"
     remote_api_port: int = 18473
     remote_api_allowed_cidrs: list = field(default_factory=list)
+    scrobble_lastfm_enabled: bool = False
+    scrobble_lastfm_api_key: str = ""
+    scrobble_lastfm_api_secret: str = ""
+    scrobble_lastfm_session_key: str = ""
+    scrobble_listenbrainz_enabled: bool = False
+    scrobble_listenbrainz_token: str = ""
 
 
 # Default settings as dict for quick access
@@ -139,6 +145,12 @@ DEFAULT_SETTINGS = {
     "remote_api_bind_host": "0.0.0.0",
     "remote_api_port": 18473,
     "remote_api_allowed_cidrs": [],
+    "scrobble_lastfm_enabled": False,
+    "scrobble_lastfm_api_key": "",
+    "scrobble_lastfm_api_secret": "",
+    "scrobble_lastfm_session_key": "",
+    "scrobble_listenbrainz_enabled": False,
+    "scrobble_listenbrainz_token": "",
 }
 
 
@@ -201,6 +213,12 @@ _VALIDATION_RULES = {
     "remote_api_bind_host": (str, None, None, "0.0.0.0"),
     "remote_api_port": (int, 1, 65535, 18473),
     "remote_api_allowed_cidrs": (list, None, None, []),
+    "scrobble_lastfm_enabled": (bool, None, None, False),
+    "scrobble_lastfm_api_key": (str, None, None, ""),
+    "scrobble_lastfm_api_secret": (str, None, None, ""),
+    "scrobble_lastfm_session_key": (str, None, None, ""),
+    "scrobble_listenbrainz_enabled": (bool, None, None, False),
+    "scrobble_listenbrainz_token": (str, None, None, ""),
 }
 
 
@@ -441,6 +459,12 @@ def normalize_settings(raw: Optional[dict[str, Any]]) -> dict[str, Any]:
     normalized["remote_api_bind_host"] = _as_str(raw.get("remote_api_bind_host"), DEFAULT_SETTINGS["remote_api_bind_host"])
     normalized["remote_api_port"] = _as_int(raw.get("remote_api_port"), DEFAULT_SETTINGS["remote_api_port"], minimum=1, maximum=65535)
     normalized["remote_api_allowed_cidrs"] = _as_str_list(raw.get("remote_api_allowed_cidrs"), DEFAULT_SETTINGS["remote_api_allowed_cidrs"], max_items=32)
+    normalized["scrobble_lastfm_enabled"] = _as_bool(raw.get("scrobble_lastfm_enabled"), False)
+    normalized["scrobble_lastfm_api_key"] = raw.get("scrobble_lastfm_api_key", "") if isinstance(raw.get("scrobble_lastfm_api_key"), str) else ""
+    normalized["scrobble_lastfm_api_secret"] = raw.get("scrobble_lastfm_api_secret", "") if isinstance(raw.get("scrobble_lastfm_api_secret"), str) else ""
+    normalized["scrobble_lastfm_session_key"] = raw.get("scrobble_lastfm_session_key", "") if isinstance(raw.get("scrobble_lastfm_session_key"), str) else ""
+    normalized["scrobble_listenbrainz_enabled"] = _as_bool(raw.get("scrobble_listenbrainz_enabled"), False)
+    normalized["scrobble_listenbrainz_token"] = raw.get("scrobble_listenbrainz_token", "") if isinstance(raw.get("scrobble_listenbrainz_token"), str) else ""
     normalized["settings_version"] = CURRENT_SETTINGS_VERSION
 
     # Exclusive lock requires bit-perfect mode.

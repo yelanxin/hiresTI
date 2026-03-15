@@ -10,7 +10,9 @@ from backend import TidalBackend
 from core.constants import CacheSettings
 from core.settings import load_settings
 from models import HistoryManager, PlaylistManager
+from services.dsp_presets import DspPresetManager
 from services.lyrics import LyricsManager
+from services.scrobbler import ScrobblerService
 from ui import config as ui_config
 from utils.paths import get_cache_dir, get_config_dir
 
@@ -77,6 +79,10 @@ def _init_audio_and_data_services(self):
     self.lyrics_mgr = LyricsManager()
     logger.info("LyricsManager initialized")
 
+    self.scrobbler = ScrobblerService()
+    self.scrobbler.configure(self.settings)
+    logger.info("ScrobblerService initialized")
+
     saved_rt_profile = self.settings.get(
         "alsa_mmap_realtime_priority",
         self.ALSA_MMAP_REALTIME_PRIORITY_DEFAULT,
@@ -107,6 +113,8 @@ def _init_audio_and_data_services(self):
 
     self.history_mgr = HistoryManager(base_dir=self._cache_root, scope_key=self._account_scope)
     self.playlist_mgr = PlaylistManager(base_dir=self._cache_root, scope_key=self._account_scope)
+    self.dsp_preset_mgr = DspPresetManager(config_dir=self._config_root)
+    logger.info("DspPresetManager initialized")
     self.cache_dir = os.path.join(self._cache_root, "covers")
     os.makedirs(self.cache_dir, exist_ok=True)
     self.audio_cache_dir = os.path.join(self._cache_root, "audio")
