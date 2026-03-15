@@ -28,16 +28,35 @@ def refresh_dsp_preset_list(self):
         del_btn.set_sensitive(bool(names))
 
 
+def _next_default_preset_name(mgr) -> str:
+    """Return 'My Preset N' where N is the lowest unused number."""
+    existing = set(mgr.list_presets())
+    i = 1
+    while True:
+        name = f"My Preset {i}"
+        if name not in existing:
+            return name
+        i += 1
+
+
 def on_dsp_preset_save_clicked(self, btn):
     """Show a dialog to enter a preset name, then save."""
+    mgr = getattr(self, "dsp_preset_mgr", None)
+    if mgr is None:
+        return
+
+    default_name = _next_default_preset_name(mgr)
+
     dialog = Adw.MessageDialog(
         transient_for=getattr(self, "win", None),
         heading="Save DSP Preset",
         body="Enter a name for this preset:",
     )
-    name_entry = Gtk.Entry(placeholder_text="My Preset", width_chars=28)
+    name_entry = Gtk.Entry(text=default_name, width_chars=28)
     name_entry.set_margin_top(8)
     name_entry.set_margin_bottom(4)
+    # Select all text so user can overwrite easily
+    name_entry.select_region(0, -1)
     dialog.set_extra_child(name_entry)
     dialog.add_response("cancel", "Cancel")
     dialog.add_response("save", "Save")
@@ -47,15 +66,12 @@ def on_dsp_preset_save_clicked(self, btn):
         if response != "save":
             return
         name = name_entry.get_text().strip()
+        # Fall back to default name if entry was cleared
         if not name:
-            return
-        mgr = getattr(self, "dsp_preset_mgr", None)
-        if mgr is None:
-            return
+            name = default_name
         ok = mgr.save_preset(name, self.settings)
         if ok:
             refresh_dsp_preset_list(self)
-            # Select the newly saved preset
             dd = getattr(self, "dsp_preset_dd", None)
             if dd is not None:
                 names = mgr.list_presets()
@@ -65,7 +81,7 @@ def on_dsp_preset_save_clicked(self, btn):
             err = Adw.MessageDialog(
                 transient_for=getattr(self, "win", None),
                 heading="Cannot Save Preset",
-                body=f"Preset limit reached (max {20}) or name is empty.",
+                body=f"Preset limit reached (max 20).",
             )
             err.add_response("ok", "OK")
             err.present()
@@ -92,12 +108,11 @@ def on_dsp_preset_load_clicked(self, btn):
     if preset is None:
         return
 
-    # Apply preset values into app.settings
     self.settings.update(preset)
     self.schedule_save_settings()
 
-    # Apply to player
     _apply_dsp_preset_to_player(self, preset)
+    _sync_dsp_ui_to_preset(self, preset)
 
     if hasattr(self, "show_output_notice"):
         self.show_output_notice(f"DSP preset loaded: {name}", "info", 2500)
@@ -136,22 +151,20 @@ def on_dsp_preset_delete_clicked(self, btn):
 
 
 def _apply_dsp_preset_to_player(self, preset: dict):
-    """Push all DSP settings from a preset dict to the player."""
+    """Push all DSP settings from a preset dict to the player.
+
+    Mirrors the initialization order in app_init_runtime.py:
+    individual module params → enabled states → dsp_enabled master last.
+    """
     p = self.player
 
-    # Master DSP enabled
-    try:
-        p.set_dsp_enabled(bool(preset.get("dsp_enabled", True)))
-    except Exception:
-        pass
-
-    # DSP order
+    # DSP order first (affects routing)
     order = preset.get("dsp_order")
     if order and hasattr(p, "set_dsp_order"):
         try:
             p.set_dsp_order(list(order))
         except Exception:
-            pass
+            logger.debug("set_dsp_order failed in preset load", exc_info=True)
 
     # PEQ
     try:
@@ -163,7 +176,7 @@ def _apply_dsp_preset_to_player(self, preset: dict):
         p.set_peq_enabled(bool(preset.get("dsp_peq_enabled", False)))
         self.eq_band_values = bands[:10]
     except Exception:
-        pass
+        logger.debug("PEQ apply failed in preset load", exc_info=True)
 
     # Convolver
     path = str(preset.get("dsp_convolver_path", "") or "").strip()
@@ -180,7 +193,7 @@ def _apply_dsp_preset_to_player(self, preset: dict):
                 p.set_convolver_pre_delay(float(delay))
                 p.set_convolver_enabled(bool(preset.get("dsp_convolver_enabled", False)))
             except Exception:
-                pass
+                logger.debug("Convolver apply failed in preset load", exc_info=True)
 
     # Resampler
     try:
@@ -190,7 +203,7 @@ def _apply_dsp_preset_to_player(self, preset: dict):
             p.set_resampler_target_rate(rate)
         p.set_resampler_enabled(bool(preset.get("dsp_resampler_enabled", False)))
     except Exception:
-        pass
+        logger.debug("Resampler apply failed in preset load", exc_info=True)
 
     # Tape
     try:
@@ -199,7 +212,7 @@ def _apply_dsp_preset_to_player(self, preset: dict):
         p.set_tape_warmth(int(preset.get("dsp_tape_warmth", 40) or 40))
         p.set_tape_enabled(bool(preset.get("dsp_tape_enabled", False)))
     except Exception:
-        pass
+        logger.debug("Tape apply failed in preset load", exc_info=True)
 
     # Tube
     try:
@@ -209,7 +222,7 @@ def _apply_dsp_preset_to_player(self, preset: dict):
         p.set_tube_air(int(preset.get("dsp_tube_air", 52) or 52))
         p.set_tube_enabled(bool(preset.get("dsp_tube_enabled", False)))
     except Exception:
-        pass
+        logger.debug("Tube apply failed in preset load", exc_info=True)
 
     # Widener
     try:
@@ -218,7 +231,7 @@ def _apply_dsp_preset_to_player(self, preset: dict):
         p.set_widener_bass_mono_amount(int(preset.get("dsp_widener_bass_mono_amount", 100) or 100))
         p.set_widener_enabled(bool(preset.get("dsp_widener_enabled", False)))
     except Exception:
-        pass
+        logger.debug("Widener apply failed in preset load", exc_info=True)
 
     # Limiter
     try:
@@ -228,7 +241,7 @@ def _apply_dsp_preset_to_player(self, preset: dict):
         p.set_limiter_ratio(float(ratio))
         p.set_limiter_enabled(bool(preset.get("dsp_limiter_enabled", False)))
     except Exception:
-        pass
+        logger.debug("Limiter apply failed in preset load", exc_info=True)
 
     # LV2 slots
     lv2_slots = preset.get("dsp_lv2_slots") or []
@@ -236,4 +249,42 @@ def _apply_dsp_preset_to_player(self, preset: dict):
         try:
             p.lv2_restore_slots(lv2_slots)
         except Exception:
+            logger.debug("LV2 restore failed in preset load", exc_info=True)
+
+    # DSP master switch LAST — mirrors app_init_runtime.py order
+    try:
+        p.set_dsp_enabled(bool(preset.get("dsp_enabled", True)))
+    except Exception:
+        logger.debug("set_dsp_enabled failed in preset load", exc_info=True)
+
+
+def _sync_dsp_ui_to_preset(self, preset: dict):
+    """Sync DSP workspace UI switches to match loaded preset state."""
+    module_switches = getattr(self, "dsp_module_switches", {})
+    module_map = {
+        "peq": "dsp_peq_enabled",
+        "convolver": "dsp_convolver_enabled",
+        "tape": "dsp_tape_enabled",
+        "tube": "dsp_tube_enabled",
+        "widener": "dsp_widener_enabled",
+        "resampler": "dsp_resampler_enabled",
+        "limiter": "dsp_limiter_enabled",
+    }
+    for module_id, key in module_map.items():
+        switch = module_switches.get(module_id)
+        if switch is not None:
+            try:
+                switch.set_active(bool(preset.get(key, False)))
+            except Exception:
+                pass
+
+    master_switch = getattr(self, "dsp_master_switch", None)
+    if master_switch is not None:
+        try:
+            master_switch.set_active(bool(preset.get("dsp_enabled", True)))
+        except Exception:
             pass
+
+    # Refresh overview chain buttons' active/inactive styling
+    if hasattr(self, "_update_dsp_ui_state"):
+        GLib.idle_add(self._update_dsp_ui_state)
