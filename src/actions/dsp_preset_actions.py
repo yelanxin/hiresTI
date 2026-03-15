@@ -285,6 +285,38 @@ def _sync_dsp_ui_to_preset(self, preset: dict):
         except Exception:
             pass
 
+    # Sync PEQ sliders to the updated eq_band_values
+    if hasattr(self, "_sync_eq_slider_groups"):
+        try:
+            self._sync_eq_slider_groups()
+        except Exception:
+            pass
+
+    # Remove existing LV2 detail pages from the stack before rebuilding, so
+    # _lv2_build_slot_page recreates them with the restored preset's port values.
+    # Without this, the "already built?" guard skips pages for same-slot-id plugins,
+    # leaving stale knob/slider positions even though the player has the correct values.
+    player = getattr(self, "player", None)
+    stack = getattr(self, "dsp_module_stack", None)
+    restored_lv2_slots = dict(getattr(player, "lv2_slots", {}) or {}) if player else {}
+    if stack is not None and restored_lv2_slots:
+        scales = getattr(self, "dsp_lv2_slot_scales", {})
+        for slot_id in restored_lv2_slots:
+            try:
+                child_page = stack.get_child_by_name(slot_id)
+                if child_page is not None:
+                    stack.remove(child_page)
+                scales.pop(slot_id, None)
+            except Exception:
+                pass
+
+    # Rebuild LV2 sidebar rows (also calls _lv2_build_slot_page for each slot)
+    if hasattr(self, "_lv2_rebuild_sidebar_rows"):
+        try:
+            GLib.idle_add(self._lv2_rebuild_sidebar_rows)
+        except Exception:
+            pass
+
     # Refresh overview chain buttons' active/inactive styling
     if hasattr(self, "_update_dsp_ui_state"):
         GLib.idle_add(self._update_dsp_ui_state)

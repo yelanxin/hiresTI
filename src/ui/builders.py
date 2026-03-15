@@ -944,6 +944,7 @@ def build_body(app, container):
         ("home", "hiresti-home-symbolic", "Home"),
         ("new", "starred-symbolic", "New"),
         ("top", "view-grid-symbolic", "Top"),
+        ("hires", "audio-x-generic-symbolic", "Hi-Res"),
         ("collection", "hiresti-collection-symbolic", "My Albums"),
         ("liked_songs", "hiresti-favorite-symbolic", "Liked Songs"),
         ("artists", "hiresti-artists-symbolic", "Artists"),

@@ -63,13 +63,17 @@ def _listenbrainz_post(token: str, payload: dict) -> bool:
         return False
 
 
+_LASTFM_API_KEY = "24f06b8f7dbc89a0061d0c9a0f450eec"
+_LASTFM_API_SECRET = "1ddd21eee354659d148d19736255c9e5"
+
+
 class ScrobblerService:
     """Manages scrobbling to Last.fm and/or ListenBrainz."""
 
     def __init__(self):
         self._lastfm_enabled = False
-        self._lastfm_api_key = ""
-        self._lastfm_api_secret = ""
+        self._lastfm_api_key = _LASTFM_API_KEY
+        self._lastfm_api_secret = _LASTFM_API_SECRET
         self._lastfm_session_key = ""
         self._listenbrainz_enabled = False
         self._listenbrainz_token = ""
@@ -82,8 +86,6 @@ class ScrobblerService:
     def configure(self, settings: dict):
         """Update service configuration from app settings dict."""
         self._lastfm_enabled = bool(settings.get("scrobble_lastfm_enabled", False))
-        self._lastfm_api_key = str(settings.get("scrobble_lastfm_api_key", "") or "")
-        self._lastfm_api_secret = str(settings.get("scrobble_lastfm_api_secret", "") or "")
         self._lastfm_session_key = str(settings.get("scrobble_lastfm_session_key", "") or "")
         self._listenbrainz_enabled = bool(settings.get("scrobble_listenbrainz_enabled", False))
         self._listenbrainz_token = str(settings.get("scrobble_listenbrainz_token", "") or "")

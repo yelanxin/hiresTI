@@ -230,6 +230,8 @@ def on_remote_playlist_card_clicked(self, playlist_obj):
     self.header_artist.set_text(creator_name)
     self.header_artist.set_tooltip_text(creator_name)
     self.header_meta.set_text("")
+    if hasattr(self, "similar_albums_box"):
+        self.similar_albums_box.set_visible(False)
     if self.fav_btn is not None:
         self.fav_btn.set_visible(False)
     if self.add_playlist_btn is not None:
