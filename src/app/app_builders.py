@@ -129,8 +129,9 @@ def _configure_dsp_scale(scale, digits=0, value_pos=Gtk.PositionType.RIGHT):
 
 def _build_dsp_scroll_area(child, min_height=_DSP_WORKSPACE_MIN_HEIGHT, max_height=_DSP_WORKSPACE_MAX_HEIGHT):
     scroll = Gtk.ScrolledWindow(hexpand=True, vexpand=True)
-    scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+    scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
     scroll.set_propagate_natural_height(True)
+    scroll.set_propagate_natural_width(False)
     if min_height is not None:
         scroll.set_min_content_height(int(min_height))
     if max_height is not None:

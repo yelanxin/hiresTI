@@ -2893,7 +2893,13 @@ def batch_load_home(app, sections):
             context_img = Gtk.Image(pixel_size=48, css_classes=["album-cover-img"])
             context_img.set_size_request(48, 48)
             utils.load_img(context_img, context_image_url, app.cache_dir, 48)
-            section_head.append(context_img)
+            if context_header.get("obj") is not None:
+                ctx_btn = Gtk.Button(css_classes=["flat", "history-card-btn"])
+                ctx_btn.set_child(context_img)
+                ctx_btn.connect("clicked", lambda _b, d=context_header: _open_item(d))
+                section_head.append(ctx_btn)
+            else:
+                section_head.append(context_img)
         heading_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
         header_lines = _home_section_header_lines(sec)
         if header_lines["kicker"]:
@@ -2906,8 +2912,15 @@ def batch_load_home(app, sections):
                     css_classes=["dim-label", "home-card-subtitle", "home-section-subtitle"],
                 )
             )
-        section_title = Gtk.Label(label=header_lines["title"], xalign=0, hexpand=True, css_classes=["home-section-title"])
-        heading_box.append(section_title)
+        if context_header.get("obj") is not None:
+            section_title_label = Gtk.Label(label=header_lines["title"], xalign=0, css_classes=["home-section-title", "home-section-title-link"])
+            section_title_btn = Gtk.Button(css_classes=["home-section-title-btn"], hexpand=True, halign=Gtk.Align.FILL)
+            section_title_btn.set_child(section_title_label)
+            section_title_btn.connect("clicked", lambda _b, d=context_header: _open_item(d))
+            heading_box.append(section_title_btn)
+        else:
+            section_title = Gtk.Label(label=header_lines["title"], xalign=0, hexpand=True, css_classes=["home-section-title"])
+            heading_box.append(section_title)
         section_subtitle = header_lines["secondary"]
         if section_subtitle:
             heading_box.append(
@@ -4024,7 +4037,6 @@ def render_collection_dashboard(app, favorite_tracks=None, favorite_albums=None)
                     label=_album_title_text(alb),
                     halign=Gtk.Align.CENTER,
                     ellipsize=3,
-                    wrap=True,
                     max_width_chars=14,
                     css_classes=["home-card-title"],
                 )

@@ -274,10 +274,6 @@ def _get_rounded_radius(classes: set, size: int) -> int:
 
 def load_img(widget: Any, url_provider: Callable[[], str] | str, cache_dir: str, size: int = 84) -> None:
     widget.set_size_request(size, size)
-    if hasattr(widget, 'set_paintable'):
-        widget.set_paintable(None)
-    elif hasattr(widget, 'set_from_pixbuf'):
-        widget.set_from_pixbuf(None)
 
     def fetch():
         try:

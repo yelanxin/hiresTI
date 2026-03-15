@@ -38,6 +38,8 @@ class TidalBackend:
         self._favorite_artists_index_dirty = False
         self._artist_artwork_cache = {}  # LRU cache using dict (ordered in Python 3.7+)
         self.max_artist_artwork_cache = 500  # Limit cache size to prevent memory leak
+        self._artist_artwork_inflight: dict[str, threading.Event] = {}  # per-key dedup lock
+        self._artist_artwork_inflight_lock = threading.Lock()
         self._artist_placeholder_uuids = {
             "1e01cdb6-f15d-4d8b-8440-a047976c1cac",
         }
@@ -2416,6 +2418,20 @@ class TidalBackend:
             # Do not keep negative cache entries forever; allow retry.
             self._artist_artwork_cache.pop(cache_key, None)
 
+        # Deduplicate concurrent resolution for the same key: if another thread
+        # is already fetching this artist's artwork, wait for it and use the result.
+        if cache_key:
+            with self._artist_artwork_inflight_lock:
+                if cache_key in self._artist_artwork_inflight:
+                    event = self._artist_artwork_inflight[cache_key]
+                else:
+                    event = threading.Event()
+                    self._artist_artwork_inflight[cache_key] = event
+                    event = None  # this thread is the resolver
+            if event is not None:
+                event.wait(timeout=15)
+                return self._artist_artwork_cache.get(cache_key)
+
         def _album_cover_fallback(*artist_candidates):
             for cand in artist_candidates:
                 if cand is None:
@@ -2525,6 +2541,12 @@ class TidalBackend:
                 # Enforce cache size limit: remove oldest entries from beginning
                 while len(self._artist_artwork_cache) > self.max_artist_artwork_cache:
                     self._artist_artwork_cache.popitem(last=False)
+            # Unblock any threads that were waiting for this resolution.
+            if cache_key:
+                with self._artist_artwork_inflight_lock:
+                    event = self._artist_artwork_inflight.pop(cache_key, None)
+                if event is not None:
+                    event.set()
 
     def _get_url_from_stream(self, full_track):
         """Resolve a playable URI via the newer playbackinfopostpaywall endpoint.

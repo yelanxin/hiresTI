@@ -818,13 +818,16 @@ button.circular {
         background-color: rgba(34, 38, 48, 0.98);
         min-height: 28px;
         min-width: 0;
-        padding: 3px 14px;
+        padding: 3px 8px;
         font-weight: 800;
         font-size: 12px;
         opacity: 1;
         transition: all 0.2s;
         border-radius: 0;
         border-bottom: none;
+    }
+    .viz-theme-dd button label {
+        min-width: 0;
     }
     .viz-right-first button,
     .lyrics-font-dd button {
@@ -1135,6 +1138,22 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
 .home-section-subtitle {
     padding-top: 1px;
     padding-bottom: 1px;
+}
+.home-section-title-btn {
+    padding: 0;
+    min-height: 0;
+    min-width: 0;
+    background: transparent;
+    box-shadow: none;
+    border-radius: 4px;
+}
+.home-section-title-btn:hover,
+.home-section-title-btn:active {
+    background: transparent;
+    box-shadow: none;
+}
+.home-section-title-btn:hover .home-section-title-link {
+    text-decoration: underline;
 }
 .history-rank-badge {
     min-width: 20px;

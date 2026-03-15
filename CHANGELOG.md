@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.6.10 - 2026-03-14
+
+### Added
+- "Because You Liked" and "Because You Listened To" section headers on the Home page are now clickable: tapping the context artwork or artist/album title navigates directly to that album or artist detail page.
+
+### Fixed
+- Fixed album cover area briefly going black when entering an album detail page. The cover widget no longer clears its paintable before the new image finishes loading, so the previous image (or the initial blank state) stays visible until the new artwork is ready.
+- Fixed artist artwork sometimes failing to load on the first visit to an artist detail page. Three concurrent panels (center, left, right) previously all raced to resolve the same artwork URL simultaneously; resolution is now deduplicated per artist key so only one network fetch is issued and the other two panels wait for its result.
+- Fixed a GTK warning (`GtkLabel reported min height 30 and natural height 25`) triggered when opening My Collection. Album title labels in the collection grid had `wrap=True` and `ellipsize` set simultaneously, which causes inconsistent size measurements in GTK4; `wrap` is now removed since `ellipsize` and `max_width_chars` already constrain long titles.
+- Fixed DSP panel content overflowing its container. The outer DSP tab scroller was set to `NEVER` horizontal scroll policy, causing wide content (such as the EQ or chain view) to clip outside the panel boundary; the policy is now `AUTOMATIC` so a scrollbar appears when needed and content stays within bounds.
+
 ## 1.6.8 - 2026-03-14
 Signal Path + ALSA behavior polish release: more accurate runtime reporting in the tech window, ALSA latency controls that match the actual output path, and a harder Bit-Perfect volume lock.
 

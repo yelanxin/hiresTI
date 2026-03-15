@@ -919,8 +919,9 @@ def build_body(app, container):
 
     app.dsp_tab_root = app._build_dsp_workspace()
     app.dsp_tab_scroller = Gtk.ScrolledWindow(vexpand=True, hexpand=True)
-    app.dsp_tab_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+    app.dsp_tab_scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
     app.dsp_tab_scroller.set_propagate_natural_height(False)
+    app.dsp_tab_scroller.set_propagate_natural_width(False)
     app.dsp_tab_scroller.set_child(app.dsp_tab_root)
     app.viz_stack.add_titled(app.dsp_tab_scroller, "dsp", "DSP")
     _body_mark("viz-dsp-tab")
