@@ -710,6 +710,124 @@ def build_settings_page(app):
 
     settings_vbox.append(group_remote)
 
+    # ---- DSP Presets section ----
+    settings_vbox.append(Gtk.Label(label="DSP Presets", xalign=0, css_classes=["section-title"], margin_top=10))
+    group_dsp_presets = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["settings-group"])
+
+    row_presets = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
+    preset_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
+    preset_info.append(Gtk.Label(label="Saved Presets", xalign=0, css_classes=["settings-label"]))
+    preset_info.append(
+        Gtk.Label(
+            label="Save and restore complete DSP chain configurations",
+            xalign=0,
+            css_classes=["dim-label"],
+        )
+    )
+    row_presets.append(preset_info)
+    preset_controls = Gtk.Box(spacing=6, hexpand=True, halign=Gtk.Align.END, valign=Gtk.Align.CENTER)
+    app.dsp_preset_dd = Gtk.DropDown(model=Gtk.StringList.new(["(no presets)"]))
+    app.dsp_preset_dd.set_sensitive(False)
+    app.dsp_preset_dd.set_valign(Gtk.Align.CENTER)
+    preset_controls.append(app.dsp_preset_dd)
+    app.dsp_preset_load_btn = Gtk.Button(label="Load", css_classes=["flat"])
+    app.dsp_preset_load_btn.set_sensitive(False)
+    app.dsp_preset_load_btn.connect("clicked", app.on_dsp_preset_load_clicked)
+    preset_controls.append(app.dsp_preset_load_btn)
+    app.dsp_preset_save_btn = Gtk.Button(label="Save As…", css_classes=["flat"])
+    app.dsp_preset_save_btn.connect("clicked", app.on_dsp_preset_save_clicked)
+    preset_controls.append(app.dsp_preset_save_btn)
+    app.dsp_preset_delete_btn = Gtk.Button(label="Delete", css_classes=["flat", "destructive-action"])
+    app.dsp_preset_delete_btn.set_sensitive(False)
+    app.dsp_preset_delete_btn.connect("clicked", app.on_dsp_preset_delete_clicked)
+    preset_controls.append(app.dsp_preset_delete_btn)
+    row_presets.append(preset_controls)
+    group_dsp_presets.append(row_presets)
+    settings_vbox.append(group_dsp_presets)
+
+    # ---- Scrobbling section ----
+    settings_vbox.append(Gtk.Label(label="Scrobbling", xalign=0, css_classes=["section-title"], margin_top=10))
+    group_scrobble = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["settings-group"])
+
+    # Last.fm enable
+    row_lfm_enable = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
+    lfm_enable_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
+    lfm_enable_info.append(Gtk.Label(label="Last.fm", xalign=0, css_classes=["settings-label"]))
+    lfm_enable_info.append(
+        Gtk.Label(label="Scrobble played tracks to your Last.fm profile", xalign=0, css_classes=["dim-label"])
+    )
+    row_lfm_enable.append(lfm_enable_info)
+    row_lfm_enable.append(Gtk.Box(hexpand=True))
+    app.scrobble_lastfm_switch = Gtk.Switch(valign=Gtk.Align.CENTER)
+    app.scrobble_lastfm_switch.connect("state-set", app.on_lastfm_enabled_toggled)
+    row_lfm_enable.append(app.scrobble_lastfm_switch)
+    group_scrobble.append(row_lfm_enable)
+
+    # Last.fm API Key
+    row_lfm_key = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=4, margin_bottom=4)
+    row_lfm_key.append(Gtk.Label(label="API Key", xalign=0, css_classes=["dim-label"], width_chars=12))
+    app.scrobble_lastfm_key_entry = Gtk.Entry(hexpand=True, placeholder_text="Get yours at last.fm/api/account/create")
+    row_lfm_key.append(app.scrobble_lastfm_key_entry)
+    group_scrobble.append(row_lfm_key)
+
+    # Last.fm API Secret
+    row_lfm_secret = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=4, margin_bottom=4)
+    row_lfm_secret.append(Gtk.Label(label="API Secret", xalign=0, css_classes=["dim-label"], width_chars=12))
+    app.scrobble_lastfm_secret_entry = Gtk.Entry(hexpand=True, visibility=False, input_purpose=Gtk.InputPurpose.PASSWORD)
+    row_lfm_secret.append(app.scrobble_lastfm_secret_entry)
+    group_scrobble.append(row_lfm_secret)
+
+    # Last.fm Connect row
+    row_lfm_connect = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=4, margin_bottom=8)
+    app.scrobble_lastfm_status_label = Gtk.Label(label="Not connected", xalign=0, css_classes=["dim-label"], hexpand=True)
+    row_lfm_connect.append(app.scrobble_lastfm_status_label)
+    app.scrobble_lastfm_disconnect_btn = Gtk.Button(label="Disconnect", css_classes=["flat", "destructive-action"])
+    app.scrobble_lastfm_disconnect_btn.set_sensitive(False)
+    app.scrobble_lastfm_disconnect_btn.connect("clicked", app.on_lastfm_disconnect_clicked)
+    row_lfm_connect.append(app.scrobble_lastfm_disconnect_btn)
+    lfm_connect_btn = Gtk.Button(label="Connect", css_classes=["flat", "suggested-action"])
+    lfm_connect_btn.connect("clicked", app.on_lastfm_connect_clicked)
+    row_lfm_connect.append(lfm_connect_btn)
+    group_scrobble.append(row_lfm_connect)
+
+    sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL, margin_start=12, margin_end=12)
+    group_scrobble.append(sep)
+
+    # ListenBrainz enable
+    row_lb_enable = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
+    lb_enable_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
+    lb_enable_info.append(Gtk.Label(label="ListenBrainz", xalign=0, css_classes=["settings-label"]))
+    lb_enable_info.append(
+        Gtk.Label(label="Submit listens to your ListenBrainz account", xalign=0, css_classes=["dim-label"])
+    )
+    row_lb_enable.append(lb_enable_info)
+    row_lb_enable.append(Gtk.Box(hexpand=True))
+    app.scrobble_lb_switch = Gtk.Switch(valign=Gtk.Align.CENTER)
+    app.scrobble_lb_switch.connect("state-set", app.on_listenbrainz_enabled_toggled)
+    row_lb_enable.append(app.scrobble_lb_switch)
+    group_scrobble.append(row_lb_enable)
+
+    # ListenBrainz token
+    row_lb_token = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=4, margin_bottom=8)
+    row_lb_token.append(Gtk.Label(label="User Token", xalign=0, css_classes=["dim-label"], width_chars=12))
+    app.scrobble_lb_token_entry = Gtk.Entry(hexpand=True, visibility=False, input_purpose=Gtk.InputPurpose.PASSWORD,
+                                             placeholder_text="From listenbrainz.org/profile/")
+    row_lb_token.append(app.scrobble_lb_token_entry)
+    app.scrobble_lb_status_label = Gtk.Label(label="", css_classes=["dim-label"])
+    row_lb_token.append(app.scrobble_lb_status_label)
+    lb_save_btn = Gtk.Button(label="Save", css_classes=["flat"])
+    lb_save_btn.connect("clicked", app.on_listenbrainz_token_saved)
+    row_lb_token.append(lb_save_btn)
+    group_scrobble.append(row_lb_token)
+
+    settings_vbox.append(group_scrobble)
+
+    # Populate preset list and sync scrobble UI
+    if hasattr(app, "refresh_dsp_preset_list"):
+        app.refresh_dsp_preset_list()
+    if hasattr(app, "_init_scrobble_settings_ui"):
+        app._init_scrobble_settings_ui()
+
     settings_vbox.append(Gtk.Label(label="Diagnostics", xalign=0, css_classes=["section-title"], margin_top=10))
     group_diag = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["settings-group"])
     row_diag = Gtk.Box(spacing=10, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)

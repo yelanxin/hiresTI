@@ -104,6 +104,42 @@ def bind_action_delegates(TidalApp, seen=None):
     ], seen=seen)
 
 
+def bind_scrobble_actions(TidalApp, seen=None):
+    from actions.scrobble_actions import (
+        init_scrobble_settings_ui,
+        on_lastfm_connect_clicked,
+        on_lastfm_disconnect_clicked,
+        on_lastfm_enabled_toggled,
+        on_listenbrainz_enabled_toggled,
+        on_listenbrainz_token_saved,
+    )
+
+    bind_map(TidalApp, [
+        ("on_lastfm_enabled_toggled", on_lastfm_enabled_toggled),
+        ("on_lastfm_connect_clicked", on_lastfm_connect_clicked),
+        ("on_lastfm_disconnect_clicked", on_lastfm_disconnect_clicked),
+        ("on_listenbrainz_enabled_toggled", on_listenbrainz_enabled_toggled),
+        ("on_listenbrainz_token_saved", on_listenbrainz_token_saved),
+        ("_init_scrobble_settings_ui", init_scrobble_settings_ui),
+    ], seen=seen)
+
+
+def bind_dsp_preset_actions(TidalApp, seen=None):
+    from actions.dsp_preset_actions import (
+        on_dsp_preset_delete_clicked,
+        on_dsp_preset_load_clicked,
+        on_dsp_preset_save_clicked,
+        refresh_dsp_preset_list,
+    )
+
+    bind_map(TidalApp, [
+        ("on_dsp_preset_save_clicked", on_dsp_preset_save_clicked),
+        ("on_dsp_preset_load_clicked", on_dsp_preset_load_clicked),
+        ("on_dsp_preset_delete_clicked", on_dsp_preset_delete_clicked),
+        ("refresh_dsp_preset_list", refresh_dsp_preset_list),
+    ], seen=seen)
+
+
 def bind_audio_settings_extras(TidalApp, seen=None):
     from actions import audio_settings_actions
     from actions.audio_settings_actions import (
