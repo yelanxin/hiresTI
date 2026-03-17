@@ -22,7 +22,7 @@ Audio Optimization Guide: [audio-optimization-guide.md](audio-optimization-guide
 
 ## Screenshots
 ### Main Window
-![Main Window](screenshots/1.5.3-1.png)
+![Main Window](screenshots/1.7.3-1.png)
 ![Main Window](screenshots/1.4.5-2.png)
 ![Main Window](screenshots/1.6.0-1.png)
 ![Main Window](screenshots/1.5.0-2.png)
