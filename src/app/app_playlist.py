@@ -224,6 +224,9 @@ def on_remote_playlist_card_clicked(self, playlist_obj):
     title = getattr(playlist_obj, "name", "TIDAL Playlist")
     creator = getattr(playlist_obj, "creator", None)
     creator_name = str(getattr(creator, "name", None) or "TIDAL")
+    user_id = str(getattr(getattr(self.backend, "user", None), "id", "") or "").strip()
+    creator_id = str(getattr(creator, "id", "") or "").strip()
+    self._remote_playlist_is_own = bool(user_id and creator_id and user_id == creator_id)
     self.header_kicker.set_text("Playlist")
     self.header_title.set_text(title)
     self.header_title.set_tooltip_text(title)
@@ -241,7 +244,7 @@ def on_remote_playlist_card_clicked(self, playlist_obj):
     if self.remote_playlist_visibility_btn is not None:
         self.remote_playlist_visibility_btn.set_visible(False)
     if self.remote_playlist_more_btn is not None:
-        self.remote_playlist_more_btn.set_visible(True)
+        self.remote_playlist_more_btn.set_visible(self._remote_playlist_is_own)
     self._refresh_remote_playlist_visibility_button(playlist_obj)
     # Ensure play/shuffle buttons exist and are visible
     from actions.ui_actions import _ensure_play_shuffle_btns

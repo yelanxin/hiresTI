@@ -1760,7 +1760,8 @@ def populate_tracks(app, tracks):
         fav_btn = app.create_track_fav_button(t)
         box.append(fav_btn)
         current_remote = getattr(app, "current_remote_playlist", None)
-        if current_remote is not None:
+        is_own_remote = getattr(app, "_remote_playlist_is_own", False)
+        if current_remote is not None and is_own_remote:
             rm_btn = Gtk.Button(icon_name="user-trash-symbolic", css_classes=["flat", "playlist-tool-btn"])
             rm_btn.set_tooltip_text("Remove from Playlist")
             rm_btn.connect("clicked", lambda _b, tr=t: app.on_remove_single_track_from_remote_playlist(tr))
