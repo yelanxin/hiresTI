@@ -143,13 +143,7 @@ mod alsa_ffi {
             frames: SndPcmUframes,
         ) -> SndPcmSframes;
 
-        // Status query — used to read the hardware delay for clock calibration.
-        pub fn snd_pcm_status_malloc(obj: *mut *mut c_void) -> c_int;
-        pub fn snd_pcm_status_free(obj: *mut c_void);
-        pub fn snd_pcm_status(pcm: *mut c_void, obj: *mut c_void) -> c_int;
-        /// Returns the number of frames in the ALSA ring buffer not yet played.
-        /// Positive = frames queued ahead of DAC; negative indicates xrun.
-        pub fn snd_pcm_status_get_delay(obj: *const c_void) -> SndPcmSframes;
+
     }
 }
 
@@ -465,9 +459,8 @@ struct AlsaMmapCtx {
     /// device is in a persistent error state.
     start_fail_count: u32,
     format_label: &'static str,
-    /// Opaque `snd_pcm_status_t *` pre-allocated to avoid per-period malloc.
-    /// Null when status querying is unavailable.
-    status_obj: *mut std::os::raw::c_void,
+    /// True once `feed.anchor()` has been called for this playback session.
+    anchored: bool,
     /// Clock feed updated after each commit; shared with the pipeline clock.
     feed: Option<Arc<AlsaHwClockFeed>>,
 }
@@ -477,6 +470,12 @@ impl AlsaMmapCtx {
         self.primed_frames = 0;
         self.started = false;
         self.start_fail_count = 0;
+        // Re-anchor the clock on the next commit so seeks and xrun recoveries
+        // restart the frame counter from the correct CLOCK_MONOTONIC baseline.
+        self.anchored = false;
+        if let Some(ref feed) = self.feed {
+            feed.invalidate();
+        }
     }
 
     fn recover_requires_restart(rc: i32) -> bool {
@@ -598,12 +597,6 @@ impl AlsaMmapCtx {
             }
         }
 
-        // Pre-allocate a reusable snd_pcm_status_t for per-period delay queries.
-        let status_obj: *mut c_void = unsafe {
-            let mut s: *mut c_void = std::ptr::null_mut();
-            if alsa_ffi::snd_pcm_status_malloc(&mut s) == 0 { s } else { std::ptr::null_mut() }
-        };
-
         Ok(AlsaMmapCtx {
             pcm: AlsaHandle(pcm),
             period_frames,
@@ -614,7 +607,7 @@ impl AlsaMmapCtx {
             started: false,
             start_fail_count: 0,
             format_label,
-            status_obj,
+            anchored: false,
             feed: None,
         })
     }
@@ -709,23 +702,19 @@ impl AlsaMmapCtx {
             src_offset += committed * frame_bytes;
             remaining -= committed;
 
-            // Poll hardware delay and update the clock feed so the GStreamer
-            // pipeline clock tracks the DAC playback position in real time.
-            if !self.status_obj.is_null() {
-                if let Some(ref feed) = self.feed {
-                    let sys_ts_ns = {
+            // Update the frame-counting clock feed.
+            if let Some(ref feed) = self.feed {
+                if !self.anchored {
+                    // Record the CLOCK_MONOTONIC baseline on the very first commit.
+                    let now_ns = {
                         let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
                         unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
                         ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
                     };
-                    let rc = unsafe { alsa_ffi::snd_pcm_status(pcm, self.status_obj) };
-                    if rc == 0 {
-                        let delay = unsafe {
-                            alsa_ffi::snd_pcm_status_get_delay(self.status_obj)
-                        };
-                        feed.update(sys_ts_ns, delay as i64, self.rate);
-                    }
+                    feed.anchor(now_ns, self.rate);
+                    self.anchored = true;
                 }
+                feed.advance(committed as u64);
             }
 
             if !self.started {
@@ -760,10 +749,6 @@ impl AlsaMmapCtx {
 
 impl Drop for AlsaMmapCtx {
     fn drop(&mut self) {
-        if !self.status_obj.is_null() {
-            unsafe { alsa_ffi::snd_pcm_status_free(self.status_obj) };
-            self.status_obj = std::ptr::null_mut();
-        }
         if let Some(ref feed) = self.feed {
             feed.invalidate();
         }

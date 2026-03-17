@@ -1,40 +1,40 @@
-/// ALSA-hardware-backed GStreamer clock.
+/// ALSA-hardware-backed GStreamer clock — frame-counting design.
 ///
 /// # Design
 ///
-/// The ALSA mmap writer thread calls [`AlsaHwClockFeed::update`] after every
-/// `snd_pcm_mmap_commit()`.  Each update records:
-///   - `sys_ts_ns` — `CLOCK_MONOTONIC` nanoseconds at the moment
-///     `snd_pcm_status()` was called.
-///   - `delay_frames` — `snd_pcm_status_get_delay()`: frames committed to the
-///     ALSA ring buffer but not yet consumed by the DAC.
-///   - `rate` — negotiated sample rate.
+/// The ALSA mmap writer thread calls [`AlsaHwClockFeed::anchor`] once when
+/// the first frames are committed (i.e. when `snd_pcm_start` is imminent),
+/// then calls [`AlsaHwClockFeed::advance`] after every successful
+/// `snd_pcm_mmap_commit()`.
 ///
-/// From these three values the clock computes the DAC's current playback
-/// position on every `get_internal_time()` call:
+/// The clock time is computed as:
 ///
 /// ```text
-/// delay_ns   = delay_frames * 1_000_000_000 / rate
-/// hw_now_ns  = CLOCK_MONOTONIC() − delay_ns
+/// hw_time_ns = anchor_ns + total_frames * 1_000_000_000 / rate
 /// ```
 ///
-/// The insight: `CLOCK_MONOTONIC − delay_ns` is constant (≈ output latency)
-/// between updates and advances at exactly 1 ns/ns because the live monotonic
-/// clock supplies the "time since last status" term automatically.
+/// where `anchor_ns` is the `CLOCK_MONOTONIC` value recorded at the start of
+/// playback and `total_frames` is the running count of PCM frames committed to
+/// the ALSA ring buffer since that anchor.
 ///
-/// Before the first ALSA status arrives (pre-playback, during seeks, …) the
-/// clock falls back to a plain `CLOCK_MONOTONIC` reading, so it always returns
-/// a valid, monotonically increasing time.
+/// This is a **purely feed-forward, jitter-free** clock.  It never reads
+/// `snd_pcm_status()`, so there is no delay-measurement feedback loop that
+/// could destabilise the pipeline at low latencies.  The clock advances at
+/// exactly 1 ns per sample-period because frame counting is integer arithmetic
+/// locked to the hardware sample rate.
+///
+/// Before the first anchor arrives (pre-playback, after seeks, …) the clock
+/// falls back to a plain `CLOCK_MONOTONIC` reading so it always returns a
+/// valid, monotonically increasing time.
 ///
 /// # Thread safety
 ///
 /// [`AlsaHwClockFeed`] uses only atomics; it is `Send + Sync` and safe to
 /// share between the audio RT thread and GStreamer's streaming threads.
-/// The clock object itself is a GObject and follows GStreamer's usual rules.
 use std::sync::OnceLock;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 
 use gstreamer as gst;
@@ -49,24 +49,36 @@ use gst::subclass::prelude::*;
 /// Lock-free state published by the ALSA mmap writer thread.
 #[derive(Debug, Default)]
 pub struct AlsaHwClockFeed {
-    sys_ts_ns:    AtomicU64,
-    delay_frames: AtomicI64,
+    /// `CLOCK_MONOTONIC` nanoseconds at the start of playback (first commit).
+    anchor_ns:    AtomicU64,
+    /// Total PCM frames committed since the anchor was set.
+    total_frames: AtomicU64,
+    /// Negotiated sample rate (frames per second).
     rate:         AtomicU32,
+    /// True once `anchor()` has been called and the feed is ready.
     valid:        AtomicBool,
 }
 
 impl AlsaHwClockFeed {
-    /// Called from the writer thread after each `snd_pcm_mmap_commit()`.
+    /// Called once when playback starts (before or at the first commit).
     ///
-    /// `sys_ts_ns`    : `CLOCK_MONOTONIC` ns when `snd_pcm_status()` was polled.
-    /// `delay_frames` : frames buffered in ALSA but not yet played.
-    /// `rate`         : negotiated sample rate.
-    pub fn update(&self, sys_ts_ns: u64, delay_frames: i64, rate: u32) {
-        self.sys_ts_ns.store(sys_ts_ns,       Ordering::Relaxed);
-        self.delay_frames.store(delay_frames, Ordering::Relaxed);
-        self.rate.store(rate,                 Ordering::Relaxed);
-        // Release fence: all stores above become visible before valid=true.
+    /// `anchor_ns` : `CLOCK_MONOTONIC` ns at the moment of the first commit.\
+    /// `rate`      : negotiated sample rate in Hz.
+    pub fn anchor(&self, anchor_ns: u64, rate: u32) {
+        self.anchor_ns.store(anchor_ns, Ordering::Relaxed);
+        self.total_frames.store(0, Ordering::Relaxed);
+        self.rate.store(rate, Ordering::Relaxed);
+        // Release fence: all stores above become visible before valid = true.
         self.valid.store(true, Ordering::Release);
+    }
+
+    /// Called after every successful `snd_pcm_mmap_commit(n)`.
+    ///
+    /// `frames` : the number of frames returned by `snd_pcm_mmap_commit`.
+    pub fn advance(&self, frames: u64) {
+        // Relaxed is fine: the reader only needs the latest snapshot, not
+        // strict ordering relative to other stores.
+        self.total_frames.fetch_add(frames, Ordering::Relaxed);
     }
 
     /// Invalidate: called when ALSA device closes (rate change, seek, …).
@@ -75,32 +87,22 @@ impl AlsaHwClockFeed {
     }
 
     /// Estimate of the hardware playback position as `CLOCK_MONOTONIC` ns.
-    /// Returns `None` if no valid status has been published yet.
+    /// Returns `None` if the feed has not been anchored yet.
     pub fn hw_now_ns(&self) -> Option<u64> {
-        // Acquire: ensures we read consistent delay/rate after seeing valid=true.
+        // Acquire: ensures we read consistent anchor/rate after valid = true.
         if !self.valid.load(Ordering::Acquire) {
             return None;
         }
-        let delay_frames = self.delay_frames.load(Ordering::Relaxed);
+        let anchor_ns    = self.anchor_ns.load(Ordering::Relaxed);
+        let total_frames = self.total_frames.load(Ordering::Relaxed);
         let rate         = self.rate.load(Ordering::Relaxed) as u64;
         if rate == 0 {
             return None;
         }
-        let delay_ns = if delay_frames > 0 {
-            (delay_frames as u64).saturating_mul(1_000_000_000) / rate
-        } else {
-            0
-        };
-        // CLOCK_MONOTONIC − output_latency = hardware playback position.
-        Some(monotonic_ns().saturating_sub(delay_ns))
+        // Integer arithmetic: no floating-point, no jitter.
+        let elapsed_ns = total_frames.saturating_mul(1_000_000_000) / rate;
+        Some(anchor_ns.saturating_add(elapsed_ns))
     }
-}
-
-#[inline]
-fn monotonic_ns() -> u64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
 // ---------------------------------------------------------------------------
@@ -134,14 +136,10 @@ mod imp {
     impl ClockImpl for AlsaHwClock {
         /// Override the internal time source with the hardware playback position.
         ///
-        /// When ALSA has provided a valid status snapshot the function returns
-        /// `CLOCK_MONOTONIC − output_latency`, which advances at exactly 1 ns/ns
-        /// and represents where the DAC needle is right now.
-        ///
-        /// When the feed is not yet valid (pre-playback, device closed, …) the
-        /// call delegates to the parent `SystemClock`, which returns a plain
-        /// `CLOCK_MONOTONIC` reading.  This guarantees the clock is always
-        /// monotonically increasing and never stalls the pipeline.
+        /// Returns `anchor_ns + total_frames * 1e9 / rate`, which advances at
+        /// exactly 1 ns/ns with zero jitter.  Falls back to the parent
+        /// `SystemClock` (plain `CLOCK_MONOTONIC`) when the feed is not yet
+        /// anchored, so the clock is always valid.
         fn internal_time(&self) -> gst::ClockTime {
             if let Some(feed) = self.feed.get() {
                 if let Some(hw_ns) = feed.hw_now_ns() {
@@ -158,7 +156,7 @@ mod imp {
 // ---------------------------------------------------------------------------
 
 glib::wrapper! {
-    /// GStreamer clock whose internal time tracks the ALSA DAC playback position.
+    /// GStreamer clock whose internal time tracks committed PCM frame count.
     pub struct AlsaHwClock(ObjectSubclass<imp::AlsaHwClock>)
         @extends gst::SystemClock, gst::Clock, gst::Object;
 }
