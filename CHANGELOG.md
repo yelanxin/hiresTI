@@ -21,6 +21,8 @@
 - Fixed `Genres` initial visible-item counts being inconsistent across Fedora and Ubuntu. The page now derives its two-row limit from GTK's real rendered layout instead of relying only on width heuristics.
 - Fixed `Genres` pages sometimes leaving a large empty scrollable area below the content because the stack child was being vertically stretched.
 - Fixed GTK warnings such as `GtkGizmo (slider) reported min width/min height < 0` triggered when opening `Genres`; the tab-strip now hides scrolling controls without forcing invalid scrollbar sizing.
+- Fixed sidebar and global font sizes appearing significantly larger on Ubuntu than on Fedora/HiDPI setups. The previous 1.4× CSS font scale override for 1× displays was over-correcting — GTK4/Adwaita already handles cross-DPI rendering via logical pixels. The override is now removed; font scaling only applies when the user has explicitly set GNOME's `text-scaling-factor` accessibility setting above 1.0.
+- Normalised base font family in CSS to reduce visual metric differences between Ubuntu Font and Cantarell across distros.
 
 ## 1.7.2 - 2026-03-15
 

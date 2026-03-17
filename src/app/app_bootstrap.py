@@ -26,6 +26,23 @@ def _detect_display_scale(display) -> int:
     return 1
 
 
+def _get_text_scale_factor() -> float:
+    """Return the GNOME text-scaling-factor from GSettings (default 1.0).
+
+    Ubuntu and other distros sometimes set this above 1.0 (e.g. 1.25) to make
+    system fonts larger.  We use this to cancel out the distro-level scaling
+    from our own CSS font overrides so we don't double-scale.
+    """
+    try:
+        from gi.repository import Gio
+        settings = Gio.Settings.new("org.gnome.desktop.interface")
+        val = settings.get_double("text-scaling-factor")
+        return max(0.5, val)
+    except Exception as e:
+        logger.debug("Could not read text-scaling-factor: %s", e)
+    return 1.0
+
+
 def detect_app_version(self):
     env_ver = str(os.environ.get("HIRESTI_VERSION", "")).strip()
     if env_ver:
@@ -205,7 +222,13 @@ def do_activate(self):
     _display_scale = _detect_display_scale(display)
     import utils.helpers as _helpers
     _helpers.set_ui_scale(_display_scale)
-    _font_scale = max(1.0, min(1.4, 2.0 / max(1, _display_scale)))
+    _text_scale = _get_text_scale_factor()
+    # GTK4/Adwaita already handles cross-DPI rendering correctly via logical
+    # pixels — no manual font scaling needed for integer scale factors.
+    # Only apply an override when the user has explicitly set a text-scaling-
+    # factor above 1.0 (accessibility preference), in which case we honour it
+    # by scaling our custom CSS classes to match.
+    _font_scale = _text_scale if _text_scale > 1.05 else 1.0
     _override_css = ui_config.get_scale_css_overrides(_font_scale)
     if _override_css:
         _scale_provider = Gtk.CssProvider()
@@ -213,8 +236,8 @@ def do_activate(self):
         Gtk.StyleContext.add_provider_for_display(
             display, _scale_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1
         )
-    logger.info("Display scale=%d → font_scale=%.2f, COVER_SIZE=%d",
-                _display_scale, _font_scale, _helpers.COVER_SIZE)
+    logger.info("Display scale=%d, text-scaling-factor=%.2f → font_scale=%.2f, COVER_SIZE=%d",
+                _display_scale, _text_scale, _font_scale, _helpers.COVER_SIZE)
     _startup_mark("display-scale")
 
     self.win = Adw.ApplicationWindow(

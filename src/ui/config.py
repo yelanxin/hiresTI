@@ -6,6 +6,13 @@ WINDOW_WIDTH = 1250
 WINDOW_HEIGHT = 800
 
 CSS_DATA = """
+/* Normalise base font across distros (Ubuntu Font vs Cantarell have different
+   metrics).  Listing both ensures whichever is installed wins, with a
+   consistent sans-serif fallback so pixel sizes feel the same everywhere. */
+window, .sidebar-row, .sidebar-header, label {
+    font-family: "Cantarell", "Ubuntu", "Noto Sans", sans-serif;
+}
+
 .circular-avatar { border-radius: 9999px; }
 button.flat,
 button.circular {
