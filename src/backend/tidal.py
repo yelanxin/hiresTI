@@ -2356,20 +2356,16 @@ class TidalBackend:
             return f"https://resources.tidal.com/images/{token}/{int(size)}x{int(size)}.jpg"
 
         def _collect_category_items(category):
+            """Return (initial_items, more_path).
+
+            The _more link is NOT fetched here; it is returned as more_path so
+            the UI can fetch it on demand when the user clicks "Show More",
+            avoiding N extra serial network calls on every tab switch.
+            """
             items = list(getattr(category, "items", None) or [])
             more = getattr(category, "_more", None)
             more_path = _norm_path(getattr(more, "api_path", None) if more is not None else None)
-            if not more_path or not hasattr(self.session, "page") or self.session.page is None:
-                return items
-            try:
-                more_page = self.session.page.get(more_path, params={"deviceType": "BROWSER"})
-                for sub_cat in list(getattr(more_page, "categories", None) or []):
-                    sub_items = list(getattr(sub_cat, "items", None) or [])
-                    if sub_items:
-                        items.extend(sub_items)
-            except Exception as e:
-                logger.debug("Genres category view-all fetch failed for %s: %s", more_path, e)
-            return items
+            return items, more_path
 
         def _process_item(item):
             try:
@@ -2445,7 +2441,8 @@ class TidalBackend:
                     continue
                 seen_cat_titles.add(cat_title.lower())
                 cat_items = []
-                for item in _collect_category_items(category):
+                raw_items, more_path = _collect_category_items(category)
+                for item in raw_items:
                     processed = _process_item(item)
                     if not processed:
                         processed = self._process_generic_item(item)
@@ -2453,12 +2450,83 @@ class TidalBackend:
                         cat_items.append(processed)
                 cat_items = _dedupe_items(cat_items)
                 if cat_items:
-                    categories.append({"title": cat_title, "items": cat_items})
+                    categories.append({"title": cat_title, "items": cat_items, "more_path": more_path})
             if categories:
                 return {"title": label, "categories": categories}
         except Exception as e:
             logger.debug("Genres: failed to fetch %s (%s): %s", label, path, e)
         return None
+
+    def fetch_genre_more(self, more_path):
+        """Fetch additional items from a genre category _more link on demand.
+
+        Called when the user clicks "Show More" after exhausting the initial
+        items returned by get_genre_section().  Returns a flat list of
+        processed item dicts ready for the UI, or [] on failure.
+        """
+        def _norm(p):
+            p = str(p or "").strip()
+            return p[1:] if p.startswith("/") else p or None
+
+        def _img(image_id, size=320):
+            val = str(image_id or "").strip()
+            if not val:
+                return None
+            if val.startswith("http://") or val.startswith("https://"):
+                return val
+            return f"https://resources.tidal.com/images/{val.replace('-', '/')}/{size}x{size}.jpg"
+
+        def _proc(item):
+            try:
+                if item is None:
+                    return None
+                if hasattr(item, "header") and hasattr(item, "type"):
+                    raw_type = str(getattr(item, "type", "") or "").strip().upper()
+                    type_map = {"TRACK": "Track", "ALBUM": "Album", "ARTIST": "Artist",
+                                "PLAYLIST": "Playlist", "MIX": "Mix"}
+                    return {
+                        "obj": item,
+                        "name": str(getattr(item, "header", "") or getattr(item, "short_header", "") or "Unknown"),
+                        "sub_title": str(getattr(item, "short_sub_header", "") or ""),
+                        "image_url": _img(getattr(item, "image_id", None)),
+                        "type": type_map.get(raw_type, "PageItem"),
+                    }
+                if hasattr(item, "title") and hasattr(item, "api_path"):
+                    _t = getattr(item, "title", None)
+                    return {
+                        "obj": item,
+                        "name": str(_t if _t is not None and not callable(_t) else "") or "Unknown",
+                        "sub_title": "",
+                        "image_url": _img(getattr(item, "image_id", None)),
+                        "type": "PageLink",
+                    }
+            except Exception:
+                return None
+            return None
+
+        try:
+            norm = _norm(more_path)
+            if not norm or not hasattr(self.session, "page") or self.session.page is None:
+                return []
+            more_page = self.session.page.get(norm, params={"deviceType": "BROWSER"})
+            result, seen = [], set()
+            for sub_cat in list(getattr(more_page, "categories", None) or []):
+                for raw_item in list(getattr(sub_cat, "items", None) or []):
+                    processed = _proc(raw_item) or self._process_generic_item(raw_item)
+                    if not processed:
+                        continue
+                    obj = processed.get("obj")
+                    item_id = getattr(obj, "id", None) if obj is not None else None
+                    key = (processed.get("type"), str(item_id).strip()) if item_id else None
+                    if key and key in seen:
+                        continue
+                    if key:
+                        seen.add(key)
+                    result.append(processed)
+            return result
+        except Exception as e:
+            logger.debug("Genres: fetch_genre_more failed for %s: %s", more_path, e)
+            return []
 
     def get_hires_page(self):
         """

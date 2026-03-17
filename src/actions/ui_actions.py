@@ -4629,7 +4629,7 @@ def render_genres_dashboard(app, prefer_cache=True):
             return
         app.show_album_details(obj)
 
-    def _populate_category(cat_box, items):
+    def _populate_category(cat_box, items, more_path=None):
         flow = Gtk.FlowBox(
             homogeneous=True,
             min_children_per_line=2,
@@ -4741,9 +4741,15 @@ def render_genres_dashboard(app, prefer_cache=True):
                 count += 1
             return count if count > 0 else 0
 
-        def _sync_more_row(items=items, idx_state=idx_state):
+        more_exhausted = [False]
+        more_loading = [False]
+
+        def _sync_more_row():
             if more_row is not None:
-                more_row.set_visible(idx_state[0] < len(items))
+                has_more = idx_state[0] < len(items) or (
+                    bool(more_path) and not more_exhausted[0]
+                )
+                more_row.set_visible(has_more)
 
         def _append_chunk(flow=flow, items=items, idx_state=idx_state):
             chunk_size = resolved_chunk_size[0] or _measured_chunk_size()
@@ -4775,7 +4781,36 @@ def render_genres_dashboard(app, prefer_cache=True):
             more_row.append(Gtk.Box(hexpand=True))
             more_btn = Gtk.Button(label="Show More", css_classes=["flat", "genres-show-more-btn"])
             more_btn.set_halign(Gtk.Align.END)
-            more_btn.connect("clicked", lambda *_args: GLib.idle_add(_append_chunk))
+
+            def _on_show_more(_btn, btn=more_btn):
+                if idx_state[0] < len(items):
+                    GLib.idle_add(_append_chunk)
+                    return
+                # Local items exhausted — fetch from server _more link if available.
+                if not more_path or more_exhausted[0] or more_loading[0]:
+                    return
+                more_loading[0] = True
+                btn.set_sensitive(False)
+
+                def _fetch_more(btn=btn):
+                    new_items = app.backend.fetch_genre_more(more_path)
+
+                    def _apply(new_items=new_items, btn=btn):
+                        more_loading[0] = False
+                        btn.set_sensitive(True)
+                        if new_items:
+                            items.extend(new_items)
+                            GLib.idle_add(_append_chunk)
+                        else:
+                            more_exhausted[0] = True
+                        _sync_more_row()
+                        return False
+
+                    GLib.idle_add(_apply)
+
+                Thread(target=_fetch_more, daemon=True).start()
+
+            more_btn.connect("clicked", _on_show_more)
             more_row.append(more_btn)
             cat_box.append(more_row)
 
@@ -4795,12 +4830,13 @@ def render_genres_dashboard(app, prefer_cache=True):
             items = list(cat.get("items", []) or [])
             if not items:
                 continue
+            more_path = cat.get("more_path")
             lbl = Gtk.Label(label=cat_title, xalign=0, css_classes=["home-section-title"])
             lbl.set_margin_top(4)
             tab_box.append(lbl)
             cat_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
             tab_box.append(cat_box)
-            _populate_category(cat_box, items)
+            _populate_category(cat_box, items, more_path=more_path)
         return tab_box
 
     def _build_ui(definitions, tab_cache):
@@ -4921,6 +4957,27 @@ def render_genres_dashboard(app, prefer_cache=True):
                     )
                 )
 
+        def _prefetch_tab(label):
+            """Silently pre-load a tab into tab_cache without rendering."""
+            if label in tab_cache or label in _loading_tabs or label in _built_tabs:
+                return
+            path = next((p for l, p in definitions if l == label), None)
+            if not path:
+                return
+            _loading_tabs.add(label)
+
+            def fetch(label=label, path=path):
+                sec = app.backend.get_genre_section(label, path)
+
+                def cache(label=label, sec=sec):
+                    tab_cache[label] = sec
+                    _loading_tabs.discard(label)
+                    return False
+
+                GLib.idle_add(cache)
+
+            Thread(target=fetch, daemon=True).start()
+
         def _ensure_tab_loaded(label):
             if label in _built_tabs or label in _loading_tabs:
                 return
@@ -4928,6 +4985,14 @@ def render_genres_dashboard(app, prefer_cache=True):
             if sec is not None:
                 _built_tabs.add(label)
                 _populate_placeholder(label, sec)
+                # Cache hit — schedule prefetch of the next two tabs.
+                labels = [d[0] for d in definitions]
+                try:
+                    idx = labels.index(label)
+                    for next_label in labels[idx + 1:idx + 3]:
+                        GLib.idle_add(lambda lbl=next_label: _prefetch_tab(lbl) or False)
+                except ValueError:
+                    pass
                 return
 
             _loading_tabs.add(label)
@@ -4946,13 +5011,24 @@ def render_genres_dashboard(app, prefer_cache=True):
 
             def fetch(label=label, path=path):
                 sec = app.backend.get_genre_section(label, path)
+
                 def apply(label=label, sec=sec):
                     tab_cache[label] = sec
                     _loading_tabs.discard(label)
                     _built_tabs.add(label)
                     _populate_placeholder(label, sec)
+                    # After rendering, prefetch the next two tabs in the background.
+                    labels = [d[0] for d in definitions]
+                    try:
+                        idx = labels.index(label)
+                        for next_label in labels[idx + 1:idx + 3]:
+                            GLib.idle_add(lambda lbl=next_label: _prefetch_tab(lbl) or False)
+                    except ValueError:
+                        pass
                     return False
+
                 GLib.idle_add(apply)
+
             Thread(target=fetch, daemon=True).start()
 
         def _on_tab_changed(stack, _pspec):
