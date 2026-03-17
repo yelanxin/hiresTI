@@ -49,6 +49,28 @@ def test_build_qr_tempfile_returns_none_when_all_generators_fail(monkeypatch):
         assert path is None
 
 
+def test_ensure_svg_white_background_inserts_rect():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "qr.svg")
+        _write_file(
+            path,
+            (
+                '<?xml version="1.0" encoding="UTF-8"?>\n'
+                '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10">'
+                '<path d="M0 0h10v10H0z"/>'
+                '</svg>'
+            ),
+        )
+
+        app_auth._ensure_svg_white_background(path)
+
+        with open(path, "r", encoding="utf-8") as fh:
+            svg = fh.read()
+
+        assert 'fill="white"' in svg
+        assert svg.index('fill="white"') < svg.index("<path")
+
+
 def _write_file(path, content):
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(content)

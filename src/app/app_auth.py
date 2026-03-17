@@ -5,6 +5,7 @@ import os
 import subprocess
 import time
 import webbrowser
+import xml.etree.ElementTree as ET
 from urllib.parse import urlparse
 
 import gi
@@ -352,10 +353,37 @@ def _build_qr_svg(url, path):
         qr.make(fit=True)
         img = qr.make_image(image_factory=qrcode_svg.SvgPathImage)
         img.save(path)
+        _ensure_svg_white_background(path)
         return True
     except Exception as e:
         logger.debug("SVG QR generation failed for %s: %s", path, e)
         return False
+
+
+def _ensure_svg_white_background(path):
+    tree = ET.parse(path)
+    root = tree.getroot()
+    ns_end = root.tag.find("}")
+    ns = root.tag[1:ns_end] if root.tag.startswith("{") and ns_end > 0 else ""
+    rect_tag = f"{{{ns}}}rect" if ns else "rect"
+
+    for child in root:
+        if child.tag == rect_tag and child.attrib.get("fill") == "white":
+            return
+
+    if ns:
+        ET.register_namespace("", ns)
+
+    bg = ET.Element(
+        rect_tag,
+        {
+            "width": "100%",
+            "height": "100%",
+            "fill": "white",
+        },
+    )
+    root.insert(0, bg)
+    tree.write(path, encoding="utf-8", xml_declaration=True)
 
 
 def _build_qr_png(url, path):
