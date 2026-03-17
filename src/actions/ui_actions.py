@@ -4768,7 +4768,36 @@ def render_genres_dashboard(app, prefer_cache=True):
             elif rendered < chunk_size:
                 _append_items(chunk_size - rendered)
             _sync_more_row()
+            # If the initial items from the main page aren't enough to fill 2
+            # rows (common for Track categories which only return ~5 items
+            # upfront), silently auto-fetch the _more link so the grid looks
+            # full without requiring the user to click "Show More".
+            if idx_state[0] >= len(items) and more_path and not more_exhausted[0] and not more_loading[0]:
+                _auto_fill_rows()
             return False
+
+        def _auto_fill_rows():
+            """Transparently fetch _more items to fill up to the 2-row capacity."""
+            more_loading[0] = True
+
+            def fetch():
+                new_items = app.backend.fetch_genre_more(more_path)
+
+                def apply(new_items=new_items):
+                    more_loading[0] = False
+                    if new_items:
+                        items.extend(new_items)
+                        needed = max(0, resolved_chunk_size[0] - idx_state[0])
+                        if needed > 0:
+                            _append_items(needed)
+                    else:
+                        more_exhausted[0] = True
+                    _sync_more_row()
+                    return False
+
+                GLib.idle_add(apply)
+
+            Thread(target=fetch, daemon=True).start()
 
         if len(items) > 2:
             more_row = Gtk.Box(
