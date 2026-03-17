@@ -26,8 +26,10 @@ use std::sync::{Arc, Mutex, Once};
 use std::thread;
 use std::time::Duration;
 
+mod alsa_clock;
 mod dsp;
 
+use alsa_clock::{AlsaHwClock, AlsaHwClockFeed};
 use dsp::{DspGraphConfig, DspGraphRuntime, LufsValues, PEQ_BAND_COUNT};
 
 static GST_INIT: Once = Once::new();
@@ -140,6 +142,8 @@ mod alsa_ffi {
             offset: SndPcmUframes,
             frames: SndPcmUframes,
         ) -> SndPcmSframes;
+
+
     }
 }
 
@@ -455,6 +459,10 @@ struct AlsaMmapCtx {
     /// device is in a persistent error state.
     start_fail_count: u32,
     format_label: &'static str,
+    /// True once `feed.anchor()` has been called for this playback session.
+    anchored: bool,
+    /// Clock feed updated after each commit; shared with the pipeline clock.
+    feed: Option<Arc<AlsaHwClockFeed>>,
 }
 
 impl AlsaMmapCtx {
@@ -462,6 +470,12 @@ impl AlsaMmapCtx {
         self.primed_frames = 0;
         self.started = false;
         self.start_fail_count = 0;
+        // Re-anchor the clock on the next commit so seeks and xrun recoveries
+        // restart the frame counter from the correct CLOCK_MONOTONIC baseline.
+        self.anchored = false;
+        if let Some(ref feed) = self.feed {
+            feed.invalidate();
+        }
     }
 
     fn recover_requires_restart(rc: i32) -> bool {
@@ -593,6 +607,8 @@ impl AlsaMmapCtx {
             started: false,
             start_fail_count: 0,
             format_label,
+            anchored: false,
+            feed: None,
         })
     }
 
@@ -685,6 +701,22 @@ impl AlsaMmapCtx {
             let committed = committed as usize;
             src_offset += committed * frame_bytes;
             remaining -= committed;
+
+            // Update the frame-counting clock feed.
+            if let Some(ref feed) = self.feed {
+                if !self.anchored {
+                    // Record the CLOCK_MONOTONIC baseline on the very first commit.
+                    let now_ns = {
+                        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+                        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+                        ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+                    };
+                    feed.anchor(now_ns, self.rate);
+                    self.anchored = true;
+                }
+                feed.advance(committed as u64);
+            }
+
             if !self.started {
                 self.primed_frames = self.primed_frames.saturating_add(committed);
                 // Pre-fill 3 periods before starting.  The extra period absorbs
@@ -717,6 +749,9 @@ impl AlsaMmapCtx {
 
 impl Drop for AlsaMmapCtx {
     fn drop(&mut self) {
+        if let Some(ref feed) = self.feed {
+            feed.invalidate();
+        }
         if !self.pcm.0.is_null() {
             unsafe {
                 // Teardown happens on track switches and app shutdown. Discard
@@ -862,6 +897,7 @@ fn alsa_mmap_writer_thread(
     stop: Arc<AtomicBool>,
     events: ThreadEventQueue,
     diagnostics: MmapThreadDiagnosticsHandle,
+    feed: Arc<AlsaHwClockFeed>,
 ) {
     // Prevent the CPU from entering deep C-states (C2+) during playback.
     // Deep C-states have wakeup latencies of 100–300 µs; keeping the CPU in
@@ -957,6 +993,8 @@ fn alsa_mmap_writer_thread(
                                 unsafe { libc::mlockall(libc::MCL_CURRENT) };
                                 dma_locked = true;
                             }
+                            let mut c = c;
+                            c.feed = Some(Arc::clone(&feed));
                             ctx = Some(c);
                         }
                         Err(e) => {
@@ -1038,6 +1076,8 @@ fn alsa_mmap_writer_thread(
                         unsafe { libc::mlockall(libc::MCL_CURRENT) };
                         dma_locked = true;
                     }
+                    let mut c = c;
+                    c.feed = Some(Arc::clone(&feed));
                     ctx = Some(c);
                 }
                 Err(e) => {
@@ -3088,7 +3128,7 @@ impl Engine {
     /// (rate unconstrained — the thread opens ALSA with the actual source rate).
     /// GStreamer's internal `audioconvert` will handle format conversion upstream.
     ///
-    /// Returns `(appsink_element, MmapSink)` on success.
+    /// Returns `(appsink_element, MmapSink, AlsaHwClock)` on success.
     fn build_appsink_mmap(
         &self,
         device: Option<&str>,
@@ -3096,7 +3136,7 @@ impl Engine {
         latency_us: i32,
         preferred_output_format: &str,
         realtime_priority: i32,
-    ) -> Result<(gst::Element, MmapSink), String> {
+    ) -> Result<(gst::Element, MmapSink, AlsaHwClock), String> {
         let dev = device.unwrap_or("hw:0,0").to_string();
         let audio_format = mmap_audio_format_from_preference(preferred_output_format);
 
@@ -3133,9 +3173,9 @@ impl Engine {
             .field("channels", 2i32)
             .build();
         appsink.set_property("caps", &caps);
-        // The mmap writer thread already blocks on ALSA hardware pacing, so do
-        // not add a second clock gate at appsink.
-        appsink.set_property("sync", false);
+        // Enable clock-based sync: buffers are released when AlsaHwClock says
+        // it is time, giving explicit hardware clock control of the pipeline.
+        appsink.set_property("sync", true);
         // Timed pull mode: the writer thread polls appsink directly so it can
         // react promptly to URI changes and shutdown.
         appsink.set_property("emit-signals", false);
@@ -3181,6 +3221,12 @@ impl Engine {
             bin.upcast::<gst::Element>()
         };
 
+        // Create the shared feed and the hardware-backed GStreamer clock.
+        // The feed is written by the RT writer thread (lock-free atomics) and
+        // read by AlsaHwClock::internal_time() from any GStreamer thread.
+        let feed = Arc::new(AlsaHwClockFeed::default());
+        let hw_clock = AlsaHwClock::new(Arc::clone(&feed));
+
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = stop.clone();
         let events: ThreadEventQueue = Arc::new(Mutex::new(VecDeque::new()));
@@ -3190,6 +3236,7 @@ impl Engine {
         let diagnostics_clone = diagnostics.clone();
         let appsink_clone = appsink.clone();
         let dev_clone = dev.clone();
+        let feed_clone = Arc::clone(&feed);
 
         let t = thread::spawn(move || {
             // Allocate the decoded PCM window before `mlockall(MCL_CURRENT)` so
@@ -3209,6 +3256,7 @@ impl Engine {
                 stop_clone,
                 events_clone,
                 diagnostics_clone.clone(),
+                feed_clone,
             );
             update_mmap_thread_diagnostics(&diagnostics_clone, |state| {
                 state.running = false;
@@ -3223,6 +3271,7 @@ impl Engine {
                 diagnostics,
                 thread: Some(t),
             },
+            hw_clock,
         ))
     }
 
@@ -3384,14 +3433,19 @@ impl Engine {
                 &self.preferred_output_format,
                 self.output_mmap_realtime_priority,
             ) {
-                Ok((elem, mmap)) => {
+                Ok((elem, mmap, hw_clock)) => {
                     self.mmap_sink = Some(mmap);
+                    // Inject the hardware clock into the pipeline so that
+                    // appsink.sync=true gates buffers against the DAC timeline.
+                    if let Ok(pipeline) = self.playbin.clone().dynamic_cast::<gst::Pipeline>() {
+                        pipeline.use_clock(Some(hw_clock.upcast_ref::<gst::Clock>()));
+                    }
                     let audio_format =
                         mmap_audio_format_from_preference(&self.preferred_output_format);
                     self.emit_event(
                         EVT_STATE,
                         &format!(
-                            "alsa-mmap configured device={} format={}",
+                            "alsa-mmap configured device={} format={} clock=hw",
                             device_norm.unwrap_or("hw:0,0"),
                             audio_format.gst_format
                         ),
