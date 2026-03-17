@@ -297,23 +297,30 @@ def build_tracks_view(app):
     app.track_list.connect("row-activated", app.on_track_selected)
     trk_content.append(app.track_list)
 
-    # Similar albums section (populated async in show_album_details)
+    # Similar albums section (populated async in show_album_details).
+    # Placed as a sibling of trk_content (not a child) so it can use its own
+    # margin_start/end that matches collection_content_box (20 px each side),
+    # giving the FlowBox the same available width as the main album grid.
     app.similar_albums_box = Gtk.Box(
         orientation=Gtk.Orientation.VERTICAL,
         spacing=12,
         margin_top=8,
         margin_bottom=32,
+        margin_start=20,
+        margin_end=20,
         visible=False,
         css_classes=["home-section", "home-generic-section"],
     )
     app.similar_albums_label = Gtk.Label(label="More by this Artist", xalign=0, css_classes=["home-section-title"])
     app.similar_albums_box.append(app.similar_albums_label)
     app.similar_albums_flow = Gtk.FlowBox(
+        homogeneous=True,
         valign=Gtk.Align.START,
-        max_children_per_line=30,
+        min_children_per_line=4,
+        max_children_per_line=10,
+        column_spacing=16,
+        row_spacing=16,
         selection_mode=Gtk.SelectionMode.NONE,
-        column_spacing=24,
-        row_spacing=28,
         css_classes=["home-flow"],
     )
     app.similar_albums_box.append(app.similar_albums_flow)
@@ -323,9 +330,11 @@ def build_tracks_view(app):
         visible=False,
     )
     app.similar_albums_box.append(app.similar_albums_more_row)
-    trk_content.append(app.similar_albums_box)
 
-    trk_scroll.set_child(trk_content)
+    trk_scroll_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+    trk_scroll_container.append(trk_content)
+    trk_scroll_container.append(app.similar_albums_box)
+    trk_scroll.set_child(trk_scroll_container)
     trk_vbox.append(trk_scroll)
     app.right_stack.add_named(trk_vbox, "tracks")
 

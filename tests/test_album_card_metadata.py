@@ -24,12 +24,20 @@ class _FakeImage:
     def __init__(self, *args, **kwargs):
         self.args = args
         self.kwargs = kwargs
+        self.icon_name = None
+
+    def set_from_icon_name(self, icon_name):
+        self.icon_name = icon_name
 
 
 class _FakeLabel:
     def __init__(self, *args, **kwargs):
         self.label = kwargs.get("label")
         self.kwargs = kwargs
+        self.tooltip = None
+
+    def set_tooltip_text(self, value):
+        self.tooltip = value
 
 
 class _FakeFlowBoxChild:
@@ -52,12 +60,19 @@ class _FakeFlow:
 class _FakeButton:
     def __init__(self, *args, **kwargs):
         self.child = None
+        self._clicked = None
 
     def set_child(self, child):
         self.child = child
 
-    def connect(self, *_args, **_kwargs):
+    def connect(self, signal, callback):
+        if signal == "clicked":
+            self._clicked = callback
         return None
+
+    def emit_clicked(self):
+        if self._clicked is not None:
+            self._clicked(self)
 
 
 def test_album_release_year_text_supports_date_and_string_values():
@@ -76,7 +91,7 @@ def test_album_subtitle_helpers_keep_year_visible():
     assert ui_actions._album_year_subtitle_text(album) == "1994"
 
 
-def test_batch_load_albums_adds_artist_and_year_subtitle(monkeypatch):
+def test_batch_load_albums_matches_saved_album_card_subtitle(monkeypatch):
     fake_gtk = SimpleNamespace(
         Box=_FakeBox,
         Image=_FakeImage,
@@ -98,6 +113,7 @@ def test_batch_load_albums_adds_artist_and_year_subtitle(monkeypatch):
         backend=SimpleNamespace(get_artwork_url=lambda *_args, **_kwargs: "artwork"),
         cache_dir="/tmp",
         main_flow=_FakeFlow(),
+        show_album_details=lambda *_args, **_kwargs: None,
     )
 
     assert ui_actions.batch_load_albums(app, [album], batch=6) is False
@@ -106,8 +122,46 @@ def test_batch_load_albums_adds_artist_and_year_subtitle(monkeypatch):
     labels = [item for item in child.child.children if isinstance(item, _FakeLabel)]
     assert [label.label for label in labels] == [
         "Mezzanine",
-        "1998",
+        "Massive Attack  •  1998",
     ]
+
+
+def test_my_albums_style_button_matches_saved_album_card_layout(monkeypatch):
+    fake_gtk = SimpleNamespace(
+        Box=_FakeBox,
+        Image=_FakeImage,
+        Label=_FakeLabel,
+        FlowBoxChild=_FakeFlowBoxChild,
+        Button=_FakeButton,
+        Orientation=SimpleNamespace(VERTICAL="vertical"),
+        Align=SimpleNamespace(CENTER="center"),
+    )
+    monkeypatch.setattr(ui_actions, "Gtk", fake_gtk)
+    monkeypatch.setattr(ui_actions.utils, "load_img", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ui_actions, "_build_feed_media_overlay", lambda widget, *_args, **_kwargs: widget)
+
+    clicked = []
+    album = SimpleNamespace(
+        name="Mezzanine",
+        artist=SimpleNamespace(name="Massive Attack"),
+        release_date="1998-04-20",
+    )
+    app = SimpleNamespace(
+        backend=SimpleNamespace(get_artwork_url=lambda *_args, **_kwargs: "artwork"),
+        cache_dir="/tmp",
+    )
+
+    btn = ui_actions._build_my_albums_style_button(app, album, lambda alb: clicked.append(alb))
+
+    labels = [item for item in btn.child.children if isinstance(item, _FakeLabel)]
+    assert [label.label for label in labels] == [
+        "Mezzanine",
+        "Massive Attack  •  1998",
+    ]
+    assert labels[1].tooltip == "Massive Attack  •  1998"
+
+    btn.emit_clicked()
+    assert clicked == [album]
 
 
 def test_artist_index_filter_and_sort_support_full_search_and_ordering():

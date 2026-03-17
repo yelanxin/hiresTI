@@ -2,6 +2,7 @@
 
 import logging
 import os
+import subprocess
 import time
 import webbrowser
 from urllib.parse import urlparse
@@ -19,8 +20,13 @@ from ui import views_builders as ui_views_builders
 
 try:
     import qrcode
+    try:
+        import qrcode.image.svg as qrcode_svg
+    except Exception:
+        qrcode_svg = None
 except Exception:
     qrcode = None
+    qrcode_svg = None
 
 logger = logging.getLogger(__name__)
 
@@ -320,18 +326,76 @@ def _cancel_login_attempt(self, attempt_id, reason="canceled"):
 
 
 def _build_qr_tempfile(self, url, attempt_id):
-    if not qrcode:
-        return None
     if not url:
         logger.error("QR generation aborted: empty login url (id=%s).", attempt_id)
         return None
-    path = os.path.join(GLib.get_tmp_dir(), f"hiresti-login-qr-{attempt_id}.png")
-    qr = qrcode.QRCode(border=2, box_size=8)
-    qr.add_data(url)
-    qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white")
-    img.save(path)
-    return path
+
+    base_path = os.path.join(GLib.get_tmp_dir(), f"hiresti-login-qr-{attempt_id}")
+    svg_path = f"{base_path}.svg"
+    png_path = f"{base_path}.png"
+
+    if _build_qr_svg(url, svg_path):
+        return svg_path
+    if _build_qr_png(url, png_path):
+        return png_path
+    if _build_qr_with_qrencode(url, png_path):
+        return png_path
+    return None
+
+
+def _build_qr_svg(url, path):
+    if not qrcode or not qrcode_svg:
+        return False
+    try:
+        qr = qrcode.QRCode(border=2, box_size=8)
+        qr.add_data(url)
+        qr.make(fit=True)
+        img = qr.make_image(image_factory=qrcode_svg.SvgPathImage)
+        img.save(path)
+        return True
+    except Exception as e:
+        logger.debug("SVG QR generation failed for %s: %s", path, e)
+        return False
+
+
+def _build_qr_png(url, path):
+    if not qrcode:
+        return False
+    try:
+        qr = qrcode.QRCode(border=2, box_size=8)
+        qr.add_data(url)
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="black", back_color="white")
+        img.save(path)
+        return True
+    except Exception as e:
+        logger.debug("PNG QR generation failed for %s: %s", path, e)
+        return False
+
+
+def _build_qr_with_qrencode(url, path):
+    try:
+        proc = subprocess.run(
+            ["qrencode", "-o", path, url],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except Exception as e:
+        logger.debug("qrencode fallback failed for %s: %s", path, e)
+        return False
+
+    if proc.returncode != 0:
+        logger.debug(
+            "qrencode returned %s for %s: %s",
+            proc.returncode,
+            path,
+            (proc.stderr or "").strip(),
+        )
+        return False
+
+    return True
 
 
 def _show_login_qr_dialog(self, oauth, attempt_id):

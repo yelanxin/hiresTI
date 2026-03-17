@@ -343,11 +343,17 @@ def test_batch_load_albums_uses_explicit_flow_target_and_token(monkeypatch):
 
     class _FakeGtkImage:
         def __init__(self, *args, **kwargs):
-            pass
+            self.icon_name = None
+
+        def set_from_icon_name(self, icon_name):
+            self.icon_name = icon_name
 
     class _FakeGtkLabel:
         def __init__(self, *args, **kwargs):
-            pass
+            self.tooltip = None
+
+        def set_tooltip_text(self, value):
+            self.tooltip = value
 
     class _FakeGtkButton:
         def __init__(self, *args, **kwargs):
@@ -374,7 +380,7 @@ def test_batch_load_albums_uses_explicit_flow_target_and_token(monkeypatch):
     monkeypatch.setattr(ui_actions, "_build_feed_media_overlay", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(ui_actions.utils, "load_img", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(ui_actions, "_album_title_text", lambda alb: alb.name)
-    monkeypatch.setattr(ui_actions, "_album_year_subtitle_text", lambda _alb: "1970")
+    monkeypatch.setattr(ui_actions, "_album_artist_year_subtitle_text", lambda _alb: "Artist  •  1970")
     monkeypatch.setattr(ui_actions.GLib, "timeout_add", lambda *_args, **_kwargs: None)
 
     target_flow = _Container()
@@ -456,7 +462,12 @@ def test_batch_load_artists_uses_explicit_flow_target(monkeypatch):
     wrong_flow = _Container()
     app = SimpleNamespace(
         main_flow=wrong_flow,
-        backend=SimpleNamespace(get_artist_artwork_url=lambda *_args, **_kwargs: ""),
+        backend=SimpleNamespace(
+            get_artist_artwork_url=lambda *_args, **_kwargs: "",
+            _artist_artwork_cache={},
+            get_artwork_url=lambda *_args, **_kwargs: "",
+            _is_placeholder_artist_artwork_url=lambda *_args, **_kwargs: False,
+        ),
         cache_dir="/tmp",
         _artists_render_token=7,
     )

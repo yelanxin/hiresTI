@@ -113,6 +113,15 @@ from app.app_wiring import wire_tidal_app
 wire_tidal_app(TidalApp)
 
 if __name__ == "__main__":
+    try:
+        import setproctitle
+        setproctitle.setproctitle("hiresti")
+    except ImportError:
+        try:
+            import ctypes
+            ctypes.CDLL("libc.so.6").prctl(15, b"hiresti", 0, 0, 0)
+        except Exception:
+            pass
     setup_logging()
     try:
         git_rev = (

@@ -30,6 +30,7 @@ depends=(
   'python-six'
   'python-tidalapi'
   'python-typing_extensions'
+  'python-setproctitle'
 )
 makedepends=(
   'cargo'
