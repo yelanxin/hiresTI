@@ -4743,6 +4743,7 @@ def render_genres_dashboard(app, prefer_cache=True):
 
         more_exhausted = [False]
         more_loading = [False]
+        more_auto_fill_ran = [False]
 
         def _dedup_new_items(new_items):
             """Filter new_items to exclude anything already present in items."""
@@ -4798,12 +4799,15 @@ def render_genres_dashboard(app, prefer_cache=True):
             # rows (common for Track categories which only return ~5 items
             # upfront), silently auto-fetch the _more link so the grid looks
             # full without requiring the user to click "Show More".
-            if idx_state[0] >= len(items) and more_path and not more_exhausted[0] and not more_loading[0]:
+            if (idx_state[0] >= len(items) and more_path
+                    and not more_exhausted[0] and not more_loading[0]
+                    and not more_auto_fill_ran[0]):
                 _auto_fill_rows()
             return False
 
         def _auto_fill_rows():
             """Transparently fetch _more items to fill up to the 2-row capacity.
+            Only called once per category (guarded by more_auto_fill_ran).
 
             _rendered_two_row_capacity() may under-report when fewer items than
             one full row are available (all items land in row 1, so it counts
@@ -4812,6 +4816,7 @@ def render_genres_dashboard(app, prefer_cache=True):
             reliable regardless of how many rows are actually rendered.
             """
             more_loading[0] = True
+            more_auto_fill_ran[0] = True
 
             def fetch():
                 new_items = app.backend.fetch_genre_more(more_path)
@@ -4821,23 +4826,21 @@ def render_genres_dashboard(app, prefer_cache=True):
                     deduped = _dedup_new_items(new_items)
                     if deduped:
                         items.extend(deduped)
-                        # Use _genre_category_visible_count instead of
-                        # _measured_chunk_size: when only a few items are in the
-                        # FlowBox, homogeneous layout stretches each child to fill
-                        # the row, making the allocated child width far larger than
-                        # the natural card width and causing column count to be
-                        # severely under-estimated.  _genre_category_visible_count
-                        # uses COVER_SIZE + available-width heuristics which are
-                        # reliable regardless of how many items are rendered.
-                        sample = items[idx_state[0]] if idx_state[0] < len(items) else (items[0] if items else None)
-                        target = _genre_category_visible_count(sample, flow)
-                        resolved_chunk_size[0] = target
-                        needed = max(0, target - idx_state[0])
-                        if needed > 0:
-                            _append_items(needed)
+                        # Probe-append up to 48 items so the FlowBox has enough
+                        # children to render multiple real rows.  Then delegate to
+                        # _finalize_initial_layout which calls
+                        # _rendered_two_row_capacity() on the live layout to get
+                        # the exact 2-row capacity and trims the FlowBox to it.
+                        # This sidesteps all width-estimation issues: homogeneous
+                        # FlowBox with few items stretches children to fill the
+                        # row, making card-width-based column math unreliable.
+                        probe = min(len(items) - idx_state[0], 48)
+                        if probe > 0:
+                            _append_items(probe)
+                        GLib.idle_add(_finalize_initial_layout)
                     else:
                         more_exhausted[0] = True
-                    _sync_more_row()
+                        _sync_more_row()
                     return False
 
                 GLib.idle_add(apply)
