@@ -4777,7 +4777,14 @@ def render_genres_dashboard(app, prefer_cache=True):
             return False
 
         def _auto_fill_rows():
-            """Transparently fetch _more items to fill up to the 2-row capacity."""
+            """Transparently fetch _more items to fill up to the 2-row capacity.
+
+            _rendered_two_row_capacity() may under-report when fewer items than
+            one full row are available (all items land in row 1, so it counts
+            them as the "2-row capacity").  Use _measured_chunk_size() here
+            which derives the column count from the FlowBox width and is
+            reliable regardless of how many rows are actually rendered.
+            """
             more_loading[0] = True
 
             def fetch():
@@ -4787,7 +4794,11 @@ def render_genres_dashboard(app, prefer_cache=True):
                     more_loading[0] = False
                     if new_items:
                         items.extend(new_items)
-                        needed = max(0, resolved_chunk_size[0] - idx_state[0])
+                        # Re-measure using width heuristics so we get the real
+                        # 2-row target even when only 1 row was rendered before.
+                        target = _measured_chunk_size()
+                        resolved_chunk_size[0] = target
+                        needed = max(0, target - idx_state[0])
                         if needed > 0:
                             _append_items(needed)
                     else:
