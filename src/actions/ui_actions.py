@@ -4828,6 +4828,10 @@ def render_genres_dashboard(app, prefer_cache=True):
                         needed = max(0, target - idx_state[0])
                         if needed > 0:
                             _append_items(needed)
+                        # If all fetched items are now shown, the _more endpoint
+                        # is exhausted — hide Show More to avoid a wasted request.
+                        if idx_state[0] >= len(items):
+                            more_exhausted[0] = True
                     else:
                         more_exhausted[0] = True
                     _sync_more_row()
