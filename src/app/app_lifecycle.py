@@ -74,7 +74,12 @@ def _restore_last_view(self):
             break
         child = child.get_next_sibling()
     if target is None:
-        target = self.nav_list.get_first_child()
+        child = self.nav_list.get_first_child()
+        while child:
+            if str(getattr(child, "nav_id", "") or "").strip():
+                target = child
+                break
+            child = child.get_next_sibling()
     if target is not None:
         self.nav_list.select_row(target)
         self.on_nav_selected(self.nav_list, target)

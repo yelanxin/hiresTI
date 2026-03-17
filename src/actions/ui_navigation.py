@@ -156,7 +156,7 @@ def _restore_artists_page_state(app):
 
 
 def on_nav_selected(app, box, row):
-    if not row:
+    if not row or not str(getattr(row, "nav_id", "") or "").strip():
         return
 
     _cancel_artist_albums_view(app)
@@ -252,8 +252,22 @@ def on_nav_selected(app, box, row):
         app.render_hires_dashboard()
         return
 
+    if row.nav_id == "genres":
+        app.grid_title_label.set_text("Genres")
+        if hasattr(app, "grid_subtitle_label") and app.grid_subtitle_label is not None:
+            app.grid_subtitle_label.set_text("Browse official TIDAL genres and curated picks")
+        app.render_genres_dashboard()
+        return
+
+    if row.nav_id == "decades":
+        app.grid_title_label.set_text("Decades")
+        if hasattr(app, "grid_subtitle_label") and app.grid_subtitle_label is not None:
+            app.grid_subtitle_label.set_text("Browse music from the 1950s to today")
+        app.render_decades_dashboard()
+        return
+
     if row.nav_id == "collection":
-        app.grid_title_label.set_text("My Albums")
+        app.grid_title_label.set_text("Albums")
         if app.backend.user:
             cached = list(getattr(app.backend, "_cached_albums", []) or [])
             now = time.time()
@@ -308,7 +322,7 @@ def on_nav_selected(app, box, row):
         return
 
     if row.nav_id == "liked_songs":
-        app.grid_title_label.set_text("Liked Songs")
+        app.grid_title_label.set_text("Tracks")
         if hasattr(app, "grid_subtitle_label") and app.grid_subtitle_label is not None:
             app.grid_subtitle_label.set_text("Your TIDAL favorite tracks")
         # Instant first paint: render cached/skeleton UI immediately, then refresh async.
@@ -415,6 +429,12 @@ def on_back_clicked(app, btn):
             btn.set_sensitive(False)
         elif nav_id == "hires":
             app.render_hires_dashboard(prefer_cache=True)
+            btn.set_sensitive(False)
+        elif nav_id == "genres":
+            app.render_genres_dashboard(prefer_cache=True)
+            btn.set_sensitive(False)
+        elif nav_id == "decades":
+            app.render_decades_dashboard(prefer_cache=True)
             btn.set_sensitive(False)
         elif nav_id == "home":
             cached_sections = getattr(app, "_home_sections_cache", None)

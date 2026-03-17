@@ -295,6 +295,10 @@ def _init_runtime_state(self):
     self._playing_pulse_source = 0
     self._playing_pulse_on = False
     self._home_sections_cache = None
+    self._genres_definitions = None
+    self._genres_tab_cache = {}
+    self._genres_cache_time = 0.0
+    self._genres_selected_tab = ""
     self.stream_prefetch_cache = {}
     self.eq_band_values = list(self.settings.get("dsp_peq_bands", [0.0] * 10) or [])
     while len(self.eq_band_values) < 10:

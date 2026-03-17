@@ -1,5 +1,42 @@
 # Changelog
 
+## 1.7.3 - 2026-03-16
+
+### Added
+- Added an official **Genres** page in the sidebar. The page reads TIDAL's genre feed from `pages/genre_page`, shows each genre as a tab, and lazily loads content: only the first tab fetches on page open; the remaining tabs load on demand when selected.
+- Added left/right scroll buttons for the Genres tab strip, matching the horizontal-scroll controls already used in `Liked Songs`.
+- Added sidebar section grouping with `DISCOVER`, `YOUR LIBRARY`, and `RECENT` headers for clearer navigation.
+- Added custom symbolic sidebar icons for `Genres`, `Decades`, and `Albums` so navigation artwork stays consistent across icon themes and Linux distributions.
+
+### Changed
+- Sidebar naming has been simplified:
+  - `My Albums` is now `Albums`
+  - `Liked Songs` is now `Tracks`
+- The right-side page titles for those library pages now match the sidebar labels: `Albums` and `Tracks`.
+- `Genres` category sections now show only the first two rows initially, with a `Show More` button at the bottom-right of each section that appends more items in-place.
+- `Genres` tab-strip scrolling no longer relies on a visible scrollbar.
+
+### Fixed
+- Fixed the `Hi-Res` page occasionally showing a redundant internal `Hi-Res` tab when TIDAL returned a same-named section from the official page feed.
+- Fixed `Genres` initial visible-item counts being inconsistent across Fedora and Ubuntu. The page now derives its two-row limit from GTK's real rendered layout instead of relying only on width heuristics.
+- Fixed `Genres` pages sometimes leaving a large empty scrollable area below the content because the stack child was being vertically stretched.
+- Fixed GTK warnings such as `GtkGizmo (slider) reported min width/min height < 0` triggered when opening `Genres`; the tab-strip now hides scrolling controls without forcing invalid scrollbar sizing.
+
+## 1.7.2 - 2026-03-15
+
+### Added
+- **Decades** page in the sidebar: browse TIDAL's curated content by decade (1950s–2010s). Each decade is a separate tab with Playlists, Milestone Year Albums, and Albums Of The Decade sections. Content is loaded lazily — only the first tab fetches on page open; remaining decades load on demand when the tab is clicked.
+- **Process name**: the app now registers itself as `hiresti` in the process list (via `setproctitle`), replacing the generic `python3 main.py` entry visible in `top`/`htop`.
+
+### Changed
+- Artist cards on the Artists page now use cached artwork URLs for instant display when available, falling back to the full `get_artist_artwork_url` lookup only when no cache hit exists. This eliminates the blank-image flash when revisiting the Artists page.
+- Similar albums section in artist detail view is now hidden when opening a remote playlist from that page.
+- Artist detail album grid now fits up to 10 columns (previously 8) with tighter 16 px gaps, making better use of wide windows.
+
+### Fixed
+- Fixed Hi-Res, Top, and New pages occasionally showing `<built-in method title of …>` as a card title. Certain tidalapi objects expose `title` as a callable rather than a plain string attribute; all category title and item name lookups now guard against callable values before passing to `str()`.
+- Fixed back button navigating to the Playlists page instead of the Decades dashboard when returning from a playlist detail view opened inside Decades.
+
 ## 1.7.0 - 2026-03-15
 
 ### Added

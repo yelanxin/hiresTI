@@ -17,6 +17,13 @@ button.circular {
 .sidebar-row { padding: 8px 12px; border-radius: 6px; margin: 0 4px; }
 .sidebar-row:hover { background-color: alpha(currentColor, 0.08); }
 .sidebar-row:selected { background-color: alpha(@accent_bg_color, 0.8); color: white; }
+.sidebar-group-row,
+.sidebar-group-row:hover,
+.sidebar-group-row:selected {
+    background: transparent;
+    background-color: transparent;
+    box-shadow: none;
+}
 
 /* 核心播放栏样式 */
 .card-bar { 
@@ -1583,6 +1590,30 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
 .liked-artist-filter-scroll viewport,
 .liked-artist-filter-flow {
     background: transparent;
+}
+
+.genres-tabs-scroll,
+.genres-tabs-scroll viewport,
+.genres-tabs-scroll stackswitcher {
+    background: transparent;
+}
+
+.genres-show-more-row {
+    margin-top: 6px;
+}
+
+.genres-show-more-btn {
+    min-height: 28px;
+    padding: 0 12px;
+    border-radius: 999px;
+    background-color: alpha(@accent_bg_color, 0.12);
+    border-color: alpha(@accent_bg_color, 0.34);
+    box-shadow: none;
+}
+
+.genres-show-more-btn:hover {
+    background-color: alpha(@accent_bg_color, 0.18);
+    border-color: alpha(@accent_bg_color, 0.48);
 }
 
 .liked-artist-scroll-btn {

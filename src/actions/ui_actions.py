@@ -118,6 +118,21 @@ def _norm_trackish_text(value):
     return " ".join("".join(keep).split())
 
 
+def _normalized_section_key(value):
+    return "".join(ch for ch in str(value or "").strip().lower() if ch.isalnum())
+
+
+def _filter_hires_sections(sections):
+    visible_sections = list(sections or [])
+    if len(visible_sections) <= 1:
+        return visible_sections
+
+    filtered_sections = [
+        sec for sec in visible_sections if _normalized_section_key((sec or {}).get("title")) != "hires"
+    ]
+    return filtered_sections or visible_sections
+
+
 def _liked_tracks_signature(tracks):
     items = list(tracks or [])
     digest = blake2b(digest_size=8)
@@ -276,6 +291,46 @@ def _album_year_subtitle_text(album):
     if year:
         return year
     return _album_artist_name_text(album)
+
+
+def _build_my_albums_style_button(app, album, on_click):
+    card = Gtk.Box(
+        orientation=Gtk.Orientation.VERTICAL,
+        spacing=6,
+        css_classes=_feed_card_classes("history-card"),
+    )
+    img = Gtk.Image(pixel_size=utils.COVER_SIZE, css_classes=["album-cover-img"])
+    img.set_from_icon_name("audio-x-generic-symbolic")
+    utils.load_img(
+        img,
+        lambda a=album: app.backend.get_artwork_url(a, 320),
+        app.cache_dir,
+        utils.COVER_SIZE,
+    )
+    card.append(_build_feed_media_overlay(img, utils.COVER_SIZE, "album-cover-img"))
+    card.append(
+        Gtk.Label(
+            label=_album_title_text(album),
+            halign=Gtk.Align.CENTER,
+            ellipsize=3,
+            max_width_chars=14,
+            css_classes=["home-card-title"],
+        )
+    )
+    subtitle = _album_artist_year_subtitle_text(album)
+    subtitle_label = Gtk.Label(
+        label=subtitle,
+        halign=Gtk.Align.CENTER,
+        ellipsize=3,
+        max_width_chars=18,
+        css_classes=["dim-label", "home-card-subtitle"],
+    )
+    subtitle_label.set_tooltip_text(subtitle)
+    card.append(subtitle_label)
+    btn = Gtk.Button(css_classes=["flat", "history-card-btn", "home-feed-btn"])
+    btn.set_child(card)
+    btn.connect("clicked", lambda _btn, a=album: on_click(a))
+    return btn
 
 
 def sort_objects_by_name_fast(items, context="items"):
@@ -1515,32 +1570,14 @@ def _load_similar_albums(app, alb):
             sidebar_width = max(int(base_width * float(getattr(ui_config, "SIDEBAR_RATIO", 0.15))), 120)
             available_width = max(320, base_width - sidebar_width - 64)
         item_width = max(150, int(getattr(utils, "COVER_SIZE", 170) or 170) + 20)
-        gap = 24
-        columns = max(1, min(8, int((available_width + gap) // (item_width + gap)) or 1))
+        gap = 16
+        columns = max(1, min(10, int((available_width + gap) // (item_width + gap)) or 1))
         return max(1, columns * 2)
 
     initial_count = _similar_initial_count()
 
     def _build_album_card(s_alb):
-        v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, css_classes=_feed_card_classes())
-        img = Gtk.Image(pixel_size=utils.COVER_SIZE, css_classes=["album-cover-img"])
-        utils.load_img(img, lambda a=s_alb: app.backend.get_artwork_url(a, 640), app.cache_dir, utils.COVER_SIZE)
-        v.append(_build_feed_media_overlay(img, utils.COVER_SIZE, "album-cover-img"))
-        title = str(getattr(s_alb, "title", getattr(s_alb, "name", "Unknown")) or "Unknown")
-        v.append(Gtk.Label(
-            label=title, ellipsize=3, halign=Gtk.Align.CENTER,
-            wrap=True, max_width_chars=16,
-            css_classes=["home-card-title"],
-        ))
-        v.append(Gtk.Label(
-            label=_album_year_subtitle_text(s_alb),
-            halign=Gtk.Align.CENTER, ellipsize=3, max_width_chars=18,
-            css_classes=["dim-label", "home-card-subtitle"],
-        ))
-        btn = Gtk.Button(css_classes=["flat", "history-card-btn", "home-feed-btn"])
-        btn.set_child(v)
-        btn.connect("clicked", lambda _b, a=s_alb: app.show_album_details(a))
-        return btn
+        return _build_my_albums_style_button(app, s_alb, app.show_album_details)
 
     def populate():
         flow = getattr(app, "similar_albums_flow", None)
@@ -1584,6 +1621,10 @@ def _load_similar_albums(app, alb):
 
 
 def show_album_details(app, alb):
+    # Invalidate any in-flight playlist page-load callbacks so they don't
+    # overwrite the track list we're about to populate with album tracks.
+    app._remote_pl_render_token = int(getattr(app, "_remote_pl_render_token", 0) or 0) + 1
+
     current_view = app.right_stack.get_visible_child_name()
     if current_view and current_view != "tracks":
         app.nav_history.append(current_view)
@@ -1747,33 +1788,7 @@ def batch_load_albums(app, albs, batch=6, _flow=None, _token=None, _token_attr=N
         return False
     curr, rem = albs[:batch], albs[batch:]
     for alb in curr:
-        v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, css_classes=_feed_card_classes())
-        img = Gtk.Image(pixel_size=utils.COVER_SIZE, css_classes=["album-cover-img"])
-        utils.load_img(img, lambda a=alb: app.backend.get_artwork_url(a, 640), app.cache_dir, utils.COVER_SIZE)
-        v.append(_build_feed_media_overlay(img, utils.COVER_SIZE, "album-cover-img"))
-        v.append(
-            Gtk.Label(
-                label=_album_title_text(alb),
-                ellipsize=3,
-                halign=Gtk.Align.CENTER,
-                wrap=True,
-                max_width_chars=16,
-                css_classes=["home-card-title"],
-            )
-        )
-        v.append(
-            Gtk.Label(
-                label=_album_year_subtitle_text(alb),
-                halign=Gtk.Align.CENTER,
-                ellipsize=3,
-                max_width_chars=18,
-                css_classes=["dim-label", "home-card-subtitle"],
-            )
-        )
-        btn = Gtk.Button(css_classes=["flat", "history-card-btn", "home-feed-btn"])
-        btn.set_child(v)
-        btn.connect("clicked", lambda _b, a=alb: app.show_album_details(a))
-        flow.append(btn)
+        flow.append(_build_my_albums_style_button(app, alb, app.show_album_details))
     if rem:
         GLib.timeout_add(50, app.batch_load_albums, rem, batch, flow, _token, _token_attr)
     return False
@@ -1792,7 +1807,18 @@ def batch_load_artists(app, artists, batch=10, _token=None, _flow=None):
     for art in curr:
         v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, css_classes=_artist_card_classes())
         img = Gtk.Image(pixel_size=150, css_classes=["circular-avatar"])
-        utils.load_img(img, lambda a=art: app.backend.get_artist_artwork_url(a, 320), app.cache_dir, 150)
+        # Fast path: try to get artwork URL synchronously from in-memory cache or local
+        # object attributes (no network calls). This prevents all _IMG_EXECUTOR workers
+        # from being blocked on URL resolution API calls when rendering large collections.
+        _cached_url = app.backend._artist_artwork_cache.get(
+            f"id:{getattr(art, 'id', None)}:320"
+        ) if getattr(art, "id", None) is not None else None
+        if not _cached_url:
+            _quick_url = app.backend.get_artwork_url(art, 320)
+            if _quick_url and not app.backend._is_placeholder_artist_artwork_url(_quick_url):
+                _cached_url = _quick_url
+        url_arg = _cached_url if _cached_url else (lambda a=art: app.backend.get_artist_artwork_url(a, 320))
+        utils.load_img(img, url_arg, app.cache_dir, 150)
         v.append(_build_feed_media_overlay(img, 150, "circular-avatar"))
         v.append(
             Gtk.Label(
@@ -1983,7 +2009,11 @@ def render_artists_dashboard(app):
         render_token = int(getattr(app, "_artists_render_token", 0) or 0) + 1
         app._artists_render_token = render_token
         if items:
-            app.batch_load_artists(items, 10, render_token, flow)
+            # Render all artists in one shot so every image download is submitted
+            # to the executor at t=0.  With the old batch=10/50ms approach the
+            # last batch's downloads were queued 200 ms late, causing the last
+            # few covers to appear blank until workers caught up.
+            app.batch_load_artists(items, len(items), render_token, flow)
 
     def _set_status(message):
         text = str(message or "")
@@ -2326,8 +2356,8 @@ def _artist_release_initial_visible_count(app):
 
     # Card width is dominated by cover size plus padding/gap.
     item_width = max(150, int(getattr(utils, "COVER_SIZE", 170) or 170) + 20)
-    gap = 24
-    columns = max(1, min(8, int((available_width + gap) // (item_width + gap)) or 1))
+    gap = 16
+    columns = max(1, min(10, int((available_width + gap) // (item_width + gap)) or 1))
     return max(1, columns * 2)
 
 
@@ -2676,11 +2706,13 @@ def render_artist_detail(app, artist, render_token=None):
 
     albums_section = _append_section_header("Albums", 0)
     albums_flow = Gtk.FlowBox(
+        homogeneous=True,
         valign=Gtk.Align.START,
-        max_children_per_line=30,
+        min_children_per_line=4,
+        max_children_per_line=10,
         selection_mode=Gtk.SelectionMode.NONE,
-        column_spacing=24,
-        row_spacing=28,
+        column_spacing=16,
+        row_spacing=16,
         css_classes=["home-flow"],
     )
     albums_flow.connect("child-activated", app.on_grid_item_activated)
@@ -2701,11 +2733,13 @@ def render_artist_detail(app, artist, render_token=None):
 
     eps_section = _append_section_header("EP & Singles", 0)
     eps_flow = Gtk.FlowBox(
+        homogeneous=True,
         valign=Gtk.Align.START,
-        max_children_per_line=30,
+        min_children_per_line=4,
+        max_children_per_line=10,
         selection_mode=Gtk.SelectionMode.NONE,
-        column_spacing=24,
-        row_spacing=28,
+        column_spacing=16,
+        row_spacing=16,
         css_classes=["home-flow"],
     )
     eps_flow.connect("child-activated", app.on_grid_item_activated)
@@ -4145,8 +4179,9 @@ def render_hires_dashboard(app, prefer_cache=True):
 
     def _render_sections(sections):
         _clear_container(app.collection_content_box)
-        if sections:
-            app._hires_sections_cache = list(sections)
+        visible_sections = _filter_hires_sections(sections)
+        if visible_sections:
+            app._hires_sections_cache = list(visible_sections)
             app._hires_sections_cache_time = time.monotonic()
             tabs_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
             hires_stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
@@ -4199,7 +4234,7 @@ def render_hires_dashboard(app, prefer_cache=True):
                 return _build_feed_item_button(app, item_data, _open_item)
 
             _tab_data = {}
-            for idx, sec in enumerate(sections):
+            for idx, sec in enumerate(visible_sections):
                 page_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, css_classes=["home-section"])
                 page_box.set_valign(Gtk.Align.START)
                 page_box.set_vexpand(False)
@@ -4283,6 +4318,683 @@ def render_hires_dashboard(app, prefer_cache=True):
         def task():
             sections = list(app.backend.get_hires_page() or [])
             GLib.idle_add(lambda: (_render_sections(sections), False)[1])
+        Thread(target=task, daemon=True).start()
+
+
+def render_decades_dashboard(app, prefer_cache=True):
+    _clear_container(app.collection_content_box)
+
+    def _open_item(item_data):
+        if not item_data:
+            return
+        obj = item_data.get("obj")
+        typ = item_data.get("type")
+        if typ in {"PageItem", "PageLink"} and obj is not None and hasattr(obj, "get") and callable(obj.get):
+            def task():
+                try:
+                    resolved = obj.get()
+                except Exception:
+                    resolved = None
+                if resolved is None:
+                    return
+                def apply():
+                    resolved_type = type(resolved).__name__
+                    if "Track" in resolved_type:
+                        app._play_single_track(resolved)
+                    elif "Artist" in resolved_type:
+                        app.on_artist_clicked(resolved)
+                    elif "Playlist" in resolved_type:
+                        app.on_remote_playlist_card_clicked(resolved)
+                    else:
+                        app.show_album_details(resolved)
+                    return False
+                GLib.idle_add(apply)
+            Thread(target=task, daemon=True).start()
+            return
+        if typ == "Track":
+            app._play_single_track(obj)
+            return
+        if typ == "Artist":
+            app.on_artist_clicked(obj)
+            return
+        if "Playlist" in str(typ or ""):
+            app.on_remote_playlist_card_clicked(obj)
+            return
+        app.show_album_details(obj)
+
+    def _populate_category(cat_box, items):
+        """Progressively append items into a FlowBox inside cat_box."""
+        flow = Gtk.FlowBox(
+            homogeneous=True,
+            min_children_per_line=2,
+            max_children_per_line=16,
+            column_spacing=16,
+            row_spacing=16,
+            selection_mode=Gtk.SelectionMode.NONE,
+        )
+        cat_box.append(flow)
+        idx_state = [0]
+
+        def _tick(flow=flow, items=items, idx_state=idx_state):
+            for _ in range(8):
+                i = idx_state[0]
+                if i >= len(items):
+                    return False
+                btn = _build_feed_item_button(app, items[i], _open_item)
+                child = Gtk.FlowBoxChild()
+                child.set_child(btn)
+                flow.append(child)
+                idx_state[0] += 1
+            return idx_state[0] < len(items)
+
+        GLib.idle_add(_tick)
+
+    def _build_decade_tab(sec):
+        """Build the scrollable content box for one decade tab."""
+        tab_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24)
+        tab_box.set_valign(Gtk.Align.START)
+        tab_box.set_vexpand(False)
+        for cat in list(sec.get("categories", []) or []):
+            cat_title = str(cat.get("title", "") or "")
+            items = list(cat.get("items", []) or [])
+            if not items:
+                continue
+            # Section header label
+            lbl = Gtk.Label(label=cat_title, xalign=0, css_classes=["home-section-title"])
+            lbl.set_margin_top(4)
+            tab_box.append(lbl)
+            cat_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            tab_box.append(cat_box)
+            _populate_category(cat_box, items)
+        return tab_box
+
+    def _build_ui(definitions, tab_cache):
+        """Build the full tab structure. definitions = [(label, path), …].
+        tab_cache = {label: sec} for already-fetched decades."""
+        _clear_container(app.collection_content_box)
+
+        if not definitions:
+            app.collection_content_box.append(
+                Gtk.Label(
+                    label="Decades content is not available for your account or region.",
+                    xalign=0,
+                    css_classes=["dim-label"],
+                    margin_start=8,
+                    margin_top=8,
+                )
+            )
+            return
+
+        tabs_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        decades_stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
+        decades_stack.set_hhomogeneous(False)
+        decades_switcher = Gtk.StackSwitcher(stack=decades_stack)
+        decades_switcher.set_halign(Gtk.Align.START)
+        tabs_box.append(decades_switcher)
+        tabs_box.append(decades_stack)
+
+        # placeholder boxes keyed by label
+        _placeholders = {}
+        _built_tabs = set()
+        _loading_tabs = set()
+
+        for label, _path in definitions:
+            placeholder = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            _placeholders[label] = placeholder
+            decades_stack.add_titled(placeholder, label, label)
+
+        selected = str(getattr(app, "_decades_selected_tab", "") or "")
+        labels = [d[0] for d in definitions]
+        initial = selected if selected in labels else (labels[0] if labels else None)
+        if initial:
+            decades_stack.set_visible_child_name(initial)
+
+        def _populate_placeholder(label, sec):
+            placeholder = _placeholders.get(label)
+            if placeholder is None:
+                return
+            # Remove loading spinner if present
+            child = placeholder.get_first_child()
+            while child:
+                nxt = child.get_next_sibling()
+                placeholder.remove(child)
+                child = nxt
+            if sec:
+                placeholder.append(_build_decade_tab(sec))
+            else:
+                placeholder.append(Gtk.Label(
+                    label="Content not available.",
+                    xalign=0, css_classes=["dim-label"],
+                    margin_start=8, margin_top=8,
+                ))
+
+        def _ensure_tab_loaded(label):
+            if label in _built_tabs or label in _loading_tabs:
+                return
+            # Already in cache?
+            sec = tab_cache.get(label)
+            if sec is not None:
+                _built_tabs.add(label)
+                _populate_placeholder(label, sec)
+                return
+            # Need to fetch — show spinner first
+            _loading_tabs.add(label)
+            spinner = Gtk.Spinner()
+            spinner.set_margin_top(24)
+            spinner.set_halign(Gtk.Align.CENTER)
+            spinner.start()
+            placeholder = _placeholders.get(label)
+            if placeholder:
+                placeholder.append(spinner)
+
+            path = next((p for l, p in definitions if l == label), None)
+            if not path:
+                _loading_tabs.discard(label)
+                return
+
+            def fetch(label=label, path=path):
+                sec = app.backend.get_decade_section(label, path)
+                def apply(label=label, sec=sec):
+                    tab_cache[label] = sec
+                    _loading_tabs.discard(label)
+                    _built_tabs.add(label)
+                    _populate_placeholder(label, sec)
+                    return False
+                GLib.idle_add(apply)
+            Thread(target=fetch, daemon=True).start()
+
+        def _on_tab_changed(stack, _pspec):
+            try:
+                name = str(stack.get_visible_child_name() or "")
+            except Exception:
+                name = ""
+            if name:
+                app._decades_selected_tab = name
+                _ensure_tab_loaded(name)
+
+        decades_stack.connect("notify::visible-child-name", _on_tab_changed)
+        app.collection_content_box.append(tabs_box)
+        if initial:
+            _ensure_tab_loaded(initial)
+
+    # Per-decade cache: {label: sec}, survives across re-renders
+    tab_cache = getattr(app, "_decades_tab_cache", None)
+    definitions = getattr(app, "_decades_definitions", None)
+    cache_time = getattr(app, "_decades_cache_time", 0)
+    cache_is_fresh = bool(definitions) and (time.monotonic() - cache_time) < 300
+
+    if prefer_cache and definitions:
+        _build_ui(definitions, tab_cache or {})
+
+    if not cache_is_fresh:
+        def task():
+            defs, eager = app.backend.get_decades_page()
+            new_cache = dict(getattr(app, "_decades_tab_cache", None) or {})
+            for sec in eager:
+                if sec:
+                    new_cache[sec["title"]] = sec
+
+            def apply(defs=defs, new_cache=new_cache):
+                app._decades_definitions = defs
+                app._decades_tab_cache = new_cache
+                app._decades_cache_time = time.monotonic()
+                _build_ui(defs, new_cache)
+                return False
+            GLib.idle_add(apply)
+        Thread(target=task, daemon=True).start()
+
+
+def render_genres_dashboard(app, prefer_cache=True):
+    _clear_container(app.collection_content_box)
+
+    def _genre_category_visible_count(sample_item=None, widget=None):
+        available_width = 0
+        try:
+            if widget is not None:
+                available_width = int(widget.get_width() or 0)
+        except Exception:
+            available_width = 0
+
+        if available_width <= 0:
+            try:
+                content_box = getattr(app, "collection_content_box", None)
+                if content_box is not None:
+                    available_width = int(content_box.get_width() or 0)
+            except Exception:
+                available_width = 0
+
+        if available_width <= 0:
+            try:
+                win = getattr(app, "win", None)
+                if win is not None:
+                    available_width = int(win.get_width() or 0)
+            except Exception:
+                available_width = 0
+
+        if available_width <= 0:
+            try:
+                base_width = int(getattr(app, "saved_width", 0) or 0)
+            except Exception:
+                base_width = 0
+            if base_width <= 0:
+                base_width = int(getattr(ui_config, "WINDOW_WIDTH", 1250) or 1250)
+            sidebar_width = max(int(base_width * float(getattr(ui_config, "SIDEBAR_RATIO", 0.15))), 120)
+            available_width = max(320, base_width - sidebar_width - 64)
+
+        layout = _home_card_layout(sample_item or {}, utils.COVER_SIZE)
+        # Feed cards add 8 px horizontal padding on each side via the shared
+        # `.card` class, so visible columns must be computed from the outer slot
+        # width rather than the media width alone. This is especially important
+        # for Track cards, whose media is only 88 px wide.
+        item_width = max(88, int(layout.get("card_width", getattr(utils, "COVER_SIZE", 170) or 170)) + 16)
+        gap = 16
+        columns = max(1, min(16, int((available_width + gap) // (item_width + gap)) or 1))
+        return max(1, columns * 2)
+
+    def _open_item(item_data):
+        if not item_data:
+            return
+        obj = item_data.get("obj")
+        typ = item_data.get("type")
+        if typ in {"PageItem", "PageLink"} and obj is not None and hasattr(obj, "get") and callable(obj.get):
+            def task():
+                try:
+                    resolved = obj.get()
+                except Exception:
+                    resolved = None
+                if resolved is None:
+                    return
+                def apply():
+                    resolved_type = type(resolved).__name__
+                    if "Track" in resolved_type:
+                        app._play_single_track(resolved)
+                    elif "Artist" in resolved_type:
+                        app.on_artist_clicked(resolved)
+                    elif "Playlist" in resolved_type:
+                        app.on_remote_playlist_card_clicked(resolved)
+                    else:
+                        app.show_album_details(resolved)
+                    return False
+                GLib.idle_add(apply)
+            Thread(target=task, daemon=True).start()
+            return
+        if typ == "Track":
+            app._play_single_track(obj)
+            return
+        if typ == "Artist":
+            app.on_artist_clicked(obj)
+            return
+        if "Playlist" in str(typ or ""):
+            app.on_remote_playlist_card_clicked(obj)
+            return
+        app.show_album_details(obj)
+
+    def _populate_category(cat_box, items):
+        flow = Gtk.FlowBox(
+            homogeneous=True,
+            min_children_per_line=2,
+            max_children_per_line=16,
+            column_spacing=16,
+            row_spacing=16,
+            selection_mode=Gtk.SelectionMode.NONE,
+        )
+        cat_box.append(flow)
+        idx_state = [0]
+        resolved_chunk_size = [0]
+        more_row = None
+
+        def _append_items(limit, flow=flow, items=items, idx_state=idx_state):
+            appended = 0
+            while appended < limit:
+                i = idx_state[0]
+                if i >= len(items):
+                    break
+                btn = _build_feed_item_button(app, items[i], _open_item)
+                child = Gtk.FlowBoxChild()
+                child.set_child(btn)
+                flow.append(child)
+                idx_state[0] += 1
+                appended += 1
+
+        def _measured_chunk_size(flow=flow, items=items):
+            gap = 16
+            flow_width = 0
+            try:
+                flow_width = int(flow.get_allocated_width() or 0)
+            except Exception:
+                flow_width = 0
+            if flow_width <= 0:
+                try:
+                    flow_width = int(flow.get_width() or 0)
+                except Exception:
+                    flow_width = 0
+
+            first_child = flow.get_first_child() if hasattr(flow, "get_first_child") else None
+            first_widget = None
+            if first_child is not None:
+                if hasattr(first_child, "get_first_child"):
+                    try:
+                        first_widget = first_child.get_first_child()
+                    except Exception:
+                        first_widget = None
+                if first_widget is None:
+                    first_widget = getattr(first_child, "child", None)
+
+            child_width = 0
+            if first_widget is not None:
+                try:
+                    child_width = int(first_widget.get_allocated_width() or 0)
+                except Exception:
+                    child_width = 0
+                if child_width <= 0:
+                    try:
+                        child_width = int(first_widget.get_width() or 0)
+                    except Exception:
+                        child_width = 0
+
+            if flow_width > 0 and child_width > 0:
+                columns = max(1, min(16, int((flow_width + gap) // (child_width + gap)) or 1))
+                return max(1, columns * 2)
+
+            return _genre_category_visible_count(
+                items[0] if items else None,
+                flow,
+            )
+
+        def _rendered_two_row_capacity(flow=flow):
+            children = []
+            child = flow.get_first_child() if hasattr(flow, "get_first_child") else None
+            while child is not None:
+                children.append(child)
+                if not hasattr(child, "get_next_sibling"):
+                    return 0
+                child = child.get_next_sibling() if hasattr(child, "get_next_sibling") else None
+
+            if not children:
+                return 0
+
+            row_positions = []
+            count = 0
+            for child in children:
+                try:
+                    alloc = child.get_allocation()
+                except Exception:
+                    alloc = None
+                y = int(getattr(alloc, "y", 0) or 0)
+                height = int(getattr(alloc, "height", 0) or 0)
+                if height <= 0:
+                    try:
+                        height = int(child.get_allocated_height() or 0)
+                    except Exception:
+                        height = 0
+                tolerance = max(4, int(height // 4) if height > 0 else 4)
+
+                matched = False
+                for row_y in row_positions:
+                    if abs(y - row_y) <= tolerance:
+                        matched = True
+                        break
+                if not matched:
+                    row_positions.append(y)
+                    if len(row_positions) > 2:
+                        break
+                count += 1
+            return count if count > 0 else 0
+
+        def _sync_more_row(items=items, idx_state=idx_state):
+            if more_row is not None:
+                more_row.set_visible(idx_state[0] < len(items))
+
+        def _append_chunk(flow=flow, items=items, idx_state=idx_state):
+            chunk_size = resolved_chunk_size[0] or _measured_chunk_size()
+            _append_items(chunk_size)
+            _sync_more_row()
+            return False
+
+        def _finalize_initial_layout(flow=flow, items=items, idx_state=idx_state):
+            chunk_size = _rendered_two_row_capacity() or _measured_chunk_size()
+            resolved_chunk_size[0] = chunk_size
+            rendered = idx_state[0]
+            if rendered > chunk_size:
+                _clear_container(flow)
+                idx_state[0] = 0
+                _append_items(chunk_size)
+            elif rendered < chunk_size:
+                _append_items(chunk_size - rendered)
+            _sync_more_row()
+            return False
+
+        if len(items) > 2:
+            more_row = Gtk.Box(
+                orientation=Gtk.Orientation.HORIZONTAL,
+                hexpand=True,
+                css_classes=["genres-show-more-row"],
+            )
+            more_row.set_halign(Gtk.Align.FILL)
+            more_row.set_visible(False)
+            more_row.append(Gtk.Box(hexpand=True))
+            more_btn = Gtk.Button(label="Show More", css_classes=["flat", "genres-show-more-btn"])
+            more_btn.set_halign(Gtk.Align.END)
+            more_btn.connect("clicked", lambda *_args: GLib.idle_add(_append_chunk))
+            more_row.append(more_btn)
+            cat_box.append(more_row)
+
+        # Let FlowBox lay out a representative sample first, then clamp the
+        # initial visible range to the real two-row capacity for this distro/theme.
+        # FlowBox caps at 16 children per line here, so 48 items guarantees
+        # we probe at least 3 full rows even for tiny Track cards.
+        _append_items(min(len(items), 48))
+        GLib.idle_add(_finalize_initial_layout)
+
+    def _build_genre_tab(sec):
+        tab_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24)
+        tab_box.set_valign(Gtk.Align.START)
+        tab_box.set_vexpand(False)
+        for cat in list(sec.get("categories", []) or []):
+            cat_title = str(cat.get("title", "") or "")
+            items = list(cat.get("items", []) or [])
+            if not items:
+                continue
+            lbl = Gtk.Label(label=cat_title, xalign=0, css_classes=["home-section-title"])
+            lbl.set_margin_top(4)
+            tab_box.append(lbl)
+            cat_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            tab_box.append(cat_box)
+            _populate_category(cat_box, items)
+        return tab_box
+
+    def _build_ui(definitions, tab_cache):
+        _clear_container(app.collection_content_box)
+
+        if not definitions:
+            app.collection_content_box.append(
+                Gtk.Label(
+                    label="Genres content is not available for your account or region.",
+                    xalign=0,
+                    css_classes=["dim-label"],
+                    margin_start=8,
+                    margin_top=8,
+                )
+            )
+            return
+
+        tabs_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        tabs_box.set_valign(Gtk.Align.START)
+        tabs_box.set_vexpand(False)
+        genres_stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
+        genres_stack.set_hhomogeneous(False)
+        genres_stack.set_vhomogeneous(False)
+        genres_stack.set_valign(Gtk.Align.START)
+        genres_stack.set_vexpand(False)
+        genres_switcher = Gtk.StackSwitcher(stack=genres_stack)
+        genres_switcher.set_halign(Gtk.Align.START)
+
+        genres_tabs_prev_btn = Gtk.Button(
+            icon_name="go-previous-symbolic",
+            css_classes=["flat", "circular", "liked-artist-scroll-btn"],
+            valign=Gtk.Align.CENTER,
+        )
+        genres_tabs_prev_btn.set_tooltip_text("Scroll genres left")
+        genres_tabs_next_btn = Gtk.Button(
+            icon_name="go-next-symbolic",
+            css_classes=["flat", "circular", "liked-artist-scroll-btn"],
+            valign=Gtk.Align.CENTER,
+        )
+        genres_tabs_next_btn.set_tooltip_text("Scroll genres right")
+
+        switcher_scroller = Gtk.ScrolledWindow(
+            hexpand=True,
+            vexpand=False,
+            css_classes=["genres-tabs-scroll"],
+        )
+        switcher_scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
+        if hasattr(switcher_scroller, "set_overlay_scrolling"):
+            switcher_scroller.set_overlay_scrolling(True)
+        if hasattr(switcher_scroller, "set_propagate_natural_height"):
+            switcher_scroller.set_propagate_natural_height(True)
+        switcher_scroller.set_child(genres_switcher)
+        try:
+            h_scrollbar = switcher_scroller.get_hscrollbar()
+        except Exception:
+            h_scrollbar = None
+        if h_scrollbar is not None and hasattr(h_scrollbar, "set_visible"):
+            h_scrollbar.set_visible(False)
+
+        genres_tabs_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        genres_tabs_row.append(genres_tabs_prev_btn)
+        genres_tabs_row.append(switcher_scroller)
+        genres_tabs_row.append(genres_tabs_next_btn)
+
+        tabs_box.append(genres_tabs_row)
+        tabs_box.append(genres_stack)
+
+        _bind_horizontal_scroll_buttons(switcher_scroller, genres_tabs_prev_btn, genres_tabs_next_btn)
+
+        def _scroll_genres_tabs(direction):
+            h_adj = switcher_scroller.get_hadjustment()
+            if h_adj is None:
+                return
+            step = max(120.0, float(h_adj.get_page_size() or 0.0) * 0.75)
+            lower = float(h_adj.get_lower() or 0.0)
+            upper = float(h_adj.get_upper() or 0.0)
+            page = float(h_adj.get_page_size() or 0.0)
+            max_value = max(lower, upper - page)
+            cur = float(h_adj.get_value() or 0.0)
+            target = cur + (step * direction)
+            h_adj.set_value(max(lower, min(max_value, target)))
+
+        genres_tabs_prev_btn.connect("clicked", lambda _b: _scroll_genres_tabs(-1))
+        genres_tabs_next_btn.connect("clicked", lambda _b: _scroll_genres_tabs(1))
+
+        _placeholders = {}
+        _built_tabs = set()
+        _loading_tabs = set()
+
+        for label, _path in definitions:
+            placeholder = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            placeholder.set_valign(Gtk.Align.START)
+            placeholder.set_vexpand(False)
+            _placeholders[label] = placeholder
+            genres_stack.add_titled(placeholder, label, label)
+
+        selected = str(getattr(app, "_genres_selected_tab", "") or "")
+        labels = [d[0] for d in definitions]
+        initial = selected if selected in labels else (labels[0] if labels else None)
+        if initial:
+            genres_stack.set_visible_child_name(initial)
+
+        def _populate_placeholder(label, sec):
+            placeholder = _placeholders.get(label)
+            if placeholder is None:
+                return
+            _clear_container(placeholder)
+            if sec:
+                placeholder.append(_build_genre_tab(sec))
+            else:
+                placeholder.append(
+                    Gtk.Label(
+                        label="Content not available.",
+                        xalign=0,
+                        css_classes=["dim-label"],
+                        margin_start=8,
+                        margin_top=8,
+                    )
+                )
+
+        def _ensure_tab_loaded(label):
+            if label in _built_tabs or label in _loading_tabs:
+                return
+            sec = tab_cache.get(label)
+            if sec is not None:
+                _built_tabs.add(label)
+                _populate_placeholder(label, sec)
+                return
+
+            _loading_tabs.add(label)
+            spinner = Gtk.Spinner()
+            spinner.set_margin_top(24)
+            spinner.set_halign(Gtk.Align.CENTER)
+            spinner.start()
+            placeholder = _placeholders.get(label)
+            if placeholder:
+                placeholder.append(spinner)
+
+            path = next((p for l, p in definitions if l == label), None)
+            if not path:
+                _loading_tabs.discard(label)
+                return
+
+            def fetch(label=label, path=path):
+                sec = app.backend.get_genre_section(label, path)
+                def apply(label=label, sec=sec):
+                    tab_cache[label] = sec
+                    _loading_tabs.discard(label)
+                    _built_tabs.add(label)
+                    _populate_placeholder(label, sec)
+                    return False
+                GLib.idle_add(apply)
+            Thread(target=fetch, daemon=True).start()
+
+        def _on_tab_changed(stack, _pspec):
+            try:
+                name = str(stack.get_visible_child_name() or "")
+            except Exception:
+                name = ""
+            if name:
+                app._genres_selected_tab = name
+                _ensure_tab_loaded(name)
+
+        genres_stack.connect("notify::visible-child-name", _on_tab_changed)
+        app.collection_content_box.append(tabs_box)
+        if initial:
+            _ensure_tab_loaded(initial)
+
+    tab_cache = getattr(app, "_genres_tab_cache", None)
+    if not isinstance(tab_cache, dict):
+        tab_cache = {}
+        app._genres_tab_cache = tab_cache
+    definitions = getattr(app, "_genres_definitions", None)
+    cache_time = getattr(app, "_genres_cache_time", 0)
+    cache_is_fresh = bool(definitions) and (time.monotonic() - cache_time) < 300
+
+    if prefer_cache and definitions:
+        _build_ui(definitions, tab_cache)
+
+    if not cache_is_fresh:
+        def task():
+            defs, eager = app.backend.get_genres_page()
+            new_cache = dict(tab_cache)
+            for sec in eager:
+                if sec:
+                    new_cache[sec["title"]] = sec
+
+            def apply(defs=defs, new_cache=new_cache):
+                app._genres_definitions = defs
+                app._genres_tab_cache = new_cache
+                app._genres_cache_time = time.monotonic()
+                _build_ui(defs, new_cache)
+                return False
+            GLib.idle_add(apply)
         Thread(target=task, daemon=True).start()
 
 
@@ -4421,29 +5133,7 @@ def render_collection_dashboard(app, favorite_tracks=None, favorite_albums=None)
         """Render albums for a specific page."""
         _clear_container(flow)
         for alb in albums_page:
-            card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, css_classes=_feed_card_classes("history-card"))
-            img = Gtk.Image(pixel_size=utils.COVER_SIZE, css_classes=["album-cover-img"])
-            # Default icon shown immediately; overridden asynchronously once the URL resolves.
-            img.set_from_icon_name("audio-x-generic-symbolic")
-            utils.load_img(img, lambda a=alb: app.backend.get_artwork_url(a, 320), app.cache_dir, utils.COVER_SIZE)
-            card.append(_build_feed_media_overlay(img, utils.COVER_SIZE, "album-cover-img"))
-            card.append(
-                Gtk.Label(
-                    label=_album_title_text(alb),
-                    halign=Gtk.Align.CENTER,
-                    ellipsize=3,
-                    max_width_chars=14,
-                    css_classes=["home-card-title"],
-                )
-            )
-            subtitle = _album_artist_year_subtitle_text(alb)
-            artist_lbl = Gtk.Label(label=subtitle, halign=Gtk.Align.CENTER, ellipsize=3, max_width_chars=18, css_classes=["dim-label", "home-card-subtitle"])
-            artist_lbl.set_tooltip_text(subtitle)
-            card.append(artist_lbl)
-            btn = Gtk.Button(css_classes=["flat", "history-card-btn", "home-feed-btn"])
-            btn.set_child(card)
-            btn.connect("clicked", lambda _b, a=alb: app.on_history_album_clicked(a))
-            flow.append(btn)
+            flow.append(_build_my_albums_style_button(app, alb, app.on_history_album_clicked))
 
     def _update_pagination():
         """Update pagination UI and re-render current page."""
@@ -5263,10 +5953,16 @@ def render_playlists_home(app):
         folders = list(payload.get("folders", []) or [])
         playlists = list(payload.get("playlists", []) or [])
 
+        # Phase 1: render all cards immediately with placeholder collages.
+        # Phase 2: async per-folder preview artwork fetching without blocking the UI.
+        folder_collage_imgs: dict = {}  # fid -> list[Gtk.Image]
+
         def apply():
+            nonlocal folder_collage_imgs
             count_lbl.set_text(f"{len(folders)} folders • {len(playlists)} playlists")
 
             for f in folders:
+                fid = str(getattr(f, "id", "") or "")
                 card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, css_classes=_feed_card_classes())
                 overlay = Gtk.Overlay(css_classes=["home-feed-media"])
                 cover = Gtk.Box(css_classes=["playlist-folder-cover"])
@@ -5278,23 +5974,23 @@ def render_playlists_home(app):
                 collage.set_row_homogeneous(True)
                 collage.set_column_homogeneous(True)
                 collage.set_size_request(utils.COVER_SIZE, utils.COVER_SIZE)
-                preview_urls = list(app.backend.get_folder_preview_artworks(f, limit=4, size=320) or [])
+                # All 4 slots start as placeholders; async task fills in real artwork.
                 for idx in range(4):
                     cell = Gtk.Box(css_classes=["playlist-folder-cell"])
                     img = Gtk.Image(css_classes=["album-cover-img", "playlist-cover-img", "playlist-folder-preview-img"])
                     img.set_size_request(utils.COVER_SIZE // 2, utils.COVER_SIZE // 2)
                     img.set_pixel_size(utils.COVER_SIZE // 2)
-                    if idx < len(preview_urls):
-                        utils.load_img(img, preview_urls[idx], app.cache_dir, utils.COVER_SIZE // 2)
-                        img.set_opacity(1.0)
-                    else:
-                        img.set_from_icon_name("audio-x-generic-symbolic")
-                        img.set_opacity(0.35)
+                    img.set_from_icon_name("audio-x-generic-symbolic")
+                    img.set_opacity(0.35)
                     cell.append(img)
                     collage.attach(cell, idx % 2, idx // 2, 1, 1)
                 collage.set_row_spacing(2)
                 collage.set_column_spacing(2)
                 cover.append(collage)
+                # Save img widgets for async artwork population below.
+                if fid:
+                    slot_imgs = [collage.get_child_at(i % 2, i // 2).get_first_child() for i in range(4)]
+                    folder_collage_imgs[fid] = (f, slot_imgs)
 
                 folder_items = int(getattr(f, "total_number_of_items", 0) or 0)
                 badge = Gtk.Label(label=str(folder_items), css_classes=["playlist-folder-badge"])
@@ -5381,6 +6077,29 @@ def render_playlists_home(app):
                     margin_top=8,
                 )
                 section_box.append(hint)
+
+            # Phase 2: fetch folder preview artworks asynchronously so the page
+            # renders immediately without waiting for per-folder API calls.
+            if folder_collage_imgs:
+                def _fetch_folder_previews(collage_map=dict(folder_collage_imgs)):
+                    for fid, (f_obj, slot_imgs) in collage_map.items():
+                        try:
+                            urls = list(app.backend.get_folder_preview_artworks(f_obj, limit=4, size=320) or [])
+                        except Exception:
+                            urls = []
+                        captured = list(zip(urls, slot_imgs))
+
+                        def _apply_previews(pairs=captured):
+                            for url, img in pairs:
+                                if url:
+                                    img.set_opacity(1.0)
+                                    utils.load_img(img, url, app.cache_dir, utils.COVER_SIZE // 2)
+                            return False
+
+                        GLib.idle_add(_apply_previews)
+
+                Thread(target=_fetch_folder_previews, daemon=True).start()
+
             return False
 
         GLib.idle_add(apply)

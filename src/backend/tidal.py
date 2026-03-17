@@ -5,6 +5,7 @@ import os
 import json
 import time
 import threading
+import collections
 import requests
 import requests.adapters
 from datetime import datetime
@@ -36,7 +37,7 @@ class TidalBackend:
         self._cached_albums_ts = 0.0
         self._albums_cache_ttl = 0.0
         self._favorite_artists_index_dirty = False
-        self._artist_artwork_cache = {}  # LRU cache using dict (ordered in Python 3.7+)
+        self._artist_artwork_cache = collections.OrderedDict()  # LRU cache
         self.max_artist_artwork_cache = 500  # Limit cache size to prevent memory leak
         self._artist_artwork_inflight: dict[str, threading.Event] = {}  # per-key dedup lock
         self._artist_artwork_inflight_lock = threading.Lock()
@@ -49,7 +50,7 @@ class TidalBackend:
                 val = raw.strip().lower()
                 if val:
                     self._artist_placeholder_uuids.add(val)
-        self.lyrics_cache = {}  # LRU cache using dict (ordered in Python 3.7+)
+        self.lyrics_cache = collections.OrderedDict()  # LRU cache
         self.max_lyrics_cache = 300
         self._last_login_error = ""
         # Circuit breaker for unstable mix endpoint.
@@ -1864,7 +1865,7 @@ class TidalBackend:
                 if hasattr(item, "title") and hasattr(item, "api_path"):
                     return {
                         "obj": item,
-                        "name": str(getattr(item, "title", "") or "Top"),
+                        "name": (lambda _t: str(_t) if _t is not None and not callable(_t) else "")(getattr(item, "title", None)) or "Top",
                         "sub_title": "",
                         "image_url": _top_image_url_from_uuid(getattr(item, "image_id", None), size=320),
                         "type": "PageLink",
@@ -1892,7 +1893,8 @@ class TidalBackend:
 
                 categories = list(getattr(page_obj, "categories", None) or [])
                 for category in categories:
-                    title = str(getattr(category, "title", "") or "").strip() or "Top"
+                    _ct = getattr(category, "title", "")
+                    title = (str(_ct) if _ct is not None and not callable(_ct) else "").strip() or "Top"
                     raw_items = _collect_category_items(category)
                     sec_items = []
 
@@ -1994,7 +1996,7 @@ class TidalBackend:
                         return None
                     return {
                         "obj": item,
-                        "name": str(getattr(item, "title", "") or "New"),
+                        "name": (lambda _t: str(_t) if _t is not None and not callable(_t) else "")(getattr(item, "title", None)) or "New",
                         "sub_title": "",
                         "image_url": _image_url_from_uuid(getattr(item, "image_id", None), size=320),
                         "type": "PageLink",
@@ -2056,7 +2058,8 @@ class TidalBackend:
 
                 categories = list(getattr(page_obj, "categories", None) or [])
                 for category in categories:
-                    title = str(getattr(category, "title", "") or "").strip() or "New"
+                    _ct = getattr(category, "title", "")
+                    title = (str(_ct) if _ct is not None and not callable(_ct) else "").strip() or "New"
                     if _is_video_text(title):
                         continue
                     raw_items = _collect_category_items(category)
@@ -2087,6 +2090,375 @@ class TidalBackend:
         except Exception as e:
             logger.warning("Get new page error [%s]: %s", classify_exception(e), e)
         return sections
+
+    def get_decades_page(self):
+        """
+        Fetch TIDAL Decades content.
+        Each decade has its own page at pages/m_1950s, pages/m_1960s, …
+        Returns a list of sections, one per decade, each with all items
+        from all categories on that decade's page merged together.
+        """
+        DECADES = [
+            ("1950s", "pages/m_1950s"),
+            ("1960s", "pages/m_1960s"),
+            ("1970s", "pages/m_1970s"),
+            ("1980s", "pages/m_1980s"),
+            ("1990s", "pages/m_1990s"),
+            ("2000s", "pages/m_2000s"),
+            ("2010s", "pages/m_2010s"),
+        ]
+
+        def _image_url_from_uuid(image_id, size=320):
+            val = str(image_id or "").strip()
+            if not val:
+                return None
+            if val.startswith("http://") or val.startswith("https://"):
+                return val
+            token = val.replace("-", "/")
+            return f"https://resources.tidal.com/images/{token}/{int(size)}x{int(size)}.jpg"
+
+        def _process_item(item):
+            try:
+                if item is None:
+                    return None
+                if hasattr(item, "header") and hasattr(item, "type"):
+                    raw_type = str(getattr(item, "type", "") or "").strip().upper()
+                    type_map = {
+                        "TRACK": "Track", "ALBUM": "Album", "ARTIST": "Artist",
+                        "PLAYLIST": "Playlist", "MIX": "Mix",
+                    }
+                    return {
+                        "obj": item,
+                        "name": str(getattr(item, "header", "") or getattr(item, "short_header", "") or "Unknown"),
+                        "sub_title": str(getattr(item, "short_sub_header", "") or ""),
+                        "image_url": _image_url_from_uuid(getattr(item, "image_id", None)),
+                        "type": type_map.get(raw_type, "PageItem"),
+                    }
+                if hasattr(item, "title") and hasattr(item, "api_path"):
+                    _t = getattr(item, "title", None)
+                    return {
+                        "obj": item,
+                        "name": str(_t if _t is not None and not callable(_t) else "") or "Unknown",
+                        "sub_title": "",
+                        "image_url": _image_url_from_uuid(getattr(item, "image_id", None)),
+                        "type": "PageLink",
+                    }
+            except Exception:
+                return None
+            return None
+
+        def _dedupe_items(items):
+            out, seen = [], set()
+            for it in list(items or []):
+                if not isinstance(it, dict):
+                    continue
+                obj = it.get("obj")
+                item_id = getattr(obj, "id", None) or getattr(obj, "track_id", None) if obj is not None else None
+                typ = str(it.get("type") or "")
+                key = (typ, str(item_id).strip()) if item_id is not None and str(item_id).strip() else (typ, str(it.get("name", "")).strip().lower())
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(it)
+            return out
+
+        def _fetch_decade(label, path):
+            """Fetch one decade page; preserve each category as a sub-section."""
+            try:
+                page_obj = self.session.page.get(path, params={"deviceType": "BROWSER"})
+                categories = []
+                seen_cat_titles = set()
+                for category in list(getattr(page_obj, "categories", None) or []):
+                    cat_title = str(getattr(category, "title", "") or "").strip()
+                    if not cat_title or cat_title.lower() in seen_cat_titles:
+                        continue
+                    seen_cat_titles.add(cat_title.lower())
+                    cat_items = []
+                    for item in list(getattr(category, "items", None) or []):
+                        processed = _process_item(item)
+                        if not processed:
+                            processed = self._process_generic_item(item)
+                        if processed:
+                            cat_items.append(processed)
+                    cat_items = _dedupe_items(cat_items)
+                    if cat_items:
+                        categories.append({"title": cat_title, "items": cat_items})
+                if categories:
+                    logger.debug("Decades: loaded %d categories for %s", len(categories), label)
+                    return {"title": label, "categories": categories}
+            except Exception as e:
+                logger.debug("Decades: failed to fetch %s (%s): %s", label, path, e)
+            return None
+
+        if not hasattr(self.session, "page") or self.session.page is None:
+            return [], []
+
+        # Return the decade definitions and only the first decade's content eagerly.
+        # Callers use get_decade_section() to fetch remaining decades on demand.
+        first_sec = _fetch_decade(DECADES[0][0], DECADES[0][1])
+        eager = [first_sec] if first_sec else []
+        return DECADES, eager
+
+    def get_decade_section(self, label, path):
+        """Fetch a single decade's content on demand (used for lazy tab loading)."""
+        DECADES = [
+            ("1950s", "pages/m_1950s"),
+            ("1960s", "pages/m_1960s"),
+            ("1970s", "pages/m_1970s"),
+            ("1980s", "pages/m_1980s"),
+            ("1990s", "pages/m_1990s"),
+            ("2000s", "pages/m_2000s"),
+            ("2010s", "pages/m_2010s"),
+        ]
+
+        def _image_url_from_uuid(image_id, size=320):
+            val = str(image_id or "").strip()
+            if not val:
+                return None
+            if val.startswith("http://") or val.startswith("https://"):
+                return val
+            token = val.replace("-", "/")
+            return f"https://resources.tidal.com/images/{token}/{int(size)}x{int(size)}.jpg"
+
+        def _process_item(item):
+            try:
+                if item is None:
+                    return None
+                if hasattr(item, "header") and hasattr(item, "type"):
+                    raw_type = str(getattr(item, "type", "") or "").strip().upper()
+                    type_map = {
+                        "TRACK": "Track", "ALBUM": "Album", "ARTIST": "Artist",
+                        "PLAYLIST": "Playlist", "MIX": "Mix",
+                    }
+                    return {
+                        "obj": item,
+                        "name": str(getattr(item, "header", "") or getattr(item, "short_header", "") or "Unknown"),
+                        "sub_title": str(getattr(item, "short_sub_header", "") or ""),
+                        "image_url": _image_url_from_uuid(getattr(item, "image_id", None)),
+                        "type": type_map.get(raw_type, "PageItem"),
+                    }
+                if hasattr(item, "title") and hasattr(item, "api_path"):
+                    _t = getattr(item, "title", None)
+                    return {
+                        "obj": item,
+                        "name": str(_t if _t is not None and not callable(_t) else "") or "Unknown",
+                        "sub_title": "",
+                        "image_url": _image_url_from_uuid(getattr(item, "image_id", None)),
+                        "type": "PageLink",
+                    }
+            except Exception:
+                return None
+            return None
+
+        def _dedupe_items(items):
+            out, seen = [], set()
+            for it in list(items or []):
+                if not isinstance(it, dict):
+                    continue
+                obj = it.get("obj")
+                item_id = getattr(obj, "id", None) or getattr(obj, "track_id", None) if obj is not None else None
+                typ = str(it.get("type") or "")
+                key = (typ, str(item_id).strip()) if item_id is not None and str(item_id).strip() else (typ, str(it.get("name", "")).strip().lower())
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(it)
+            return out
+
+        try:
+            page_obj = self.session.page.get(path, params={"deviceType": "BROWSER"})
+            categories = []
+            seen_cat_titles = set()
+            for category in list(getattr(page_obj, "categories", None) or []):
+                cat_title = str(getattr(category, "title", "") or "").strip()
+                if not cat_title or cat_title.lower() in seen_cat_titles:
+                    continue
+                seen_cat_titles.add(cat_title.lower())
+                cat_items = []
+                for item in list(getattr(category, "items", None) or []):
+                    processed = _process_item(item)
+                    if not processed:
+                        processed = self._process_generic_item(item)
+                    if processed:
+                        cat_items.append(processed)
+                cat_items = _dedupe_items(cat_items)
+                if cat_items:
+                    categories.append({"title": cat_title, "items": cat_items})
+            if categories:
+                return {"title": label, "categories": categories}
+        except Exception as e:
+            logger.debug("Decades: failed to fetch %s (%s): %s", label, path, e)
+        return None
+
+    def get_genres_page(self):
+        """
+        Fetch official TIDAL Genres tab definitions from /pages/genre_page.
+        Returns the tab definitions plus the first tab's content eagerly.
+        """
+        def _norm_path(path):
+            p = str(path or "").strip()
+            if not p:
+                return None
+            return p[1:] if p.startswith("/") else p
+
+        definitions = []
+        seen = set()
+
+        try:
+            if not hasattr(self.session, "page") or self.session.page is None:
+                return [], []
+
+            page_fetch = getattr(self.session, "genres", None)
+            if callable(page_fetch):
+                page_obj = page_fetch()
+            else:
+                page_obj = self.session.page.get("pages/genre_page", params={"deviceType": "BROWSER"})
+
+            for category in list(getattr(page_obj, "categories", None) or []):
+                for item in list(getattr(category, "items", None) or []):
+                    _title = getattr(item, "title", None)
+                    title = (str(_title) if _title is not None and not callable(_title) else "").strip()
+                    path = _norm_path(getattr(item, "api_path", None))
+                    if not title or not path:
+                        continue
+                    key = (title.lower(), path)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    definitions.append((title, path))
+        except Exception as e:
+            logger.warning("Get genres page error [%s]: %s", classify_exception(e), e)
+            return [], []
+
+        eager = []
+        if definitions:
+            first_label, first_path = definitions[0]
+            first_sec = self.get_genre_section(first_label, first_path)
+            if first_sec:
+                eager.append(first_sec)
+        return definitions, eager
+
+    def get_genre_section(self, label, path):
+        """Fetch a single genre page on demand (used for lazy tab loading)."""
+        def _norm_path(raw_path):
+            p = str(raw_path or "").strip()
+            if not p:
+                return None
+            return p[1:] if p.startswith("/") else p
+
+        def _image_url_from_uuid(image_id, size=320):
+            val = str(image_id or "").strip()
+            if not val:
+                return None
+            if val.startswith("http://") or val.startswith("https://"):
+                return val
+            token = val.replace("-", "/")
+            return f"https://resources.tidal.com/images/{token}/{int(size)}x{int(size)}.jpg"
+
+        def _collect_category_items(category):
+            items = list(getattr(category, "items", None) or [])
+            more = getattr(category, "_more", None)
+            more_path = _norm_path(getattr(more, "api_path", None) if more is not None else None)
+            if not more_path or not hasattr(self.session, "page") or self.session.page is None:
+                return items
+            try:
+                more_page = self.session.page.get(more_path, params={"deviceType": "BROWSER"})
+                for sub_cat in list(getattr(more_page, "categories", None) or []):
+                    sub_items = list(getattr(sub_cat, "items", None) or [])
+                    if sub_items:
+                        items.extend(sub_items)
+            except Exception as e:
+                logger.debug("Genres category view-all fetch failed for %s: %s", more_path, e)
+            return items
+
+        def _process_item(item):
+            try:
+                if item is None:
+                    return None
+                if hasattr(item, "header") and hasattr(item, "type"):
+                    raw_type = str(getattr(item, "type", "") or "").strip().upper()
+                    type_map = {
+                        "TRACK": "Track",
+                        "ALBUM": "Album",
+                        "ARTIST": "Artist",
+                        "PLAYLIST": "Playlist",
+                        "MIX": "Mix",
+                    }
+                    return {
+                        "obj": item,
+                        "name": str(getattr(item, "header", "") or getattr(item, "short_header", "") or "Unknown"),
+                        "sub_title": str(getattr(item, "short_sub_header", "") or ""),
+                        "image_url": _image_url_from_uuid(getattr(item, "image_id", None)),
+                        "type": type_map.get(raw_type, "PageItem"),
+                    }
+                if hasattr(item, "title") and hasattr(item, "api_path"):
+                    _title = getattr(item, "title", None)
+                    return {
+                        "obj": item,
+                        "name": str(_title if _title is not None and not callable(_title) else "") or "Unknown",
+                        "sub_title": "",
+                        "image_url": _image_url_from_uuid(getattr(item, "image_id", None)),
+                        "type": "PageLink",
+                    }
+            except Exception:
+                return None
+            return None
+
+        def _norm_text(value):
+            s = str(value or "").strip().lower()
+            keep = []
+            for ch in s:
+                if ch.isalnum() or ch.isspace():
+                    keep.append(ch)
+            return " ".join("".join(keep).split())
+
+        def _dedupe_items(items):
+            out, seen = [], set()
+            for it in list(items or []):
+                if not isinstance(it, dict):
+                    continue
+                obj = it.get("obj")
+                item_id = getattr(obj, "id", None) or getattr(obj, "track_id", None) if obj is not None else None
+                typ = str(it.get("type") or "")
+                if item_id is not None and str(item_id).strip():
+                    key = (typ, str(item_id).strip())
+                else:
+                    key = (typ, _norm_text(it.get("name")), _norm_text(it.get("sub_title")))
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(it)
+            return out
+
+        try:
+            genre_path = _norm_path(path)
+            if not genre_path or not hasattr(self.session, "page") or self.session.page is None:
+                return None
+
+            page_obj = self.session.page.get(genre_path, params={"deviceType": "BROWSER"})
+            categories = []
+            seen_cat_titles = set()
+            for category in list(getattr(page_obj, "categories", None) or []):
+                _title = getattr(category, "title", None)
+                cat_title = (str(_title) if _title is not None and not callable(_title) else "").strip()
+                if not cat_title or cat_title.lower() in seen_cat_titles:
+                    continue
+                seen_cat_titles.add(cat_title.lower())
+                cat_items = []
+                for item in _collect_category_items(category):
+                    processed = _process_item(item)
+                    if not processed:
+                        processed = self._process_generic_item(item)
+                    if processed:
+                        cat_items.append(processed)
+                cat_items = _dedupe_items(cat_items)
+                if cat_items:
+                    categories.append({"title": cat_title, "items": cat_items})
+            if categories:
+                return {"title": label, "categories": categories}
+        except Exception as e:
+            logger.debug("Genres: failed to fetch %s (%s): %s", label, path, e)
+        return None
 
     def get_hires_page(self):
         """
@@ -2141,9 +2513,10 @@ class TidalBackend:
                         "type": type_map.get(raw_type, "PageItem"),
                     }
                 if hasattr(item, "title") and hasattr(item, "api_path"):
+                    _t = getattr(item, "title", None)
                     return {
                         "obj": item,
-                        "name": str(getattr(item, "title", "") or "Hi-Res"),
+                        "name": str(_t if _t is not None and not callable(_t) else "") or "Hi-Res",
                         "sub_title": "",
                         "image_url": _image_url_from_uuid(getattr(item, "image_id", None)),
                         "type": "PageLink",
@@ -2180,7 +2553,8 @@ class TidalBackend:
                 return sections
             page_obj = self.session.page.get("pages/hires", params={"deviceType": "BROWSER"})
             for category in list(getattr(page_obj, "categories", None) or []):
-                title = str(getattr(category, "title", "") or "").strip() or "Hi-Res"
+                _ct = getattr(category, "title", "")
+                title = (str(_ct) if _ct is not None and not callable(_ct) else "").strip() or "Hi-Res"
                 dedupe_key = title.lower()
                 if dedupe_key in seen_titles:
                     continue
@@ -2203,9 +2577,11 @@ class TidalBackend:
     def _process_generic_item(self, item):
         try:
             # 基础信息
+            _t = getattr(item, 'title', None)
+            _name = str(_t) if _t is not None and not callable(_t) else str(getattr(item, 'name', None) or 'Unknown')
             data = {
-                'obj': item, 
-                'name': getattr(item, 'title', getattr(item, 'name', 'Unknown')),
+                'obj': item,
+                'name': _name,
                 'sub_title': '',
                 'image_url': self.get_artwork_url(item, 320),
                 'type': type(item).__name__ 

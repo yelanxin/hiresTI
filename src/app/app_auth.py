@@ -48,6 +48,10 @@ def on_logout_clicked(self, btn):
     self._home_sections_cache = None
     self._top_sections_cache = None
     self._new_sections_cache = None
+    self._genres_definitions = None
+    self._genres_tab_cache = None
+    self._genres_cache_time = 0.0
+    self._genres_selected_tab = ""
     self.stream_prefetch_cache.clear()
     self._toggle_login_view(False)
     self._clear_initial_search_focus()

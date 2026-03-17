@@ -21,6 +21,37 @@ logger = logging.getLogger(__name__)
 _SEARCH_HEADER_DRAG_THRESHOLD_PX = 6.0
 
 
+def _sidebar_nav_sections():
+    return [
+        (
+            "DISCOVER",
+            [
+                ("home", "hiresti-home-symbolic", "Home"),
+                ("new", "starred-symbolic", "New"),
+                ("top", "view-grid-symbolic", "Top"),
+                ("hires", "audio-x-generic-symbolic", "Hi-Res"),
+                ("genres", "hiresti-genres-symbolic", "Genres"),
+                ("decades", "hiresti-decades-symbolic", "Decades"),
+            ],
+        ),
+        (
+            "YOUR LIBRARY",
+            [
+                ("collection", "hiresti-albums-symbolic", "Albums"),
+                ("liked_songs", "hiresti-favorite-symbolic", "Tracks"),
+                ("artists", "hiresti-artists-symbolic", "Artists"),
+                ("playlists", "hiresti-playlists-symbolic", "Playlists"),
+            ],
+        ),
+        (
+            "RECENT",
+            [
+                ("history", "hiresti-history-symbolic", "History"),
+            ],
+        ),
+    ]
+
+
 def _build_global_share_popover(app, parent):
     pop = Gtk.Popover()
     pop.set_parent(parent)
@@ -940,25 +971,25 @@ def build_body(app, container):
     app.nav_list = Gtk.ListBox(css_classes=["navigation-sidebar"], margin_top=10)
     app.nav_list.connect("row-activated", app.on_nav_selected)
 
-    nav_items = [
-        ("home", "hiresti-home-symbolic", "Home"),
-        ("new", "starred-symbolic", "New"),
-        ("top", "view-grid-symbolic", "Top"),
-        ("hires", "audio-x-generic-symbolic", "Hi-Res"),
-        ("collection", "hiresti-collection-symbolic", "My Albums"),
-        ("liked_songs", "hiresti-favorite-symbolic", "Liked Songs"),
-        ("artists", "hiresti-artists-symbolic", "Artists"),
-        ("playlists", "hiresti-playlists-symbolic", "Playlists"),
-        ("history", "hiresti-history-symbolic", "History"),
-    ]
-    for nid, icon, txt in nav_items:
-        row = Gtk.ListBoxRow()
-        row.nav_id = nid
-        box = Gtk.Box(spacing=12, margin_start=12, margin_top=8, margin_bottom=8)
-        box.append(Gtk.Image.new_from_icon_name(icon))
-        box.append(Gtk.Label(label=txt))
-        row.set_child(box)
-        app.nav_list.append(row)
+    for header, nav_items in _sidebar_nav_sections():
+        header_row = Gtk.ListBoxRow()
+        header_row.nav_id = ""
+        header_row.add_css_class("sidebar-group-row")
+        if hasattr(header_row, "set_activatable"):
+            header_row.set_activatable(False)
+        if hasattr(header_row, "set_selectable"):
+            header_row.set_selectable(False)
+        header_row.set_child(Gtk.Label(label=header, xalign=0, css_classes=["sidebar-header"]))
+        app.nav_list.append(header_row)
+
+        for nid, icon, txt in nav_items:
+            row = Gtk.ListBoxRow()
+            row.nav_id = nid
+            box = Gtk.Box(spacing=12, margin_start=12, margin_top=8, margin_bottom=8)
+            box.append(Gtk.Image.new_from_icon_name(icon))
+            box.append(Gtk.Label(label=txt))
+            row.set_child(box)
+            app.nav_list.append(row)
 
     app.sidebar_box.append(app.nav_list)
     app.paned.set_start_child(app.sidebar_box)
