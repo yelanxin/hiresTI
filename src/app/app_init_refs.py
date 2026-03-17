@@ -15,6 +15,7 @@ def _init_widget_refs(self):
     self.viz_fullscreen_btn = None
     self.viz_corner_box = None
     self.viz_surface_overlay = None
+    self.dr_meter = None
     self.viz_theme_dd = None
     self.viz_bars_dd = None
     self.viz_effect_dd = None

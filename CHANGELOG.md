@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.7.5 - 2026-03-17
+
+### Added
+- **Accurate LUFS metering (EBU R128 / ITU-R BS.1770-4)**: The Rust DSP backend now computes true K-weighted loudness using two biquad stages (Stage 1: high-shelf pre-filter at ~1682 Hz; Stage 2: RLB high-pass at ~38 Hz). Filter coefficients are derived via bilinear transform at the actual sample rate (44.1, 48, 88.2, 96, 192 kHz, etc.). Replaces the previous FFT-bin approximation which under-reported integrated loudness by ~20 LUFS.
+- **DR metering moved to Rust**: Dynamic Range is now calculated from raw PCM samples in the Rust DSP chain rather than FFT magnitude bins, matching the Pleasurize Music Foundation DR meter standard (RMS-of-peaks method: `DR = 10·log₁₀(mean_peak²) − 10·log₁₀(mean_power)`).
+- **Whole-track DR accumulation**: DR now accumulates over the full track (resetting on track change), identical lifecycle to Integrated LUFS. Previously used a 4-second sliding window which inflated DR readings by capturing only locally loud passages.
+- The Level Monitor panel now displays **Momentary (M), Short-term (S), Integrated (I) LUFS** and **LRA** sourced from the Rust engine via a new `rac_get_lufs` FFI call.
+
+### Changed
+- Level bar **colour** is now driven by the LUFS M value rather than the FFT spectral mean power. Previously the bars were always green because the mean power across all FFT bins is ~30 dB below true loudness; now bars turn yellow above −18 LUFS M and red above −9 LUFS M, consistent with the M row colour coding below.
+- The Level Monitor panel is now laid out as a **side-by-side column** next to the spectrum area instead of an overlay on top of it, so waveform bars no longer render behind the LUFS/DR readout.
+- Level Monitor height is now 85 % of the spectrum panel height, pinned to the bottom-right of the panel.
+
+### Fixed
+- Fixed **empty Moods tabs** appearing in the tab strip for regional or editorial content categories (e.g. "Women's History Month", "TIDAL Magazine") that return items with no displayable title. Such items are now filtered out; a tab whose entire content resolves to untitled items is suppressed entirely — matching the Hi-Res page's section-filtering behaviour.
+
 ## 1.7.4 - 2026-03-17
 
 ### Added

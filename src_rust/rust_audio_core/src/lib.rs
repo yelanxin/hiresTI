@@ -28,7 +28,7 @@ use std::time::Duration;
 
 mod dsp;
 
-use dsp::{DspGraphConfig, DspGraphRuntime, PEQ_BAND_COUNT};
+use dsp::{DspGraphConfig, DspGraphRuntime, LufsValues, PEQ_BAND_COUNT};
 
 static GST_INIT: Once = Once::new();
 static PW_INIT: Once = Once::new();
@@ -1896,6 +1896,10 @@ impl Engine {
         self.spectrum_ring_len = [0; SPECTRUM_RING_CAP];
         self.spectrum_ring_pos_s = [0.0; SPECTRUM_RING_CAP];
         self.spectrum_ring_seq = [0; SPECTRUM_RING_CAP];
+        // Reset LUFS accumulators so integrated / LRA restart on each new track.
+        if let Some(ref graph) = self.audio_filter_graph {
+            graph.reset_lufs();
+        }
     }
 
     fn set_spectrum_filter_enabled(&mut self, enabled: bool) {
@@ -3618,6 +3622,46 @@ pub extern "C" fn rac_get_spectrum_frame(
         *out_len = n as c_int;
         *out_pos_s = engine.spectrum_pos_s;
         *out_seq = engine.spectrum_seq;
+    }
+    0
+}
+
+/// Retrieve the latest K-weighted LUFS values and dynamic range from the DSP meter.
+///
+/// All five output pointers must be non-null.  Values are f32:
+///   - `out_m`   : Momentary LUFS  (~400 ms).    f32::NEG_INFINITY when unavailable.
+///   - `out_s`   : Short-term LUFS (~3 s).       f32::NEG_INFINITY when unavailable.
+///   - `out_i`   : Integrated LUFS (gated).      f32::NEG_INFINITY when unavailable.
+///   - `out_lra` : Loudness Range  (~30 s LU).   0.0 when unavailable.
+///   - `out_dr`  : Dynamic Range   (~4 s, dBFS). 0.0 when unavailable.
+///
+/// Returns 0 on success, −1 if the engine pointer is null, −2 if any output pointer is null.
+#[no_mangle]
+pub extern "C" fn rac_get_lufs(
+    ptr: *const Engine,
+    out_m: *mut f32,
+    out_s: *mut f32,
+    out_i: *mut f32,
+    out_lra: *mut f32,
+    out_dr: *mut f32,
+) -> c_int {
+    let Some(engine) = as_engine(ptr) else {
+        return -1;
+    };
+    if out_m.is_null() || out_s.is_null() || out_i.is_null() || out_lra.is_null() || out_dr.is_null() {
+        return -2;
+    }
+    let vals: LufsValues = engine
+        .audio_filter_graph
+        .as_ref()
+        .map(|g| g.lufs_values())
+        .unwrap_or_default();
+    unsafe {
+        *out_m   = vals.momentary;
+        *out_s   = vals.short_term;
+        *out_i   = vals.integrated;
+        *out_lra = vals.lra;
+        *out_dr  = vals.dr;
     }
     0
 }

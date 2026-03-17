@@ -512,6 +512,9 @@ def on_viz_page_changed(self, stack, _param):
         self.lyrics_offset_box.set_visible(is_lyrics)
     if hasattr(self, "_update_dsp_ui_state") and is_dsp:
         self._update_dsp_ui_state()
+    dr_meter = getattr(self, "dr_meter", None)
+    if dr_meter is not None:
+        dr_meter.set_visible(is_spectrum)
     self._sync_viz_tab_runtime_state()
     self._sync_spectrum_stream_state()
 
@@ -706,6 +709,18 @@ def _apply_viz_frame(self, frame):
         self.bg_viz.update_energy(_spectrum_frame_channel(frame, "mono"))
     if current_page == "spectrum" and self.viz is not None:
         self.viz.update_data(frame)
+        dr_meter = getattr(self, "dr_meter", None)
+        if dr_meter is not None and dr_meter.get_visible():
+            left  = _spectrum_frame_channel(frame, "left")
+            right = _spectrum_frame_channel(frame, "right")
+            dr_meter.update(left, right)
+            # Poll accurate K-weighted LUFS from the Rust backend.
+            try:
+                lufs = self.player.get_lufs()
+                if lufs is not None:
+                    dr_meter.set_lufs(*lufs)
+            except Exception:
+                pass
 
 
 def _stop_viz_placeholder(self):
@@ -718,6 +733,9 @@ def _stop_viz_placeholder(self):
 
 def _start_viz_placeholder_if_needed(self):
     self._stop_viz_placeholder()
+    dr_meter = getattr(self, "dr_meter", None)
+    if dr_meter is not None:
+        dr_meter.reset()
     if not self._is_viz_surface_visible():
         return
     # With the always-on stream policy, _last_spectrum_ts is kept current

@@ -345,6 +345,19 @@ class _RustAudioCore:
             lib.rac_set_spectrum_enabled.restype = ctypes.c_int
             lib.rac_set_spectrum_enabled.argtypes = [ctypes.c_void_p, ctypes.c_int]
 
+            self._rac_get_lufs = None
+            if hasattr(lib, "rac_get_lufs"):
+                lib.rac_get_lufs.restype = ctypes.c_int
+                lib.rac_get_lufs.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.POINTER(ctypes.c_float),
+                    ctypes.POINTER(ctypes.c_float),
+                    ctypes.POINTER(ctypes.c_float),
+                    ctypes.POINTER(ctypes.c_float),
+                    ctypes.POINTER(ctypes.c_float),
+                ]
+                self._rac_get_lufs = lib.rac_get_lufs
+
             self.lib = lib
             self.handle = ctypes.c_void_p(lib.rac_new())
             self.available = bool(self.handle)
@@ -1063,6 +1076,43 @@ class _RustAudioCore:
                             self.lib.rac_free_string(ctypes.c_void_p(raw_ptr))
                 except Exception:
                     pass
+
+    def get_lufs(self):
+        """Return (momentary, short_term, integrated, lra) as floats, or None on error.
+
+        Values follow EBU R128 LUFS conventions.  Unavailable values are
+        returned as float('-inf') (momentary/short_term/integrated) or 0.0 (lra).
+        """
+        if (not self.available) or self._closed or self._rac_get_lufs is None:
+            return None
+        with self._call_lock:
+            if self._closed or not self.handle:
+                return None
+            try:
+                out_m   = ctypes.c_float(0.0)
+                out_s   = ctypes.c_float(0.0)
+                out_i   = ctypes.c_float(0.0)
+                out_lra = ctypes.c_float(0.0)
+                out_dr  = ctypes.c_float(0.0)
+                rc = int(self._rac_get_lufs(
+                    self.handle,
+                    ctypes.byref(out_m),
+                    ctypes.byref(out_s),
+                    ctypes.byref(out_i),
+                    ctypes.byref(out_lra),
+                    ctypes.byref(out_dr),
+                ))
+                if rc != 0:
+                    return None
+                return (
+                    float(out_m.value),
+                    float(out_s.value),
+                    float(out_i.value),
+                    float(out_lra.value),
+                    float(out_dr.value),
+                )
+            except Exception:
+                return None
 
     def get_spectrum_frame(self):
         if (not self.available) or self._closed:
@@ -3735,6 +3785,10 @@ class RustAudioPlayerAdapter:
         except Exception:
             pass
         return max(0.0, lat)
+
+    def get_lufs(self):
+        """Return (momentary, short_term, integrated, lra) from the K-weighted LUFS meter."""
+        return self._rust.get_lufs()
 
     def get_position(self):
         self._refresh_rust_cache(force=False)

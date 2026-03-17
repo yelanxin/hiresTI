@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 mod convolver;
 mod limiter;
+pub mod lufs;
 mod lv2;
 mod peq;
 mod resampler;
@@ -13,6 +14,7 @@ mod widener;
 
 pub use convolver::{ConvolverConfig, ConvolverNode};
 pub use limiter::{LimiterConfig, LimiterNode};
+pub use lufs::{LufsNode, LufsValues};
 pub use lv2::{Lv2Node, Lv2SlotConfig, lv2_scan_plugins};
 pub use peq::{PeqConfig, PeqNode, PEQ_BAND_COUNT};
 pub use resampler::{ResamplerConfig, ResamplerNode};
@@ -285,6 +287,7 @@ pub struct DspGraphRuntime {
     resampler: Option<ResamplerNode>,
     lv2_slots: HashMap<String, Lv2Node>,
     spectrum: Option<gst::Element>,
+    lufs: Option<LufsNode>,
 }
 
 impl DspGraphRuntime {
@@ -372,6 +375,14 @@ impl DspGraphRuntime {
         };
 
         let spectrum = Self::build_spectrum_element()?;
+
+        let lufs = match LufsNode::new() {
+            Ok(node) => Some(node),
+            Err(err) => {
+                eprintln!("[dsp] lufs meter unavailable: {err}");
+                None
+            }
+        };
 
         // Refresh the GStreamer registry once per graph build so that newly
         // installed LV2 plugins are visible.  Calling this once here (rather than
@@ -461,6 +472,10 @@ impl DspGraphRuntime {
             bin.add(spectrum_elem)
                 .map_err(|_| "failed to add dsp spectrum".to_string())?;
         }
+        if let Some(ref node) = lufs {
+            bin.add(node.element())
+                .map_err(|_| "failed to add dsp lufs meter".to_string())?;
+        }
         bin.add(&out_capsfilter)
             .map_err(|_| "failed to add dsp output caps".to_string())?;
         bin.add(&out_convert)
@@ -506,6 +521,12 @@ impl DspGraphRuntime {
         }
         if let Some(ref spectrum_elem) = spectrum {
             chain.push(spectrum_elem.clone());
+        }
+        // LUFS meter tap: placed after spectrum (and limiter) so it measures
+        // the final processed loudness, before the output resampler so that
+        // K-weighting coefficients match the source sample rate.
+        if let Some(ref node) = lufs {
+            chain.push(node.element().clone());
         }
         // Keep the analyzer tap before the output resampler so FFT bin spacing
         // follows the decoded/DSP-processed content bandwidth rather than the
@@ -555,6 +576,7 @@ impl DspGraphRuntime {
             resampler,
             lv2_slots,
             spectrum,
+            lufs,
         })
     }
 
@@ -629,6 +651,21 @@ impl DspGraphRuntime {
         }
         if !updated && enabled {
             eprintln!("[dsp] spectrum element lacks message/post-messages property");
+        }
+    }
+
+    /// Read the latest K-weighted LUFS values.  Non-blocking; returns defaults on contention.
+    pub fn lufs_values(&self) -> LufsValues {
+        self.lufs
+            .as_ref()
+            .map(|n| n.get_values())
+            .unwrap_or_default()
+    }
+
+    /// Reset LUFS accumulators (call on track change).
+    pub fn reset_lufs(&self) {
+        if let Some(ref node) = self.lufs {
+            node.reset();
         }
     }
 

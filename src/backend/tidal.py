@@ -2430,18 +2430,26 @@ class TidalBackend:
                         "PLAYLIST": "Playlist",
                         "MIX": "Mix",
                     }
+                    name = str(getattr(item, "header", "") or getattr(item, "short_header", "") or "").strip()
+                    if not name:
+                        # Item has no displayable title — editorial/unsupported content;
+                        # skip it so tabs made up entirely of such items are hidden.
+                        return None
                     return {
                         "obj": item,
-                        "name": str(getattr(item, "header", "") or getattr(item, "short_header", "") or "Unknown"),
+                        "name": name,
                         "sub_title": str(getattr(item, "short_sub_header", "") or ""),
                         "image_url": _image_url_from_uuid(getattr(item, "image_id", None)),
                         "type": type_map.get(raw_type, "PageItem"),
                     }
                 if hasattr(item, "title") and hasattr(item, "api_path"):
                     _title = getattr(item, "title", None)
+                    name = str(_title if _title is not None and not callable(_title) else "").strip()
+                    if not name:
+                        return None
                     return {
                         "obj": item,
-                        "name": str(_title if _title is not None and not callable(_title) else "") or "Unknown",
+                        "name": name,
                         "sub_title": "",
                         "image_url": _image_url_from_uuid(getattr(item, "image_id", None)),
                         "type": "PageLink",

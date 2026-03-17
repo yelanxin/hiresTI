@@ -15,6 +15,7 @@ from gi.repository import Gtk, Adw, Pango, GLib, Gdk
 
 from background_viz import BackgroundVisualizer
 from visualizer import SpectrumVisualizer
+from dr_meter import LevelMonitor
 from ui import config as ui_config
 
 logger = logging.getLogger(__name__)
@@ -906,7 +907,15 @@ def build_body(app, container):
     app.viz_corner_box.set_margin_top(12)
     app.viz_corner_box.set_margin_end(18)
     app.viz_corner_box.append(app.viz_fullscreen_btn)
-    app.viz_surface_overlay.add_overlay(app.viz_corner_box)
+    # added to viz_content_overlay below so it stays at full-panel top-right
+
+    app.dr_meter = LevelMonitor()
+    app.dr_meter.set_halign(Gtk.Align.FILL)
+    app.dr_meter.set_valign(Gtk.Align.FILL)
+    app.dr_meter.set_margin_end(4)
+    app.dr_meter.set_margin_top(4)
+    app.dr_meter.set_margin_bottom(4)
+    app.dr_meter.set_can_target(False)
 
     app.lyrics_tab_root = Gtk.Overlay()
     app.bg_viz = BackgroundVisualizer()
@@ -958,7 +967,29 @@ def build_body(app, container):
     app.viz_stack.add_titled(app.dsp_tab_scroller, "dsp", "DSP")
     _body_mark("viz-dsp-tab")
 
-    app.viz_stack_box.append(app.viz_surface_overlay)
+    # Horizontal row: spectrum fills remaining space, DR meter sits to the right.
+    # Wrapped in an Overlay so the fullscreen icon stays at top-right of the full panel.
+    app.viz_main_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+    app.viz_main_row.set_hexpand(True)
+    app.viz_main_row.set_vexpand(False)
+    app.viz_main_row.set_valign(Gtk.Align.FILL)
+    app.viz_surface_overlay.set_hexpand(True)
+    app.viz_main_row.append(app.viz_surface_overlay)
+
+    # DR meter: 70% of the viz panel height, pinned to bottom-right
+    _dr_h = int(ui_config.WINDOW_HEIGHT / 2 * 0.85)
+    app.dr_meter.set_vexpand(False)
+    app.dr_meter.set_valign(Gtk.Align.END)
+    app.dr_meter.set_size_request(84, _dr_h)
+    app.viz_main_row.append(app.dr_meter)
+
+    app.viz_content_overlay = Gtk.Overlay()
+    app.viz_content_overlay.set_hexpand(True)
+    app.viz_content_overlay.set_vexpand(False)
+    app.viz_content_overlay.set_valign(Gtk.Align.FILL)
+    app.viz_content_overlay.set_child(app.viz_main_row)
+    app.viz_content_overlay.add_overlay(app.viz_corner_box)  # fullscreen btn at panel top-right
+    app.viz_stack_box.append(app.viz_content_overlay)
     app.viz_stack_box.set_size_request(-1, int(ui_config.WINDOW_HEIGHT / 2))
     app.viz_root.append(theme_row)
     app.viz_root.append(app.viz_stack_box)
