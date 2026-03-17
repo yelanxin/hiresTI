@@ -4821,17 +4821,20 @@ def render_genres_dashboard(app, prefer_cache=True):
                     deduped = _dedup_new_items(new_items)
                     if deduped:
                         items.extend(deduped)
-                        # Re-measure using width heuristics so we get the real
-                        # 2-row target even when only 1 row was rendered before.
-                        target = _measured_chunk_size()
+                        # Use _genre_category_visible_count instead of
+                        # _measured_chunk_size: when only a few items are in the
+                        # FlowBox, homogeneous layout stretches each child to fill
+                        # the row, making the allocated child width far larger than
+                        # the natural card width and causing column count to be
+                        # severely under-estimated.  _genre_category_visible_count
+                        # uses COVER_SIZE + available-width heuristics which are
+                        # reliable regardless of how many items are rendered.
+                        sample = items[idx_state[0]] if idx_state[0] < len(items) else (items[0] if items else None)
+                        target = _genre_category_visible_count(sample, flow)
                         resolved_chunk_size[0] = target
                         needed = max(0, target - idx_state[0])
                         if needed > 0:
                             _append_items(needed)
-                        # If all fetched items are now shown, the _more endpoint
-                        # is exhausted — hide Show More to avoid a wasted request.
-                        if idx_state[0] >= len(items):
-                            more_exhausted[0] = True
                     else:
                         more_exhausted[0] = True
                     _sync_more_row()
