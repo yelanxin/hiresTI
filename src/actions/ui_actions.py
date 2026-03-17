@@ -4744,6 +4744,32 @@ def render_genres_dashboard(app, prefer_cache=True):
         more_exhausted = [False]
         more_loading = [False]
 
+        def _dedup_new_items(new_items):
+            """Filter new_items to exclude anything already present in items."""
+            seen = set()
+            for it in items:
+                obj = it.get("obj")
+                item_id = getattr(obj, "id", None) if obj is not None else None
+                typ = str(it.get("type") or "")
+                if item_id:
+                    seen.add((typ, str(item_id).strip()))
+                else:
+                    seen.add((typ, str(it.get("name") or "").lower(),
+                              str(it.get("sub_title") or "").lower()))
+            result = []
+            for it in new_items:
+                obj = it.get("obj")
+                item_id = getattr(obj, "id", None) if obj is not None else None
+                typ = str(it.get("type") or "")
+                key = (typ, str(item_id).strip()) if item_id else (
+                    typ, str(it.get("name") or "").lower(),
+                    str(it.get("sub_title") or "").lower()
+                )
+                if key not in seen:
+                    seen.add(key)
+                    result.append(it)
+            return result
+
         def _sync_more_row():
             if more_row is not None:
                 has_more = idx_state[0] < len(items) or (
@@ -4792,8 +4818,9 @@ def render_genres_dashboard(app, prefer_cache=True):
 
                 def apply(new_items=new_items):
                     more_loading[0] = False
-                    if new_items:
-                        items.extend(new_items)
+                    deduped = _dedup_new_items(new_items)
+                    if deduped:
+                        items.extend(deduped)
                         # Re-measure using width heuristics so we get the real
                         # 2-row target even when only 1 row was rendered before.
                         target = _measured_chunk_size()
@@ -4838,8 +4865,9 @@ def render_genres_dashboard(app, prefer_cache=True):
                     def _apply(new_items=new_items, btn=btn):
                         more_loading[0] = False
                         btn.set_sensitive(True)
-                        if new_items:
-                            items.extend(new_items)
+                        deduped = _dedup_new_items(new_items)
+                        if deduped:
+                            items.extend(deduped)
                             GLib.idle_add(_append_chunk)
                         else:
                             more_exhausted[0] = True
