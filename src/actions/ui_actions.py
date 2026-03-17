@@ -4544,7 +4544,7 @@ def render_decades_dashboard(app, prefer_cache=True):
         Thread(target=task, daemon=True).start()
 
 
-def render_genres_dashboard(app, prefer_cache=True):
+def _render_tabbed_page_dashboard(app, cfg, prefer_cache=True):
     _clear_container(app.collection_content_box)
 
     def _genre_category_visible_count(sample_item=None, widget=None):
@@ -4923,7 +4923,7 @@ def render_genres_dashboard(app, prefer_cache=True):
         if not definitions:
             app.collection_content_box.append(
                 Gtk.Label(
-                    label="Genres content is not available for your account or region.",
+                    label=cfg.get("empty_msg", "Content is not available for your account or region."),
                     xalign=0,
                     css_classes=["dim-label"],
                     margin_start=8,
@@ -5011,7 +5011,7 @@ def render_genres_dashboard(app, prefer_cache=True):
             _placeholders[label] = placeholder
             genres_stack.add_titled(placeholder, label, label)
 
-        selected = str(getattr(app, "_genres_selected_tab", "") or "")
+        selected = str(getattr(app, cfg["selected_tab_attr"], "") or "")
         labels = [d[0] for d in definitions]
         initial = selected if selected in labels else (labels[0] if labels else None)
         if initial:
@@ -5115,7 +5115,7 @@ def render_genres_dashboard(app, prefer_cache=True):
             except Exception:
                 name = ""
             if name:
-                app._genres_selected_tab = name
+                setattr(app, cfg["selected_tab_attr"], name)
                 _ensure_tab_loaded(name)
 
         genres_stack.connect("notify::visible-child-name", _on_tab_changed)
@@ -5123,12 +5123,12 @@ def render_genres_dashboard(app, prefer_cache=True):
         if initial:
             _ensure_tab_loaded(initial)
 
-    tab_cache = getattr(app, "_genres_tab_cache", None)
+    tab_cache = getattr(app, cfg["tab_cache_attr"], None)
     if not isinstance(tab_cache, dict):
         tab_cache = {}
-        app._genres_tab_cache = tab_cache
-    definitions = getattr(app, "_genres_definitions", None)
-    cache_time = getattr(app, "_genres_cache_time", 0)
+        setattr(app, cfg["tab_cache_attr"], tab_cache)
+    definitions = getattr(app, cfg["defs_attr"], None)
+    cache_time = getattr(app, cfg["cache_time_attr"], 0)
     cache_is_fresh = bool(definitions) and (time.monotonic() - cache_time) < 300
 
     if prefer_cache and definitions:
@@ -5136,20 +5136,42 @@ def render_genres_dashboard(app, prefer_cache=True):
 
     if not cache_is_fresh:
         def task():
-            defs, eager = app.backend.get_genres_page()
+            defs, eager = cfg["get_page_fn"]()
             new_cache = dict(tab_cache)
             for sec in eager:
                 if sec:
                     new_cache[sec["title"]] = sec
 
             def apply(defs=defs, new_cache=new_cache):
-                app._genres_definitions = defs
-                app._genres_tab_cache = new_cache
-                app._genres_cache_time = time.monotonic()
+                setattr(app, cfg["defs_attr"], defs)
+                setattr(app, cfg["tab_cache_attr"], new_cache)
+                setattr(app, cfg["cache_time_attr"], time.monotonic())
                 _build_ui(defs, new_cache)
                 return False
             GLib.idle_add(apply)
         Thread(target=task, daemon=True).start()
+
+
+def render_genres_dashboard(app, prefer_cache=True):
+    _render_tabbed_page_dashboard(app, {
+        "get_page_fn": app.backend.get_genres_page,
+        "defs_attr": "_genres_definitions",
+        "tab_cache_attr": "_genres_tab_cache",
+        "cache_time_attr": "_genres_cache_time",
+        "selected_tab_attr": "_genres_selected_tab",
+        "empty_msg": "Genres content is not available for your account or region.",
+    }, prefer_cache=prefer_cache)
+
+
+def render_moods_dashboard(app, prefer_cache=True):
+    _render_tabbed_page_dashboard(app, {
+        "get_page_fn": app.backend.get_moods_page,
+        "defs_attr": "_moods_definitions",
+        "tab_cache_attr": "_moods_tab_cache",
+        "cache_time_attr": "_moods_cache_time",
+        "selected_tab_attr": "_moods_selected_tab",
+        "empty_msg": "Moods & Activities content is not available for your account or region.",
+    }, prefer_cache=prefer_cache)
 
 
 def refresh_dashboard_playing_state(app):

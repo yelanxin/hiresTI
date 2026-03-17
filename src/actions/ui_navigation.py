@@ -266,6 +266,13 @@ def on_nav_selected(app, box, row):
         app.render_decades_dashboard()
         return
 
+    if row.nav_id == "moods":
+        app.grid_title_label.set_text("Moods")
+        if hasattr(app, "grid_subtitle_label") and app.grid_subtitle_label is not None:
+            app.grid_subtitle_label.set_text("Browse music by mood and activity")
+        app.render_moods_dashboard()
+        return
+
     if row.nav_id == "collection":
         app.grid_title_label.set_text("Albums")
         if app.backend.user:
@@ -435,6 +442,9 @@ def on_back_clicked(app, btn):
             btn.set_sensitive(False)
         elif nav_id == "decades":
             app.render_decades_dashboard(prefer_cache=True)
+            btn.set_sensitive(False)
+        elif nav_id == "moods":
+            app.render_moods_dashboard(prefer_cache=True)
             btn.set_sensitive(False)
         elif nav_id == "home":
             cached_sections = getattr(app, "_home_sections_cache", None)

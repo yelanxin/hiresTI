@@ -32,6 +32,7 @@ def _sidebar_nav_sections():
                 ("hires", "audio-x-generic-symbolic", "Hi-Res"),
                 ("genres", "hiresti-genres-symbolic", "Genres"),
                 ("decades", "hiresti-decades-symbolic", "Decades"),
+                ("moods", "hiresti-moods-symbolic", "Moods"),
             ],
         ),
         (

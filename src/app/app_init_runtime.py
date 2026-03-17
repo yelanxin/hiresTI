@@ -299,6 +299,10 @@ def _init_runtime_state(self):
     self._genres_tab_cache = {}
     self._genres_cache_time = 0.0
     self._genres_selected_tab = ""
+    self._moods_definitions = None
+    self._moods_tab_cache = {}
+    self._moods_cache_time = 0.0
+    self._moods_selected_tab = ""
     self.stream_prefetch_cache = {}
     self.eq_band_values = list(self.settings.get("dsp_peq_bands", [0.0] * 10) or [])
     while len(self.eq_band_values) < 10:

@@ -2338,6 +2338,56 @@ class TidalBackend:
                 eager.append(first_sec)
         return definitions, eager
 
+    def get_moods_page(self):
+        """
+        Fetch official TIDAL Moods & Activities tab definitions from /pages/moods_page.
+        Returns the tab definitions plus the first tab's content eagerly.
+        """
+        def _norm_path(path):
+            p = str(path or "").strip()
+            if not p:
+                return None
+            return p[1:] if p.startswith("/") else p
+
+        _EXCLUDED_TABS = {"record labels", "record label"}
+
+        definitions = []
+        seen = set()
+
+        try:
+            if not hasattr(self.session, "page") or self.session.page is None:
+                return [], []
+
+            page_obj = self.session.page.get("pages/moods_page", params={"deviceType": "BROWSER"})
+
+            for category in list(getattr(page_obj, "categories", None) or []):
+                for item in list(getattr(category, "items", None) or []):
+                    _title = getattr(item, "title", None)
+                    title = (str(_title) if _title is not None and not callable(_title) else "").strip()
+                    if title.lower() in _EXCLUDED_TABS:
+                        continue
+                    path = _norm_path(getattr(item, "api_path", None))
+                    if not title or not path:
+                        continue
+                    key = (title.lower(), path)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    definitions.append((title, path))
+            logger.info("Moods page: found %d tabs: %s", len(definitions),
+                        [(t, p) for t, p in definitions])
+        except Exception as e:
+            logger.warning("Get moods page error [%s]: %s", classify_exception(e), e)
+            return [], []
+
+        eager = []
+        if definitions:
+            first_label, first_path = definitions[0]
+            first_sec = self.get_genre_section(first_label, first_path)
+            if first_sec:
+                eager.append(first_sec)
+        return definitions, eager
+
     def get_genre_section(self, label, path):
         """Fetch a single genre page on demand (used for lazy tab loading)."""
         def _norm_path(raw_path):
@@ -2434,12 +2484,14 @@ class TidalBackend:
             page_obj = self.session.page.get(genre_path, params={"deviceType": "BROWSER"})
             categories = []
             seen_cat_titles = set()
-            for category in list(getattr(page_obj, "categories", None) or []):
+            for cat_idx, category in enumerate(list(getattr(page_obj, "categories", None) or [])):
                 _title = getattr(category, "title", None)
                 cat_title = (str(_title) if _title is not None and not callable(_title) else "").strip()
-                if not cat_title or cat_title.lower() in seen_cat_titles:
+                # Only deduplicate titled categories; untitled sections always pass through.
+                if cat_title and cat_title.lower() in seen_cat_titles:
                     continue
-                seen_cat_titles.add(cat_title.lower())
+                if cat_title:
+                    seen_cat_titles.add(cat_title.lower())
                 cat_items = []
                 raw_items, more_path = _collect_category_items(category)
                 for item in raw_items:
@@ -2454,7 +2506,8 @@ class TidalBackend:
             if categories:
                 return {"title": label, "categories": categories}
         except Exception as e:
-            logger.debug("Genres: failed to fetch %s (%s): %s", label, path, e)
+            logger.warning("Page section fetch failed for '%s' (path=%s) [%s]: %s",
+                           label, path, classify_exception(e), e)
         return None
 
     def fetch_genre_more(self, more_path):

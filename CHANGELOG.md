@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.7.4 - 2026-03-17
+
+### Added
+- Added **Moods** page in the sidebar. Fetches TIDAL's mood feed from `pages/moods_page` and displays each mood (Party, Sleep, Workout, Focus, Happy, Romance, …) as a lazy-loaded tab — same tab-and-section layout as the Genres page.
+- Added a crescent-moon-and-stars symbolic icon for the Moods sidebar entry.
+
+### Changed
+- Genres and Decades tab page logic has been refactored into a shared `_render_tabbed_page_dashboard` helper, eliminating duplicated code. Moods reuses the same infrastructure.
+- Moods tabs: "Record Labels" is filtered out as it is not a mood/activity category.
+
+### Fixed
+- Fixed mood sub-pages (e.g. Sleep) showing "Content not available" because the API returns categories with no title. Untitled category sections are now accepted and rendered without a section header instead of being silently dropped.
+- Fixed `Genres`/`Moods` section-fetch errors being swallowed at `DEBUG` log level. Failures now log at `WARNING` so they are visible in normal operation.
+
 ## 1.7.3 - 2026-03-16
 
 ### Added
