@@ -4904,11 +4904,13 @@ def _render_tabbed_page_dashboard(app, cfg, prefer_cache=True):
         tab_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24)
         tab_box.set_valign(Gtk.Align.START)
         tab_box.set_vexpand(False)
+        has_items = False
         for cat in list(sec.get("categories", []) or []):
             cat_title = str(cat.get("title", "") or "")
             items = list(cat.get("items", []) or [])
             if not items:
                 continue
+            has_items = True
             more_path = cat.get("more_path")
             lbl = Gtk.Label(label=cat_title, xalign=0, css_classes=["home-section-title"])
             lbl.set_margin_top(4)
@@ -4916,7 +4918,7 @@ def _render_tabbed_page_dashboard(app, cfg, prefer_cache=True):
             cat_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
             tab_box.append(cat_box)
             _populate_category(cat_box, items, more_path=more_path)
-        return tab_box
+        return tab_box if has_items else None
 
     def _build_ui(definitions, tab_cache):
         _clear_container(app.collection_content_box)
@@ -5018,13 +5020,25 @@ def _render_tabbed_page_dashboard(app, cfg, prefer_cache=True):
         if initial:
             genres_stack.set_visible_child_name(initial)
 
+        def _hide_stack_page(placeholder):
+            try:
+                page = genres_stack.get_page(placeholder)
+                if page is not None:
+                    page.set_visible(False)
+            except Exception:
+                pass
+
         def _populate_placeholder(label, sec):
             placeholder = _placeholders.get(label)
             if placeholder is None:
                 return
             _clear_container(placeholder)
             if sec:
-                placeholder.append(_build_genre_tab(sec))
+                tab_content = _build_genre_tab(sec)
+                if tab_content is not None:
+                    placeholder.append(tab_content)
+                else:
+                    _hide_stack_page(placeholder)
             else:
                 placeholder.append(
                     Gtk.Label(

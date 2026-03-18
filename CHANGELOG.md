@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.7.6 - 2026-03-17
+
+### Fixed
+- Fixed `AttributeError: 'ListBox' object has no attribute 'remove_all'` on startup. `Gtk.ListBox.remove_all()` was introduced in GTK 4.6; replaced with `get_row_at_index(0)` loop for compatibility with older GTK4 runtimes (e.g. Ubuntu 24.04).
+- Fixed empty Genres/Moods tabs remaining visible in the tab strip when a tab's content loads successfully from the API but all items resolve to no displayable entries. The tab is now hidden via `StackPage.set_visible(False)` after load.
+
 ## 1.7.5 - 2026-03-17
 
 ### Added

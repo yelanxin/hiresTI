@@ -2007,7 +2007,8 @@ def _render_now_playing_queue_windowed(self, queue_tracks, win_start, win_end):
     """Re-render the queue list with an explicit window (called by expand buttons)."""
     if self.now_playing_queue_list is None:
         return
-    self.now_playing_queue_list.remove_all()
+    while (row := self.now_playing_queue_list.get_row_at_index(0)) is not None:
+        self.now_playing_queue_list.remove(row)
     _render_now_playing_queue_body(self, queue_tracks, win_start=win_start, win_end=win_end)
 
 
@@ -2015,7 +2016,8 @@ def _render_now_playing_queue(self, tracks):
     if self.now_playing_queue_list is None:
         return
 
-    self.now_playing_queue_list.remove_all()
+    while (row := self.now_playing_queue_list.get_row_at_index(0)) is not None:
+        self.now_playing_queue_list.remove(row)
 
     queue_tracks = list(tracks or [])
     if self.now_playing_queue_count_label is not None:
@@ -2103,7 +2105,8 @@ def _render_now_playing_album_tracks(self, tracks):
     if self.now_playing_track_list is None:
         return
 
-    self.now_playing_track_list.remove_all()
+    while (row := self.now_playing_track_list.get_row_at_index(0)) is not None:
+        self.now_playing_track_list.remove(row)
 
     track_items = list(tracks or [])
     self.now_playing_album_tracks = track_items
