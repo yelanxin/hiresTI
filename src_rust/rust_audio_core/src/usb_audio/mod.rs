@@ -24,6 +24,7 @@
 pub mod control;
 pub mod descriptor;
 pub mod device;
+pub mod dop;
 pub mod feedback;
 pub mod queue;
 pub mod sink;
@@ -31,6 +32,7 @@ pub mod transfer;
 
 pub use descriptor::{UacFormat, UacStreamAlt, UacVersion};
 pub use device::{enumerate_usb_audio_devices, OpenUsbDevice, UsbAudioDevice};
+pub use dop::DopEncoder;
 pub use queue::FrameQueue;
 pub use sink::UsbAudioSink;
 pub use transfer::{IsoTransferRing, RingState};

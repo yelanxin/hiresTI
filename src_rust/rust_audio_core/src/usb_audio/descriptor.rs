@@ -57,6 +57,13 @@ pub struct UacStreamAlt {
     /// Bit resolution (16 / 24 / 32).  Matches `bBitResolution` in the
     /// Format Type I descriptor.
     pub bit_depth: u8,
+    /// Container size in bytes per sample per channel.  Matches `bSubFrameSize`
+    /// (UAC 1.0) or `bSubSlotSize` (UAC 2.0).
+    ///
+    /// Critical for 24-bit devices: `subframe_size=3` → packed S24_3LE;
+    /// `subframe_size=4` → S24LE (24-bit value in a 32-bit container).
+    /// Falls back to `(bit_depth + 7) / 8` when the descriptor omits it.
+    pub subframe_size: u8,
     /// Number of audio channels.
     pub channels: u8,
     /// Supported sample rates in Hz.
@@ -159,6 +166,7 @@ pub fn parse_stream_alt(
     let mut format = UacFormat::Unknown;
     let mut channels: u8 = 2;
     let mut bit_depth: u8 = 0;
+    let mut subframe_size: u8 = 0;
     let mut sample_rates: Vec<u32> = Vec::new();
     let mut found_general = false;
     let mut found_format = false;
@@ -216,7 +224,8 @@ pub fn parse_stream_alt(
                         continue;
                     }
                     channels = desc[4];
-                    bit_depth = desc[6];
+                    subframe_size = desc[5]; // bSubFrameSize — wire bytes per sample
+                    bit_depth = desc[6];     // bBitResolution — used bits
                     let freq_type = desc[7];
                     if freq_type == 0 {
                         // Continuous: tLower(3B) tUpper(3B) — record both endpoints
@@ -254,7 +263,8 @@ pub fn parse_stream_alt(
                     if desc.len() < 6 || desc[3] != 0x01 {
                         continue;
                     }
-                    bit_depth = desc[5];
+                    subframe_size = desc[4]; // bSubSlotSize — wire bytes per sample
+                    bit_depth = desc[5];     // bBitResolution — used bits
                     // UAC 2.0 sample rates queried at open via Clock Source control transfer
                     found_format = true;
                 }
@@ -285,10 +295,19 @@ pub fn parse_stream_alt(
 
     let (out_ep_addr, max_packet) = out_ep?;
 
+    // Fallback: derive subframe_size from bit_depth when the descriptor did not
+    // provide it (should not happen for a well-formed device).
+    let subframe_size = if subframe_size > 0 {
+        subframe_size
+    } else {
+        (bit_depth + 7) / 8
+    };
+
     Some(UacStreamAlt {
         alt_setting,
         format,
         bit_depth,
+        subframe_size,
         channels,
         sample_rates,
         out_ep: out_ep_addr,

@@ -131,8 +131,13 @@ impl UsbAudioSink {
         let ctx_raw = open_dev.handle.context().as_raw();
 
         // 6. Build shared ring state.
-        //    bytes_per_sample: for packed formats (S24_3LE), 24-bit → 3 bytes.
-        let bytes_per_sample = ((alt.bit_depth as usize) + 7) / 8;
+        //    Use bSubFrameSize/bSubSlotSize for the exact wire byte count:
+        //    S24_3LE → subframe_size=3; S24LE (32-bit container) → 4; S32LE/F32LE → 4.
+        let bytes_per_sample = if alt.subframe_size > 0 {
+            alt.subframe_size as usize
+        } else {
+            (alt.bit_depth as usize + 7) / 8
+        };
         let state = RingState::new(
             Arc::clone(&queue),
             rate,

@@ -827,8 +827,17 @@ fn usb_audio_pusher_thread(
     ring_state: Arc<usb_audio::RingState>,
     events: ThreadEventQueue,
     stop: Arc<AtomicBool>,
+    // Non-zero → DSD-over-PCM mode: raw DSD bytes from the appsink are
+    // DoP-encoded before being pushed into the queue.  The value is the
+    // channel count passed to DopEncoder.
+    dop_channels: usize,
 ) {
     let mut last_xruns: u64 = 0;
+    let mut dop_enc = if dop_channels > 0 {
+        Some(usb_audio::DopEncoder::new(dop_channels))
+    } else {
+        None
+    };
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -865,7 +874,15 @@ fn usb_audio_pusher_thread(
 
         if let Some(buf) = sample.buffer() {
             if let Ok(map) = buf.map_readable() {
-                let data = map.as_slice();
+                // For DoP mode: encode DSD bytes → S24_3LE PCM frames first.
+                let encoded: Vec<u8>;
+                let data: &[u8] = if let Some(ref mut enc) = dop_enc {
+                    encoded = enc.encode(map.as_slice());
+                    &encoded
+                } else {
+                    map.as_slice()
+                };
+
                 let mut written = 0;
                 while written < data.len() {
                     // Recheck disconnect while spinning on a full queue.
@@ -3330,26 +3347,69 @@ impl Engine {
                 .unwrap_or(48_000),
         };
 
-        // GStreamer format string matching the USB bit depth.
-        let gst_format = match alt.bit_depth {
-            16 => "S16LE",
-            24 => "S24_3LE",
-            _ => "S32LE",
+        // Detect DoP mode: device carries PCM at a DoP carrier rate (176400 /
+        // 352800 Hz) with S24_3LE (subframe_size=3, bit_depth=24).  When
+        // active the appsink requests raw DSD; the pusher thread DoP-encodes
+        // it before pushing into the FrameQueue.
+        let is_dop = usb_audio::dop::is_dsd_rate(target_rate.saturating_mul(16))
+            || (alt.subframe_size == 3
+                && alt.bit_depth == 24
+                && matches!(target_rate, 176_400 | 352_800));
+
+        // GStreamer format and caps:
+        //
+        //   subframe_size=2, bit_depth=16                    → S16LE
+        //   subframe_size=3, bit_depth=24                    → S24_3LE (packed)
+        //   subframe_size=4, bit_depth=24                    → S24LE   (32-bit container)
+        //   subframe_size=4, bit_depth=32, format=Float32    → F32LE
+        //   subframe_size=4, bit_depth=32                    → S32LE
+        //   DoP mode (176400/352800 Hz, S24_3LE carrier)     → audio/x-dsd
+        let (caps_media_type, gst_format): (&str, &str) = if is_dop {
+            // DSD audio delivered by GStreamer as DSDU8
+            ("audio/x-dsd", "DSDU8")
+        } else {
+            let fmt = match (alt.format, alt.subframe_size, alt.bit_depth) {
+                (usb_audio::UacFormat::Float32, _, _) => "F32LE",
+                (_, 2, 16) | (_, _, 16) => "S16LE",
+                (_, 3, 24) => "S24_3LE",
+                (_, 4, 24) => "S24LE",
+                (_, _, 32) => "S32LE",
+                _ => "S32LE",
+            };
+            ("audio/x-raw", fmt)
         };
 
-        // Build appsink with fixed caps.  `sync=true` lets the AlsaHwClock
-        // gate buffer release against the USB frame counter.
+        // DoP PCM carrier rate (used for USB device open); DSD appsink rate
+        // is the DSD bit rate delivered by GStreamer.
+        let usb_rate = if is_dop {
+            usb_audio::dop::dop_pcm_rate(target_rate).unwrap_or(target_rate)
+        } else {
+            target_rate
+        };
+        let appsink_rate = if is_dop { target_rate } else { target_rate };
+
+        // Build appsink.  `sync=true` lets the AlsaHwClock gate buffer
+        // release against the USB frame counter.
         let appsink = gst::ElementFactory::make("appsink")
             .name("rust-usb-appsink")
             .build()
             .map_err(|e| format!("appsink unavailable: {e}"))?;
 
-        let caps = gst::Caps::builder("audio/x-raw")
-            .field("format", gst_format)
-            .field("layout", "interleaved")
-            .field("rate", target_rate as i32)
-            .field("channels", alt.channels as i32)
-            .build();
+        let caps = if is_dop {
+            gst::Caps::builder(caps_media_type)
+                .field("rate", appsink_rate as i32)
+                .field("channels", alt.channels as i32)
+                .field("format", gst_format)
+                .field("layout", "interleaved")
+                .build()
+        } else {
+            gst::Caps::builder(caps_media_type)
+                .field("format", gst_format)
+                .field("layout", "interleaved")
+                .field("rate", appsink_rate as i32)
+                .field("channels", alt.channels as i32)
+                .build()
+        };
         appsink.set_property("caps", &caps);
         appsink.set_property("sync", true);
         appsink.set_property("emit-signals", false);
@@ -3357,11 +3417,13 @@ impl Engine {
         appsink.set_property("drop", false);
         appsink.set_property("wait-on-eos", false);
 
-        // Open the USB output device and start the ISO transfer ring.
+        // Open the USB output device at the PCM carrier rate (for DoP) or the
+        // native rate (for PCM modes).
         let (usb_sink, hw_clock) =
-            usb_audio::UsbAudioSink::open(device_id, target_rate, alt.bit_depth)?;
+            usb_audio::UsbAudioSink::open(device_id, usb_rate, alt.bit_depth)?;
 
         // Spawn the appsink → FrameQueue bridge thread.
+        // For DoP mode pass a DopEncoder so the thread can pack DSD bytes.
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = Arc::clone(&stop);
         let queue = Arc::clone(&usb_sink.queue);
@@ -3369,15 +3431,23 @@ impl Engine {
         let events: ThreadEventQueue = Arc::new(Mutex::new(VecDeque::new()));
         let events_clone = Arc::clone(&events);
         let appsink_clone = appsink.clone();
+        let dop_channels = if is_dop { alt.channels as usize } else { 0 };
         let thread = thread::spawn(move || {
-            usb_audio_pusher_thread(appsink_clone, queue, ring_state, events_clone, stop_clone);
+            usb_audio_pusher_thread(
+                appsink_clone,
+                queue,
+                ring_state,
+                events_clone,
+                stop_clone,
+                dop_channels,
+            );
         });
 
         self.emit_event(
             EVT_STATE,
             &format!(
-                "usb-audio configured device={} format={} rate={} channels={}",
-                device_id, gst_format, target_rate, alt.channels
+                "usb-audio configured device={} format={} rate={} channels={} dop={}",
+                device_id, gst_format, usb_rate, alt.channels, is_dop
             ),
         );
 
@@ -6944,6 +7014,8 @@ mod tests {
             started: true,
             start_fail_count: 2,
             format_label: "S32_LE",
+            anchored: false,
+            feed: None,
         };
 
         assert!(AlsaMmapCtx::recover_requires_restart(-libc::EPIPE));
