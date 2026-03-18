@@ -793,6 +793,8 @@ struct UsbSinkHandle {
     stop: Arc<AtomicBool>,
     /// The appsink → FrameQueue bridge thread.
     thread: Option<thread::JoinHandle<()>>,
+    /// Events (errors, xrun reports) posted by the pusher thread.
+    events: ThreadEventQueue,
 }
 
 impl std::fmt::Debug for UsbSinkHandle {
@@ -814,33 +816,67 @@ impl UsbSinkHandle {
 /// the [`usb_audio::FrameQueue`].  The ISO OUT transfer ring consumes the queue
 /// from its own event thread.
 ///
-/// Blocks on `try-pull-sample` with a 100 ms timeout so it wakes promptly on
-/// track switches and shutdown.  When the queue is full (USB not consuming
-/// fast enough) the thread spin-yields — this should not happen in practice
-/// since the ISO ring is always consuming at the negotiated sample rate.
+/// - Blocks on `try-pull-sample` with a 100 ms timeout so it wakes promptly
+///   on track switches and shutdown.
+/// - After each pull (or timeout) checks `ring_state.error` for device
+///   disconnect; reports via `events` and exits on error.
+/// - Periodically reports xrun counts via `EVT_STATE` when they change.
 fn usb_audio_pusher_thread(
     appsink: gst::Element,
     queue: Arc<usb_audio::FrameQueue>,
+    ring_state: Arc<usb_audio::RingState>,
+    events: ThreadEventQueue,
     stop: Arc<AtomicBool>,
 ) {
+    let mut last_xruns: u64 = 0;
+
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
         }
+
+        // Device disconnect check — set by the ISO callback on NO_DEVICE.
+        if ring_state.error.load(Ordering::Acquire) {
+            push_thread_event(
+                &events,
+                EVT_ERROR,
+                "usb-audio: device disconnected or fatal transfer error",
+            );
+            break;
+        }
+
         // 100 ms pull timeout keeps the thread responsive to stop/flush.
         let sample =
             appsink.emit_by_name::<Option<gst::Sample>>("try-pull-sample", &[&100_000_000u64]);
+
+        // Report any new xruns accumulated during the pull wait.
+        let xruns = ring_state.xruns.load(Ordering::Relaxed);
+        if xruns != last_xruns {
+            push_thread_event(&events, EVT_STATE, format!("usb-xruns={xruns}"));
+            last_xruns = xruns;
+        }
+
         let Some(sample) = sample else {
             if stop.load(Ordering::Relaxed) {
                 break;
             }
             continue;
         };
+
         if let Some(buf) = sample.buffer() {
             if let Ok(map) = buf.map_readable() {
                 let data = map.as_slice();
                 let mut written = 0;
                 while written < data.len() {
+                    // Recheck disconnect while spinning on a full queue.
+                    if ring_state.error.load(Ordering::Acquire) {
+                        push_thread_event(
+                            &events,
+                            EVT_ERROR,
+                            "usb-audio: device disconnected or fatal transfer error",
+                        );
+                        return;
+                    }
                     let n = queue.push(&data[written..]);
                     written += n;
                     if n == 0 {
@@ -3115,8 +3151,25 @@ impl Engine {
         }
     }
 
+    fn drain_usb_events(&mut self) {
+        let Some(events) = self.usb_sink.as_ref().map(|us| us.events.clone()) else {
+            return;
+        };
+        let drained: Vec<(c_int, String)> = match events.lock() {
+            Ok(mut pending) => pending.drain(..).collect(),
+            Err(_) => return,
+        };
+        for (evt, msg) in drained {
+            if evt == EVT_ERROR {
+                self.set_error(msg.clone());
+            }
+            self.emit_event(evt, &msg);
+        }
+    }
+
     fn pump_events(&mut self) -> c_int {
         self.drain_mmap_events();
+        self.drain_usb_events();
         let Some(bus) = self.playbin.bus() else {
             return 0;
         };
@@ -3312,9 +3365,12 @@ impl Engine {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = Arc::clone(&stop);
         let queue = Arc::clone(&usb_sink.queue);
+        let ring_state = Arc::clone(&usb_sink.state);
+        let events: ThreadEventQueue = Arc::new(Mutex::new(VecDeque::new()));
+        let events_clone = Arc::clone(&events);
         let appsink_clone = appsink.clone();
         let thread = thread::spawn(move || {
-            usb_audio_pusher_thread(appsink_clone, queue, stop_clone);
+            usb_audio_pusher_thread(appsink_clone, queue, ring_state, events_clone, stop_clone);
         });
 
         self.emit_event(
@@ -3331,6 +3387,7 @@ impl Engine {
                 _sink: usb_sink,
                 stop,
                 thread: Some(thread),
+                events,
             },
             hw_clock,
         ))

@@ -20,7 +20,7 @@
 //! event thread before dropping the Arc.
 
 use std::os::raw::{c_int, c_uchar, c_uint};
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
@@ -66,6 +66,14 @@ pub struct RingState {
     pub in_flight: AtomicI32,
     /// Frame-counting clock feed (shared with GStreamer pipeline).
     pub clock_feed: Arc<AlsaHwClockFeed>,
+    /// Set to `true` when a fatal transfer error (NO_DEVICE, submit failure
+    /// after all transfers exit) is detected.  Polled by the pusher thread to
+    /// signal the engine about a disconnect.
+    pub error: AtomicBool,
+    /// Running count of ISO packets filled with silence because the
+    /// [`FrameQueue`] was empty.  Each unit = 1 ms of silence (one ISO
+    /// packet).  Polled by the pusher thread for periodic xrun reporting.
+    pub xruns: AtomicU64,
 }
 
 impl RingState {
@@ -87,6 +95,8 @@ impl RingState {
             max_packet,
             in_flight: AtomicI32::new(0),
             clock_feed,
+            error: AtomicBool::new(false),
+            xruns: AtomicU64::new(0),
         })
     }
 }
@@ -129,11 +139,13 @@ unsafe fn fill_transfer(state: &RingState, transfer: *mut libusb_transfer) {
             .add(i);
         (*pkt).length = packet_bytes as c_uint;
 
-        // Fill from queue; silence-pad anything missing
+        // Fill from queue; silence-pad anything missing.
+        // Count each silence-padded packet as one xrun (= 1 ms underrun).
         let pkt_buf = std::slice::from_raw_parts_mut(buf_base.add(offset), state.max_packet);
         let got = state.queue.pop(&mut pkt_buf[..packet_bytes]);
         if got < packet_bytes {
             pkt_buf[got..packet_bytes].fill(0);
+            state.xruns.fetch_add(1, Ordering::Relaxed);
         }
 
         // Advance clock by actual samples written
@@ -157,16 +169,30 @@ extern "system" fn iso_out_callback(transfer: *mut libusb_transfer) {
         return;
     }
 
-    // Refill the buffer regardless of transfer status (STALL → silence keeps
-    // the endpoint alive; don't let the ring go empty).
+    // Detect fatal transfer conditions.
+    let status = unsafe { (*transfer).status };
+    if status == libusb1_sys::constants::LIBUSB_TRANSFER_NO_DEVICE {
+        // Device disconnected.  Set the error flag so the pusher thread can
+        // report it to the Engine, then stop the ring.
+        state.error.store(true, Ordering::Release);
+        state.stop.store(true, Ordering::Release);
+        return;
+    }
+
+    // For STALL / ERROR: refill with silence to keep the ring alive; the
+    // device may recover (e.g. brief USB bus reset).
     unsafe { fill_transfer(state, transfer) };
 
     let rc = unsafe { libusb_submit_transfer(transfer) };
     if rc == 0 {
         state.in_flight.fetch_add(1, Ordering::AcqRel);
+    } else if rc == libusb1_sys::constants::LIBUSB_ERROR_NO_DEVICE {
+        // Submit failed because device is gone — same as NO_DEVICE above.
+        state.error.store(true, Ordering::Release);
+        state.stop.store(true, Ordering::Release);
     }
-    // On submit failure, in_flight stays decremented; the ring self-heals if
-    // other transfers are still running, or stop() will clean up.
+    // Other submit failures: in_flight stays decremented; the ring self-heals
+    // if other transfers are still running, or stop() will clean up.
 }
 
 // ---------------------------------------------------------------------------

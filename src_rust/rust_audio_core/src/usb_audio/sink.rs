@@ -60,12 +60,27 @@ pub struct UsbAudioSink {
     pub queue: Arc<FrameQueue>,
     /// Frame-counting clock feed — expose to GStreamer as `AlsaHwClock`.
     pub feed: Arc<AlsaHwClockFeed>,
-    /// ISO IN feedback reader (UAC 2.0 only). Dropped before `_ring`.
+    /// Shared transfer state — exposes `error` and `xruns` counters.
+    pub state: Arc<RingState>,
+    /// ISO IN feedback reader (UAC 2.0 only). Dropped before `ring`.
     _feedback: Option<FeedbackReader>,
     /// ISO OUT transfer ring + event thread. Dropped before `_open_dev`.
-    _ring: IsoTransferRing,
+    ring: IsoTransferRing,
     /// Open USB device handle + claimed interface. Dropped last.
     _open_dev: OpenUsbDevice,
+}
+
+impl UsbAudioSink {
+    /// `true` if a fatal USB transfer error (device disconnect) was detected.
+    pub fn has_error(&self) -> bool {
+        self.state.error.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Total ISO packets filled with silence due to an empty queue (underruns).
+    /// Each unit represents 1 ms of silence.
+    pub fn xrun_count(&self) -> u64 {
+        self.state.xruns.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 impl UsbAudioSink {
@@ -153,8 +168,9 @@ impl UsbAudioSink {
             UsbAudioSink {
                 queue,
                 feed,
+                state,
                 _feedback: feedback,
-                _ring: ring,
+                ring,
                 _open_dev: open_dev,
             },
             clock,
