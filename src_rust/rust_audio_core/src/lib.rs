@@ -28,6 +28,7 @@ use std::time::Duration;
 
 mod alsa_clock;
 mod dsp;
+mod usb_audio;
 
 use alsa_clock::{AlsaHwClock, AlsaHwClockFeed};
 use dsp::{DspGraphConfig, DspGraphRuntime, LufsValues, PEQ_BAND_COUNT};
@@ -5536,6 +5537,129 @@ pub extern "C" fn rac_free_string(s: *mut c_char) {
     // SAFETY: s was allocated by CString::into_raw in this library.
     unsafe {
         let _ = CString::from_raw(s);
+    }
+}
+
+/// Enumerate USB Audio Class devices visible to the current user.
+///
+/// Returns a JSON array (UTF-8, null-terminated).  Caller must free the
+/// returned pointer with `rac_free_string`.  Returns `null` on allocation
+/// failure (extremely unlikely).
+///
+/// Each element:
+/// ```json
+/// {
+///   "id":           "usb:1234:5678",
+///   "name":         "FiiO DAC",
+///   "serial":       "A0B1C2",      // or null
+///   "vendor_id":    0x1234,
+///   "product_id":   0x5678,
+///   "bus":          1,
+///   "address":      3,
+///   "uac_version":  2,
+///   "ctrl_iface":   0,
+///   "stream_iface": 1,
+///   "alts": [
+///     {
+///       "alt": 1,
+///       "format": "PCM",
+///       "bit_depth": 32,
+///       "channels": 2,
+///       "sample_rates": [44100, 48000, 88200, 96000, 176400, 192000],
+///       "out_ep": 1,
+///       "feedback_ep": 129,    // or null
+///       "max_packet": 392
+///     }
+///   ]
+/// }
+/// ```
+#[no_mangle]
+pub extern "C" fn rac_list_usb_audio_devices() -> *mut c_char {
+    use usb_audio::descriptor::UacFormat;
+    use usb_audio::descriptor::UacVersion;
+    use usb_audio::device::enumerate_usb_audio_devices;
+
+    let devices = enumerate_usb_audio_devices();
+    let mut json = String::from("[");
+
+    for (i, dev) in devices.iter().enumerate() {
+        if i > 0 {
+            json.push(',');
+        }
+
+        // Serialize alts array
+        let alts_json: String = dev
+            .alts
+            .iter()
+            .enumerate()
+            .map(|(j, alt)| {
+                let sep = if j > 0 { "," } else { "" };
+                let fmt = match alt.format {
+                    UacFormat::Pcm => "PCM",
+                    UacFormat::Pcm8 => "PCM8",
+                    UacFormat::Float32 => "FLOAT32",
+                    UacFormat::Unknown => "UNKNOWN",
+                };
+                let rates: String = alt
+                    .sample_rates
+                    .iter()
+                    .map(|r| r.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let fb = alt
+                    .feedback_ep
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "null".to_string());
+                format!(
+                    r#"{sep}{{"alt":{alt},"format":"{fmt}","bit_depth":{bd},"channels":{ch},"sample_rates":[{rates}],"out_ep":{out},"feedback_ep":{fb},"max_packet":{mp}}}"#,
+                    sep = sep,
+                    alt = alt.alt_setting,
+                    fmt = fmt,
+                    bd = alt.bit_depth,
+                    ch = alt.channels,
+                    rates = rates,
+                    out = alt.out_ep,
+                    fb = fb,
+                    mp = alt.max_packet,
+                )
+            })
+            .collect();
+
+        let serial_json = dev
+            .serial
+            .as_deref()
+            .map(|s| format!("\"{}\"", s.replace('"', "\\\"")))
+            .unwrap_or_else(|| "null".to_string());
+
+        let ver = match dev.uac_version {
+            UacVersion::V1 => 1,
+            UacVersion::V2 => 2,
+        };
+
+        json.push_str(&format!(
+            concat!(
+                r#"{{"id":"{id}","name":"{name}","serial":{serial},"#,
+                r#""vendor_id":{vid},"product_id":{pid},"bus":{bus},"address":{addr},"#,
+                r#""uac_version":{ver},"ctrl_iface":{ci},"stream_iface":{si},"alts":[{alts}]}}"#,
+            ),
+            id = dev.id(),
+            name = dev.name.replace('"', "\\\""),
+            serial = serial_json,
+            vid = dev.vendor_id,
+            pid = dev.product_id,
+            bus = dev.bus,
+            addr = dev.address,
+            ver = ver,
+            ci = dev.ctrl_iface,
+            si = dev.stream_iface,
+            alts = alts_json,
+        ));
+    }
+
+    json.push(']');
+    match CString::new(json) {
+        Ok(c) => c.into_raw(),
+        Err(_) => ptr::null_mut(),
     }
 }
 
