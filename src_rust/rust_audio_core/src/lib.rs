@@ -779,6 +779,104 @@ impl std::fmt::Debug for MmapSink {
     }
 }
 
+// ---------------------------------------------------------------------------
+// USB audio sink handle
+// ---------------------------------------------------------------------------
+
+/// Live handle for the USB audio output session.
+///
+/// Dropped by `stop_usb_sink()` during output switching or engine free.
+struct UsbSinkHandle {
+    /// Owns the USB device handle, ISO ring, and feedback reader.
+    _sink: usb_audio::UsbAudioSink,
+    /// Signals the pusher thread to exit.
+    stop: Arc<AtomicBool>,
+    /// The appsink → FrameQueue bridge thread.
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl std::fmt::Debug for UsbSinkHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "UsbSinkHandle(running={})", self.thread.is_some())
+    }
+}
+
+impl UsbSinkHandle {
+    fn stop_and_join(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// Background thread: drains the GStreamer appsink and pushes PCM bytes into
+/// the [`usb_audio::FrameQueue`].  The ISO OUT transfer ring consumes the queue
+/// from its own event thread.
+///
+/// Blocks on `try-pull-sample` with a 100 ms timeout so it wakes promptly on
+/// track switches and shutdown.  When the queue is full (USB not consuming
+/// fast enough) the thread spin-yields — this should not happen in practice
+/// since the ISO ring is always consuming at the negotiated sample rate.
+fn usb_audio_pusher_thread(
+    appsink: gst::Element,
+    queue: Arc<usb_audio::FrameQueue>,
+    stop: Arc<AtomicBool>,
+) {
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        // 100 ms pull timeout keeps the thread responsive to stop/flush.
+        let sample =
+            appsink.emit_by_name::<Option<gst::Sample>>("try-pull-sample", &[&100_000_000u64]);
+        let Some(sample) = sample else {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            continue;
+        };
+        if let Some(buf) = sample.buffer() {
+            if let Ok(map) = buf.map_readable() {
+                let data = map.as_slice();
+                let mut written = 0;
+                while written < data.len() {
+                    let n = queue.push(&data[written..]);
+                    written += n;
+                    if n == 0 {
+                        // Queue full — USB ISO ring should catch up within a
+                        // millisecond; yield the scheduler slice and retry.
+                        std::thread::yield_now();
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// USB output format helpers
+// ---------------------------------------------------------------------------
+
+/// Return `true` when `driver` requests the self-hosted USB audio path.
+fn driver_is_usb(driver: &str) -> bool {
+    let norm = normalized_driver_label(driver);
+    norm == "usb" || norm.starts_with("usb(")
+}
+
+/// Map a GStreamer format preference string to a bit depth.
+///
+/// Returns `0` for "auto" / unrecognised, meaning "use the device's native
+/// depth".
+fn preferred_format_to_bit_depth(preferred: &str) -> u8 {
+    match preferred.trim().to_ascii_uppercase().as_str() {
+        "S16LE" | "S16BE" | "U16LE" | "U16BE" => 16,
+        "S24LE" | "S24BE" | "S24_3LE" | "S24_3BE" => 24,
+        "S32LE" | "S32BE" | "F32LE" | "F32BE" => 32,
+        _ => 0,
+    }
+}
+
 /// Preallocated byte window for decoded PCM.
 ///
 /// Unlike `Vec::drain(..period_bytes)`, this keeps a read offset and only
@@ -1253,6 +1351,7 @@ pub struct Engine {
     preferred_output_format: String,
     spectrum_enabled: bool,
     mmap_sink: Option<MmapSink>,
+    usb_sink: Option<UsbSinkHandle>,
     output_mmap_realtime_priority: i32,
     output_driver: String,
     output_device: Option<String>,
@@ -2958,6 +3057,7 @@ impl Engine {
             preferred_output_format: String::new(),
             spectrum_enabled: true,
             mmap_sink: None,
+            usb_sink: None,
             output_mmap_realtime_priority: ALSA_MMAP_RT_PRIORITY_DEFAULT,
             output_driver: String::new(),
             output_device: None,
@@ -3120,6 +3220,120 @@ impl Engine {
                 let _ = t.join();
             }
         }
+    }
+
+    fn stop_usb_sink(&mut self) {
+        if let Some(mut us) = self.usb_sink.take() {
+            us.stop_and_join();
+            // `us` (UsbSinkHandle) drops here → UsbAudioSink drops →
+            // IsoTransferRing::stop() + FeedbackReader cancelled + device released.
+        }
+    }
+
+    /// Build an appsink element whose output is pushed into the USB audio
+    /// [`FrameQueue`] by a background thread.
+    ///
+    /// Caps are pinned to the USB device's negotiated rate / format / channels
+    /// so GStreamer places `audioconvert + audioresample` upstream automatically.
+    ///
+    /// Returns `(appsink_element, UsbSinkHandle, AlsaHwClock)`.
+    fn build_appsink_usb(
+        &self,
+        device_id: &str,
+    ) -> Result<(gst::Element, UsbSinkHandle, AlsaHwClock), String> {
+        use usb_audio::descriptor::UacVersion;
+
+        // Enumerate to find the device and determine its native format before
+        // building the appsink caps.
+        let dev = usb_audio::device::enumerate_usb_audio_devices()
+            .into_iter()
+            .find(|d| d.id() == device_id)
+            .ok_or_else(|| format!("USB audio device '{}' not found", device_id))?;
+
+        // Preferred bit depth from user setting (0 = auto → highest available).
+        let pref_depth = preferred_format_to_bit_depth(&self.preferred_output_format);
+
+        // Pick the best alt-setting to learn channels and actual bit depth.
+        let alt = dev
+            .alts
+            .iter()
+            .find(|a| pref_depth == 0 || a.bit_depth == pref_depth)
+            .or_else(|| {
+                // Fallback: nearest bit depth (prefer higher)
+                dev.alts.iter().max_by_key(|a| a.bit_depth)
+            })
+            .ok_or_else(|| "USB device has no usable alt-settings".to_string())?;
+
+        // Target sample rate:
+        //   UAC 2.0 — clock is programmable; default to 96 kHz
+        //   UAC 1.0 — must be a rate the device advertises
+        let target_rate: u32 = match dev.uac_version {
+            UacVersion::V2 => 96_000,
+            UacVersion::V1 => alt
+                .sample_rates
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or(48_000),
+        };
+
+        // GStreamer format string matching the USB bit depth.
+        let gst_format = match alt.bit_depth {
+            16 => "S16LE",
+            24 => "S24_3LE",
+            _ => "S32LE",
+        };
+
+        // Build appsink with fixed caps.  `sync=true` lets the AlsaHwClock
+        // gate buffer release against the USB frame counter.
+        let appsink = gst::ElementFactory::make("appsink")
+            .name("rust-usb-appsink")
+            .build()
+            .map_err(|e| format!("appsink unavailable: {e}"))?;
+
+        let caps = gst::Caps::builder("audio/x-raw")
+            .field("format", gst_format)
+            .field("layout", "interleaved")
+            .field("rate", target_rate as i32)
+            .field("channels", alt.channels as i32)
+            .build();
+        appsink.set_property("caps", &caps);
+        appsink.set_property("sync", true);
+        appsink.set_property("emit-signals", false);
+        appsink.set_property("max-buffers", 8u32);
+        appsink.set_property("drop", false);
+        appsink.set_property("wait-on-eos", false);
+
+        // Open the USB output device and start the ISO transfer ring.
+        let (usb_sink, hw_clock) =
+            usb_audio::UsbAudioSink::open(device_id, target_rate, alt.bit_depth)?;
+
+        // Spawn the appsink → FrameQueue bridge thread.
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = Arc::clone(&stop);
+        let queue = Arc::clone(&usb_sink.queue);
+        let appsink_clone = appsink.clone();
+        let thread = thread::spawn(move || {
+            usb_audio_pusher_thread(appsink_clone, queue, stop_clone);
+        });
+
+        self.emit_event(
+            EVT_STATE,
+            &format!(
+                "usb-audio configured device={} format={} rate={} channels={}",
+                device_id, gst_format, target_rate, alt.channels
+            ),
+        );
+
+        Ok((
+            appsink,
+            UsbSinkHandle {
+                _sink: usb_sink,
+                stop,
+                thread: Some(thread),
+            },
+            hw_clock,
+        ))
     }
 
     /// Build an `appsink` element whose output is consumed by a background
@@ -3286,9 +3500,10 @@ impl Engine {
     ) -> c_int {
         let cur_state = self.playbin.state(gst::ClockTime::from_mseconds(50)).1;
         let _ = self.playbin.set_state(gst::State::Null);
-        // Stop any running mmap writer thread *after* set_state(Null) so the
+        // Stop any running output sink threads *after* set_state(Null) so the
         // appsink sees EOS and pull-sample unblocks cleanly.
         self.stop_mmap_sink();
+        self.stop_usb_sink();
 
         let driver_norm = normalized_driver_label(driver);
         self.spectrum_enabled = true;
@@ -3476,6 +3691,26 @@ impl Engine {
                     return -15;
                 }
             }
+        } else if driver_is_usb(driver) {
+            // Self-hosted USB Audio Class output via libusb isochronous transfers.
+            // `device_norm` must be a "usb:VID:PID" or "usb:VID:PID:SERIAL" ID.
+            let usb_device_id = device_norm.unwrap_or("");
+            match self.build_appsink_usb(usb_device_id) {
+                Ok((elem, usb_handle, hw_clock)) => {
+                    self.usb_sink = Some(usb_handle);
+                    if let Ok(pipeline) = self.playbin.clone().dynamic_cast::<gst::Pipeline>() {
+                        pipeline.use_clock(Some(hw_clock.upcast_ref::<gst::Clock>()));
+                    }
+                    // Caps are already set on the appsink — return None so
+                    // wrap_sink_with_caps is not called.
+                    (Some(elem), None::<String>)
+                }
+                Err(e) => {
+                    self.set_error(format!("usb-audio setup failed: {e}"));
+                    self.emit_event(EVT_ERROR, &format!("usb-audio setup failed: {e}"));
+                    return -18;
+                }
+            }
         } else {
             self.set_error(format!("unsupported driver: {driver}"));
             self.emit_event(EVT_ERROR, &format!("unsupported driver: {driver}"));
@@ -3489,10 +3724,11 @@ impl Engine {
         };
 
         let preferred_caps_format = self.preferred_output_format.trim().to_string();
-        // For alsa_mmap the appsink already has caps set on the element itself;
-        // wrapping it inside an audioconvert+capsfilter bin would conflict.
+        // For alsa_mmap and usb, the appsink already has caps set on the element
+        // itself; wrapping it inside an audioconvert+capsfilter bin would conflict.
         let is_mmap = driver_is_alsa_mmap(driver);
-        let selected_caps_format = if is_mmap {
+        let is_usb = driver_is_usb(driver);
+        let selected_caps_format = if is_mmap || is_usb {
             None
         } else if !preferred_caps_format.is_empty() {
             Some(preferred_caps_format.as_str())
@@ -5238,6 +5474,7 @@ pub extern "C" fn rac_free(ptr: *mut Engine) {
         let mut boxed = Box::from_raw(ptr);
         let _ = boxed.playbin.set_state(gst::State::Null);
         boxed.stop_mmap_sink();
+        boxed.stop_usb_sink();
     }
 }
 
