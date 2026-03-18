@@ -18,6 +18,7 @@ const CS_INTERFACE: u8 = 0x24;
 
 /// AC interface descriptor subtypes.
 const AC_HEADER: u8 = 0x01;
+const AC_OUTPUT_TERMINAL: u8 = 0x03;
 
 /// AS interface descriptor subtypes.
 const AS_GENERAL: u8 = 0x01;
@@ -294,4 +295,36 @@ pub fn parse_stream_alt(
         feedback_ep,
         max_packet,
     })
+}
+
+// ---------------------------------------------------------------------------
+// UAC 2.0 Clock Source ID extraction
+// ---------------------------------------------------------------------------
+
+/// Extract the Clock Source entity ID from the Audio Control interface descriptors.
+///
+/// Walks `ac_extra` looking for an OUTPUT_TERMINAL (subtype 0x03) and returns
+/// its `bCSourceID` field (byte 8), which is the entity ID to use for
+/// UAC 2.0 clock frequency control transfers.
+///
+/// Returns `None` if no OUTPUT_TERMINAL with a valid `bCSourceID` is found
+/// (not a UAC 2.0 device, or descriptor too short).
+pub fn parse_clock_id_from_ac(ac_extra: &[u8]) -> Option<u8> {
+    for desc in CsDescIter::new(ac_extra) {
+        // UAC 2.0 OUTPUT_TERMINAL is 12 bytes:
+        // [0] bLength, [1] bDescriptorType=0x24, [2] bDescriptorSubtype=0x03,
+        // [3] bTerminalID, [4..5] wTerminalType, [6] bAssocTerminal,
+        // [7] bSourceID, [8] bCSourceID, [9..10] bmControls, [11] iTerminal
+        if desc.len() < 9 {
+            continue;
+        }
+        if desc[1] != CS_INTERFACE || desc[2] != AC_OUTPUT_TERMINAL {
+            continue;
+        }
+        let clock_id = desc[8];
+        if clock_id != 0 {
+            return Some(clock_id);
+        }
+    }
+    None
 }

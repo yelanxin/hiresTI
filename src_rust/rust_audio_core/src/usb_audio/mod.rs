@@ -21,8 +21,9 @@
 //! Phase 1 (this file): descriptor parsing + device enumeration.
 //! Later phases add the transfer ring, feedback reader, and Engine integration.
 
+pub mod control;
 pub mod descriptor;
 pub mod device;
 
 pub use descriptor::{UacFormat, UacStreamAlt, UacVersion};
-pub use device::{UsbAudioDevice, enumerate_usb_audio_devices};
+pub use device::{enumerate_usb_audio_devices, OpenUsbDevice, UsbAudioDevice};
