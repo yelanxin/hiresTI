@@ -3182,7 +3182,12 @@ impl Engine {
         // Keep bounded headroom so short ALSA hiccups do not stall upstream
         // spectrum/filter production immediately.
         appsink.set_property("max-buffers", queue_buffers);
-        appsink.set_property("max-time", queue_time_ns);
+        // max-time was added in GStreamer 1.20; skip silently on older runtimes
+        // (e.g. Debian/Ubuntu with GStreamer 1.18) to avoid a panic across the
+        // FFI boundary that would abort the process.
+        if appsink.find_property("max-time").is_some() {
+            appsink.set_property("max-time", queue_time_ns);
+        }
         appsink.set_property("drop", false);
         appsink.set_property("wait-on-eos", false);
 
