@@ -310,6 +310,15 @@ def do_activate(self):
         self.player.set_alsa_latency(buf_ms, lat_ms)
     _startup_mark("alsa-latency")
 
+    # 3b. 应用 USB 时钟模式
+    from actions.audio_settings_actions import USB_CLOCK_DEFAULT, _USB_CLOCK_MODE_MAP
+    saved_usb_clock = self.settings.get("usb_clock_mode", USB_CLOCK_DEFAULT)
+    if saved_usb_clock not in _USB_CLOCK_MODE_MAP:
+        saved_usb_clock = USB_CLOCK_DEFAULT
+    if hasattr(self.player, "set_usb_clock_mode"):
+        self.player.set_usb_clock_mode(_USB_CLOCK_MODE_MAP[saved_usb_clock])
+    _startup_mark("usb-clock-mode")
+
     # 4. 恢复驱动选择
     drivers = self.player.get_drivers()
     saved_drv = self.settings.get("driver", "Auto (Default)")

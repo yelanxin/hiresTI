@@ -37,24 +37,36 @@
 pub struct RateAdapter {
     /// Accumulated millisamples (1/1_000_000 sample units).
     accumulator: i64,
-    /// Nominal millisamples per packet = rate * 1000
-    /// (so that accumulator / 1_000_000 = nominal samples/packet on average).
+    /// Nominal millisamples per packet.
+    ///
+    /// For 1ms-per-packet (full-speed or HS bInterval=4): `rate * 1000`
+    /// For 125µs-per-packet (HS bInterval=1 microframe):  `rate * 125`
+    ///
+    /// `accumulator / 1_000_000` gives the integer samples per packet.
     nominal_millisamples: i64,
+    /// Packet rate in Hz (1000 for 1ms, 8000 for 125µs microframes).
+    packets_per_sec: u32,
 }
 
 impl RateAdapter {
-    /// Create a new adapter for `rate` Hz.
-    pub fn new(rate: u32) -> Self {
+    /// Create a new adapter for `rate` Hz with the given ISO packet rate.
+    ///
+    /// `packets_per_sec` is the number of ISO OUT packets delivered per
+    /// second by libusb (1000 for full-speed / HS bInterval=4; 8000 for
+    /// HS bInterval=1 microframe devices).
+    pub fn new(rate: u32, packets_per_sec: u32) -> Self {
+        let nominal = (rate as i64 * 1_000_000) / packets_per_sec as i64;
         Self {
             accumulator: 0,
-            nominal_millisamples: rate as i64 * 1000,
+            nominal_millisamples: nominal,
+            packets_per_sec,
         }
     }
 
     /// Reset the adapter to a new sample rate (e.g. after a format change).
     pub fn reset(&mut self, rate: u32) {
         self.accumulator = 0;
-        self.nominal_millisamples = rate as i64 * 1000;
+        self.nominal_millisamples = (rate as i64 * 1_000_000) / self.packets_per_sec as i64;
     }
 
     /// Return the number of samples to put in the current ISO packet, then
@@ -112,24 +124,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rate_adapter_44100_averages_correctly() {
-        let mut ra = RateAdapter::new(44100);
-        // Over 1000 packets the total should be exactly 44100 samples
+    fn rate_adapter_44100_1ms_averages_correctly() {
+        let mut ra = RateAdapter::new(44100, 1000);
+        // Over 1000 packets (1 second) total = 44100 samples
         let total: u32 = (0..1000).map(|_| ra.samples_this_packet(None)).sum();
         assert_eq!(total, 44100);
     }
 
     #[test]
-    fn rate_adapter_48000_is_flat() {
-        let mut ra = RateAdapter::new(48000);
+    fn rate_adapter_44100_microframe_averages_correctly() {
+        let mut ra = RateAdapter::new(44100, 8000);
+        // Over 8000 packets (1 second) total = 44100 samples
+        let total: u32 = (0..8000).map(|_| ra.samples_this_packet(None)).sum();
+        assert_eq!(total, 44100);
+    }
+
+    #[test]
+    fn rate_adapter_48000_1ms_is_flat() {
+        let mut ra = RateAdapter::new(48000, 1000);
         for _ in 0..100 {
             assert_eq!(ra.samples_this_packet(None), 48);
         }
     }
 
     #[test]
-    fn rate_adapter_96000_is_flat() {
-        let mut ra = RateAdapter::new(96000);
+    fn rate_adapter_48000_microframe_is_flat() {
+        let mut ra = RateAdapter::new(48000, 8000);
+        for _ in 0..100 {
+            assert_eq!(ra.samples_this_packet(None), 6);
+        }
+    }
+
+    #[test]
+    fn rate_adapter_96000_1ms_is_flat() {
+        let mut ra = RateAdapter::new(96000, 1000);
         for _ in 0..100 {
             assert_eq!(ra.samples_this_packet(None), 96);
         }

@@ -1,6 +1,9 @@
 from threading import Thread
 import logging
+import os
 import re
+import subprocess
+import tempfile
 import time
 
 import gi
@@ -19,6 +22,11 @@ _OUTPUT_BIT_DEPTH_GUESS_FORMATS = {
 
 DRIVER_ALSA_AUTO = "ALSA（auto）"
 DRIVER_ALSA_MMAP = "ALSA（mmap）"
+DRIVER_USB_RAWLINK = "USB Rawlink"
+
+USB_CLOCK_OPTIONS = ["Push", "Pull"]
+USB_CLOCK_DEFAULT = "Push"
+_USB_CLOCK_MODE_MAP = {"Push": 0, "Pull": 1}
 _PLAYBACK_STATUS_NORMAL = "normal"
 _PLAYBACK_STATUS_BIT_PERFECT = "bit-perfect"
 _PLAYBACK_STATUS_EXCLUSIVE = "exclusive"
@@ -249,7 +257,7 @@ def _driver_choices_for_mode(app, exclusive_enabled=None):
         else:
             exclusive_enabled = bool(getattr(app, "settings", {}).get("exclusive_lock", False))
     if exclusive_enabled:
-        drivers = [drv for drv in drivers if _driver_is_alsa_family(drv)]
+        drivers = [drv for drv in drivers if _driver_is_alsa_family(drv) or drv == DRIVER_USB_RAWLINK]
     return drivers
 
 
@@ -811,6 +819,25 @@ def update_output_status_ui(app):
     app._last_output_state = state
     app._last_output_error = err
 
+    # If snd-usb-audio just finished re-attaching (after USB rawlink release),
+    # the device list had a placeholder entry with no hw: label.  Refresh now
+    # so it shows the proper hw:X,Y device.
+    if getattr(app.player, "_needs_device_list_refresh", False):
+        app.player._needs_device_list_refresh = False
+        try:
+            _refresh_devices_for_current_driver_ui_only(app, reason="alsa-device-ready")
+        except Exception:
+            pass
+
+    is_usb_perm_error = (
+        state == "error"
+        and bool(err)
+        and ("Access denied" in err or "Permission denied" in err)
+        and getattr(app.player, "requested_driver", "") == "USB Rawlink"
+    )
+    if hasattr(app, "usb_fix_perm_btn") and app.usb_fix_perm_btn is not None:
+        app.usb_fix_perm_btn.set_visible(is_usb_perm_error)
+
     can_recover = state in ("fallback", "error") and bool(getattr(app.player, "requested_driver", None))
     if hasattr(app, "output_recover_btn") and app.output_recover_btn is not None:
         app.output_recover_btn.set_sensitive(can_recover)
@@ -827,6 +854,75 @@ def update_output_status_ui(app):
     _passive_sync_device_list(app)
     if hasattr(app, "_sync_playback_status_icon"):
         app._sync_playback_status_icon()
+
+
+_USB_UDEV_RULE_PATH = "/etc/udev/rules.d/99-hiresti-usb-audio.rules"
+# Use broad uaccess tag (no ID_USB_INTERFACES pattern - format varies across udev versions).
+# TAG+="uaccess" only grants access to the currently logged-in session user, not world.
+_USB_UDEV_RULE_CONTENT = (
+    "# HiresTI USB Rawlink - grant logged-in user access to USB audio devices\n"
+    'SUBSYSTEM=="usb", TAG+="uaccess"\n'
+)
+
+
+def on_usb_fix_permissions_clicked(app, _btn=None):
+    if hasattr(app, "usb_fix_perm_btn") and app.usb_fix_perm_btn is not None:
+        app.usb_fix_perm_btn.set_sensitive(False)
+
+    try:
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".rules", delete=False, prefix="hiresti_usb_"
+        )
+        tmp.write(_USB_UDEV_RULE_CONTENT)
+        tmp.close()
+        tmp_path = tmp.name
+
+        # Install the udev rule AND directly set ACLs on all USB device nodes via
+        # setfacl.  TAG+="uaccess" is processed asynchronously by systemd-logind,
+        # so there is a window after udevadm settle returns where the ACL may not
+        # yet be applied.  The setfacl step provides an immediate, synchronous
+        # grant that takes effect before pkexec returns, eliminating the race.
+        # $PKEXEC_UID is set by pkexec to the invoking user's UID.
+        cmd = (
+            f"cp {tmp_path} {_USB_UDEV_RULE_PATH} "
+            f"&& udevadm control --reload-rules "
+            f"&& udevadm trigger --subsystem-match=usb "
+            f"&& udevadm settle --timeout=3 "
+            f"&& _U=$(id -nu $PKEXEC_UID 2>/dev/null || id -nu) "
+            f"&& for _d in /dev/bus/usb/*/*; do setfacl -m \"u:$_U:rw\" \"$_d\" 2>/dev/null || true; done "
+            f"&& rm -f {tmp_path}"
+        )
+
+        def _on_done(proc):
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            rc = proc.returncode
+
+            def _ui():
+                if hasattr(app, "usb_fix_perm_btn") and app.usb_fix_perm_btn is not None:
+                    app.usb_fix_perm_btn.set_sensitive(True)
+                if rc == 0:
+                    logger.info("USB udev rule installed successfully")
+                    if hasattr(app, "record_diag_event"):
+                        app.record_diag_event("USB permission rule installed via pkexec")
+                    # Extra 1s delay: systemd-logind sets ACLs asynchronously after
+                    # udevadm settle returns, so give it a moment before retrying.
+                    GLib.timeout_add(1000, lambda: on_recover_output_clicked(app) or False)
+                else:
+                    logger.warning("pkexec USB rule install failed (rc=%d)", rc)
+
+            GLib.idle_add(_ui)
+
+        def _run():
+            proc = subprocess.run(["pkexec", "sh", "-c", cmd])
+            _on_done(proc)
+
+        Thread(target=_run, daemon=True).start()
+
+    except Exception as e:
+        logger.error("USB fix permissions error: %s", e)
+        if hasattr(app, "usb_fix_perm_btn") and app.usb_fix_perm_btn is not None:
+            app.usb_fix_perm_btn.set_sensitive(True)
 
 
 def on_recover_output_clicked(app, _btn=None):
@@ -893,6 +989,19 @@ def on_mmap_realtime_priority_changed(app, dd, p):
         app.on_driver_changed(app.driver_dd, None)
 
 
+def on_usb_clock_mode_changed(app, dd, p):
+    selected = dd.get_selected_item()
+    if not selected:
+        return
+    label = selected.get_string()
+    app.settings["usb_clock_mode"] = label
+    app.save_settings()
+    mode_int = _USB_CLOCK_MODE_MAP.get(label, 0)
+    if hasattr(app, "player") and hasattr(app.player, "set_usb_clock_mode"):
+        app.player.set_usb_clock_mode(mode_int)
+    logger.info("USB clock mode changed: %s (%d)", label, mode_int)
+
+
 def on_driver_changed(app, dd, p):
     driver_change_t0 = time.monotonic()
 
@@ -913,17 +1022,17 @@ def on_driver_changed(app, dd, p):
     driver_name = selected.get_string()
     _driver_mark(f"begin driver={driver_name}")
 
-    if app.ex_switch.get_active() and not _driver_is_alsa_family(driver_name):
+    if app.ex_switch.get_active() and not _driver_is_alsa_family(driver_name) and driver_name != DRIVER_USB_RAWLINK:
         app._force_driver_selection(DRIVER_ALSA_AUTO)
         if hasattr(app, "show_output_notice"):
             app.show_output_notice(
-                f"Exclusive mode requires {DRIVER_ALSA_AUTO} or {DRIVER_ALSA_MMAP}.",
+                f"Exclusive mode requires {DRIVER_ALSA_AUTO}, {DRIVER_ALSA_MMAP}, or {DRIVER_USB_RAWLINK}.",
                 "warn",
                 3200,
             )
         return
 
-    if not app.ex_switch.get_active() or _driver_is_alsa_family(driver_name):
+    if not app.ex_switch.get_active() or _driver_is_alsa_family(driver_name) or driver_name == DRIVER_USB_RAWLINK:
         app.settings["driver"] = driver_name
         app.save_settings()
     _driver_mark("settings-saved")
@@ -974,11 +1083,15 @@ def on_driver_changed(app, dd, p):
                         sel_idx = i
                         break
 
-            app.device_dd.set_sensitive(len(devices) > 1)
+            # USB Rawlink has no "Default" placeholder — enable with ≥1 device.
+            min_count = 1 if driver_name == DRIVER_USB_RAWLINK else 2
+            app.device_dd.set_sensitive(len(devices) >= min_count)
             if hasattr(app, "mmap_realtime_priority_dd"):
                 app.mmap_realtime_priority_dd.set_sensitive(driver_name == DRIVER_ALSA_MMAP)
             if hasattr(app, "latency_dd"):
                 app.latency_dd.set_sensitive(_driver_is_alsa_family(driver_name))
+            if hasattr(app, "usb_clock_mode_dd"):
+                app.usb_clock_mode_dd.set_sensitive(driver_name == DRIVER_USB_RAWLINK)
 
             if sel_idx < len(devices):
                 app.device_dd.set_selected(sel_idx)

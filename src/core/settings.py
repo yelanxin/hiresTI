@@ -70,6 +70,7 @@ class SettingsSchema:
     dsp_limiter_enabled: bool = False
     dsp_limiter_threshold: int = 85
     dsp_limiter_ratio: int = 20
+    usb_clock_mode: str = "Push"
     output_auto_rebind_once: bool = False
     remote_api_enabled: bool = False
     remote_api_access_mode: str = "local"
@@ -137,6 +138,7 @@ DEFAULT_SETTINGS = {
     "dsp_limiter_enabled": False,
     "dsp_limiter_threshold": 85,
     "dsp_limiter_ratio": 20,
+    "usb_clock_mode": "Push",
     "output_auto_rebind_once": False,
     "remote_api_enabled": False,
     "remote_api_access_mode": "local",
@@ -446,6 +448,8 @@ def normalize_settings(raw: Optional[dict[str, Any]]) -> dict[str, Any]:
     normalized["dsp_limiter_enabled"] = _as_bool(raw.get("dsp_limiter_enabled"), DEFAULT_SETTINGS["dsp_limiter_enabled"])
     normalized["dsp_limiter_threshold"] = _as_int(raw.get("dsp_limiter_threshold"), DEFAULT_SETTINGS["dsp_limiter_threshold"], minimum=0, maximum=100)
     normalized["dsp_limiter_ratio"] = _as_int(raw.get("dsp_limiter_ratio"), DEFAULT_SETTINGS["dsp_limiter_ratio"], minimum=1, maximum=60)
+    _usb_clk = _as_str(raw.get("usb_clock_mode"), DEFAULT_SETTINGS["usb_clock_mode"])
+    normalized["usb_clock_mode"] = _usb_clk if _usb_clk in ("Push", "Pull") else DEFAULT_SETTINGS["usb_clock_mode"]
     normalized["output_auto_rebind_once"] = _as_bool(raw.get("output_auto_rebind_once"), DEFAULT_SETTINGS["output_auto_rebind_once"])
     normalized["remote_api_enabled"] = _as_bool(raw.get("remote_api_enabled"), DEFAULT_SETTINGS["remote_api_enabled"])
     remote_mode = _as_str(raw.get("remote_api_access_mode"), DEFAULT_SETTINGS["remote_api_access_mode"]).lower()

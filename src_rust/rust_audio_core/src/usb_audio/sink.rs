@@ -16,9 +16,10 @@
 //!
 //! Drop order is significant — fields are dropped top-to-bottom in declaration
 //! order:
-//! 1. `_feedback` — cancel feedback ISO IN transfer
-//! 2. `_ring`     — stop ISO OUT ring + join event thread
-//! 3. `_open_dev` — release USB interface / device handle
+//! 1. `ring`      — stop ISO OUT ring: cancels feedback + OUT transfers, joins
+//!                  event thread (waits for `feedback_in_flight = false`)
+//! 2. `_feedback` — free feedback ISO IN transfer (safe: event thread exited)
+//! 3. `_open_dev` — release USB interface / device handle → snd-usb-audio re-attaches
 //!
 //! # FeedbackReader
 //!
@@ -62,10 +63,21 @@ pub struct UsbAudioSink {
     pub feed: Arc<AlsaHwClockFeed>,
     /// Shared transfer state — exposes `error` and `xruns` counters.
     pub state: Arc<RingState>,
-    /// ISO IN feedback reader (UAC 2.0 only). Dropped before `ring`.
-    _feedback: Option<FeedbackReader>,
-    /// ISO OUT transfer ring + event thread. Dropped before `_open_dev`.
+    /// Actual sample rate negotiated with the device.  May differ from the
+    /// requested rate for UAC 2.0 devices with a fixed (non-programmable) clock.
+    pub actual_rate: u32,
+    /// ISO OUT transfer ring + event thread.
+    ///
+    /// **Must be dropped before `_feedback`.**  `IsoTransferRing::drop()` calls
+    /// `stop()` which cancels the feedback + OUT transfers and joins the event
+    /// thread (waiting for `feedback_in_flight = false`).  Only then is it safe
+    /// for `_feedback.drop()` to call `libusb_free_transfer()`.
+    #[allow(dead_code)]
     ring: IsoTransferRing,
+    /// ISO IN feedback reader (UAC 2.0 only).
+    /// Dropped **after** `ring` so the transfer is freed only after the event
+    /// thread has fully exited.
+    _feedback: Option<FeedbackReader>,
     /// Open USB device handle + claimed interface. Dropped last.
     _open_dev: OpenUsbDevice,
 }
@@ -126,6 +138,15 @@ impl UsbAudioSink {
 
         open_dev.configure(&alt, rate)?;
 
+        // Read back the actual negotiated rate.  For UAC 2.0 devices with a
+        // fixed clock, configure() may have updated active_rate to the value
+        // returned by GET_CUR rather than the requested `rate`.
+        let actual_rate = open_dev.active_rate;
+        eprintln!(
+            "usb-audio: sink::open device={} requested_rate={} actual_rate={} bit_depth={} channels={}",
+            device_id, rate, actual_rate, bit_depth, alt.channels
+        );
+
         // 5. Obtain raw libusb handles (valid for the lifetime of open_dev).
         let dev_handle_raw = open_dev.handle.as_raw();
         let ctx_raw = open_dev.handle.context().as_raw();
@@ -138,20 +159,22 @@ impl UsbAudioSink {
         } else {
             (alt.bit_depth as usize + 7) / 8
         };
+        let packets_per_sec = iso_packets_per_sec(dev.is_high_speed, alt.out_ep_interval);
         let state = RingState::new(
             Arc::clone(&queue),
-            rate,
+            actual_rate,
             bytes_per_sample,
             alt.channels as usize,
             alt.max_packet as usize,
+            packets_per_sec,
             Arc::clone(&feed),
         );
 
         // 7. Create and start the ISO OUT transfer ring.
-        //    Anchor the clock immediately before the first transfer is submitted
-        //    so the clock epoch aligns with the start of audio output.
+        //    Anchor the clock with the actual device rate so the frame counter
+        //    advances at the correct pace.
         let anchor_ns = clock_monotonic_ns();
-        feed.anchor(anchor_ns, rate);
+        feed.anchor(anchor_ns, actual_rate);
 
         let mut ring =
             IsoTransferRing::new(dev_handle_raw, ctx_raw, alt.out_ep, Arc::clone(&state))?;
@@ -169,23 +192,150 @@ impl UsbAudioSink {
             })
             .transpose()?;
 
+        // Register feedback transfer with the ring so stop() can cancel it.
+        if let Some(ref fb) = feedback {
+            ring.feedback_xfer = Some(fb.transfer);
+        }
+
         Ok((
             UsbAudioSink {
                 queue,
                 feed,
                 state,
-                _feedback: feedback,
+                actual_rate,
                 ring,
+                _feedback: feedback,
                 _open_dev: open_dev,
             },
             clock,
         ))
+    }
+
+    /// Open the USB device using a caller-supplied clock feed.
+    ///
+    /// Like [`open`] but the caller creates the [`AlsaHwClockFeed`] (and its
+    /// paired [`AlsaHwClock`]) before calling this function.  This enables a
+    /// **lazy-open** pattern: give GStreamer the clock immediately, then call
+    /// this once the negotiated sample rate is known (e.g. on the first PCM
+    /// buffer from the appsink).
+    ///
+    /// The feed is anchored inside this call at the actual negotiated rate.
+    pub fn open_with_feed(
+        device_id: &str,
+        rate: u32,
+        bit_depth: u8,
+        feed: Arc<AlsaHwClockFeed>,
+    ) -> Result<Self, String> {
+        // 1. Find device.
+        let dev = find_device_by_id(device_id)
+            .ok_or_else(|| format!("USB audio device '{}' not found", device_id))?;
+
+        // 2. Frame queue.
+        let queue = FrameQueue::new();
+
+        // 3. Open device handle and configure.
+        let mut open_dev = OpenUsbDevice::open(&dev)?;
+
+        let alt = open_dev
+            .best_alt(rate, bit_depth)
+            .ok_or_else(|| {
+                format!(
+                    "no alt-setting for rate={} bit_depth={} on '{}'",
+                    rate, bit_depth, device_id
+                )
+            })?
+            .clone();
+
+        open_dev.configure(&alt, rate)?;
+
+        let actual_rate = open_dev.active_rate;
+        eprintln!(
+            "usb-audio: sink::open_with_feed device={} requested_rate={} actual_rate={} bit_depth={} channels={} feedback_ep={:?}",
+            device_id, rate, actual_rate, bit_depth, alt.channels, alt.feedback_ep
+        );
+
+        // 4. Raw handles.
+        let dev_handle_raw = open_dev.handle.as_raw();
+        let ctx_raw = open_dev.handle.context().as_raw();
+
+        // 5. Ring state.
+        let bytes_per_sample = if alt.subframe_size > 0 {
+            alt.subframe_size as usize
+        } else {
+            (alt.bit_depth as usize + 7) / 8
+        };
+        let packets_per_sec = iso_packets_per_sec(dev.is_high_speed, alt.out_ep_interval);
+        let state = RingState::new(
+            Arc::clone(&queue),
+            actual_rate,
+            bytes_per_sample,
+            alt.channels as usize,
+            alt.max_packet as usize,
+            packets_per_sec,
+            Arc::clone(&feed),
+        );
+
+        // 6. Anchor the caller's clock feed and start the ring.
+        let anchor_ns = clock_monotonic_ns();
+        feed.anchor(anchor_ns, actual_rate);
+
+        let mut ring =
+            IsoTransferRing::new(dev_handle_raw, ctx_raw, alt.out_ep, Arc::clone(&state))?;
+        ring.start()?;
+
+        // 7. Feedback reader (UAC 2.0 only).
+        let feedback = alt
+            .feedback_ep
+            .map(|ep| {
+                FeedbackReader::new(dev_handle_raw, ep, Arc::clone(&state), dev.uac_version)
+                    .and_then(|mut fr| {
+                        fr.start()?;
+                        Ok(fr)
+                    })
+            })
+            .transpose()?;
+
+        // Register feedback transfer with the ring so stop() can cancel it.
+        if let Some(ref fb) = feedback {
+            ring.feedback_xfer = Some(fb.transfer);
+        }
+
+        Ok(UsbAudioSink {
+            queue,
+            feed,
+            state,
+            actual_rate,
+            ring,
+            _feedback: feedback,
+            _open_dev: open_dev,
+        })
     }
 }
 
 // ---------------------------------------------------------------------------
 // Device lookup helpers
 // ---------------------------------------------------------------------------
+
+/// Compute the number of ISO packets (transfer completions) per second from
+/// the endpoint's `bInterval` and the USB bus speed.
+///
+/// For **High-Speed** (USB 2.0, 480 Mbit/s) isochronous endpoints:
+///   interval = 2^(bInterval-1) × 125 µs
+///   → bInterval=1 → 8000/s, bInterval=4 → 1000/s, …
+///
+/// For **Full-Speed** (USB 1.1, 12 Mbit/s) isochronous endpoints:
+///   interval = bInterval × 1 ms  (bInterval=1 → 1000/s for typical audio devices)
+fn iso_packets_per_sec(is_high_speed: bool, b_interval: u8) -> u32 {
+    let b = b_interval.max(1) as u32;
+    if is_high_speed {
+        // HS: interval in microframes = 2^(bInterval-1); 8000 µf/sec total
+        let microframes = 1u32 << (b - 1).min(13);
+        8_000 / microframes
+    } else {
+        // FS: interval in 1ms frames
+        1_000 / b
+    }
+}
 
 /// Find a device in the live enumeration by its string ID.
 fn find_device_by_id(device_id: &str) -> Option<UsbAudioDevice> {
@@ -234,23 +384,31 @@ extern "system" fn feedback_in_callback(transfer: *mut libusb_transfer) {
     let ctx = unsafe { &*((*transfer).user_data as *const FeedbackCtx) };
 
     if ctx.state.stop.load(Ordering::Acquire) {
-        return; // Stop requested — do not resubmit.
+        // Stop requested — do not resubmit.  Clear the in-flight flag so the
+        // event thread's exit condition (`!feedback_in_flight`) can be met.
+        ctx.state.feedback_in_flight.store(false, Ordering::Release);
+        return;
+    }
+
+    let status = unsafe { (*transfer).status };
+    if status != libusb1_sys::constants::LIBUSB_TRANSFER_COMPLETED {
+        // Non-recoverable status (CANCELLED, NO_DEVICE, etc.) — stop tracking.
+        ctx.state.feedback_in_flight.store(false, Ordering::Release);
+        return;
     }
 
     // Parse only completed packets.
-    if unsafe { (*transfer).status } == libusb1_sys::constants::LIBUSB_TRANSFER_COMPLETED {
-        let len = unsafe { (*transfer).actual_length } as usize;
-        let buf = unsafe {
-            std::slice::from_raw_parts((*transfer).buffer as *const u8, len)
-        };
-        let ms = match ctx.uac_version {
-            UacVersion::V2 => parse_feedback_uac2(buf),
-            UacVersion::V1 => parse_feedback_uac1(buf),
-        };
-        if let Some(v) = ms {
-            if let Ok(mut lock) = ctx.state.feedback_ms.lock() {
-                *lock = Some(v);
-            }
+    let len = unsafe { (*transfer).actual_length } as usize;
+    let buf = unsafe {
+        std::slice::from_raw_parts((*transfer).buffer as *const u8, len)
+    };
+    let ms = match ctx.uac_version {
+        UacVersion::V2 => parse_feedback_uac2(buf),
+        UacVersion::V1 => parse_feedback_uac1(buf),
+    };
+    if let Some(v) = ms {
+        if let Ok(mut lock) = ctx.state.feedback_ms.lock() {
+            *lock = Some(v);
         }
     }
 
@@ -320,8 +478,12 @@ impl FeedbackReader {
 
     /// Submit the transfer for the first time.
     pub fn start(&mut self) -> Result<(), String> {
+        // Mark in-flight BEFORE submitting so the event thread's exit
+        // condition sees it immediately.
+        self._ctx.state.feedback_in_flight.store(true, Ordering::Release);
         let rc = unsafe { libusb_submit_transfer(self.transfer) };
         if rc != 0 {
+            self._ctx.state.feedback_in_flight.store(false, Ordering::Release);
             return Err(format!("submit feedback ISO IN transfer: rc={}", rc));
         }
         Ok(())
@@ -334,9 +496,11 @@ impl FeedbackReader {
 
 impl Drop for FeedbackReader {
     fn drop(&mut self) {
+        // `ring` (IsoTransferRing) drops before us: its `stop()` already
+        // cancelled this transfer and joined the event thread, so the
+        // callback will never fire again.  `cancel()` here is a no-op
+        // safety belt; `libusb_free_transfer` is then safe.
         self.cancel();
-        // The event thread (owned by IsoTransferRing, dropped after us) will
-        // drain the cancelled transfer before exiting.
         unsafe { libusb_free_transfer(self.transfer) };
     }
 }

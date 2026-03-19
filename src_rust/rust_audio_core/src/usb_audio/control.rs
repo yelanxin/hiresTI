@@ -105,6 +105,26 @@ pub fn set_sample_rate_uac2<T: UsbContext>(
         .map_err(|e| format!("UAC2 SET_CUR CS_SAM_FREQ (clock_id={}): {}", clock_id, e))
 }
 
+/// Read the current sample rate from a UAC 2.0 Clock Source entity via GET_CUR.
+///
+/// Returns `None` if the transfer fails or the response is too short.
+pub fn get_cur_sample_rate_uac2<T: UsbContext>(
+    handle: &DeviceHandle<T>,
+    ctrl_iface: u8,
+    clock_id: u8,
+) -> Option<u32> {
+    let mut buf = [0u8; 4];
+    let rt = rusb::request_type(Direction::In, RequestType::Class, Recipient::Interface);
+    let w_value = (UAC2_CS_SAM_FREQ as u16) << 8;
+    let w_index = ((clock_id as u16) << 8) | (ctrl_iface as u16);
+
+    handle
+        .read_control(rt, GET_CUR, w_value, w_index, &mut buf, CTRL_TIMEOUT)
+        .ok()
+        .filter(|&n| n >= 4)
+        .map(|_| u32::from_le_bytes(buf))
+}
+
 /// Query supported sample rates from a UAC 2.0 Clock Source entity via GET_RANGE.
 ///
 /// Returns a list of discrete frequencies reported by the device.

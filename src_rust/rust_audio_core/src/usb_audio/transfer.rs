@@ -30,6 +30,13 @@ use libusb1_sys::{
     libusb_set_iso_packet_lengths, libusb_submit_transfer, libusb_transfer,
 };
 
+/// Read `CLOCK_MONOTONIC` as nanoseconds.
+fn clock_monotonic_ns() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
 use crate::alsa_clock::AlsaHwClockFeed;
 
 use super::feedback::RateAdapter;
@@ -40,9 +47,11 @@ use super::queue::FrameQueue;
 // ---------------------------------------------------------------------------
 
 /// Number of concurrent in-flight transfers.
-const N_TRANSFERS: usize = 16;
-/// ISO packets per transfer — each packet = 1 ms of audio.
-const N_PACKETS: usize = 8;
+pub const N_TRANSFERS: usize = 16;
+/// Target audio duration covered by one transfer, in milliseconds.
+/// Each transfer holds `N_PACKETS_TARGET_MS * packets_per_sec / 1000` ISO packets.
+/// 1ms/FS device (1000 pkt/s) → 8 packets; 125µs/HS device (8000 pkt/s) → 64 packets.
+pub const N_PACKETS_TARGET_MS: usize = 8;
 
 // ---------------------------------------------------------------------------
 // Shared state (Arc, accessed from both event thread and main thread)
@@ -56,12 +65,16 @@ pub struct RingState {
     pub rate_adapter: Mutex<RateAdapter>,
     /// Latest feedback value in millisamples (updated from feedback callback).
     pub feedback_ms: Mutex<Option<i64>>,
+    /// Sample rate in Hz.
+    pub rate: u32,
     /// Bytes per audio sample (e.g. 4 for S32LE, 3 for S24_3LE).
     pub bytes_per_sample: usize,
     /// Number of audio channels.
     pub channels: usize,
     /// `wMaxPacketSize` from the ISO OUT endpoint descriptor.
     pub max_packet: usize,
+    /// ISO packets delivered per second (1000 for 1ms/FS, 8000 for 125µs/HS).
+    pub packets_per_sec: u32,
     /// Transfers that have been submitted but not yet completed.
     pub in_flight: AtomicI32,
     /// Frame-counting clock feed (shared with GStreamer pipeline).
@@ -74,6 +87,16 @@ pub struct RingState {
     /// [`FrameQueue`] was empty.  Each unit = 1 ms of silence (one ISO
     /// packet).  Polled by the pusher thread for periodic xrun reporting.
     pub xruns: AtomicU64,
+    /// Running total of PCM bytes consumed by the ISO OUT ring.
+    /// Polled by the pusher thread to measure drain throughput.
+    pub bytes_drained_total: AtomicU64,
+    /// `true` while the ISO IN feedback transfer is in flight.
+    /// Set to `true` in `FeedbackReader::start()`; cleared in
+    /// `feedback_in_callback` when the transfer stops (stop requested or
+    /// non-recoverable status).  The event thread waits for this to become
+    /// `false` before exiting so `FeedbackReader::drop()` can safely free
+    /// the transfer struct.
+    pub feedback_in_flight: AtomicBool,
 }
 
 impl RingState {
@@ -83,20 +106,30 @@ impl RingState {
         bytes_per_sample: usize,
         channels: usize,
         max_packet: usize,
+        packets_per_sec: u32,
         clock_feed: Arc<AlsaHwClockFeed>,
     ) -> Arc<Self> {
+        eprintln!(
+            "usb-audio: RingState rate={} ch={} bps={} max_packet={} packets_per_sec={}",
+            rate, channels, bytes_per_sample, max_packet, packets_per_sec
+        );
+
         Arc::new(Self {
             queue,
             stop: AtomicBool::new(false),
-            rate_adapter: Mutex::new(RateAdapter::new(rate)),
+            rate_adapter: Mutex::new(RateAdapter::new(rate, packets_per_sec)),
             feedback_ms: Mutex::new(None),
+            rate,
             bytes_per_sample,
             channels,
             max_packet,
+            packets_per_sec,
             in_flight: AtomicI32::new(0),
             clock_feed,
             error: AtomicBool::new(false),
             xruns: AtomicU64::new(0),
+            bytes_drained_total: AtomicU64::new(0),
+            feedback_in_flight: AtomicBool::new(false),
         })
     }
 }
@@ -118,21 +151,26 @@ unsafe fn fill_transfer(state: &RingState, transfer: *mut libusb_transfer) {
     let buf_base = (*transfer).buffer as *mut u8;
     let buf_len = ((*transfer).length) as usize;
 
-    // Set all packet slots to max_packet first (libusb needs this for buffer
-    // addressing), then override individual lengths below.
-    libusb_set_iso_packet_lengths(transfer, state.max_packet as c_uint);
-
     let feedback = *state.feedback_ms.lock().unwrap_or_else(|e| e.into_inner());
     let mut adapter = state.rate_adapter.lock().unwrap_or_else(|e| e.into_inner());
 
+    let frame_bytes = state.channels * state.bytes_per_sample;
+
+    // ISO packets must be laid out tightly (no gaps) in the transfer buffer.
+    // libusb/usbfs computes each packet's start offset as the cumulative sum
+    // of the *actual* lengths of all preceding packets — NOT as i * max_packet.
+    // Writing at stride=max_packet but using smaller lengths would cause the
+    // USB host controller to read from the wrong buffer positions for packets
+    // 1..N, producing garbage audio (continuous crackling).
     let mut offset = 0usize;
+    let mut total_frames: u64 = 0;
     for i in 0..n_packets {
         let samples = adapter.samples_this_packet(feedback) as usize;
-        let packet_bytes = (samples * state.channels * state.bytes_per_sample)
+        let packet_bytes = (samples * frame_bytes)
             .min(state.max_packet)
             .min(buf_len.saturating_sub(offset));
 
-        // Set actual packet length in the ISO descriptor
+        // Set actual packet length in the ISO descriptor.
         let pkt = (*transfer)
             .iso_packet_desc
             .as_mut_ptr()
@@ -140,20 +178,28 @@ unsafe fn fill_transfer(state: &RingState, transfer: *mut libusb_transfer) {
         (*pkt).length = packet_bytes as c_uint;
 
         // Fill from queue; silence-pad anything missing.
-        // Count each silence-padded packet as one xrun (= 1 ms underrun).
-        let pkt_buf = std::slice::from_raw_parts_mut(buf_base.add(offset), state.max_packet);
-        let got = state.queue.pop(&mut pkt_buf[..packet_bytes]);
+        let pkt_buf = std::slice::from_raw_parts_mut(buf_base.add(offset), packet_bytes);
+        let got = state.queue.pop(pkt_buf);
         if got < packet_bytes {
-            pkt_buf[got..packet_bytes].fill(0);
+            pkt_buf[got..].fill(0);
             state.xruns.fetch_add(1, Ordering::Relaxed);
         }
 
-        // Advance clock by actual samples written
-        state.clock_feed.advance(samples as u64);
+        state.bytes_drained_total.fetch_add(packet_bytes as u64, Ordering::Relaxed);
 
-        offset += state.max_packet;
+        let actual_samples = if frame_bytes > 0 { packet_bytes / frame_bytes } else { samples };
+        total_frames += actual_samples as u64;
+
+        // Advance by actual packet bytes so each packet's data immediately
+        // follows the previous one (tight packing required by usbfs).
+        offset += packet_bytes;
     }
     drop(adapter);
+    // Advance the clock once per transfer (batched) instead of once per packet.
+    // 8–64 atomic add calls → 1, cutting hot-path overhead ~8–64×.
+    if total_frames > 0 {
+        state.clock_feed.advance(total_frames);
+    }
 }
 
 /// libusb ISO OUT transfer completion callback.
@@ -182,6 +228,10 @@ extern "system" fn iso_out_callback(transfer: *mut libusb_transfer) {
     // For STALL / ERROR: refill with silence to keep the ring alive; the
     // device may recover (e.g. brief USB bus reset).
     unsafe { fill_transfer(state, transfer) };
+
+    // Record ISO completion timestamp for pull-clock rate calibration.
+    // Called after fill_transfer so total_frames reflects the just-written batch.
+    state.clock_feed.record_iso(clock_monotonic_ns());
 
     let rc = unsafe { libusb_submit_transfer(transfer) };
     if rc == 0 {
@@ -214,6 +264,12 @@ pub struct IsoTransferRing {
     /// Raw libusb context pointer (borrowed from the DeviceHandle's context).
     ctx_raw: *mut libusb_context,
     event_thread: Option<JoinHandle<()>>,
+    /// Optional ISO IN feedback transfer.  Stored here so `stop()` can cancel
+    /// it alongside the OUT transfers, ensuring the event thread processes its
+    /// completion callback (and clears `state.feedback_in_flight`) before
+    /// exiting.  This prevents `FeedbackReader::drop()` from freeing the
+    /// transfer while libusb still holds an internal reference.
+    pub feedback_xfer: Option<*mut libusb_transfer>,
 }
 
 // SAFETY: All raw pointers are valid for the struct's lifetime.
@@ -238,8 +294,17 @@ impl IsoTransferRing {
         ep: u8,
         state: Arc<RingState>,
     ) -> Result<Self, String> {
-        let buf_size = N_PACKETS * state.max_packet;
+        // Scale ISO packets per transfer so each transfer covers ~8ms of audio,
+        // regardless of whether the device uses 1ms frames or 125µs microframes.
+        let n_packets = (N_PACKETS_TARGET_MS * state.packets_per_sec as usize / 1000).max(8);
+        let buf_size = n_packets * state.max_packet;
         let state_ptr = Arc::as_ptr(&state) as *mut std::ffi::c_void;
+
+        eprintln!(
+            "usb-audio: IsoTransferRing n_transfers={} n_packets={} buf_size={} bytes ({} ms/transfer)",
+            N_TRANSFERS, n_packets, buf_size,
+            n_packets * 1000 / state.packets_per_sec as usize,
+        );
 
         let mut transfers = Vec::with_capacity(N_TRANSFERS);
         let mut bufs = Vec::with_capacity(N_TRANSFERS);
@@ -247,7 +312,7 @@ impl IsoTransferRing {
         for _ in 0..N_TRANSFERS {
             let mut buf: Vec<u8> = vec![0u8; buf_size];
 
-            let xfer = unsafe { libusb_alloc_transfer(N_PACKETS as c_int) };
+            let xfer = unsafe { libusb_alloc_transfer(n_packets as c_int) };
             if xfer.is_null() {
                 // Free any already-allocated transfers before returning
                 for t in &transfers {
@@ -263,7 +328,7 @@ impl IsoTransferRing {
                     ep as c_uchar,
                     buf.as_mut_ptr() as *mut c_uchar,
                     buf_size as c_int,
-                    N_PACKETS as c_int,
+                    n_packets as c_int,
                     iso_out_callback,
                     state_ptr,
                     0, // timeout = 0 (no timeout)
@@ -281,6 +346,7 @@ impl IsoTransferRing {
             state,
             ctx_raw,
             event_thread: None,
+            feedback_xfer: None,
         })
     }
 
@@ -311,9 +377,14 @@ impl IsoTransferRing {
             .name("usb-iso-events".into())
             .spawn(move || {
                 let ctx = ctx_addr as *mut libusb_context;
-                let tv = libc::timeval { tv_sec: 0, tv_usec: 1_000 }; // 1 ms
+                // Use a timeout that matches the transfer duration (~8 ms).
+                // Polling at 1 ms would cause ~1000 syscalls/sec but transfers
+                // only complete every 8 ms; 8 ms here reduces idle syscalls by ~8×.
+                // With 128 ms of in-flight buffer this latency is safe.
+                let tv = libc::timeval { tv_sec: 0, tv_usec: 8_000 }; // 8 ms
                 while !state.stop.load(Ordering::Acquire)
                     || state.in_flight.load(Ordering::Acquire) > 0
+                    || state.feedback_in_flight.load(Ordering::Acquire)
                 {
                     unsafe {
                         libusb_handle_events_timeout(ctx, &tv);
@@ -329,10 +400,18 @@ impl IsoTransferRing {
     /// Stop the transfer ring gracefully.
     ///
     /// 1. Sets `stop = true` (callbacks will not resubmit)
-    /// 2. Cancels all in-flight transfers
-    /// 3. Waits for the event thread to drain and exit
+    /// 2. Cancels the ISO IN feedback transfer (if any) so the event thread
+    ///    processes its completion callback and clears `feedback_in_flight`
+    /// 3. Cancels all ISO OUT transfers
+    /// 4. Waits for the event thread to drain and exit (it checks both
+    ///    `in_flight` and `feedback_in_flight` before returning)
     pub fn stop(&mut self) {
         self.state.stop.store(true, Ordering::SeqCst);
+
+        // Cancel the feedback transfer first so the event thread can drain it.
+        if let Some(fb) = self.feedback_xfer {
+            unsafe { libusb_cancel_transfer(fb) };
+        }
 
         for &xfer in &self.transfers {
             unsafe { libusb_cancel_transfer(xfer) };

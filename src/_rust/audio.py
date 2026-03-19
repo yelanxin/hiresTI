@@ -19,6 +19,7 @@ _LV2_HOST_MANAGED_PORT_SYMBOLS = {"enabled", "enable", "bypass"}
 
 DRIVER_ALSA_AUTO = "ALSA（auto）"
 DRIVER_ALSA_MMAP = "ALSA（mmap）"
+DRIVER_USB_RAWLINK = "USB Rawlink"
 
 
 def _driver_key(driver_name):
@@ -33,6 +34,8 @@ def _driver_key(driver_name):
         return "pipewire"
     if compact in ("auto", "auto(default)"):
         return "auto"
+    if compact in ("usbrawlink", "usb_rawlink"):
+        return "usb_rawlink"
     return compact
 
 
@@ -145,6 +148,9 @@ class _RustAudioCore:
             if hasattr(lib, "rac_set_preferred_output_format"):
                 lib.rac_set_preferred_output_format.restype = ctypes.c_int
                 lib.rac_set_preferred_output_format.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+            if hasattr(lib, "rac_set_usb_clock_mode"):
+                lib.rac_set_usb_clock_mode.restype = ctypes.c_int
+                lib.rac_set_usb_clock_mode.argtypes = [ctypes.c_void_p, ctypes.c_int]
             if hasattr(lib, "rac_set_dsp_enabled"):
                 lib.rac_set_dsp_enabled.restype = ctypes.c_int
                 lib.rac_set_dsp_enabled.argtypes = [ctypes.c_void_p, ctypes.c_int]
@@ -499,6 +505,13 @@ class _RustAudioCore:
             ctypes.c_int(int(priority or 0)),
             default_rc=-3,
         )
+
+    def set_usb_clock_mode(self, mode):
+        if (not self.available) or self._closed:
+            return -1
+        if not hasattr(self.lib, "rac_set_usb_clock_mode"):
+            return -3
+        return self._call_int("rac_set_usb_clock_mode", ctypes.c_int(int(mode or 0)), default_rc=-2)
 
     def set_preferred_output_format(self, format_name=None):
         if (not self.available) or self._closed:
@@ -1615,6 +1628,7 @@ class RustAudioPlayerAdapter:
         self.alsa_mmap_realtime_priority = 60
         self.output_state = "idle"
         self.output_error = None
+        self._needs_device_list_refresh = False
         self.dsp_enabled = True
         self.dsp_order = ["peq", "convolver", "tape", "tube", "widener"]
         self.peq_enabled = False
@@ -2322,6 +2336,25 @@ class RustAudioPlayerAdapter:
             )
         return True
 
+    def set_usb_clock_mode(self, mode):
+        """Set USB rawlink clock alignment mode: 0 = push, 1 = pull."""
+        try:
+            mode_int = int(mode or 0)
+        except Exception:
+            mode_int = 0
+        rc = -2
+        try:
+            rc = int(self._rust.set_usb_clock_mode(mode_int))
+        except Exception:
+            logger.debug("Rust USB clock mode setter failed", exc_info=True)
+        if rc == 0:
+            logger.info("USB clock mode set: %s", "pull" if mode_int == 1 else "push")
+        elif rc == -3:
+            logger.debug("Rust USB clock mode setter unavailable")
+        elif rc < 0:
+            logger.warning("Rust USB clock mode apply failed rc=%s mode=%s", rc, mode_int)
+        return rc == 0 or rc == -3
+
     def toggle_bit_perfect(self, enabled, exclusive_lock=False):
         old_exclusive = bool(getattr(self, "exclusive_lock_mode", False))
         self.bit_perfect_mode = bool(enabled)
@@ -2871,7 +2904,7 @@ class RustAudioPlayerAdapter:
             return []
 
     def get_drivers(self):
-        return ["Auto (Default)", "PipeWire", DRIVER_ALSA_AUTO, DRIVER_ALSA_MMAP]
+        return ["Auto (Default)", "PipeWire", DRIVER_ALSA_AUTO, DRIVER_ALSA_MMAP, DRIVER_USB_RAWLINK]
 
     def _on_rust_event(self, evt, msg):
         if evt == _RustAudioCore.EVENT_EOS:
@@ -2909,6 +2942,12 @@ class RustAudioPlayerAdapter:
             if msg and "output-switched" in msg:
                 self.output_state = "active"
                 self.output_error = None
+            if msg and "alsa-mmap device ready" in msg:
+                self.output_error = None
+                # Signal the app to refresh the device list immediately —
+                # snd-usb-audio has finished re-attaching and the device now
+                # shows up with proper hw: labels in /proc/asound.
+                self._needs_device_list_refresh = True
             if msg:
                 lmsg = msg.lower()
                 if "container-adapter" in lmsg:
@@ -3118,7 +3157,7 @@ class RustAudioPlayerAdapter:
         if self._on_spectrum_callback is None or (not bool(self._rust_spectrum_enabled)):
             return True
         try:
-            self._refresh_rust_cache(force=True)
+            self._refresh_rust_cache(force=False)
             cur_pos = float(self._cached_pos_s or 0.0)
             delay_ms = self._estimate_rust_visual_delay_ms(current_pos_s=cur_pos, msg_pos_s=None)
             target_pos = max(

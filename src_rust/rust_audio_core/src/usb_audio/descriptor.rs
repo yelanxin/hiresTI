@@ -19,6 +19,7 @@ const CS_INTERFACE: u8 = 0x24;
 /// AC interface descriptor subtypes.
 const AC_HEADER: u8 = 0x01;
 const AC_OUTPUT_TERMINAL: u8 = 0x03;
+const AC_CLOCK_SELECTOR: u8 = 0x0B;
 
 /// AS interface descriptor subtypes.
 const AS_GENERAL: u8 = 0x01;
@@ -76,6 +77,9 @@ pub struct UacStreamAlt {
     pub feedback_ep: Option<u8>,
     /// `wMaxPacketSize` of the ISO OUT endpoint.
     pub max_packet: u16,
+    /// `bInterval` of the ISO OUT endpoint (verbatim from the descriptor).
+    /// Interpret together with the bus speed to get the actual packet period.
+    pub out_ep_interval: u8,
 }
 
 // ---------------------------------------------------------------------------
@@ -151,6 +155,10 @@ pub struct EpInfo {
     pub is_out: bool,
     pub is_iso: bool,
     pub max_packet: u16,
+    /// `bInterval` from the endpoint descriptor.
+    /// For HS ISO: interval = 2^(bInterval-1) × 125 µs.
+    /// For FS ISO: interval = bInterval × 1 ms.
+    pub b_interval: u8,
 }
 
 /// Parse one AS interface alt-setting into a [`UacStreamAlt`].
@@ -278,7 +286,7 @@ pub fn parse_stream_alt(
     }
 
     // Find ISO OUT endpoint (required) and optional feedback IN endpoint
-    let mut out_ep: Option<(u8, u16)> = None;
+    let mut out_ep: Option<(u8, u16, u8)> = None; // (address, max_packet, b_interval)
     let mut feedback_ep: Option<u8> = None;
 
     for ep in endpoints {
@@ -286,14 +294,14 @@ pub fn parse_stream_alt(
             continue;
         }
         if ep.is_out {
-            out_ep = Some((ep.address, ep.max_packet));
+            out_ep = Some((ep.address, ep.max_packet, ep.b_interval));
         } else {
             // ISO IN on an audio streaming interface = feedback endpoint
             feedback_ep = Some(ep.address);
         }
     }
 
-    let (out_ep_addr, max_packet) = out_ep?;
+    let (out_ep_addr, max_packet, out_ep_interval) = out_ep?;
 
     // Fallback: derive subframe_size from bit_depth when the descriptor did not
     // provide it (should not happen for a well-formed device).
@@ -313,6 +321,7 @@ pub fn parse_stream_alt(
         out_ep: out_ep_addr,
         feedback_ep,
         max_packet,
+        out_ep_interval,
     })
 }
 
@@ -322,28 +331,57 @@ pub fn parse_stream_alt(
 
 /// Extract the Clock Source entity ID from the Audio Control interface descriptors.
 ///
-/// Walks `ac_extra` looking for an OUTPUT_TERMINAL (subtype 0x03) and returns
-/// its `bCSourceID` field (byte 8), which is the entity ID to use for
-/// UAC 2.0 clock frequency control transfers.
+/// UAC 2.0 OUTPUT_TERMINAL carries a `bCSourceID` field (byte 8) that may point
+/// to either a Clock Source (subtype 0x0A) directly, or to a Clock Selector
+/// (subtype 0x0B).  Control transfers for sample rate (SET_CUR / GET_RANGE) must
+/// target a Clock **Source**, not a Selector — addressing a Selector is ignored
+/// by most devices, causing SET_CUR to fail silently and the device to play at
+/// an incorrect rate (wrong pitch / crackling).
 ///
-/// Returns `None` if no OUTPUT_TERMINAL with a valid `bCSourceID` is found
-/// (not a UAC 2.0 device, or descriptor too short).
+/// This function resolves the chain:
+///   OUTPUT_TERMINAL.bCSourceID
+///     → if Clock Selector: follow baCSourceID[0] to reach the Clock Source
+///     → if already a Clock Source: return as-is
+///
+/// Returns `None` if no OUTPUT_TERMINAL with a valid `bCSourceID` is found.
 pub fn parse_clock_id_from_ac(ac_extra: &[u8]) -> Option<u8> {
+    // Pass 1: find bCSourceID from the (first) OUTPUT_TERMINAL.
+    let mut initial_id: Option<u8> = None;
     for desc in CsDescIter::new(ac_extra) {
-        // UAC 2.0 OUTPUT_TERMINAL is 12 bytes:
-        // [0] bLength, [1] bDescriptorType=0x24, [2] bDescriptorSubtype=0x03,
+        // UAC 2.0 OUTPUT_TERMINAL (12 bytes):
+        // [0] bLength, [1] 0x24, [2] 0x03 (OUTPUT_TERMINAL),
         // [3] bTerminalID, [4..5] wTerminalType, [6] bAssocTerminal,
         // [7] bSourceID, [8] bCSourceID, [9..10] bmControls, [11] iTerminal
-        if desc.len() < 9 {
+        if desc.len() < 9 || desc[1] != CS_INTERFACE || desc[2] != AC_OUTPUT_TERMINAL {
             continue;
         }
-        if desc[1] != CS_INTERFACE || desc[2] != AC_OUTPUT_TERMINAL {
-            continue;
-        }
-        let clock_id = desc[8];
-        if clock_id != 0 {
-            return Some(clock_id);
+        let id = desc[8]; // bCSourceID
+        if id != 0 {
+            initial_id = Some(id);
+            break;
         }
     }
-    None
+    let initial_id = initial_id?;
+
+    // Pass 2: if initial_id is a Clock Selector, follow it to the Clock Source.
+    // UAC 2.0 Clock Selector descriptor:
+    // [0] bLength, [1] 0x24, [2] 0x0B (CLOCK_SELECTOR),
+    // [3] bClockID, [4] bNrInPins, [5..] baCSourceID[0..bNrInPins-1], ...
+    for desc in CsDescIter::new(ac_extra) {
+        if desc.len() < 6 || desc[1] != CS_INTERFACE || desc[2] != AC_CLOCK_SELECTOR {
+            continue;
+        }
+        if desc[3] != initial_id {
+            continue; // not the selector we're looking for
+        }
+        let n_pins = desc[4] as usize;
+        if n_pins > 0 && desc.len() >= 6 {
+            // Return the first (and normally only) input pin — the programmable
+            // Clock Source that accepts SET_CUR frequency commands.
+            return Some(desc[5]); // baCSourceID[0]
+        }
+    }
+
+    // initial_id was not a Clock Selector — it is the Clock Source itself.
+    Some(initial_id)
 }
