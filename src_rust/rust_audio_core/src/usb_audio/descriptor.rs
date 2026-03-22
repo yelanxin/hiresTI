@@ -207,8 +207,7 @@ pub fn parse_stream_alt(
                     if desc.len() < 11 {
                         continue;
                     }
-                    let bm_formats =
-                        u32::from_le_bytes([desc[6], desc[7], desc[8], desc[9]]);
+                    let bm_formats = u32::from_le_bytes([desc[6], desc[7], desc[8], desc[9]]);
                     format = if bm_formats & 0x01 != 0 {
                         UacFormat::Pcm
                     } else if bm_formats & 0x04 != 0 {
@@ -233,7 +232,7 @@ pub fn parse_stream_alt(
                     }
                     channels = desc[4];
                     subframe_size = desc[5]; // bSubFrameSize — wire bytes per sample
-                    bit_depth = desc[6];     // bBitResolution — used bits
+                    bit_depth = desc[6]; // bBitResolution — used bits
                     let freq_type = desc[7];
                     if freq_type == 0 {
                         // Continuous: tLower(3B) tUpper(3B) — record both endpoints
@@ -272,8 +271,8 @@ pub fn parse_stream_alt(
                         continue;
                     }
                     subframe_size = desc[4]; // bSubSlotSize — wire bytes per sample
-                    bit_depth = desc[5];     // bBitResolution — used bits
-                    // UAC 2.0 sample rates queried at open via Clock Source control transfer
+                    bit_depth = desc[5]; // bBitResolution — used bits
+                                         // UAC 2.0 sample rates queried at open via Clock Source control transfer
                     found_format = true;
                 }
             }

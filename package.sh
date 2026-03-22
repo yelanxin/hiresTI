@@ -23,7 +23,7 @@ else
 fi
 
 if [ -z "$TYPE" ] || [ -z "$VERSION" ]; then
-    echo "Usage: ./package.sh [deb|rpm|rpm-fedora|rpm-el9|arch|flatpak|all] [version]  (note: 'all' skips flatpak)"
+    echo "Usage: ./package.sh [deb|rpm|rpm-fedora|rpm-el9|arch|all] [version]"
     echo "Example: ./package.sh all 1.0.0"
     exit 1
 fi
@@ -43,10 +43,6 @@ if [[ "$TYPE" == "arch" || "$TYPE" == "all" ]] && ! command -v zstd &> /dev/null
     exit 1
 fi
 
-if [[ "$TYPE" == "flatpak" ]] && ! command -v flatpak-builder &> /dev/null; then
-    echo "Error: 'flatpak-builder' is required for Flatpak build."
-    exit 1
-fi
 
 echo "🚀 Starting build process for $APP_NAME v$VERSION ($TYPE)..."
 if [ "$USE_PY_BINARY" == "1" ]; then
@@ -59,41 +55,6 @@ fi
 echo "$VERSION" > version.txt
 echo "🧾 Version file updated: version.txt -> $VERSION"
 
-sync_flatpak_metainfo_release() {
-    local meta_file="flatpak/com.hiresti.player.metainfo.xml"
-    if [ ! -f "$meta_file" ]; then
-        return 0
-    fi
-
-    local release_date
-    release_date="$(
-        sed -n "s/^##[[:space:]]\\+${VERSION//./\\.}[[:space:]]*-[[:space:]]*\\([0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}\\).*$/\\1/p" CHANGELOG.md | head -n 1
-    )"
-    if [ -z "$release_date" ]; then
-        release_date="$(date -u +%F)"
-    fi
-
-    local tmp_file
-    tmp_file="$(mktemp)"
-    awk -v version="$VERSION" -v date="$release_date" '
-        /<releases>/ && !inserted {
-            print
-            print "    <release version=\"" version "\" date=\"" date "\"/>"
-            inserted = 1
-            next
-        }
-        {
-            if (index($0, "<release version=\"" version "\"") > 0) {
-                next
-            }
-            print
-        }
-    ' "$meta_file" > "$tmp_file"
-    mv "$tmp_file" "$meta_file"
-    echo "🧾 Flatpak metainfo synced: $VERSION ($release_date)"
-}
-
-sync_flatpak_metainfo_release
 
 # Preflight checks
 for required in src/main.py src/ui src/actions src/viz icons/hicolor; do
@@ -112,11 +73,20 @@ INSTALL_DIR="$BUILD_ROOT/usr/share/$APP_NAME"
 BIN_DIR="$BUILD_ROOT/usr/bin"
 APP_DIR="$BUILD_ROOT/usr/share/applications"
 SYSTEM_ICON_DIR="$BUILD_ROOT/usr/share/icons"
+UDEV_DIR="$BUILD_ROOT/lib/udev/rules.d"
 
 mkdir -p "$INSTALL_DIR"
 mkdir -p "$BIN_DIR"
 mkdir -p "$APP_DIR"
 mkdir -p "$SYSTEM_ICON_DIR"
+mkdir -p "$UDEV_DIR"
+
+# udev rule: grant logged-in user access to USB audio devices (USB Rawlink mode)
+# TAG+="uaccess" only grants access to the current session user (via systemd-logind ACL), not world.
+cat <<'UDEV_EOF' > "$UDEV_DIR/99-hiresti-usb-audio.rules"
+# HiresTI USB Rawlink - grant logged-in user access to USB audio devices
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ENV{ID_USB_INTERFACES}=="*:01????:*", TAG+="uaccess"
+UDEV_EOF
 
 # 2. 复制源文件
 echo "📂 Copying source files..."
@@ -351,11 +321,16 @@ $DISPLAY_NAME is a desktop client for Tidal (${variant} build).
 %install
 cp -r $(pwd)/$BUILD_ROOT/* %{buildroot}
 
+%post
+udevadm control --reload-rules 2>/dev/null || true
+udevadm trigger --subsystem-match=usb 2>/dev/null || true
+
 %files
 /usr/share/$APP_NAME
 /usr/bin/$APP_NAME
 /usr/share/applications/$APP_ID.desktop
 /usr/share/icons/*
+/lib/udev/rules.d/99-hiresti-usb-audio.rules
 
 %changelog
 * $(date "+%a %b %d %Y") $MAINTAINER - $VERSION-1
@@ -411,48 +386,22 @@ depend = pipewire
 depend = libpulse
 EOF
 
+    cat <<'INSTALL_EOF' > "$pkg_root/.INSTALL"
+post_install() {
+    udevadm control --reload-rules 2>/dev/null || true
+    udevadm trigger --subsystem-match=usb 2>/dev/null || true
+}
+post_upgrade() {
+    post_install
+}
+INSTALL_EOF
+
     mkdir -p dist
     tar --sort=name --mtime="@$build_ts" --owner=0 --group=0 --numeric-owner \
-        -C "$pkg_root" -I 'zstd -19 -T0' -cf "$pkg_file" .PKGINFO usr
+        -C "$pkg_root" -I 'zstd -19 -T0' -cf "$pkg_file" .PKGINFO .INSTALL usr lib
     echo "✅ Arch package created."
 }
 
-build_flatpak_package() {
-    local flatpak_builder_file="flatpak/com.hiresti.player.yml"
-    local build_dir="build_flatpak"
-    local repo_dir="flatpak/repo"
-
-    if [ ! -f "$flatpak_builder_file" ]; then
-        echo "Error: Flatpak manifest not found: $flatpak_builder_file"
-        exit 1
-    fi
-
-    # Vendor Rust dependencies for offline Flatpak build.
-    # flatpak-builder copies the source tree (type: dir) without network access, so the
-    # vendor/ directory must exist before flatpak-builder is invoked.
-    if [ -f "src_rust/rust_audio_core/Cargo.toml" ]; then
-        if command -v cargo &>/dev/null; then
-            echo "📦 Vendoring Rust audio core dependencies for Flatpak..."
-            (cd src_rust/rust_audio_core && cargo vendor vendor)
-        else
-            echo "Error: 'cargo' not found. Cannot vendor Rust dependencies for Flatpak."
-            exit 1
-        fi
-    fi
-
-    # Clean previous build
-    rm -rf "$build_dir"
-    mkdir -p dist
-
-    # Build the Flatpak using flatpak-builder
-    # Note: runtime-version in manifest should match GNOME SDK version (e.g., 48), not app version
-    flatpak-builder --force-clean --repo="$repo_dir" "$build_dir" "$flatpak_builder_file"
-
-    # Export to a single .flatpak file
-    flatpak build-bundle "$repo_dir" "dist/${APP_NAME}-${VERSION}.flatpak" "com.hiresti.player"
-
-    echo "✅ Flatpak package created: dist/${APP_NAME}-${VERSION}.flatpak"
-}
 
 if [ "$TYPE" == "deb" ]; then
     echo "📦 Building .deb package..."
@@ -468,6 +417,16 @@ Maintainer: $MAINTAINER
 Description: $DESCRIPTION
  $DISPLAY_NAME is a desktop client for Tidal focusing on High-Res audio.
 EOF
+    cat <<'POSTINST_EOF' > "$BUILD_ROOT/DEBIAN/postinst"
+#!/bin/sh
+set -e
+if [ "$1" = "configure" ]; then
+    udevadm control --reload-rules 2>/dev/null || true
+    udevadm trigger --subsystem-match=usb 2>/dev/null || true
+fi
+exit 0
+POSTINST_EOF
+    chmod 755 "$BUILD_ROOT/DEBIAN/postinst"
     mkdir -p dist
     dpkg-deb --build "$BUILD_ROOT" "dist/${APP_NAME}_${VERSION}_${DEB_ARCH}.deb"
     echo "✅ DEB created."
@@ -485,9 +444,6 @@ elif [ "$TYPE" == "rpm-el9" ]; then
 elif [ "$TYPE" == "arch" ]; then
     echo "📦 Building Arch package..."
     build_arch_package
-elif [ "$TYPE" == "flatpak" ]; then
-    echo "📦 Building Flatpak package..."
-    build_flatpak_package
 elif [ "$TYPE" == "all" ]; then
     echo "📦 Building DEB package..."
     mkdir -p "$BUILD_ROOT/DEBIAN"
@@ -502,6 +458,16 @@ Maintainer: $MAINTAINER
 Description: $DESCRIPTION
  $DISPLAY_NAME is a desktop client for Tidal focusing on High-Res audio.
 EOF
+    cat <<'POSTINST_EOF' > "$BUILD_ROOT/DEBIAN/postinst"
+#!/bin/sh
+set -e
+if [ "$1" = "configure" ]; then
+    udevadm control --reload-rules 2>/dev/null || true
+    udevadm trigger --subsystem-match=usb 2>/dev/null || true
+fi
+exit 0
+POSTINST_EOF
+    chmod 755 "$BUILD_ROOT/DEBIAN/postinst"
     mkdir -p dist
     dpkg-deb --build "$BUILD_ROOT" "dist/${APP_NAME}_${VERSION}_${DEB_ARCH}.deb"
     echo "✅ DEB created."
@@ -515,7 +481,7 @@ EOF
     echo "📦 Building Arch package..."
     build_arch_package
 else
-    echo "Error: unsupported type '$TYPE'. Use deb | rpm | rpm-fedora | rpm-el9 | arch | flatpak | all"
+    echo "Error: unsupported type '$TYPE'. Use deb | rpm | rpm-fedora | rpm-el9 | arch | all"
     exit 1
 fi
 

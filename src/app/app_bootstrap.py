@@ -165,6 +165,7 @@ def _restore_runtime_state(self):
         self.paned.set_position(sidebar_px)
 
     self._apply_viz_bars_by_count(self.settings.get("viz_bar_count", 32), update_dropdown=True)
+    self._apply_viz_frequency_scale_by_index(self.settings.get("viz_frequency_scale", 0), update_dropdown=True)
     self._apply_viz_profile_by_index(self.settings.get("viz_profile", 1), update_dropdown=True)
     self._apply_viz_effect_by_index(self.settings.get("viz_effect", 3), update_dropdown=True)
     self._apply_spectrum_theme_by_index(self.settings.get("spectrum_theme", 0), update_dropdown=True)

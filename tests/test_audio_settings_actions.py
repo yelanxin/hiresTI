@@ -136,6 +136,47 @@ class _Visible:
         self.visible_calls.append(bool(value))
 
 
+def test_usb_udev_rule_targets_audio_class_devices_only():
+    assert 'ENV{DEVTYPE}=="usb_device"' in audio_settings_actions._USB_UDEV_RULE_CONTENT
+    assert 'ENV{ID_USB_INTERFACES}=="*:01????:*"' in audio_settings_actions._USB_UDEV_RULE_CONTENT
+    assert 'SUBSYSTEM=="usb", TAG+="uaccess"' not in audio_settings_actions._USB_UDEV_RULE_CONTENT
+
+
+def test_parse_usb_rawlink_device_id_accepts_vid_pid_and_serial():
+    assert audio_settings_actions._parse_usb_rawlink_device_id("usb:1A2B:3C4D:SERIAL:01") == {
+        "vendor_id": "1a2b",
+        "product_id": "3c4d",
+        "serial": "SERIAL:01",
+    }
+    assert audio_settings_actions._parse_usb_rawlink_device_id("usb:1a2b:3c4d") == {
+        "vendor_id": "1a2b",
+        "product_id": "3c4d",
+        "serial": None,
+    }
+    assert audio_settings_actions._parse_usb_rawlink_device_id("PipeWire") is None
+
+
+def test_build_usb_permission_install_cmd_targets_requested_usb_device():
+    cmd = audio_settings_actions._build_usb_permission_install_cmd(
+        "/tmp/hiresti usb.rules",
+        "usb:1a2b:3c4d:SERIAL 01",
+    )
+
+    assert "^ID_VENDOR_ID=1a2b$" in cmd
+    assert "^ID_MODEL_ID=3c4d$" in cmd
+    assert "ID_SERIAL_SHORT=SERIAL 01" in cmd
+    assert audio_settings_actions._USB_AUDIO_INTERFACES_REGEX not in cmd
+    assert 'for _d in /dev/bus/usb/*/*; do setfacl -m "u:$_U:rw" "$_d"' not in cmd
+
+
+def test_build_usb_permission_install_cmd_falls_back_to_audio_class_filter():
+    cmd = audio_settings_actions._build_usb_permission_install_cmd("/tmp/hiresti.rules", None)
+
+    assert audio_settings_actions._USB_AUDIO_INTERFACES_REGEX in cmd
+    assert "^ID_VENDOR_ID=" not in cmd
+    assert "^ID_MODEL_ID=" not in cmd
+
+
 def test_on_bit_perfect_toggled_allows_missing_eq_controls():
     saved = []
     locked = []

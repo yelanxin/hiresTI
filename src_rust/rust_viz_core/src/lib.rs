@@ -195,6 +195,10 @@ impl VizStateEngine {
 }
 
 fn map_input_to_heights(input: &[f32], out: &mut [f32], db_min: f32, db_range: f32) {
+    // Band 0 from the GStreamer spectrum element covers 0 Hz (DC component)
+    // which is always abnormally high and causes the leftmost bar to pin at
+    // full height regardless of content.  Skip it.
+    let input = if input.len() > 1 { &input[1..] } else { input };
     let n = out.len();
     let in_n = input.len();
     if in_n == 0 || n == 0 {
@@ -243,6 +247,8 @@ fn map_input_to_heights(input: &[f32], out: &mut [f32], db_min: f32, db_range: f
 }
 
 fn build_log_bins_impl(input: &[f32], out: &mut [f32]) {
+    // Skip band 0 (DC component) for the same reason as map_input_to_heights.
+    let input = if input.len() > 1 { &input[1..] } else { input };
     let in_count = input.len();
     let out_count = out.len();
     if in_count == 0 || out_count == 0 {

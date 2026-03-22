@@ -18,7 +18,6 @@ usage() {
     echo "    fedora        Fedora 41 (RPM)"
     echo "    el9           Rocky Linux 9 / EL9 (RPM)"
     echo "    arch          Arch Linux (pkg.tar.zst)"
-    echo "    flatpak       Flatpak (fedora:41 容器)"
     echo ""
     echo "  示例:"
     echo "    $0 --version 1.2.8 --os debian"
@@ -60,7 +59,7 @@ if [[ -z "$VERSION" ]]; then
 fi
 
 # 未指定系统时，默认全部
-ALL_TARGETS=(debian ubuntu fedora el9 arch flatpak)
+ALL_TARGETS=(debian ubuntu fedora el9 arch)
 if [[ ${#TARGETS[@]} -eq 0 ]]; then
     TARGETS=("${ALL_TARGETS[@]}")
 fi
@@ -142,17 +141,6 @@ test_arch() {
     "
 }
 
-test_flatpak() {
-    echo "========== 测试 Flatpak 包 =========="
-    podman run --rm --privileged -v "$(pwd)/dist:/dist" -u root fedora:41 bash -c "
-        dnf install -y -q flatpak 2>&1 | tail -3
-        flatpak remote-add --if-not-exists --system flathub https://flathub.org/repo/flathub.flatpakrepo 2>&1 | tail -3
-        flatpak install -y --system flathub org.gnome.Platform//48 2>&1 | tail -10
-        flatpak install -y --system /dist/hiresti-${VERSION}.flatpak 2>&1 | tail -10
-        flatpak list | grep hiresti
-        flatpak run com.hiresti.player 2>&1 | head -30 || echo 'Flatpak test complete'
-    "
-}
 
 # ---------- 按顺序执行选中的测试 ----------
 first=1

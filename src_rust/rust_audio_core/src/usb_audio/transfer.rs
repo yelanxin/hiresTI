@@ -20,7 +20,7 @@
 //! event thread before dropping the Arc.
 
 use std::os::raw::{c_int, c_uchar, c_uint};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
@@ -30,16 +30,44 @@ use libusb1_sys::{
     libusb_set_iso_packet_lengths, libusb_submit_transfer, libusb_transfer,
 };
 
+/// Elevate the calling thread to `SCHED_FIFO` at `priority` (Linux only).
+/// Logs to stderr; silently ignored on non-Linux or if permission is denied
+/// (CAP_SYS_NICE / RLIMIT_RTPRIO required).
+fn set_thread_realtime(priority: i32) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let param = libc::sched_param {
+            sched_priority: priority,
+        };
+        let rc = libc::pthread_setschedparam(
+            libc::pthread_self(),
+            libc::SCHED_FIFO,
+            &param,
+        );
+        if rc == 0 {
+            eprintln!("usb-audio: iso-events thread SCHED_FIFO priority={}", priority);
+        } else {
+            eprintln!(
+                "usb-audio: iso-events thread SCHED_FIFO priority={} failed errno={}",
+                priority, rc
+            );
+        }
+    }
+}
+
 /// Read `CLOCK_MONOTONIC` as nanoseconds.
 fn clock_monotonic_ns() -> u64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
 use crate::alsa_clock::AlsaHwClockFeed;
 
-use super::feedback::RateAdapter;
+use super::feedback::{RateAdapter, DRIFT_BUMP_PPB};
 use super::queue::FrameQueue;
 
 // ---------------------------------------------------------------------------
@@ -57,6 +85,11 @@ pub const N_PACKETS_TARGET_MS: usize = 8;
 // Shared state (Arc, accessed from both event thread and main thread)
 // ---------------------------------------------------------------------------
 
+/// Duration of the linear fade-in ramp after an xrun, in samples.
+/// ~2 ms at 48 kHz.  Short enough to be inaudible but long enough to
+/// suppress the hard silence→audio transition click.
+const XRUN_FADEIN_SAMPLES: u32 = 96;
+
 pub struct RingState {
     pub queue: Arc<FrameQueue>,
     pub stop: AtomicBool,
@@ -65,6 +98,11 @@ pub struct RingState {
     pub rate_adapter: Mutex<RateAdapter>,
     /// Latest feedback value in millisamples (updated from feedback callback).
     pub feedback_ms: Mutex<Option<i64>>,
+    /// Remaining fade-in samples after an xrun recovery.
+    /// Decremented in `fill_transfer`; when >0, each sample is scaled by
+    /// `(XRUN_FADEIN_SAMPLES - remaining) / XRUN_FADEIN_SAMPLES`.
+    /// Only accessed from the ISO event thread — no contention.
+    pub fadein_remaining: AtomicU32,
     /// Sample rate in Hz.
     pub rate: u32,
     /// Bytes per audio sample (e.g. 4 for S32LE, 3 for S24_3LE).
@@ -90,6 +128,23 @@ pub struct RingState {
     /// Running total of PCM bytes consumed by the ISO OUT ring.
     /// Polled by the pusher thread to measure drain throughput.
     pub bytes_drained_total: AtomicU64,
+    /// Count of individual ISO OUT packets that completed with a non-COMPLETED
+    /// status (STALL, ERROR, OVERFLOW, etc.).  Each such packet means the device
+    /// received no audio for that ~0.125 ms slot — audible as a brief pop.
+    /// Distinct from `xruns` (which counts queue underruns, not USB errors).
+    pub usb_pkt_errors: AtomicU64,
+    /// Calibrated millisamples per ISO packet derived from `AlsaHwClockFeed`.
+    ///
+    /// Updated by `iso_out_callback` once the rate calibrator has converged.
+    /// Used by `fill_transfer` as a fallback when the UAC2 feedback endpoint
+    /// produces no data.  Corrects for the device crystal offset on
+    /// SOF-synchronized devices (e.g. FiiO KA13) where `feedback_ms` stays
+    /// `None` but the device rate differs from nominal by a few ppm, causing
+    /// the device FIFO to slowly drain and produce a glitch after ~2 minutes.
+    ///
+    /// Units: `rate_hz * 1_000_000 / packets_per_sec` (same as `feedback_ms`).
+    /// Zero means not calibrated yet; use nominal rate.
+    pub calibrated_ms: AtomicU64,
     /// `true` while the ISO IN feedback transfer is in flight.
     /// Set to `true` in `FeedbackReader::start()`; cleared in
     /// `feedback_in_callback` when the transfer stops (stop requested or
@@ -97,6 +152,13 @@ pub struct RingState {
     /// `false` before exiting so `FeedbackReader::drop()` can safely free
     /// the transfer struct.
     pub feedback_in_flight: AtomicBool,
+    /// Monotonic timestamp (ns) of the first USB packet error in the current
+    /// hysteresis window.  Zero means no window is open.
+    /// Used to require ≥ 2 error events within 1 second before bumping drift
+    /// correction — filters out sporadic EMI / USB hub glitches.
+    drift_window_start_ns: AtomicU64,
+    /// Count of error events within the current hysteresis window.
+    drift_window_count: AtomicU32,
 }
 
 impl RingState {
@@ -119,6 +181,7 @@ impl RingState {
             stop: AtomicBool::new(false),
             rate_adapter: Mutex::new(RateAdapter::new(rate, packets_per_sec)),
             feedback_ms: Mutex::new(None),
+            fadein_remaining: AtomicU32::new(0),
             rate,
             bytes_per_sample,
             channels,
@@ -129,7 +192,11 @@ impl RingState {
             error: AtomicBool::new(false),
             xruns: AtomicU64::new(0),
             bytes_drained_total: AtomicU64::new(0),
+            usb_pkt_errors: AtomicU64::new(0),
+            calibrated_ms: AtomicU64::new(0),
             feedback_in_flight: AtomicBool::new(false),
+            drift_window_start_ns: AtomicU64::new(0),
+            drift_window_count: AtomicU32::new(0),
         })
     }
 }
@@ -137,6 +204,59 @@ impl RingState {
 // ---------------------------------------------------------------------------
 // ISO OUT callback (called by libusb event thread)
 // ---------------------------------------------------------------------------
+
+/// Apply a linear fade-in gain to one interleaved audio frame (all channels).
+///
+/// `pos` is how far into the ramp we are (0 = silence, `total` = full scale).
+/// Handles S16LE, S24_3LE, S24LE/S32LE (little-endian signed integers).
+#[inline]
+fn apply_fadein_frame(frame: &mut [u8], bytes_per_sample: usize, pos: u32, total: u32) {
+    if total == 0 {
+        return;
+    }
+    let n_channels = frame.len() / bytes_per_sample;
+    for ch in 0..n_channels {
+        let off = ch * bytes_per_sample;
+        let sample_bytes = &mut frame[off..off + bytes_per_sample];
+        match bytes_per_sample {
+            2 => {
+                // S16LE
+                let val = i16::from_le_bytes([sample_bytes[0], sample_bytes[1]]);
+                let scaled = (val as i32 * pos as i32 / total as i32) as i16;
+                sample_bytes.copy_from_slice(&scaled.to_le_bytes());
+            }
+            3 => {
+                // S24_3LE — 24-bit signed, sign-extend from bit 23
+                let raw = (sample_bytes[0] as i32)
+                    | ((sample_bytes[1] as i32) << 8)
+                    | ((sample_bytes[2] as i32) << 16);
+                let val = if raw & 0x80_0000 != 0 {
+                    raw | !0xFF_FFFF // sign-extend
+                } else {
+                    raw
+                };
+                let scaled = val * pos as i32 / total as i32;
+                sample_bytes[0] = scaled as u8;
+                sample_bytes[1] = (scaled >> 8) as u8;
+                sample_bytes[2] = (scaled >> 16) as u8;
+            }
+            4 => {
+                // S32LE or F32LE — treat as S32LE (F32LE would need f32 path,
+                // but GStreamer typically delivers integer formats to USB sinks).
+                let val = i32::from_le_bytes([
+                    sample_bytes[0],
+                    sample_bytes[1],
+                    sample_bytes[2],
+                    sample_bytes[3],
+                ]);
+                // Use i64 to avoid overflow: i32::MAX * 96 fits in i64.
+                let scaled = (val as i64 * pos as i64 / total as i64) as i32;
+                sample_bytes.copy_from_slice(&scaled.to_le_bytes());
+            }
+            _ => {} // Unknown format — skip fade, pass through unchanged.
+        }
+    }
+}
 
 /// Fill the transfer buffer from [`FrameQueue`], setting each ISO packet's
 /// `length` field to the computed sample count for this packet.
@@ -156,6 +276,10 @@ unsafe fn fill_transfer(state: &RingState, transfer: *mut libusb_transfer) {
 
     let frame_bytes = state.channels * state.bytes_per_sample;
 
+    // Snapshot queue depth *before* draining so the log reflects what was
+    // available when this transfer was filled (useful for diagnosing xruns).
+    let queue_avail_before = state.queue.available_read();
+
     // ISO packets must be laid out tightly (no gaps) in the transfer buffer.
     // libusb/usbfs computes each packet's start offset as the cumulative sum
     // of the *actual* lengths of all preceding packets — NOT as i * max_packet.
@@ -164,6 +288,11 @@ unsafe fn fill_transfer(state: &RingState, transfer: *mut libusb_transfer) {
     // 1..N, producing garbage audio (continuous crackling).
     let mut offset = 0usize;
     let mut total_frames: u64 = 0;
+    let mut total_bytes: u64 = 0;
+    let mut xrun_packets: u64 = 0;
+    let mut xrun_bytes_missing: usize = 0;
+    let mut fadein_rem = state.fadein_remaining.load(Ordering::Relaxed);
+    let mut fadein_armed = false;
     for i in 0..n_packets {
         let samples = adapter.samples_this_packet(feedback) as usize;
         let packet_bytes = (samples * frame_bytes)
@@ -171,10 +300,7 @@ unsafe fn fill_transfer(state: &RingState, transfer: *mut libusb_transfer) {
             .min(buf_len.saturating_sub(offset));
 
         // Set actual packet length in the ISO descriptor.
-        let pkt = (*transfer)
-            .iso_packet_desc
-            .as_mut_ptr()
-            .add(i);
+        let pkt = (*transfer).iso_packet_desc.as_mut_ptr().add(i);
         (*pkt).length = packet_bytes as c_uint;
 
         // Fill from queue; silence-pad anything missing.
@@ -182,12 +308,40 @@ unsafe fn fill_transfer(state: &RingState, transfer: *mut libusb_transfer) {
         let got = state.queue.pop(pkt_buf);
         if got < packet_bytes {
             pkt_buf[got..].fill(0);
-            state.xruns.fetch_add(1, Ordering::Relaxed);
+            xrun_packets += 1;
+            xrun_bytes_missing += packet_bytes - got;
+            // Arm fade-in for the recovery after this xrun.
+            fadein_armed = true;
         }
 
-        state.bytes_drained_total.fetch_add(packet_bytes as u64, Ordering::Relaxed);
+        // Apply fade-in ramp if recovering from an xrun.
+        if fadein_rem > 0 && got > 0 && frame_bytes > 0 {
+            let ramp_total = XRUN_FADEIN_SAMPLES;
+            let n_frames = got / frame_bytes;
+            for f in 0..n_frames {
+                // Scale: 0 at start of ramp → 1 at end.
+                let pos = ramp_total - fadein_rem;
+                let frame_start = f * frame_bytes;
+                apply_fadein_frame(
+                    &mut pkt_buf[frame_start..frame_start + frame_bytes],
+                    state.bytes_per_sample,
+                    pos,
+                    ramp_total,
+                );
+                fadein_rem = fadein_rem.saturating_sub(1);
+                if fadein_rem == 0 {
+                    break;
+                }
+            }
+        }
 
-        let actual_samples = if frame_bytes > 0 { packet_bytes / frame_bytes } else { samples };
+        total_bytes += packet_bytes as u64;
+
+        let actual_samples = if frame_bytes > 0 {
+            packet_bytes / frame_bytes
+        } else {
+            samples
+        };
         total_frames += actual_samples as u64;
 
         // Advance by actual packet bytes so each packet's data immediately
@@ -195,6 +349,43 @@ unsafe fn fill_transfer(state: &RingState, transfer: *mut libusb_transfer) {
         offset += packet_bytes;
     }
     drop(adapter);
+
+    // If any packet in this transfer had an xrun, arm the fade-in for
+    // the *next* transfer (current one already has silence in its tail).
+    if fadein_armed {
+        fadein_rem = XRUN_FADEIN_SAMPLES;
+    }
+    state.fadein_remaining.store(fadein_rem, Ordering::Relaxed);
+
+    if xrun_packets > 0 {
+        let total_xruns_before = state.xruns.load(Ordering::Relaxed);
+        let bytes_drained = state.bytes_drained_total.load(Ordering::Relaxed);
+        // bytes_per_ms = rate * frame_bytes / 1000  (e.g. 44100 * 8 / 1000 = 352)
+        let bytes_per_ms = state.rate as u64 * frame_bytes as u64 / 1000;
+        let ms_drained = if bytes_per_ms > 0 { bytes_drained / bytes_per_ms } else { 0 };
+        let queue_ms    = if bytes_per_ms > 0 { queue_avail_before as u64 / bytes_per_ms } else { 0 };
+        eprintln!(
+            "usb-audio: xrun transfer={}/{} pkt  queue={} B (~{} ms)  missing={} B  \
+             feedback={:?} ms  xruns_total={}  playback_ms={}",
+            xrun_packets,
+            n_packets,
+            queue_avail_before,
+            queue_ms,
+            xrun_bytes_missing,
+            feedback.map(|v| v / 1000),
+            total_xruns_before,
+            ms_drained,
+        );
+    }
+
+    if total_bytes > 0 {
+        state
+            .bytes_drained_total
+            .fetch_add(total_bytes, Ordering::Relaxed);
+    }
+    if xrun_packets > 0 {
+        state.xruns.fetch_add(xrun_packets, Ordering::Relaxed);
+    }
     // Advance the clock once per transfer (batched) instead of once per packet.
     // 8–64 atomic add calls → 1, cutting hot-path overhead ~8–64×.
     if total_frames > 0 {
@@ -225,13 +416,84 @@ extern "system" fn iso_out_callback(transfer: *mut libusb_transfer) {
         return;
     }
 
-    // For STALL / ERROR: refill with silence to keep the ring alive; the
-    // device may recover (e.g. brief USB bus reset).
+    // Check each individual ISO packet's completion status from the *just-completed*
+    // transfer.  For OUT transfers, a per-packet error means that 0.125 ms slot
+    // was not delivered to the device — audible as a brief pop without any xrun.
+    let n_pkt = unsafe { (*transfer).num_iso_packets } as usize;
+    let mut bad_pkts: u64 = 0;
+    for i in 0..n_pkt {
+        let pkt_status = unsafe { (*(*transfer).iso_packet_desc.as_ptr().add(i)).status };
+        if pkt_status != libusb1_sys::constants::LIBUSB_TRANSFER_COMPLETED {
+            bad_pkts += 1;
+        }
+    }
+    if bad_pkts > 0 {
+        let total_errors_before = state.usb_pkt_errors.fetch_add(bad_pkts, Ordering::Relaxed);
+
+        // If the host-side FrameQueue has plenty of data, bad ISO packets
+        // indicate the *device* FIFO underflowed — its crystal is faster
+        // than the USB SOF-derived delivery rate.  Bump the adaptive drift
+        // correction so we deliver slightly more samples per second.
+        //
+        // Hysteresis: require ≥ 2 error events within a 1-second window
+        // before bumping, to filter sporadic EMI / USB hub glitches.
+        let queue_bytes = state.queue.available_read();
+        let frame_bytes = state.channels * state.bytes_per_sample;
+        // "Healthy" threshold: ≥ 20 ms of audio in the queue.
+        let healthy_bytes = state.rate as usize * frame_bytes * 20 / 1000;
+        let feedback = *state.feedback_ms.lock().unwrap_or_else(|e| e.into_inner());
+        if queue_bytes >= healthy_bytes && feedback.is_none() {
+            let now_ns = clock_monotonic_ns();
+            let window_start = state.drift_window_start_ns.load(Ordering::Relaxed);
+            const WINDOW_NS: u64 = 1_000_000_000; // 1 second
+            const MIN_ERRORS: u32 = 2;
+
+            if window_start == 0 || now_ns.saturating_sub(window_start) > WINDOW_NS {
+                // Start a new window.
+                state.drift_window_start_ns.store(now_ns, Ordering::Relaxed);
+                state.drift_window_count.store(1, Ordering::Relaxed);
+            } else {
+                let count = state.drift_window_count.fetch_add(1, Ordering::Relaxed) + 1;
+                if count >= MIN_ERRORS {
+                    // Confirmed: repeated errors within window → device FIFO underflow.
+                    let mut adapter = state.rate_adapter.lock().unwrap_or_else(|e| e.into_inner());
+                    let old_ppb = adapter.drift_correction_ppb();
+                    adapter.bump_drift(DRIFT_BUMP_PPB);
+                    eprintln!(
+                        "usb-audio: device FIFO underflow inferred ({} errors in window) — \
+                         drift correction {} → {} ppb  (queue={} B, bad_pkts={}/{})",
+                        count,
+                        old_ppb,
+                        adapter.drift_correction_ppb(),
+                        queue_bytes,
+                        bad_pkts,
+                        n_pkt,
+                    );
+                    // Reset window after bump.
+                    state.drift_window_start_ns.store(0, Ordering::Relaxed);
+                    state.drift_window_count.store(0, Ordering::Relaxed);
+                }
+            }
+        } else {
+            eprintln!(
+                "usb-audio: ISO OUT packet errors: {}/{} bad in this transfer (total={})  \
+                 queue={} B  feedback={:?}",
+                bad_pkts,
+                n_pkt,
+                total_errors_before + bad_pkts,
+                queue_bytes,
+                feedback.map(|v| v / 1000),
+            );
+        }
+    }
+
+    // Refill the transfer buffer with fresh audio from the queue and resubmit.
     unsafe { fill_transfer(state, transfer) };
 
-    // Record ISO completion timestamp for pull-clock rate calibration.
+    // Record ISO completion timestamp for rate calibration.
     // Called after fill_transfer so total_frames reflects the just-written batch.
     state.clock_feed.record_iso(clock_monotonic_ns());
+
 
     let rc = unsafe { libusb_submit_transfer(transfer) };
     if rc == 0 {
@@ -355,6 +617,23 @@ impl IsoTransferRing {
         self.state.stop.store(false, Ordering::SeqCst);
         self.state.in_flight.store(0, Ordering::SeqCst);
 
+        let frame_bytes = self.state.channels * self.state.bytes_per_sample;
+        let bytes_per_ms = self.state.rate as usize * frame_bytes / 1000;
+        let queue_at_start = self.state.queue.available_read();
+        // Approximate bytes the ring will drain from the queue at startup:
+        // each packet holds ceil(rate/pps) frames × frame_bytes bytes.
+        let samples_per_pkt = (self.state.rate as usize / self.state.packets_per_sec as usize) + 1;
+        let n_packets = (N_PACKETS_TARGET_MS * self.state.packets_per_sec as usize / 1000).max(8);
+        let ring_needs = self.transfers.len() * n_packets * samples_per_pkt * frame_bytes;
+        eprintln!(
+            "usb-audio: ring start  queue={} B (~{} ms)  ring_needs~{} B (~{} ms)  n_transfers={}",
+            queue_at_start,
+            if bytes_per_ms > 0 { queue_at_start / bytes_per_ms } else { 0 },
+            ring_needs,
+            if bytes_per_ms > 0 { ring_needs / bytes_per_ms } else { 0 },
+            self.transfers.len(),
+        );
+
         // Fill all transfer buffers before first submission
         for &xfer in &self.transfers {
             unsafe { fill_transfer(&self.state, xfer) };
@@ -376,12 +655,18 @@ impl IsoTransferRing {
         let handle = thread::Builder::new()
             .name("usb-iso-events".into())
             .spawn(move || {
+                // Elevate to SCHED_FIFO so USB ISO callbacks are never preempted
+                // by normal-priority threads (Python UI, GStreamer decode, etc.).
+                set_thread_realtime(70);
                 let ctx = ctx_addr as *mut libusb_context;
                 // Use a timeout that matches the transfer duration (~8 ms).
                 // Polling at 1 ms would cause ~1000 syscalls/sec but transfers
                 // only complete every 8 ms; 8 ms here reduces idle syscalls by ~8×.
                 // With 128 ms of in-flight buffer this latency is safe.
-                let tv = libc::timeval { tv_sec: 0, tv_usec: 8_000 }; // 8 ms
+                let tv = libc::timeval {
+                    tv_sec: 0,
+                    tv_usec: 8_000,
+                }; // 8 ms
                 while !state.stop.load(Ordering::Acquire)
                     || state.in_flight.load(Ordering::Acquire) > 0
                     || state.feedback_in_flight.load(Ordering::Acquire)

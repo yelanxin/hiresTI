@@ -1,6 +1,6 @@
+use gst::prelude::*;
 use gst::PadProbeReturn;
 use gst::PadProbeType;
-use gst::prelude::*;
 use gstreamer as gst;
 use std::f64::consts::PI;
 use std::sync::{Arc, Mutex};
@@ -30,23 +30,45 @@ impl TubeConfig {
     pub fn is_active(&self) -> bool {
         self.enabled
     }
-    pub fn set_enabled(&mut self, value: bool) { self.enabled = value; }
-    pub fn set_drive(&mut self, value: i32) { self.drive = value.clamp(0, 100); }
-    pub fn set_bias(&mut self, value: i32) { self.bias = value.clamp(0, 100); }
-    pub fn set_sag(&mut self, value: i32) { self.sag = value.clamp(0, 100); }
-    pub fn set_air(&mut self, value: i32) { self.air = value.clamp(0, 100); }
+    pub fn set_enabled(&mut self, value: bool) {
+        self.enabled = value;
+    }
+    pub fn set_drive(&mut self, value: i32) {
+        self.drive = value.clamp(0, 100);
+    }
+    pub fn set_bias(&mut self, value: i32) {
+        self.bias = value.clamp(0, 100);
+    }
+    pub fn set_sag(&mut self, value: i32) {
+        self.sag = value.clamp(0, 100);
+    }
+    pub fn set_air(&mut self, value: i32) {
+        self.air = value.clamp(0, 100);
+    }
 }
 
 #[derive(Debug, Clone)]
 struct Biquad {
-    b0: f64, b1: f64, b2: f64,
-    a1: f64, a2: f64,
-    z1: f64, z2: f64,
+    b0: f64,
+    b1: f64,
+    b2: f64,
+    a1: f64,
+    a2: f64,
+    z1: f64,
+    z2: f64,
 }
 
 impl Default for Biquad {
     fn default() -> Self {
-        Self { b0: 1.0, b1: 0.0, b2: 0.0, a1: 0.0, a2: 0.0, z1: 0.0, z2: 0.0 }
+        Self {
+            b0: 1.0,
+            b1: 0.0,
+            b2: 0.0,
+            a1: 0.0,
+            a2: 0.0,
+            z1: 0.0,
+            z2: 0.0,
+        }
     }
 }
 
@@ -61,7 +83,11 @@ impl Biquad {
 
     fn lowpass_1st(fc: f64, sr: f64) -> Self {
         let a = (-2.0 * PI * fc / sr).exp();
-        Self { b0: 1.0 - a, a1: -a, ..Default::default() }
+        Self {
+            b0: 1.0 - a,
+            a1: -a,
+            ..Default::default()
+        }
     }
 }
 

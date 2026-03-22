@@ -13,14 +13,17 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+use gst::prelude::*;
 use gst::PadProbeReturn;
 use gst::PadProbeType;
-use gst::prelude::*;
 use gstreamer as gst;
 
 // ---------------------------------------------------------------------------
 // K-weighting biquad coefficients
 // ---------------------------------------------------------------------------
+
+/// Maximum channels supported by the fixed-size filter state arrays.
+const MAX_CHANNELS: usize = 8;
 
 /// Direct-form II transposed biquad coefficients.
 /// Transfer function: H(z) = (b0 + b1·z⁻¹ + b2·z⁻²) / (1 + a1·z⁻¹ + a2·z⁻²)
@@ -91,9 +94,7 @@ struct BiquadState {
 impl BiquadState {
     #[inline]
     fn process(&mut self, x: f64, c: &BiquadCoeffs) -> f64 {
-        let y = c.b0 * x + c.b1 * self.x1 + c.b2 * self.x2
-            - c.a1 * self.y1
-            - c.a2 * self.y2;
+        let y = c.b0 * x + c.b1 * self.x1 + c.b2 * self.x2 - c.a1 * self.y1 - c.a2 * self.y2;
         self.x2 = self.x1;
         self.x1 = x;
         self.y2 = self.y1;
@@ -127,11 +128,11 @@ pub struct LufsValues {
 impl Default for LufsValues {
     fn default() -> Self {
         Self {
-            momentary:  f32::NEG_INFINITY,
+            momentary: f32::NEG_INFINITY,
             short_term: f32::NEG_INFINITY,
             integrated: f32::NEG_INFINITY,
             lra: 0.0,
-            dr:  0.0,
+            dr: 0.0,
         }
     }
 }
@@ -155,14 +156,15 @@ struct LufsState {
     sample_rate: u32,
     channels: usize,
 
-    // K-weighting filter state (one pair per channel)
-    filt1: Vec<BiquadState>,
-    filt2: Vec<BiquadState>,
+    // K-weighting filter state: fixed-size arrays avoid heap indirection and
+    // let the compiler unroll/vectorize the inner channel loop.
+    filt1: [BiquadState; MAX_CHANNELS],
+    filt2: [BiquadState; MAX_CHANNELS],
     coeffs1: BiquadCoeffs,
     coeffs2: BiquadCoeffs,
 
     // Current 100 ms block accumulator (K-weighted, for LUFS)
-    block_sum: f64,   // sum of (y_L² + y_R²) per frame
+    block_sum: f64, // sum of (y_L² + y_R²) per frame
     block_count: usize,
     block_target: usize, // frames per 100 ms block
 
@@ -180,9 +182,9 @@ struct LufsState {
     int_count: u64,
 
     // Whole-track DR accumulators (reset on track change, like Integrated LUFS)
-    dr_peak_sq_sum: f64,  // Σ(block_peak²) over all blocks
-    dr_power_sum: f64,    // Σ(block_mean_power) over all blocks
-    dr_block_count: u64,  // number of blocks with signal
+    dr_peak_sq_sum: f64, // Σ(block_peak²) over all blocks
+    dr_power_sum: f64,   // Σ(block_mean_power) over all blocks
+    dr_block_count: u64, // number of blocks with signal
 
     // Cached display values (written by audio thread, read by main thread)
     pub values: LufsValues,
@@ -195,8 +197,8 @@ impl LufsState {
         Self {
             sample_rate: rate,
             channels,
-            filt1: vec![BiquadState::default(); channels],
-            filt2: vec![BiquadState::default(); channels],
+            filt1: [BiquadState::default(); MAX_CHANNELS],
+            filt2: [BiquadState::default(); MAX_CHANNELS],
             coeffs1: BiquadCoeffs::k_stage1(rate as f64),
             coeffs2: BiquadCoeffs::k_stage2(rate as f64),
             block_sum: 0.0,
@@ -224,8 +226,8 @@ impl LufsState {
         self.channels = channels;
         self.coeffs1 = BiquadCoeffs::k_stage1(rate as f64);
         self.coeffs2 = BiquadCoeffs::k_stage2(rate as f64);
-        self.filt1 = vec![BiquadState::default(); channels];
-        self.filt2 = vec![BiquadState::default(); channels];
+        self.filt1 = [BiquadState::default(); MAX_CHANNELS];
+        self.filt2 = [BiquadState::default(); MAX_CHANNELS];
         self.block_target = (rate as usize).max(1) / 10;
         // Flush the in-progress block so we don't mix old and new rates.
         self.block_sum = 0.0;
@@ -236,11 +238,15 @@ impl LufsState {
 
     /// Process a slice of interleaved F64LE samples (read-only tap).
     fn process(&mut self, samples: &[f64]) {
-        let ch = self.channels.min(self.filt1.len());
+        let ch = self.channels.min(MAX_CHANNELS);
         if ch == 0 || samples.is_empty() {
             return;
         }
         let frames = samples.len() / self.channels;
+        // Copy coefficients (both are Copy) so the inner loop only borrows
+        // self.filt1/filt2 and the scalar accumulators — no aliasing with coeffs.
+        let coeffs1 = self.coeffs1;
+        let coeffs2 = self.coeffs2;
 
         for i in 0..frames {
             let base = i * self.channels;
@@ -248,8 +254,8 @@ impl LufsState {
             let mut sum_sq = 0.0f64;
             for c in 0..ch {
                 let x = samples[base + c];
-                let y1 = self.filt1[c].process(x, &self.coeffs1);
-                let y2 = self.filt2[c].process(y1, &self.coeffs2);
+                let y1 = self.filt1[c].process(x, &coeffs1);
+                let y2 = self.filt2[c].process(y1, &coeffs2);
                 sum_sq += y2 * y2;
                 // Unweighted: track peak and power for DR
                 let ax = x.abs();
@@ -298,11 +304,11 @@ impl LufsState {
         push_capped(&mut self.s_buf, block_lufs, S_BLOCKS);
         push_capped(&mut self.lra_buf, block_lufs, LRA_BLOCKS);
 
-            // DR: accumulate peak² and mean power over the whole track.
+        // DR: accumulate peak² and mean power over the whole track.
         // RMS-of-peaks method (Pleasurize Music Foundation DR meter standard).
         if block_peak > 0.0 && block_power > 0.0 {
             self.dr_peak_sq_sum += block_peak * block_peak;
-            self.dr_power_sum   += block_power;
+            self.dr_power_sum += block_power;
             self.dr_block_count += 1;
         }
 
@@ -323,12 +329,13 @@ impl LufsState {
             f32::NEG_INFINITY
         };
         self.values.lra = compute_lra(&self.lra_buf) as f32;
-        self.values.dr  = compute_dr(self.dr_peak_sq_sum, self.dr_power_sum, self.dr_block_count) as f32;
+        self.values.dr =
+            compute_dr(self.dr_peak_sq_sum, self.dr_power_sum, self.dr_block_count) as f32;
     }
 
     fn reset(&mut self) {
-        self.filt1 = vec![BiquadState::default(); self.channels];
-        self.filt2 = vec![BiquadState::default(); self.channels];
+        self.filt1 = [BiquadState::default(); MAX_CHANNELS];
+        self.filt2 = [BiquadState::default(); MAX_CHANNELS];
         self.block_sum = 0.0;
         self.block_count = 0;
         self.block_peak = 0.0;
@@ -339,7 +346,7 @@ impl LufsState {
         self.int_lin_sum = 0.0;
         self.int_count = 0;
         self.dr_peak_sq_sum = 0.0;
-        self.dr_power_sum   = 0.0;
+        self.dr_power_sum = 0.0;
         self.dr_block_count = 0;
         self.values = LufsValues::default();
     }
@@ -384,7 +391,7 @@ fn compute_dr(peak_sq_sum: f64, power_sum: f64, block_count: u64) -> f64 {
         return 0.0;
     }
     let mean_peak_sq = peak_sq_sum / block_count as f64;
-    let mean_power   = power_sum   / block_count as f64;
+    let mean_power = power_sum / block_count as f64;
     if mean_peak_sq <= 0.0 || mean_power <= 0.0 {
         return 0.0;
     }
@@ -483,10 +490,7 @@ impl LufsNode {
                 if raw.len() % 8 == 0 {
                     // SAFETY: format is F64LE, GStreamer guarantees alignment.
                     let samples = unsafe {
-                        std::slice::from_raw_parts(
-                            raw.as_ptr() as *const f64,
-                            raw.len() / 8,
-                        )
+                        std::slice::from_raw_parts(raw.as_ptr() as *const f64, raw.len() / 8)
                     };
                     st.process(samples);
                 }

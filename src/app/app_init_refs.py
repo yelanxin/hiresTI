@@ -17,6 +17,7 @@ def _init_widget_refs(self):
     self.viz_surface_overlay = None
     self.dr_meter = None
     self.viz_theme_dd = None
+    self.viz_freq_scale_dd = None
     self.viz_bars_dd = None
     self.viz_effect_dd = None
     self.viz_profile_dd = None
@@ -194,6 +195,7 @@ def _init_viz_refs(self):
     self._viz_effect_apply_source = None
     self._viz_profile_apply_source = None
     self._viz_theme_apply_source = None
+    self._viz_freq_scale_apply_source = None
     self._viz_handle_anim_source = 0
     self._viz_handle_settle_source = 0
     self._viz_handle_resize_source = 0

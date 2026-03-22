@@ -1,5 +1,5 @@
-use gst::prelude::*;
 use gst::glib;
+use gst::prelude::*;
 use gstreamer as gst;
 use std::collections::HashMap;
 
@@ -25,7 +25,11 @@ fn try_set_element_passthrough(element: &gst::Element, passthrough: bool) -> boo
         }
         gst_base_transform_set_passthrough(
             element.as_ptr() as *mut glib::gobject_ffi::GObject,
-            if passthrough { glib::ffi::GTRUE } else { glib::ffi::GFALSE },
+            if passthrough {
+                glib::ffi::GTRUE
+            } else {
+                glib::ffi::GFALSE
+            },
         );
         true
     }
@@ -40,7 +44,11 @@ pub fn refresh_gstreamer_registry() {
 
 fn host_managed_port_scalar(symbol: &str, enabled: bool) -> f32 {
     if symbol.trim().eq_ignore_ascii_case("bypass") {
-        if enabled { 0.0 } else { 1.0 }
+        if enabled {
+            0.0
+        } else {
+            1.0
+        }
     } else if enabled {
         1.0
     } else {
@@ -164,9 +172,12 @@ impl Lv2Node {
             .map_err(|e| format!("audioconvert unavailable: {e}"))?;
 
         let bin = gst::Bin::new();
-        bin.add(&pre_conv).map_err(|_| "failed to add lv2 pre-convert".to_string())?;
-        bin.add(&lv2_element).map_err(|_| "failed to add lv2 element to bin".to_string())?;
-        bin.add(&post_conv).map_err(|_| "failed to add lv2 post-convert".to_string())?;
+        bin.add(&pre_conv)
+            .map_err(|_| "failed to add lv2 pre-convert".to_string())?;
+        bin.add(&lv2_element)
+            .map_err(|_| "failed to add lv2 element to bin".to_string())?;
+        bin.add(&post_conv)
+            .map_err(|_| "failed to add lv2 post-convert".to_string())?;
         pre_conv
             .link(&lv2_element)
             .map_err(|_| format!("failed to link pre-conv → lv2 ({})", config.uri))?;
@@ -189,7 +200,10 @@ impl Lv2Node {
         bin.add_pad(&ghost_src)
             .map_err(|_| "failed to add lv2 bin ghost src pad".to_string())?;
 
-        let node = Self { wrapper: bin, lv2_element };
+        let node = Self {
+            wrapper: bin,
+            lv2_element,
+        };
         node.apply_config(config);
         Ok(node)
     }
@@ -247,7 +261,9 @@ impl Lv2Node {
                     &self.lv2_element,
                     pspec.name(),
                     &pspec,
-                    host_managed_port_scalar(host_symbol, config.enabled).max(0.0).round() as u32,
+                    host_managed_port_scalar(host_symbol, config.enabled)
+                        .max(0.0)
+                        .round() as u32,
                 );
             }
         }
@@ -255,7 +271,9 @@ impl Lv2Node {
             if is_host_managed_port_symbol(symbol.as_str()) {
                 continue;
             }
-            let Some((prop_name, pspec)) = resolve_element_property(&self.lv2_element, symbol.as_str()) else {
+            let Some((prop_name, pspec)) =
+                resolve_element_property(&self.lv2_element, symbol.as_str())
+            else {
                 continue;
             };
             let vtype = pspec.value_type();
@@ -264,7 +282,12 @@ impl Lv2Node {
             } else if vtype == f32::static_type() {
                 let _ = safe_set_property_f32(&self.lv2_element, prop_name.as_str(), &pspec, value);
             } else if vtype == f64::static_type() {
-                let _ = safe_set_property_f64(&self.lv2_element, prop_name.as_str(), &pspec, value as f64);
+                let _ = safe_set_property_f64(
+                    &self.lv2_element,
+                    prop_name.as_str(),
+                    &pspec,
+                    value as f64,
+                );
             } else if vtype == i32::static_type() {
                 let _ = safe_set_property_i32(
                     &self.lv2_element,
@@ -303,7 +326,10 @@ impl Lv2Node {
     }
 }
 
-fn resolve_element_property(element: &gst::Element, symbol: &str) -> Option<(String, glib::ParamSpec)> {
+fn resolve_element_property(
+    element: &gst::Element,
+    symbol: &str,
+) -> Option<(String, glib::ParamSpec)> {
     if let Some(pspec) = element.find_property(symbol) {
         return Some((pspec.name().to_string(), pspec));
     }
@@ -320,7 +346,12 @@ fn safe_set_property_bool(element: &gst::Element, name: &str, value: bool) -> bo
     .is_ok()
 }
 
-fn safe_set_property_f32(element: &gst::Element, name: &str, pspec: &glib::ParamSpec, value: f32) -> bool {
+fn safe_set_property_f32(
+    element: &gst::Element,
+    name: &str,
+    pspec: &glib::ParamSpec,
+    value: f32,
+) -> bool {
     let clamped = pspec
         .downcast_ref::<glib::ParamSpecFloat>()
         .map(|p| value.clamp(p.minimum(), p.maximum()))
@@ -331,7 +362,12 @@ fn safe_set_property_f32(element: &gst::Element, name: &str, pspec: &glib::Param
     .is_ok()
 }
 
-fn safe_set_property_f64(element: &gst::Element, name: &str, pspec: &glib::ParamSpec, value: f64) -> bool {
+fn safe_set_property_f64(
+    element: &gst::Element,
+    name: &str,
+    pspec: &glib::ParamSpec,
+    value: f64,
+) -> bool {
     let clamped = pspec
         .downcast_ref::<glib::ParamSpecDouble>()
         .map(|p| value.clamp(p.minimum(), p.maximum()))
@@ -342,7 +378,12 @@ fn safe_set_property_f64(element: &gst::Element, name: &str, pspec: &glib::Param
     .is_ok()
 }
 
-fn safe_set_property_i32(element: &gst::Element, name: &str, pspec: &glib::ParamSpec, value: i32) -> bool {
+fn safe_set_property_i32(
+    element: &gst::Element,
+    name: &str,
+    pspec: &glib::ParamSpec,
+    value: i32,
+) -> bool {
     if let Some(p) = pspec.downcast_ref::<glib::ParamSpecInt>() {
         let clamped = value.clamp(p.minimum(), p.maximum());
         return catch_unwind(AssertUnwindSafe(|| {
@@ -369,7 +410,12 @@ fn safe_set_property_i32(element: &gst::Element, name: &str, pspec: &glib::Param
     .is_ok()
 }
 
-fn safe_set_property_u32(element: &gst::Element, name: &str, pspec: &glib::ParamSpec, value: u32) -> bool {
+fn safe_set_property_u32(
+    element: &gst::Element,
+    name: &str,
+    pspec: &glib::ParamSpec,
+    value: u32,
+) -> bool {
     let clamped = pspec
         .downcast_ref::<glib::ParamSpecUInt>()
         .map(|p| value.clamp(p.minimum(), p.maximum()))
@@ -380,7 +426,12 @@ fn safe_set_property_u32(element: &gst::Element, name: &str, pspec: &glib::Param
     .is_ok()
 }
 
-fn safe_set_property_i64(element: &gst::Element, name: &str, pspec: &glib::ParamSpec, value: i64) -> bool {
+fn safe_set_property_i64(
+    element: &gst::Element,
+    name: &str,
+    pspec: &glib::ParamSpec,
+    value: i64,
+) -> bool {
     let clamped = pspec
         .downcast_ref::<glib::ParamSpecInt64>()
         .map(|p| value.clamp(p.minimum(), p.maximum()))
@@ -391,7 +442,12 @@ fn safe_set_property_i64(element: &gst::Element, name: &str, pspec: &glib::Param
     .is_ok()
 }
 
-fn safe_set_property_u64(element: &gst::Element, name: &str, pspec: &glib::ParamSpec, value: u64) -> bool {
+fn safe_set_property_u64(
+    element: &gst::Element,
+    name: &str,
+    pspec: &glib::ParamSpec,
+    value: u64,
+) -> bool {
     let clamped = pspec
         .downcast_ref::<glib::ParamSpecUInt64>()
         .map(|p| value.clamp(p.minimum(), p.maximum()))
@@ -402,29 +458,74 @@ fn safe_set_property_u64(element: &gst::Element, name: &str, pspec: &glib::Param
     .is_ok()
 }
 
-fn gst_property_info(element: &gst::Element, symbol: &str) -> Option<(String, f32, f32, f32, bool, bool)> {
+fn gst_property_info(
+    element: &gst::Element,
+    symbol: &str,
+) -> Option<(String, f32, f32, f32, bool, bool)> {
     let (name, pspec) = resolve_element_property(element, symbol)?;
     let vtype = pspec.value_type();
     if vtype == bool::static_type() {
         return Some((name, 0.0, 1.0, 0.0, true, false));
     }
     if let Some(p) = pspec.downcast_ref::<glib::ParamSpecFloat>() {
-        return Some((name, p.minimum(), p.maximum(), p.default_value(), false, false));
+        return Some((
+            name,
+            p.minimum(),
+            p.maximum(),
+            p.default_value(),
+            false,
+            false,
+        ));
     }
     if let Some(p) = pspec.downcast_ref::<glib::ParamSpecDouble>() {
-        return Some((name, p.minimum() as f32, p.maximum() as f32, p.default_value() as f32, false, false));
+        return Some((
+            name,
+            p.minimum() as f32,
+            p.maximum() as f32,
+            p.default_value() as f32,
+            false,
+            false,
+        ));
     }
     if let Some(p) = pspec.downcast_ref::<glib::ParamSpecInt>() {
-        return Some((name, p.minimum() as f32, p.maximum() as f32, p.default_value() as f32, false, true));
+        return Some((
+            name,
+            p.minimum() as f32,
+            p.maximum() as f32,
+            p.default_value() as f32,
+            false,
+            true,
+        ));
     }
     if let Some(p) = pspec.downcast_ref::<glib::ParamSpecUInt>() {
-        return Some((name, p.minimum() as f32, p.maximum() as f32, p.default_value() as f32, false, true));
+        return Some((
+            name,
+            p.minimum() as f32,
+            p.maximum() as f32,
+            p.default_value() as f32,
+            false,
+            true,
+        ));
     }
     if let Some(p) = pspec.downcast_ref::<glib::ParamSpecInt64>() {
-        return Some((name, p.minimum() as f32, p.maximum() as f32, p.default_value() as f32, false, true));
+        return Some((
+            name,
+            p.minimum() as f32,
+            p.maximum() as f32,
+            p.default_value() as f32,
+            false,
+            true,
+        ));
     }
     if let Some(p) = pspec.downcast_ref::<glib::ParamSpecUInt64>() {
-        return Some((name, p.minimum() as f32, p.maximum() as f32, p.default_value() as f32, false, true));
+        return Some((
+            name,
+            p.minimum() as f32,
+            p.maximum() as f32,
+            p.default_value() as f32,
+            false,
+            true,
+        ));
     }
     if let Some(p) = pspec.downcast_ref::<glib::ParamSpecEnum>() {
         let enum_class = p.enum_class();
@@ -544,7 +645,11 @@ unsafe fn scan_plugins_unsafe() -> String {
         let plugin = lilv_plugins_get(plugins, iter);
         if !plugin.is_null() {
             if let Some((uri, entry)) = build_plugin_entry_with_uri(
-                plugin, ctrl_class, in_class, toggled_prop, integer_prop,
+                plugin,
+                ctrl_class,
+                in_class,
+                toggled_prop,
+                integer_prop,
             ) {
                 if seen_uris.insert(uri) {
                     entries.push(entry);
@@ -666,8 +771,14 @@ unsafe fn build_plugin_entry_with_uri(
         let mut def_val = def_val;
 
         if let Some(ref element) = gst_element {
-            if let Some((actual_name, actual_min, actual_max, actual_default, actual_toggled, actual_integer)) =
-                gst_property_info(element, symbol.as_str())
+            if let Some((
+                actual_name,
+                actual_min,
+                actual_max,
+                actual_default,
+                actual_toggled,
+                actual_integer,
+            )) = gst_property_info(element, symbol.as_str())
             {
                 symbol = actual_name;
                 min_val = actual_min;
@@ -727,7 +838,10 @@ fn json_str(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{host_managed_port_bool, host_managed_port_scalar, is_host_managed_port_symbol, Lv2SlotConfig};
+    use super::{
+        host_managed_port_bool, host_managed_port_scalar, is_host_managed_port_symbol,
+        Lv2SlotConfig,
+    };
 
     #[test]
     fn bypass_host_port_uses_inverse_semantics() {

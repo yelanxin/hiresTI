@@ -90,7 +90,10 @@ pub struct DopEncoder {
 impl DopEncoder {
     /// Create a new encoder for an output stream with `channels` channels.
     pub fn new(channels: usize) -> Self {
-        Self { marker: 0x05, channels }
+        Self {
+            marker: 0x05,
+            channels,
+        }
     }
 
     /// Reset the marker sequence (call when the stream is restarted).
@@ -130,9 +133,9 @@ impl DopEncoder {
             for ch in 0..self.channels {
                 let src_base = f * frame_dsd_bytes + ch * 2;
                 let dst_base = (f * self.channels + ch) * 3;
-                out[dst_base]     = dsd[src_base];       // DSD byte 1 (8 samples)
-                out[dst_base + 1] = dsd[src_base + 1];   // DSD byte 2 (8 samples)
-                out[dst_base + 2] = marker;               // DoP marker
+                out[dst_base] = dsd[src_base]; // DSD byte 1 (8 samples)
+                out[dst_base + 1] = dsd[src_base + 1]; // DSD byte 2 (8 samples)
+                out[dst_base + 2] = marker; // DoP marker
             }
             // Toggle marker after each complete frame.
             self.marker = if self.marker == 0x05 { 0xFA } else { 0x05 };

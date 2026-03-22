@@ -1,6 +1,6 @@
+use gst::prelude::*;
 use gst::PadProbeReturn;
 use gst::PadProbeType;
-use gst::prelude::*;
 use gstreamer as gst;
 use std::sync::{Arc, Mutex};
 
@@ -27,10 +27,18 @@ impl WidenerConfig {
     pub fn is_active(&self) -> bool {
         self.enabled && (self.width != 100 || self.bass_mono_amount > 0)
     }
-    pub fn set_enabled(&mut self, value: bool) { self.enabled = value; }
-    pub fn set_width(&mut self, value: i32) { self.width = value.clamp(0, 200); }
-    pub fn set_bass_mono_freq(&mut self, value: i32) { self.bass_mono_freq = value.clamp(40, 250); }
-    pub fn set_bass_mono_amount(&mut self, value: i32) { self.bass_mono_amount = value.clamp(0, 100); }
+    pub fn set_enabled(&mut self, value: bool) {
+        self.enabled = value;
+    }
+    pub fn set_width(&mut self, value: i32) {
+        self.width = value.clamp(0, 200);
+    }
+    pub fn set_bass_mono_freq(&mut self, value: i32) {
+        self.bass_mono_freq = value.clamp(40, 250);
+    }
+    pub fn set_bass_mono_amount(&mut self, value: i32) {
+        self.bass_mono_amount = value.clamp(0, 100);
+    }
 }
 
 #[derive(Debug)]
@@ -167,8 +175,12 @@ impl WidenerNode {
             PadProbeReturn::Ok
         });
 
-        let sink_pad = identity.static_pad("sink").ok_or("widener missing sink pad")?;
-        let src_pad = identity.static_pad("src").ok_or("widener missing src pad")?;
+        let sink_pad = identity
+            .static_pad("sink")
+            .ok_or("widener missing sink pad")?;
+        let src_pad = identity
+            .static_pad("src")
+            .ok_or("widener missing src pad")?;
         let ghost_sink = gst::GhostPad::with_target(&sink_pad)
             .map_err(|_| "failed to create widener ghost sink".to_string())?;
         let ghost_src = gst::GhostPad::with_target(&src_pad)

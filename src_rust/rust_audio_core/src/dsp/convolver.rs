@@ -1,8 +1,8 @@
+use gst::prelude::*;
 use gst::PadProbeReturn;
 use gst::PadProbeType;
-use gst::prelude::*;
 use gstreamer as gst;
-use rustfft::{FftPlanner, num_complex::Complex};
+use rustfft::{num_complex::Complex, FftPlanner};
 use std::collections::VecDeque;
 use std::fs;
 use std::path::Path;
@@ -277,7 +277,8 @@ impl PartitionedConvolver {
         self.ifft.process(&mut y_freq);
         let scale = 1.0 / l as f64;
         for i in 0..b {
-            self.output_queue.push_back(y_freq[i].re * scale + self.overlap[i]);
+            self.output_queue
+                .push_back(y_freq[i].re * scale + self.overlap[i]);
         }
         for i in 0..b {
             self.overlap[i] = y_freq[b + i].re * scale;
@@ -423,8 +424,7 @@ impl ConvolverState {
             samples[i * channels] = buf_l[i];
         }
         if channels >= 2 {
-            let mut buf_r: Vec<f64> =
-                (0..frames).map(|i| samples[i * channels + 1]).collect();
+            let mut buf_r: Vec<f64> = (0..frames).map(|i| samples[i * channels + 1]).collect();
             self.conv_r.process(&mut buf_r);
             for i in 0..frames {
                 samples[i * channels + 1] = buf_r[i];
@@ -445,14 +445,20 @@ impl ConvolverState {
             }
             // Advance gains toward targets.
             if (self.dry_gain - self.dry_gain_target).abs() > self.xfade_step {
-                self.dry_gain +=
-                    if self.dry_gain < self.dry_gain_target { self.xfade_step } else { -self.xfade_step };
+                self.dry_gain += if self.dry_gain < self.dry_gain_target {
+                    self.xfade_step
+                } else {
+                    -self.xfade_step
+                };
             } else {
                 self.dry_gain = self.dry_gain_target;
             }
             if (self.wet_gain - self.wet_gain_target).abs() > self.xfade_step {
-                self.wet_gain +=
-                    if self.wet_gain < self.wet_gain_target { self.xfade_step } else { -self.xfade_step };
+                self.wet_gain += if self.wet_gain < self.wet_gain_target {
+                    self.xfade_step
+                } else {
+                    -self.xfade_step
+                };
             } else {
                 self.wet_gain = self.wet_gain_target;
             }
@@ -487,14 +493,20 @@ impl ConvolverNode {
         bin.add(&identity)
             .map_err(|_| "failed to add conv identity".to_string())?;
 
-        let sink_pad = identity.static_pad("sink").ok_or("conv identity missing sink")?;
-        let src_pad = identity.static_pad("src").ok_or("conv identity missing src")?;
+        let sink_pad = identity
+            .static_pad("sink")
+            .ok_or("conv identity missing sink")?;
+        let src_pad = identity
+            .static_pad("src")
+            .ok_or("conv identity missing src")?;
         let ghost_sink = gst::GhostPad::with_target(&sink_pad)
             .map_err(|_| "failed to create conv ghost sink")?;
-        let ghost_src = gst::GhostPad::with_target(&src_pad)
-            .map_err(|_| "failed to create conv ghost src")?;
-        bin.add_pad(&ghost_sink).map_err(|_| "failed to add conv ghost sink")?;
-        bin.add_pad(&ghost_src).map_err(|_| "failed to add conv ghost src")?;
+        let ghost_src =
+            gst::GhostPad::with_target(&src_pad).map_err(|_| "failed to create conv ghost src")?;
+        bin.add_pad(&ghost_sink)
+            .map_err(|_| "failed to add conv ghost sink")?;
+        bin.add_pad(&ghost_src)
+            .map_err(|_| "failed to add conv ghost src")?;
 
         let state = Arc::new(Mutex::new(ConvolverState::new()));
         let probe_state = Arc::clone(&state);
@@ -524,10 +536,7 @@ impl ConvolverNode {
                 if raw.len() % 8 == 0 {
                     // SAFETY: format is F64LE, 8-byte aligned by GStreamer.
                     let samples = unsafe {
-                        std::slice::from_raw_parts_mut(
-                            raw.as_mut_ptr() as *mut f64,
-                            raw.len() / 8,
-                        )
+                        std::slice::from_raw_parts_mut(raw.as_mut_ptr() as *mut f64, raw.len() / 8)
                     };
                     st.process(samples, channels);
                 }
@@ -596,8 +605,16 @@ fn load_impulse_file(path: &Path) -> Result<LoadedImpulse, String> {
     let global_peak = peak_of(&impulse.kernel_l).max(peak_of(&impulse.kernel_r));
     if global_peak > 1e-10 {
         let thr = global_peak * 0.01;
-        let onset_l = impulse.kernel_l.iter().position(|x| x.abs() >= thr).unwrap_or(0);
-        let onset_r = impulse.kernel_r.iter().position(|x| x.abs() >= thr).unwrap_or(0);
+        let onset_l = impulse
+            .kernel_l
+            .iter()
+            .position(|x| x.abs() >= thr)
+            .unwrap_or(0);
+        let onset_r = impulse
+            .kernel_r
+            .iter()
+            .position(|x| x.abs() >= thr)
+            .unwrap_or(0);
         let onset = onset_l.min(onset_r);
         if onset > 0 {
             impulse.kernel_l.drain(0..onset);
@@ -607,8 +624,12 @@ fn load_impulse_file(path: &Path) -> Result<LoadedImpulse, String> {
         // Normalize both channels with the same scale factor to preserve
         // the stereo balance.
         let scale = 1.0 / global_peak;
-        for s in impulse.kernel_l.iter_mut() { *s *= scale; }
-        for s in impulse.kernel_r.iter_mut() { *s *= scale; }
+        for s in impulse.kernel_l.iter_mut() {
+            *s *= scale;
+        }
+        for s in impulse.kernel_r.iter_mut() {
+            *s *= scale;
+        }
     }
 
     if impulse.kernel_l.is_empty() {
@@ -639,9 +660,9 @@ fn load_text_impulse(path: &Path) -> Result<LoadedImpulse, String> {
             if item.is_empty() {
                 continue;
             }
-            let value: f64 = item.parse().map_err(|_| {
-                format!("invalid FIR coefficient `{item}` in {}", path.display())
-            })?;
+            let value: f64 = item
+                .parse()
+                .map_err(|_| format!("invalid FIR coefficient `{item}` in {}", path.display()))?;
             if !value.is_finite() {
                 return Err(format!("non-finite FIR coefficient in {}", path.display()));
             }
@@ -669,7 +690,8 @@ fn load_text_impulse(path: &Path) -> Result<LoadedImpulse, String> {
 }
 
 fn load_wav_impulse(path: &Path) -> Result<LoadedImpulse, String> {
-    let data = fs::read(path).map_err(|e| format!("failed to read WAV IR {}: {e}", path.display()))?;
+    let data =
+        fs::read(path).map_err(|e| format!("failed to read WAV IR {}: {e}", path.display()))?;
     if data.len() < 12 {
         return Err(format!("WAV IR too small: {}", path.display()));
     }
@@ -814,8 +836,7 @@ fn decode_wav_sample(fmt_code: u16, bits_per_sample: u16, bytes: &[u8]) -> Resul
         }
         (3, 64) => {
             let value = f64::from_le_bytes([
-                bytes[0], bytes[1], bytes[2], bytes[3],
-                bytes[4], bytes[5], bytes[6], bytes[7],
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
             ]);
             if !value.is_finite() {
                 return Err("non-finite float sample in WAV IR".to_string());
@@ -921,8 +942,12 @@ mod tests {
         let (mut kl, mut kr) = make_stereo_impulse(vec![0.5, 0.3], vec![1.0, -0.8]);
         let global_peak = peak_of(&kl).max(peak_of(&kr));
         let scale = 1.0 / global_peak;
-        for s in kl.iter_mut() { *s *= scale; }
-        for s in kr.iter_mut() { *s *= scale; }
+        for s in kl.iter_mut() {
+            *s *= scale;
+        }
+        for s in kr.iter_mut() {
+            *s *= scale;
+        }
 
         // R peak should now be exactly 1.0
         assert!((peak_of(&kr) - 1.0).abs() < 1e-12);

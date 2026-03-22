@@ -1,6 +1,7 @@
 import gi
 import os
 import sys
+import ctypes
 
 _src_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _src_dir not in sys.path:
@@ -13,7 +14,302 @@ import math
 import logging
 from _rust.viz import RustVizCore
 
+try:
+    from OpenGL import GL
+    from OpenGL.GL import shaders as gl_shaders
+except Exception:
+    GL = None
+    gl_shaders = None
+
 logger = logging.getLogger(__name__)
+
+_FREQ_SCALE_LINEAR = "Linear"
+_FREQ_SCALE_LOG = "Log"
+_FREQ_SCALE_NAMES = [_FREQ_SCALE_LINEAR, _FREQ_SCALE_LOG]
+_SPECTRUM_HALF_RATE_HZ = 22050.0
+_DEFAULT_SPECTRUM_BANDS = 512
+_LINEAR_ANALYSIS_BANDS = 512
+_LINEAR_DISPLAY_ZOOM = 1.0
+_LOG_DISPLAY_MIN_FREQ_HZ = 100.0
+_LOG_DISPLAY_MAX_FREQ_HZ = 16000.0
+_LEGACY_LOG_BIN_EXPONENT = 2.15
+
+
+def _normalize_spectrum_magnitudes(values, db_min=-80.0, db_range=80.0):
+    vals = list(values or [])
+    if not vals:
+        return []
+    out = [0.0] * len(vals)
+    for i, val in enumerate(vals):
+        if val <= db_min:
+            h = 0.0
+        else:
+            h = (val - db_min) / db_range
+        # gamma=1.5: compresses the low-level noise floor toward zero while
+        # keeping the main musical content range (~-30..0 dBFS) nearly identical
+        # to the old linear -60/60 mapping.
+        out[i] = max(0.0, min(1.0, h)) ** 1.5
+    return out
+
+
+def _resample_linear_values(values, out_count, use_peak=False):
+    vals = list(values or [])
+    if out_count <= 0:
+        return []
+    if not vals:
+        return [0.0] * out_count
+    in_count = len(vals)
+    out = [0.0] * out_count
+    for i in range(out_count):
+        t0 = i / float(out_count)
+        t1 = (i + 1) / float(out_count)
+        x0 = int(t0 * in_count)
+        x1 = int(t1 * in_count)
+        if x0 >= in_count:
+            x0 = in_count - 1
+        if x1 <= x0:
+            x1 = min(in_count, x0 + 1)
+        elif x1 > in_count:
+            x1 = in_count
+        if use_peak:
+            peak = 0.0
+            for j in range(x0, x1):
+                v = float(vals[j])
+                if v > peak:
+                    peak = v
+            out[i] = peak
+        else:
+            s = 0.0
+            c = 0
+            for j in range(x0, x1):
+                s += float(vals[j])
+                c += 1
+            out[i] = (s / float(c)) if c > 0 else 0.0
+    return out
+
+
+def _build_linear_spectrum_bins(
+    values,
+    out_count,
+    rust_core=None,
+    analysis_bands=_LINEAR_ANALYSIS_BANDS,
+    db_min=-80.0,
+    db_range=80.0,
+    half_rate_hz=_SPECTRUM_HALF_RATE_HZ,
+):
+    vals = list(values or [])
+    if out_count <= 0:
+        return []
+    if not vals:
+        return [0.0] * out_count
+
+    analysis_n = max(1, int(analysis_bands))
+    base = None
+    if rust_core is not None and getattr(rust_core, "available", False):
+        try:
+            base = rust_core.process_spectrum(
+                vals,
+                analysis_n,
+                db_min=db_min,
+                db_range=db_range,
+            )
+        except Exception:
+            base = None
+    if base is None:
+        base = _resample_linear_values(
+            _normalize_spectrum_magnitudes(vals, db_min=db_min, db_range=db_range),
+            analysis_n,
+        )
+    if out_count == analysis_n:
+        return list(base or [])
+    # Blend peak and mean aggregation: peak preserves sparse mid/high-freq tones
+    # while mean smooths out transient jumpiness.  60% peak + 40% mean gives
+    # similar reactivity to log mode without fully diluting narrow-bin signals.
+    out_peak = _resample_linear_values(base or [], out_count, use_peak=True)
+    out_mean = _resample_linear_values(base or [], out_count, use_peak=False)
+    out = [p * 0.6 + m * 0.4 for p, m in zip(out_peak, out_mean)]
+    # Apply per-bar voicing: rolls off bass (prevents peak saturation) and
+    # boosts mid/high (compensates for narrow-bin bandwidth vs 96-band FFT).
+    for i in range(out_count):
+        center_f = (i + 0.5) / float(out_count) * half_rate_hz
+        out[i] = min(1.0, out[i] * _linear_display_voicing(center_f, half_rate_hz))
+    return out
+
+
+def _interpolate_series_value(values, pos):
+    vals = list(values or [])
+    if not vals:
+        return 0.0
+    if len(vals) == 1:
+        return float(vals[0])
+    p = max(0.0, min(float(len(vals) - 1), float(pos)))
+    i0 = int(math.floor(p))
+    i1 = min(len(vals) - 1, i0 + 1)
+    frac = p - float(i0)
+    return (float(vals[i0]) * (1.0 - frac)) + (float(vals[i1]) * frac)
+
+
+def _spectrum_frequency_range(total_bands, half_rate_hz=_SPECTRUM_HALF_RATE_HZ):
+    try:
+        bands = int(total_bands)
+    except Exception:
+        bands = 0
+    if bands <= 1:
+        return (20.0, min(20000.0, float(half_rate_hz)))
+    band_hz = float(half_rate_hz) / float(bands)
+    min_f = max(20.0, band_hz)
+    max_f = min(20000.0, band_hz * float(bands - 1))
+    if max_f <= min_f:
+        max_f = max(min_f, float(half_rate_hz))
+    return (min_f, max_f)
+
+
+def _linear_display_frequency_range(total_bands, half_rate_hz=_SPECTRUM_HALF_RATE_HZ):
+    _base_min, base_max = _spectrum_frequency_range(total_bands, half_rate_hz=half_rate_hz)
+    return (0.0, base_max)
+
+
+def _display_gain_multiplier(freq_scale_name):
+    if freq_scale_name == _FREQ_SCALE_LINEAR:
+        return _LINEAR_DISPLAY_ZOOM
+    return 1.0
+
+
+def _linear_display_voicing(freq_hz, half_rate_hz=_SPECTRUM_HALF_RATE_HZ):
+    """Per-bar frequency compensation for linear mode with 512-band FFT.
+
+    512-band FFT bins are ~5x narrower than the 96-band bins the display was
+    originally calibrated for.  Two opposing effects arise:
+      - Bass: many adjacent dense bins → peak aggregation yields high values
+              → needs rolloff to prevent clipping.
+      - Mid/high: narrow sparse bins carry less energy than wide 96-band bins
+              → needs a boost that grows with frequency.
+
+    Curve: 0.55 at 20 Hz, 1.0 at 1 kHz, 2.0 at Nyquist.
+    """
+    f = max(20.0, float(freq_hz))
+    if f < 1000.0:
+        # Gentle bass rolloff: 20 Hz → 0.55, 1 kHz → 1.0
+        t = math.log10(f / 20.0) / math.log10(1000.0 / 20.0)
+        return 0.55 + 0.45 * t
+    # High-end boost: 1 kHz → 1.0, Nyquist → 1.2
+    log_max = math.log10(max(1001.0, float(half_rate_hz)) / 1000.0)
+    t = math.log10(f / 1000.0) / log_max if log_max > 1e-9 else 0.0
+    return 1.0 + 0.2 * min(1.0, t)
+
+
+def _log_display_frequency_range(total_bands, half_rate_hz=_SPECTRUM_HALF_RATE_HZ):
+    base_min, base_max = _spectrum_frequency_range(total_bands, half_rate_hz=half_rate_hz)
+    min_f = max(base_min, _LOG_DISPLAY_MIN_FREQ_HZ)
+    max_f = min(base_max, _LOG_DISPLAY_MAX_FREQ_HZ)
+    if max_f <= min_f:
+        return (base_min, base_max)
+    return (min_f, max_f)
+
+
+def _log_display_eq_gain(freq_hz):
+    # Perceptual voicing: approximates the inverse of the equal-loudness
+    # contour (ISO 226) at a comfortable listening level (~70 phon).
+    # Reduces bass and very high frequencies, peaks around 3-4 kHz where
+    # the human ear is most sensitive.
+    f = max(20.0, float(freq_hz))
+    if f < 200.0:
+        # 50 Hz → 0.45, 200 Hz → 0.72 (log-interpolated)
+        t = math.log10(f / 20.0) / math.log10(200.0 / 20.0)
+        return 0.30 + 0.42 * t
+    if f < 1000.0:
+        # 200 Hz → 0.72, 1 kHz → 0.92
+        t = math.log10(f / 200.0) / math.log10(1000.0 / 200.0)
+        return 0.72 + 0.20 * t
+    if f < 3500.0:
+        # 1 kHz → 0.92, 3.5 kHz → 1.05 (ear sensitivity peak)
+        t = math.log10(f / 1000.0) / math.log10(3500.0 / 1000.0)
+        return 0.92 + 0.13 * t
+    if f < 8000.0:
+        # 3.5 kHz → 1.05, 8 kHz → 0.90
+        t = math.log10(f / 3500.0) / math.log10(8000.0 / 3500.0)
+        return 1.05 - 0.15 * t
+    # 8 kHz → 0.90, 16 kHz → 0.68
+    t = math.log10(f / 8000.0) / math.log10(16000.0 / 8000.0)
+    return max(0.50, 0.90 - 0.22 * t)
+
+
+def _build_log_spectrum_bins(values, out_count, half_rate_hz=_SPECTRUM_HALF_RATE_HZ):
+    vals = list(values or [])
+    if out_count <= 0:
+        return []
+    if not vals:
+        return [0.0] * out_count
+    if len(vals) <= 1:
+        return [float(vals[0])] * out_count
+
+    # Band 0 is the DC component. Keep log mode aligned with the normal
+    # spectrum path by skipping it when real spectrum bands are provided.
+    usable = vals[1:] if len(vals) > 1 else vals
+    if not usable:
+        return [0.0] * out_count
+    if len(usable) == 1:
+        return [float(usable[0])] * out_count
+
+    total_bands = len(vals)
+    band_hz = float(half_rate_hz) / max(1.0, float(total_bands))
+    min_f, max_f = _log_display_frequency_range(total_bands, half_rate_hz=half_rate_hz)
+    if max_f <= min_f:
+        return _resample_linear_values(usable, out_count)
+
+    log_min = math.log10(min_f)
+    log_span = math.log10(max_f) - log_min
+    if log_span <= 1e-9:
+        return _resample_linear_values(usable, out_count)
+
+    out = [0.0] * out_count
+    for i in range(out_count):
+        t0 = i / float(out_count)
+        t1 = (i + 1) / float(out_count)
+        log_f0 = log_min + (t0 * log_span)
+        log_f1 = log_min + (t1 * log_span)
+        f0 = 10.0 ** log_f0
+        f1 = 10.0 ** log_f1
+        pos0 = max(0.0, (f0 / band_hz) - 1.0)
+        pos1 = max(pos0 + 1e-6, (f1 / band_hz) - 1.0)
+        sample_count = max(4, min(48, int(math.ceil((pos1 - pos0) * 4.0))))
+        sum_sq = 0.0
+        peak = 0.0
+        for s in range(sample_count):
+            t = (s + 0.5) / float(sample_count)
+            pos = pos0 + ((pos1 - pos0) * t)
+            v = _interpolate_series_value(usable, pos)
+            sum_sq += v * v
+            if v > peak:
+                peak = v
+        rms = math.sqrt(sum_sq / float(sample_count))
+        center_f = math.sqrt(f0 * f1)  # geometric mean → log-scale centre freq
+        voiced = ((rms * 0.90) + (peak * 0.10)) * _log_display_eq_gain(center_f)
+        out[i] = max(0.0, min(1.0, voiced))
+    return out
+
+
+def _build_log_bins_python(values, out_count):
+    in_count = len(values)
+    if in_count <= 0 or out_count <= 0:
+        return []
+    out = [0.0] * out_count
+    for i in range(out_count):
+        t0 = i / float(out_count)
+        t1 = (i + 1) / float(out_count)
+        x0 = int(pow(t0, _LEGACY_LOG_BIN_EXPONENT) * (in_count - 1))
+        x1 = int(pow(t1, _LEGACY_LOG_BIN_EXPONENT) * (in_count - 1))
+        if x1 <= x0:
+            x1 = min(in_count - 1, x0 + 1)
+        s = 0.0
+        c = 0
+        for j in range(x0, x1 + 1):
+            s += values[j]
+            c += 1
+        v = (s / float(max(1, c))) if c > 0 else 0.0
+        tilt = 0.92 + (0.16 * (i / float(max(1, out_count - 1))))
+        out[i] = max(0.0, min(1.0, pow(v, 0.84) * tilt))
+    return out
 
 class SpectrumVisualizer(Gtk.DrawingArea):
     """
@@ -25,6 +321,9 @@ class SpectrumVisualizer(Gtk.DrawingArea):
         self.set_size_request(-1, 0) # 允许 Revealer 完全折叠
         self.theme_name = "Aurora (Default)"
         self.effect_name = "Dots"
+        self.frequency_scale_name = _FREQ_SCALE_LINEAR
+        self.frequency_scale_names = list(_FREQ_SCALE_NAMES)
+        self._input_band_count = _DEFAULT_SPECTRUM_BANDS
         self.effects = [
             "Bars",
             "Wave",
@@ -84,51 +383,51 @@ class SpectrumVisualizer(Gtk.DrawingArea):
                 "gain_mul": 0.72,
                 "spacing_mul": 1.10,
                 "grid_mul": 0.78,
-                "smooth": 0.22,
-                "trail_decay": 0.95,
-                "peak_hold_frames": 14,
-                "peak_fall": 0.010,
-                "beat_mul": 0.66,
+                "smooth": 0.12,
+                "trail_decay": 0.975,
+                "peak_hold_frames": 29,
+                "peak_fall": 0.005,
+                "beat_mul": 0.34,
             },
             "Soft": {
                 "gain_mul": 0.84,
                 "spacing_mul": 1.08,
                 "grid_mul": 0.85,
-                "smooth": 0.30,
-                "trail_decay": 0.93,
-                "peak_hold_frames": 12,
-                "peak_fall": 0.014,
-                "beat_mul": 0.78,
+                "smooth": 0.17,
+                "trail_decay": 0.965,
+                "peak_hold_frames": 25,
+                "peak_fall": 0.007,
+                "beat_mul": 0.41,
             },
             "Dynamic": {
                 "gain_mul": 1.0,
                 "spacing_mul": 1.0,
                 "grid_mul": 1.0,
-                "smooth": 0.45,
-                "trail_decay": 0.90,
-                "peak_hold_frames": 8,
-                "peak_fall": 0.02,
-                "beat_mul": 1.0,
+                "smooth": 0.26,
+                "trail_decay": 0.951,
+                "peak_hold_frames": 17,
+                "peak_fall": 0.010,
+                "beat_mul": 0.55,
             },
             "Extreme": {
                 "gain_mul": 1.18,
                 "spacing_mul": 0.92,
                 "grid_mul": 1.18,
-                "smooth": 0.56,
-                "trail_decay": 0.87,
-                "peak_hold_frames": 6,
-                "peak_fall": 0.03,
-                "beat_mul": 1.24,
+                "smooth": 0.34,
+                "trail_decay": 0.935,
+                "peak_hold_frames": 12,
+                "peak_fall": 0.015,
+                "beat_mul": 0.69,
             },
             "Insane": {
                 "gain_mul": 1.32,
                 "spacing_mul": 0.88,
                 "grid_mul": 1.28,
-                "smooth": 0.62,
-                "trail_decay": 0.84,
-                "peak_hold_frames": 4,
-                "peak_fall": 0.04,
-                "beat_mul": 1.42,
+                "smooth": 0.39,
+                "trail_decay": 0.918,
+                "peak_hold_frames": 8,
+                "peak_fall": 0.019,
+                "beat_mul": 0.80,
             },
         }
         self.themes = {
@@ -423,6 +722,9 @@ class SpectrumVisualizer(Gtk.DrawingArea):
     def get_profile_names(self):
         return list(self.profiles.keys())
 
+    def get_frequency_scale_names(self):
+        return list(self.frequency_scale_names)
+
     def _refresh_theme_cache(self):
         self._theme_cfg = self.themes[self.theme_name] if self.theme_name in self.themes else self.themes["Aurora (Default)"]
 
@@ -453,6 +755,11 @@ class SpectrumVisualizer(Gtk.DrawingArea):
         if profile_name in self.profiles:
             self.profile_name = profile_name
             self._refresh_profile_cache()
+            self.queue_draw()
+
+    def set_frequency_scale(self, scale_name):
+        if scale_name in self.frequency_scale_names:
+            self.frequency_scale_name = scale_name
             self.queue_draw()
 
     def set_num_bars(self, count):
@@ -489,49 +796,22 @@ class SpectrumVisualizer(Gtk.DrawingArea):
         vals = list(magnitudes or [])
         if not vals:
             return [0.0] * self.num_bars
-        if use_rust and self._rust_core.available:
-            out = self._rust_core.process_spectrum(
-                vals,
-                self.num_bars,
-                db_min=-60.0,
-                db_range=60.0,
-            )
-            if out is not None:
-                if log_rust and not self._logged_rust_path:
-                    logger.info("Spectrum preprocessing path: Rust")
-                    self._logged_rust_path = True
-                return out
-        if not self._logged_python_fallback:
+        if self.frequency_scale_name == _FREQ_SCALE_LOG:
+            return _build_log_spectrum_bins(_normalize_spectrum_magnitudes(vals), self.num_bars)
+        if use_rust and self._rust_core.available and log_rust and not self._logged_rust_path:
+            logger.info("Spectrum preprocessing path: Rust")
+            self._logged_rust_path = True
+        if (not use_rust or not self._rust_core.available) and not self._logged_python_fallback:
             logger.info("Spectrum preprocessing path: Python fallback")
             self._logged_python_fallback = True
-        db_min = -60.0
-        db_range = 60.0
-        in_count = len(vals)
-        out = [0.0] * self.num_bars
-        for i in range(self.num_bars):
-            t0 = i / float(self.num_bars)
-            t1 = (i + 1) / float(self.num_bars)
-            x0 = int(t0 * in_count)
-            x1 = int(t1 * in_count)
-            if x0 >= in_count:
-                x0 = in_count - 1
-            if x1 <= x0:
-                x1 = min(in_count, x0 + 1)
-            elif x1 > in_count:
-                x1 = in_count
-            s = 0.0
-            c = 0
-            for j in range(x0, x1):
-                val = vals[j]
-                if val <= db_min:
-                    h = 0.0
-                else:
-                    h = (val - db_min) / db_range
-                h = max(0.0, min(1.0, h))
-                s += h
-                c += 1
-            out[i] = (s / float(c)) if c > 0 else 0.0
-        return out
+        return _build_linear_spectrum_bins(
+            vals,
+            self.num_bars,
+            rust_core=self._rust_core if use_rust else None,
+            analysis_bands=_LINEAR_ANALYSIS_BANDS,
+            db_min=-80.0,
+            db_range=80.0,
+        )
 
     def _resample_channel_heights(self, values, out_count):
         vals = list(values or [])
@@ -565,15 +845,20 @@ class SpectrumVisualizer(Gtk.DrawingArea):
             return
 
         if isinstance(magnitudes, dict):
-            mono_vals = list(magnitudes.get("mono") or magnitudes.get("left") or magnitudes.get("right") or [])
-            left_vals = list(magnitudes.get("left") or mono_vals)
-            right_vals = list(magnitudes.get("right") or mono_vals)
+            mono_vals = magnitudes.get("mono") or magnitudes.get("left") or magnitudes.get("right") or ()
+            left_vals = magnitudes.get("left") or mono_vals
+            right_vals = magnitudes.get("right") or mono_vals
         else:
-            mono_vals = list(magnitudes)
-            left_vals = list(mono_vals)
-            right_vals = list(mono_vals)
+            mono_vals = magnitudes
+            left_vals = magnitudes
+            right_vals = magnitudes
 
-        actual_count = len(mono_vals)
+        try:
+            actual_count = int(len(mono_vals))
+        except Exception:
+            actual_count = 0
+        if actual_count > 1:
+            self._input_band_count = actual_count
         new_heights = self._map_magnitudes_to_heights(mono_vals, use_rust=True, log_rust=True)
         self.target_left_channel_heights = self._map_magnitudes_to_heights(left_vals, use_rust=False)
         self.target_right_channel_heights = self._map_magnitudes_to_heights(right_vals, use_rust=False)
@@ -667,14 +952,18 @@ class SpectrumVisualizer(Gtk.DrawingArea):
         if width <= 0 or height <= 0:
             return
 
+        # Opaque black background (matches GL renderers).
+        cr.set_source_rgba(0.0, 0.0, 0.0, 1.0)
+        cr.paint()
+
         n = self.num_bars
         spacing = max(0.8, theme["bar_spacing"] * float(profile["spacing_mul"]))
         gain = theme["height_gain"] * float(profile["gain_mul"])
+        gain *= _display_gain_multiplier(self.frequency_scale_name)
         bar_w = max(1.0, (width - (n - 1) * spacing) / n)
         effect = self._effect_code
         if effect not in (14, 15, 16, 17, 18, 20, 21, 22, 23, 24, 25, 26):
-            grid_alpha = max(0.0, min(1.0, theme["grid_alpha"] * float(profile["grid_mul"])))
-            self._draw_grid(cr, width, height, grid_alpha)
+            self._draw_freq_axis(cr, width, height)
         if effect == 0:
             gradient = self._make_gradient(height, theme)
             self._draw_bars(cr, width, height, gain, gradient, bar_w, spacing)
@@ -753,11 +1042,68 @@ class SpectrumVisualizer(Gtk.DrawingArea):
             cr.line_to(width, y)
             cr.stroke()
 
+    def _draw_freq_axis(self, cr, width, height):
+        # 9 evenly-spaced frequency labels along the top edge.
+        # Log mode uses the same log10(min_f..max_f) mapping as the spectrum
+        # regrouping path so labels and columns stay consistent.
+        TICKS = 9
+        HALF_RATE = _SPECTRUM_HALF_RATE_HZ
+        TOTAL_BANDS = float(max(2, int(getattr(self, "_input_band_count", _DEFAULT_SPECTRUM_BANDS) or _DEFAULT_SPECTRUM_BANDS)))
+        if self.frequency_scale_name == _FREQ_SCALE_LOG:
+            min_f, max_f = _log_display_frequency_range(int(TOTAL_BANDS), half_rate_hz=HALF_RATE)
+            log_min = math.log10(min_f)
+            log_span = math.log10(max_f) - log_min
+        else:
+            min_f, max_f = _linear_display_frequency_range(int(TOTAL_BANDS), half_rate_hz=HALF_RATE)
+
+        TICK_H = 4.0
+        LABEL_FONT = 9.0
+        LABEL_Y = TICK_H + LABEL_FONT + 1.0   # baseline below the tick
+        TICK_ALPHA = 0.45
+        LABEL_ALPHA = 0.60
+
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        cr.set_font_size(LABEL_FONT)
+
+        for k in range(TICKS):
+            p = k / float(TICKS - 1)
+            x = p * width
+            if self.frequency_scale_name == _FREQ_SCALE_LOG:
+                freq = 10.0 ** (log_min + (p * log_span))
+            else:
+                freq = min_f + (p * (max_f - min_f))
+
+            if freq >= 1000.0:
+                kv = freq / 1000.0
+                label = f"{kv:.0f}k" if kv >= 10.0 else f"{kv:.1f}k"
+            else:
+                label = f"{freq:.0f}"
+
+            ext = cr.text_extents(label)
+            tx = x - ext.width * 0.5
+            tx = max(1.0, min(width - ext.width - 1.0, tx))
+
+            # tick line
+            cr.set_source_rgba(1.0, 1.0, 1.0, TICK_ALPHA)
+            cr.set_line_width(1.0)
+            cr.move_to(x, 0.0)
+            cr.line_to(x, TICK_H)
+            cr.stroke()
+
+            # label
+            cr.set_source_rgba(1.0, 1.0, 1.0, LABEL_ALPHA)
+            cr.move_to(tx, LABEL_Y)
+            cr.show_text(label)
+
     def _make_gradient(self, height, theme):
-        gradient = cairo.LinearGradient(0, 0, 0, height)
-        for stop, rgba in theme["gradient"]:
-            gradient.add_color_stop_rgba(stop, *rgba)
-        return gradient
+        key = (height, self.theme_name)
+        if getattr(self, "_gradient_cache_key", None) != key:
+            gradient = cairo.LinearGradient(0, 0, 0, height)
+            for stop, rgba in theme["gradient"]:
+                gradient.add_color_stop_rgba(stop, *rgba)
+            self._gradient_cache = gradient
+            self._gradient_cache_key = key
+        return self._gradient_cache
 
     def _draw_rounded_top_bar(self, cr, x, y, bar_w, h, base_y):
         radius = min(bar_w * 0.28, h * 0.45)
@@ -2776,27 +3122,7 @@ class SpectrumVisualizer(Gtk.DrawingArea):
         if not self._logged_python_bins:
             logger.info("Log-bin preprocessing path: Python fallback")
             self._logged_python_bins = True
-        in_count = len(values)
-        if in_count <= 0 or out_count <= 0:
-            return []
-        out = [0.0] * out_count
-        for i in range(out_count):
-            t0 = i / float(out_count)
-            t1 = (i + 1) / float(out_count)
-            x0 = int(pow(t0, 2.15) * (in_count - 1))
-            x1 = int(pow(t1, 2.15) * (in_count - 1))
-            if x1 <= x0:
-                x1 = min(in_count - 1, x0 + 1)
-            s = 0.0
-            c = 0
-            for j in range(x0, x1 + 1):
-                s += values[j]
-                c += 1
-            v = (s / float(max(1, c))) if c > 0 else 0.0
-            # slight lift for high band readability while keeping low-end weight
-            tilt = 0.92 + (0.16 * (i / float(max(1, out_count - 1))))
-            out[i] = max(0.0, min(1.0, pow(v, 0.84) * tilt))
-        return out
+        return _build_log_bins_python(values, out_count)
 
     def _draw_pro_background(self, cr, width, height, grad):
         c_lo = self._color_from_gradient(grad, 0.85)
@@ -3085,3 +3411,1750 @@ class SpectrumVisualizer(Gtk.DrawingArea):
                 return tuple(prev_rgba[i] + ((rgba[i] - prev_rgba[i]) * w) for i in range(4))
             prev_stop, prev_rgba = stop, rgba
         return gradient[-1][1]
+
+
+# ---------------------------------------------------------------------------
+# GL-accelerated Dots visualizer
+# ---------------------------------------------------------------------------
+
+_DOTS_VERT_330 = """
+#version 330 core
+layout (location = 0) in vec2 aPos;
+out vec2 vUV;
+void main() {
+    vUV = (aPos + 1.0) * 0.5;
+    gl_Position = vec4(aPos, 0.0, 1.0);
+}
+"""
+
+_DOTS_FRAG_330 = """
+#version 330 core
+in vec2 vUV;
+out vec4 FragColor;
+const int MAX_BARS = 128;
+uniform int   uNumBars;
+uniform float uHeights[MAX_BARS];
+uniform vec4  uColors[MAX_BARS];
+uniform float uGain;
+uniform float uSpacingPx;
+uniform vec2  uResolution;
+const float DOT_H = 4.0;
+const float GAP   = 3.0;
+void main() {
+    float x_px            = vUV.x * uResolution.x;
+    float y_from_bot_px   = vUV.y * uResolution.y;
+    float slot_w          = uResolution.x / float(uNumBars);
+    int   bar_i           = int(x_px / slot_w);
+    if (bar_i >= uNumBars) discard;
+    float pos_in_slot     = x_px - float(bar_i) * slot_w;
+    if (pos_in_slot >= max(1.0, slot_w - uSpacingPx)) discard;
+    float h_px = clamp(uHeights[bar_i] * uResolution.y * uGain, 0.0, uResolution.y);
+    if (y_from_bot_px >= h_px) discard;
+    if (mod(y_from_bot_px, DOT_H + GAP) >= DOT_H) discard;
+    FragColor = uColors[bar_i];
+}
+"""
+
+_DOTS_VERT_300ES = """
+#version 300 es
+layout (location = 0) in vec2 aPos;
+out vec2 vUV;
+void main() {
+    vUV = (aPos + 1.0) * 0.5;
+    gl_Position = vec4(aPos, 0.0, 1.0);
+}
+"""
+
+_DOTS_FRAG_300ES = """
+#version 300 es
+precision mediump float;
+in vec2 vUV;
+out vec4 FragColor;
+const int MAX_BARS = 128;
+uniform int   uNumBars;
+uniform float uHeights[MAX_BARS];
+uniform vec4  uColors[MAX_BARS];
+uniform float uGain;
+uniform float uSpacingPx;
+uniform vec2  uResolution;
+const float DOT_H = 4.0;
+const float GAP   = 3.0;
+void main() {
+    float x_px          = vUV.x * uResolution.x;
+    float y_from_bot_px = vUV.y * uResolution.y;
+    float slot_w        = uResolution.x / float(uNumBars);
+    int   bar_i         = int(x_px / slot_w);
+    if (bar_i >= uNumBars) discard;
+    float pos_in_slot   = x_px - float(bar_i) * slot_w;
+    if (pos_in_slot >= max(1.0, slot_w - uSpacingPx)) discard;
+    float h_px = clamp(uHeights[bar_i] * uResolution.y * uGain, 0.0, uResolution.y);
+    if (y_from_bot_px >= h_px) discard;
+    if (mod(y_from_bot_px, DOT_H + GAP) >= DOT_H) discard;
+    FragColor = uColors[bar_i];
+}
+"""
+
+
+class DotsGLVisualizer(Gtk.GLArea):
+    """
+    GL-accelerated Dots spectrum visualizer.
+    Implements the same public interface as SpectrumVisualizer so it can be
+    used as a drop-in replacement when testing GL rendering performance.
+    Falls back to raising RuntimeError on construction if PyOpenGL is absent.
+    """
+
+    # Reuse the same theme/profile tables as SpectrumVisualizer.
+    _THEMES = None   # populated lazily from SpectrumVisualizer instance
+    _PROFILES = None
+
+    def __init__(self):
+        if GL is None or gl_shaders is None:
+            raise RuntimeError("PyOpenGL not available for DotsGLVisualizer")
+        super().__init__()
+
+        # Borrow theme/profile data from SpectrumVisualizer without rendering.
+        _sv = SpectrumVisualizer.__new__(SpectrumVisualizer)
+        _sv.__init__()          # full init so themes/profiles are populated
+        self.themes   = _sv.themes
+        self.profiles = _sv.profiles
+        self._rust_core = _sv._rust_core
+
+        self.num_bars     = 32
+        self.theme_name   = "Aurora (Default)"
+        self.profile_name = "Dynamic"
+        self.frequency_scale_name = _FREQ_SCALE_LINEAR
+        self.frequency_scale_names = list(_FREQ_SCALE_NAMES)
+        self._input_band_count = _DEFAULT_SPECTRUM_BANDS
+        self._theme_cfg   = self.themes[self.theme_name]
+        self._profile_cfg = self.profiles[self.profile_name]
+
+        self.target_heights  = [0.0] * 128
+        self.current_heights = [0.0] * 128
+        self._active      = False
+        self._anim_source = None
+
+        # GL state
+        self._program     = None
+        self._vao         = None
+        self._vbo         = None
+        self._gl_failed   = False
+        self._u_num_bars  = -1
+        self._u_heights   = -1
+        self._u_colors    = -1
+        self._u_gain      = -1
+        self._u_spacing   = -1
+        self._u_resolution = -1
+
+        # Precomputed per-bar colors (invalidated on theme/num_bars change)
+        self._color_cache     = None
+        self._color_cache_key = None
+        self._logged_rust_bins = False
+        self._logged_python_bins = False
+
+        # Pre-allocated ctypes arrays reused every frame to avoid GC churn
+        self._h_arr = (ctypes.c_float * 128)(*([0.0] * 128))
+        self._c_arr = (ctypes.c_float * 512)(*([0.0] * 512))
+
+        # Cached per-frame scalars — recomputed only on theme/profile change
+        self._cached_gain    = 0.0
+        self._cached_spacing = 0.0
+        self._cached_w       = -1
+        self._cached_h       = -1
+        # True when num_bars/colors/gain/spacing need re-upload to GPU
+        self._dirty_static   = True
+
+        self.set_auto_render(False)
+        self.set_hexpand(True)
+        self.set_vexpand(True)
+        self.connect("realize",   self._on_realize)
+        self.connect("unrealize", self._on_unrealize)
+        self.connect("render",    self._on_render)
+        logger.info("Visualizer backend selected: GL (Dots)")
+
+    # ------------------------------------------------------------------
+    # GL lifecycle
+    # ------------------------------------------------------------------
+
+    def _on_realize(self, _area):
+        self.make_current()
+        if self.get_error() is not None:
+            logger.warning("DotsGL realize error: %s", self.get_error())
+            self._gl_failed = True
+            return
+        try:
+            self._setup_gl()
+            self._update_render_cache()
+        except Exception:
+            logger.exception("DotsGL setup failed")
+            self._gl_failed = True
+
+    def _on_unrealize(self, _area):
+        self.make_current()
+        if self._vbo is not None:
+            GL.glDeleteBuffers(1, [self._vbo])
+            self._vbo = None
+        if self._vao is not None:
+            GL.glDeleteVertexArrays(1, [self._vao])
+            self._vao = None
+        if self._program is not None:
+            GL.glDeleteProgram(self._program)
+            self._program = None
+
+    def _setup_gl(self):
+        if self._program is not None:
+            return
+        err = None
+        for label, vs, fs in [
+            ("330 core", _DOTS_VERT_330, _DOTS_FRAG_330),
+            ("300 es",   _DOTS_VERT_300ES, _DOTS_FRAG_300ES),
+        ]:
+            try:
+                self._program = gl_shaders.compileProgram(
+                    gl_shaders.compileShader(vs, GL.GL_VERTEX_SHADER),
+                    gl_shaders.compileShader(fs, GL.GL_FRAGMENT_SHADER),
+                )
+                logger.info("DotsGL shader: GLSL %s", label)
+                break
+            except Exception as e:
+                err = e
+        if self._program is None:
+            raise RuntimeError(f"DotsGL shader compile failed: {err}")
+
+        p = self._program
+        self._u_num_bars   = GL.glGetUniformLocation(p, "uNumBars")
+        self._u_heights    = GL.glGetUniformLocation(p, "uHeights")
+        self._u_colors     = GL.glGetUniformLocation(p, "uColors")
+        self._u_gain       = GL.glGetUniformLocation(p, "uGain")
+        self._u_spacing    = GL.glGetUniformLocation(p, "uSpacingPx")
+        self._u_resolution = GL.glGetUniformLocation(p, "uResolution")
+
+        # Fullscreen quad
+        verts = (-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0)
+        arr   = (ctypes.c_float * 8)(*verts)
+        self._vao = GL.glGenVertexArrays(1)
+        self._vbo = GL.glGenBuffers(1)
+        GL.glBindVertexArray(self._vao)
+        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self._vbo)
+        GL.glBufferData(GL.GL_ARRAY_BUFFER, ctypes.sizeof(arr), arr, GL.GL_STATIC_DRAW)
+        GL.glEnableVertexAttribArray(0)
+        GL.glVertexAttribPointer(0, 2, GL.GL_FLOAT, GL.GL_FALSE, 0, None)
+        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, 0)
+        GL.glBindVertexArray(0)
+
+    def _on_render(self, _area, _context):
+        if self._gl_failed or self._program is None:
+            return True
+        w = int(self.get_width()  or 0)
+        h = int(self.get_height() or 0)
+        if w < 1 or h < 1:
+            return True
+
+        scale = max(1, int(self.get_scale_factor() or 1))
+        GL.glViewport(0, 0, w * scale, h * scale)
+        GL.glClearColor(0.0, 0.0, 0.0, 1.0)
+        GL.glClear(GL.GL_COLOR_BUFFER_BIT)
+
+        GL.glUseProgram(self._program)
+
+        # Re-upload static uniforms only when theme/profile/size changed
+        if self._dirty_static or w != self._cached_w or h != self._cached_h:
+            self._cached_w = w
+            self._cached_h = h
+            self._get_colors()   # rebuilds _c_arr if theme/bars changed
+            GL.glUniform1i (self._u_num_bars,   self.num_bars)
+            GL.glUniform4fv(self._u_colors,     128, self._c_arr)
+            GL.glUniform1f (self._u_gain,       self._cached_gain)
+            GL.glUniform1f (self._u_spacing,    self._cached_spacing)
+            GL.glUniform2f (self._u_resolution, float(w), float(h))
+            self._dirty_static = False
+
+        # Heights change every animated frame
+        self._h_arr[:128] = self.current_heights[:128]
+        GL.glUniform1fv(self._u_heights, 128, self._h_arr)
+
+        GL.glBindVertexArray(self._vao)
+        GL.glDrawArrays(GL.GL_TRIANGLE_STRIP, 0, 4)
+        GL.glBindVertexArray(0)
+        GL.glUseProgram(0)
+        return True
+
+    # ------------------------------------------------------------------
+    # Animation tick (height smoothing, same rate as SpectrumVisualizer)
+    # ------------------------------------------------------------------
+
+    def _on_animation_tick(self):
+        if not self._active:
+            self._anim_source = None
+            return False
+        smooth = float(self._profile_cfg["smooth"])
+        changed = False
+        for i in range(self.num_bars):
+            diff = self.target_heights[i] - self.current_heights[i]
+            if abs(diff) > 0.001:
+                self.current_heights[i] += diff * smooth
+                changed = True
+        if changed:
+            self.queue_render()
+        return True
+
+    # ------------------------------------------------------------------
+    # Color cache
+    # ------------------------------------------------------------------
+
+    def _get_colors(self):
+        key = (self.theme_name, self.num_bars)
+        if self._color_cache_key != key or self._color_cache is None:
+            grad = self._theme_cfg["gradient"]
+            n    = self.num_bars
+            self._color_cache = [
+                self._color_from_gradient(grad, i / float(max(1, n - 1)))
+                for i in range(n)
+            ]
+            self._color_cache_key = key
+            # Rebuild the pre-allocated flat ctypes array (vec4 × 128)
+            off = 0
+            for r, g, b, a in self._color_cache:
+                self._c_arr[off]     = r
+                self._c_arr[off + 1] = g
+                self._c_arr[off + 2] = b
+                self._c_arr[off + 3] = a
+                off += 4
+            # Zero-pad remaining slots
+            for i in range(off, 512):
+                self._c_arr[i] = 0.0
+        return self._color_cache
+
+    @staticmethod
+    def _color_from_gradient(gradient, t):
+        t = max(0.0, min(1.0, t))
+        prev_stop, prev_rgba = gradient[0]
+        for stop, rgba in gradient[1:]:
+            if t <= stop:
+                span = max(1e-6, stop - prev_stop)
+                w = (t - prev_stop) / span
+                return tuple(prev_rgba[i] + (rgba[i] - prev_rgba[i]) * w for i in range(4))
+            prev_stop, prev_rgba = stop, rgba
+        return gradient[-1][1]
+
+    # ------------------------------------------------------------------
+    # Public API (mirrors SpectrumVisualizer)
+    # ------------------------------------------------------------------
+
+    def set_active(self, active):
+        active = bool(active)
+        if self._active == active:
+            return
+        self._active = active
+        if active:
+            if self._anim_source is None:
+                self._anim_source = GLib.timeout_add(16, self._on_animation_tick)
+            self.queue_render()
+        else:
+            if self._anim_source:
+                try:
+                    GLib.source_remove(self._anim_source)
+                except Exception:
+                    pass
+                self._anim_source = None
+
+    def update_data(self, magnitudes):
+        if not magnitudes:
+            return
+        if isinstance(magnitudes, dict):
+            vals = magnitudes.get("mono") or magnitudes.get("left") or ()
+        else:
+            vals = magnitudes
+        vals = list(vals or [])
+        if len(vals) > 1:
+            self._input_band_count = len(vals)
+        if self.frequency_scale_name == _FREQ_SCALE_LOG:
+            new_heights = _build_log_spectrum_bins(_normalize_spectrum_magnitudes(vals), self.num_bars)
+            self.target_heights[:self.num_bars] = new_heights[:self.num_bars]
+            return
+        new_heights = _build_linear_spectrum_bins(
+            vals,
+            self.num_bars,
+            rust_core=self._rust_core,
+            analysis_bands=_LINEAR_ANALYSIS_BANDS,
+            db_min=-80.0,
+            db_range=80.0,
+        )
+        self.target_heights[:self.num_bars] = new_heights[:self.num_bars]
+
+    def _build_log_bins(self, values, out_count):
+        if self._rust_core.available:
+            out = self._rust_core.build_log_bins(values, out_count)
+            if out is not None:
+                if not self._logged_rust_bins:
+                    logger.info("DotsGL log-bin preprocessing path: Rust")
+                    self._logged_rust_bins = True
+                return out
+        if not self._logged_python_bins:
+            logger.info("DotsGL log-bin preprocessing path: Python fallback")
+            self._logged_python_bins = True
+        return _build_log_bins_python(values, out_count)
+
+    def _update_render_cache(self):
+        """Recompute cached scalars and mark static uniforms dirty."""
+        self._cached_gain    = (
+            float(self._theme_cfg["height_gain"])
+            * float(self._profile_cfg["gain_mul"])
+            * _display_gain_multiplier(self.frequency_scale_name)
+        )
+        self._cached_spacing = max(0.8, float(self._theme_cfg["bar_spacing"]) * float(self._profile_cfg["spacing_mul"]))
+        self._dirty_static   = True
+
+    def set_num_bars(self, count):
+        try:
+            n = int(count)
+        except Exception:
+            return
+        if n <= 0 or n == self.num_bars:
+            return
+        self.num_bars = min(n, 128)
+        self.target_heights  = [0.0] * 128
+        self.current_heights = [0.0] * 128
+        self._color_cache    = None
+        self._dirty_static   = True
+
+    def set_theme(self, name):
+        if name in self.themes:
+            self.theme_name = name
+            self._theme_cfg = self.themes[name]
+            self._color_cache = None
+            self._update_render_cache()
+
+    def set_effect(self, _name):
+        pass   # DotsGLVisualizer only renders Dots
+
+    def set_frequency_scale(self, name):
+        if name in self.frequency_scale_names:
+            self.frequency_scale_name = name
+            self._update_render_cache()
+            self.queue_render()
+
+    def set_profile(self, name):
+        if name in self.profiles:
+            self.profile_name = name
+            self._profile_cfg = self.profiles[name]
+            self._update_render_cache()
+
+    def get_theme_names(self):
+        return list(self.themes.keys())
+
+    def get_effect_names(self):
+        return ["Dots"]
+
+    def get_profile_names(self):
+        return list(self.profiles.keys())
+
+    def get_frequency_scale_names(self):
+        return list(self.frequency_scale_names)
+
+
+# ---------------------------------------------------------------------------
+# GL-accelerated Bars / Peak / Trail visualizer
+# ---------------------------------------------------------------------------
+
+# Vertex shader is identical to Dots — fullscreen NDC quad passthrough.
+_BARS_VERT_330 = """
+#version 330 core
+layout (location = 0) in vec2 aPos;
+out vec2 vUV;
+void main() {
+    vUV = (aPos + 1.0) * 0.5;
+    gl_Position = vec4(aPos, 0.0, 1.0);
+}
+"""
+
+_BARS_FRAG_330 = """
+#version 330 core
+in vec2 vUV;
+out vec4 FragColor;
+const int MAX_BARS = 128;
+uniform int   uNumBars;
+uniform float uHeights[MAX_BARS];
+uniform float uPeakHeights[MAX_BARS];
+uniform float uTrailHeights[MAX_BARS];
+uniform float uLeftHeights[MAX_BARS];
+uniform float uRightHeights[MAX_BARS];
+uniform vec4  uColors[MAX_BARS];
+uniform vec4  uTopColor;
+uniform vec4  uBottomColor;
+uniform vec4  uPulseColor;
+uniform float uGain;
+uniform float uSpacingPx;
+uniform float uBassLevel;
+uniform vec2  uResolution;
+uniform float uBalance;
+uniform int   uMode;  // 0=Bars 1=Peak 2=Trail 3=Mirror 4=Wave 5=Fill 6=Pulse 7=StereoMirror 8=Stereo 9=Burst 10=BalanceWave 11=CenterSide
+const float CAP_H   = 3.0;
+const float WAVE_HW = 2.0;
+const float PI      = 3.14159265;
+// Pixel-font glyphs: 5 rows x 4 cols packed as row0 in bits[3:0], row1 in bits[7:4], ...
+// Within each row: bit3=leftmost col, bit0=rightmost col.
+const int CHAR_L = 1017992;  // rows: 8,8,8,8,15
+const int CHAR_R = 642718;   // rows: 14,9,14,12,9
+const int CHAR_M = 629241;   // rows: 9,15,9,9,9
+const int CHAR_I = 934990;   // rows: 14,4,4,4,14
+const int CHAR_D = 956830;   // rows: 14,9,9,9,14
+const int CHAR_S = 923271;   // rows: 7,8,6,1,14
+const int CHAR_E = 1019535;  // rows: 15,8,14,8,15
+// Returns 1.0 if pixel (px,py) falls on glyph drawn at (cx, cy_bot) with pixel scale sc.
+float sampleGlyph(float px, float py, float cx, float cy_bot, float sc, int glyph) {
+    float lx = (px - cx) / sc;
+    float ly = (cy_bot + 5.0*sc - py) / sc;  // row 0 = top
+    if (lx < 0.0 || lx >= 4.0 || ly < 0.0 || ly >= 5.0) return 0.0;
+    int bit = (3 - int(lx)) + int(ly) * 4;
+    return float((glyph >> bit) & 1);
+}
+void main() {
+    float x_px          = vUV.x * uResolution.x;
+    float y_from_bot_px = vUV.y * uResolution.y;
+    // Stereo: L channel left half, R channel right half, balance ball at top
+    if (uMode == 8) {
+        float half8  = uResolution.x * 0.5;
+        float gap8   = 8.0;
+        int   half_n = max(1, uNumBars / 2);
+        float bars_w = half8 - gap8;
+        float max_h8 = uResolution.y * 0.92;
+        // Balance ball and meter (drawn on top of everything)
+        float meter_w  = min(120.0, uResolution.x * 0.16);
+        float meter_y  = uResolution.y * 0.92;
+        float marker_x = half8 + uBalance * meter_w * 0.5;
+        float ball_d   = length(vec2(x_px - marker_x, y_from_bot_px - meter_y));
+        if (ball_d < 4.5) {
+            FragColor = vec4(1.0, 1.0, 1.0, 0.72);
+            return;
+        }
+        if (ball_d < 10.0) {
+            vec4 gc = uBalance >= 0.0 ? uTopColor : uBottomColor;
+            FragColor = vec4(gc.rgb, 0.22 * (1.0 - (ball_d - 4.5) / 5.5));
+            return;
+        }
+        // Meter track line
+        float meter_l = half8 - meter_w * 0.5;
+        float meter_r = half8 + meter_w * 0.5;
+        if (abs(y_from_bot_px - meter_y) < 0.5 && x_px >= meter_l && x_px <= meter_r) {
+            FragColor = vec4(1.0, 1.0, 1.0, 0.10);
+            return;
+        }
+        // Center tick on meter
+        if (abs(x_px - half8) < 0.5 && abs(y_from_bot_px - meter_y) < 5.0) {
+            FragColor = vec4(1.0, 1.0, 1.0, 0.10);
+            return;
+        }
+        // Center divider line
+        if (abs(x_px - half8) < 0.5) {
+            FragColor = vec4(1.0, 1.0, 1.0, 0.08);
+            return;
+        }
+        // L bars (uTopColor)
+        if (x_px < half8 - gap8) {
+            float sw8 = bars_w / float(half_n);
+            int   bi8 = int(x_px / sw8);
+            if (bi8 >= half_n) discard;
+            if (x_px - float(bi8) * sw8 >= max(1.0, sw8 - uSpacingPx)) discard;
+            if (y_from_bot_px >= clamp(uLeftHeights[bi8] * uGain, 0.0, 1.0) * max_h8) discard;
+            FragColor = uTopColor;
+        // R bars (uBottomColor)
+        } else if (x_px > half8 + gap8) {
+            float local_x = x_px - (half8 + gap8);
+            float sw8 = bars_w / float(half_n);
+            int   bi8 = int(local_x / sw8);
+            if (bi8 >= half_n) discard;
+            if (local_x - float(bi8) * sw8 >= max(1.0, sw8 - uSpacingPx)) discard;
+            if (y_from_bot_px >= clamp(uRightHeights[bi8] * uGain, 0.0, 1.0) * max_h8) discard;
+            FragColor = uBottomColor;
+        } else { discard; }
+        return;
+    }
+    // Burst: radial spokes from center
+    if (uMode == 9) {
+        vec2  center9 = uResolution * 0.5;
+        vec2  delta9  = vec2(x_px, y_from_bot_px) - center9;
+        float dist9   = length(delta9);
+        float t9      = (atan(delta9.y, delta9.x) + PI) / (2.0 * PI);
+        int   bi9     = clamp(int(t9 * float(uNumBars)), 0, uNumBars - 1);
+        float max_r9  = min(uResolution.x, uResolution.y) * 0.46;
+        float h9      = clamp(uHeights[bi9] * uGain, 0.0, 1.0) * max_r9;
+        if (dist9 >= h9 || h9 < 2.0) discard;
+        FragColor = uColors[bi9];
+        return;
+    }
+    // Balance Wave: L (uTopColor) upper lane, R (uBottomColor) lower lane
+    if (uMode == 10) {
+        float step_bw = uResolution.x / float(max(uNumBars - 1, 1));
+        float t_bw    = x_px / step_bw;
+        int   i0_bw   = clamp(int(t_bw),     0, uNumBars - 1);
+        int   i1_bw   = clamp(int(t_bw) + 1, 0, uNumBars - 1);
+        float frac_bw = t_bw - float(i0_bw);
+        float lv      = mix(clamp(uLeftHeights[i0_bw]  * uGain, 0.0, 1.0),
+                            clamp(uLeftHeights[i1_bw]  * uGain, 0.0, 1.0), frac_bw);
+        float rv      = mix(clamp(uRightHeights[i0_bw] * uGain, 0.0, 1.0),
+                            clamp(uRightHeights[i1_bw] * uGain, 0.0, 1.0), frac_bw);
+        float amp_bw  = uResolution.y * 0.20;
+        float tmid_bw = uResolution.y * 0.66;
+        float bmid_bw = uResolution.y * 0.30;
+        float wave_l  = tmid_bw + (lv - 0.5) * 2.0 * amp_bw;
+        float wave_r  = bmid_bw + (rv - 0.5) * 2.0 * amp_bw;
+        if (abs(y_from_bot_px - tmid_bw) < 0.6 || abs(y_from_bot_px - bmid_bw) < 0.6) {
+            FragColor = vec4(1.0, 1.0, 1.0, 0.06);
+            return;
+        }
+        if (abs(y_from_bot_px - wave_l) <= WAVE_HW) {
+            FragColor = vec4(uTopColor.rgb, 0.90);
+            return;
+        }
+        float l_lo = min(wave_l, tmid_bw);
+        float l_hi = max(wave_l, tmid_bw);
+        if (y_from_bot_px >= l_lo && y_from_bot_px < l_hi) {
+            float t_lf = (l_hi - l_lo) > 0.5 ? abs(y_from_bot_px - wave_l) / (l_hi - l_lo) : 0.5;
+            FragColor = vec4(uTopColor.rgb, mix(0.18, 0.02, t_lf));
+            return;
+        }
+        if (abs(y_from_bot_px - wave_r) <= WAVE_HW) {
+            FragColor = vec4(uBottomColor.rgb, 0.90);
+            return;
+        }
+        float r_lo = min(wave_r, bmid_bw);
+        float r_hi = max(wave_r, bmid_bw);
+        if (y_from_bot_px >= r_lo && y_from_bot_px < r_hi) {
+            float t_rf = (r_hi - r_lo) > 0.5 ? abs(y_from_bot_px - wave_r) / (r_hi - r_lo) : 0.5;
+            FragColor = vec4(uBottomColor.rgb, mix(0.18, 0.02, t_rf));
+            return;
+        }
+        float lbl_sc   = 2.0;
+        float lbl_cy_l = tmid_bw + amp_bw + 8.0;
+        float lbl_cy_r = bmid_bw + amp_bw + 8.0;
+        if (sampleGlyph(x_px, y_from_bot_px, 14.0, lbl_cy_l, lbl_sc, CHAR_L) > 0.5) {
+            FragColor = vec4(uTopColor.rgb, 0.78);
+            return;
+        }
+        if (sampleGlyph(x_px, y_from_bot_px, 14.0, lbl_cy_r, lbl_sc, CHAR_R) > 0.5) {
+            FragColor = vec4(uBottomColor.rgb, 0.78);
+            return;
+        }
+        discard;
+        return;
+    }
+    // Center Side: Mid=(L+R)*0.5 upper lane, Side=|L-R| lower lane
+    if (uMode == 11) {
+        float step_cs = uResolution.x / float(max(uNumBars - 1, 1));
+        float t_cs    = x_px / step_cs;
+        int   i0_cs   = clamp(int(t_cs),     0, uNumBars - 1);
+        int   i1_cs   = clamp(int(t_cs) + 1, 0, uNumBars - 1);
+        float frac_cs = t_cs - float(i0_cs);
+        float lv_cs   = mix(clamp(uLeftHeights[i0_cs]  * uGain, 0.0, 1.0),
+                            clamp(uLeftHeights[i1_cs]  * uGain, 0.0, 1.0), frac_cs);
+        float rv_cs   = mix(clamp(uRightHeights[i0_cs] * uGain, 0.0, 1.0),
+                            clamp(uRightHeights[i1_cs] * uGain, 0.0, 1.0), frac_cs);
+        float mid_v   = (lv_cs + rv_cs) * 0.5;
+        float side_v  = abs(lv_cs - rv_cs);
+        float amp_cs  = uResolution.y * 0.18;
+        float tmid_cs = uResolution.y * 0.67;
+        float bmid_cs = uResolution.y * 0.28;
+        float wave_m  = tmid_cs + mid_v  * amp_cs;
+        float wave_s  = bmid_cs + side_v * amp_cs;
+        if (abs(y_from_bot_px - tmid_cs) < 0.6 || abs(y_from_bot_px - bmid_cs) < 0.6) {
+            FragColor = vec4(1.0, 1.0, 1.0, 0.06);
+            return;
+        }
+        if (abs(y_from_bot_px - wave_m) <= WAVE_HW) {
+            FragColor = vec4(uTopColor.rgb, 0.92);
+            return;
+        }
+        if (y_from_bot_px >= tmid_cs && y_from_bot_px < wave_m) {
+            float t_mf = (wave_m - tmid_cs) > 0.5 ? (y_from_bot_px - tmid_cs) / (wave_m - tmid_cs) : 0.5;
+            FragColor = vec4(uTopColor.rgb, mix(0.02, 0.22, t_mf));
+            return;
+        }
+        if (abs(y_from_bot_px - wave_s) <= WAVE_HW) {
+            FragColor = vec4(uBottomColor.rgb, 0.92);
+            return;
+        }
+        if (y_from_bot_px >= bmid_cs && y_from_bot_px < wave_s) {
+            float t_sf = (wave_s - bmid_cs) > 0.5 ? (y_from_bot_px - bmid_cs) / (wave_s - bmid_cs) : 0.5;
+            FragColor = vec4(uBottomColor.rgb, mix(0.02, 0.22, t_sf));
+            return;
+        }
+        float lbl_sc   = 2.0;
+        float adv      = 4.0*lbl_sc + 2.0;
+        float lbl_cy_m = tmid_cs + amp_cs + 8.0;
+        float lbl_cy_s = bmid_cs + amp_cs + 8.0;
+        if (sampleGlyph(x_px, y_from_bot_px, 14.0,         lbl_cy_m, lbl_sc, CHAR_M) > 0.5 ||
+            sampleGlyph(x_px, y_from_bot_px, 14.0+adv,     lbl_cy_m, lbl_sc, CHAR_I) > 0.5 ||
+            sampleGlyph(x_px, y_from_bot_px, 14.0+2.0*adv, lbl_cy_m, lbl_sc, CHAR_D) > 0.5) {
+            FragColor = vec4(uTopColor.rgb, 0.78);
+            return;
+        }
+        if (sampleGlyph(x_px, y_from_bot_px, 14.0,         lbl_cy_s, lbl_sc, CHAR_S) > 0.5 ||
+            sampleGlyph(x_px, y_from_bot_px, 14.0+adv,     lbl_cy_s, lbl_sc, CHAR_I) > 0.5 ||
+            sampleGlyph(x_px, y_from_bot_px, 14.0+2.0*adv, lbl_cy_s, lbl_sc, CHAR_D) > 0.5 ||
+            sampleGlyph(x_px, y_from_bot_px, 14.0+3.0*adv, lbl_cy_s, lbl_sc, CHAR_E) > 0.5) {
+            FragColor = vec4(uBottomColor.rgb, 0.78);
+            return;
+        }
+        discard;
+        return;
+    }
+    // Wave / Fill: step-based x
+    if (uMode == 4 || uMode == 5) {
+        float step_x   = uResolution.x / float(max(uNumBars - 1, 1));
+        float t_global = x_px / step_x;
+        int   i0 = clamp(int(t_global),     0, uNumBars - 1);
+        int   i1 = clamp(int(t_global) + 1, 0, uNumBars - 1);
+        float frac   = t_global - float(i0);
+        float h0     = clamp(uHeights[i0] * uGain, 0.0, 1.0) * uResolution.y;
+        float h1     = clamp(uHeights[i1] * uGain, 0.0, 1.0) * uResolution.y;
+        float wave_h = mix(h0, h1, frac);
+        vec4  col    = mix(uColors[i0], uColors[i1], frac);
+        if (uMode == 4) {
+            if (abs(y_from_bot_px - wave_h) > WAVE_HW) discard;
+            FragColor = col;
+        } else {
+            if (y_from_bot_px >= wave_h) discard;
+            FragColor = col;
+        }
+        return;
+    }
+    // Pulse: radial glow background + bars on top
+    if (uMode == 6) {
+        vec2  center_px = vec2(uResolution.x * 0.5, uResolution.y * 0.58);
+        float r_px      = min(uResolution.x, uResolution.y) * (0.16 + 0.18 * uBassLevel);
+        float dist      = length(vec2(x_px, y_from_bot_px) - center_px);
+        vec4  bg        = vec4(0.0);
+        if (dist < r_px && uBassLevel > 0.02) {
+            float fade = 1.0 - smoothstep(r_px * 0.35, r_px, dist);
+            bg = vec4(uPulseColor.rgb, uPulseColor.a * 0.24 * uBassLevel * fade);
+        }
+        float slot_w2     = uResolution.x / float(uNumBars);
+        int   bar_i2      = int(x_px / slot_w2);
+        bool  in_bar      = false;
+        vec4  bar_col     = vec4(0.0);
+        if (bar_i2 < uNumBars) {
+            float pos2 = x_px - float(bar_i2) * slot_w2;
+            float bw2  = max(1.0, slot_w2 - uSpacingPx);
+            float hp2  = clamp(uHeights[bar_i2] * uGain, 0.0, 1.0) * uResolution.y;
+            if (pos2 < bw2 && y_from_bot_px < hp2) {
+                in_bar  = true;
+                bar_col = uColors[bar_i2];
+            }
+        }
+        if (in_bar) {
+            FragColor = vec4(mix(bg.rgb, bar_col.rgb, bar_col.a), 1.0);
+        } else if (bg.a > 0.004) {
+            FragColor = bg;
+        } else {
+            discard;
+        }
+        return;
+    }
+    // Stereo Mirror: L channel above center, R channel below
+    if (uMode == 7) {
+        float slot_w3 = uResolution.x / float(uNumBars);
+        int   bar_i3  = int(x_px / slot_w3);
+        if (bar_i3 >= uNumBars) discard;
+        float pos3 = x_px - float(bar_i3) * slot_w3;
+        float bw3  = max(1.0, slot_w3 - uSpacingPx);
+        if (pos3 >= bw3) discard;
+        float center = uResolution.y * 0.5;
+        if (y_from_bot_px >= center) {
+            float lh = clamp(uLeftHeights[bar_i3] * uGain, 0.0, 1.0) * uResolution.y * 0.48;
+            if ((y_from_bot_px - center) >= lh) discard;
+            FragColor = uTopColor;
+        } else {
+            float rh = clamp(uRightHeights[bar_i3] * uGain, 0.0, 1.0) * uResolution.y * 0.48;
+            if ((center - y_from_bot_px) >= rh) discard;
+            FragColor = uBottomColor;
+        }
+        return;
+    }
+    // Slot-based x (Bars, Peak, Trail, Mirror)
+    float slot_w = uResolution.x / float(uNumBars);
+    int   bar_i  = int(x_px / slot_w);
+    if (bar_i >= uNumBars) discard;
+    float pos_in_slot = x_px - float(bar_i) * slot_w;
+    float bar_w       = max(1.0, slot_w - uSpacingPx);
+    if (pos_in_slot >= bar_w) discard;
+    vec4  col  = uColors[bar_i];
+    float h_px = clamp(uHeights[bar_i] * uGain, 0.0, 1.0) * uResolution.y;
+    if (uMode == 3) {
+        float center = uResolution.y * 0.5;
+        float h_half = clamp(uHeights[bar_i] * uGain, 0.0, 1.0) * uResolution.y * 0.48;
+        if (abs(y_from_bot_px - center) >= h_half) discard;
+        FragColor = col;
+        return;
+    }
+    if (uMode == 2) {
+        float tr_px = clamp(uTrailHeights[bar_i] * uGain, 0.0, 1.0) * uResolution.y;
+        if (y_from_bot_px >= h_px && y_from_bot_px < tr_px) {
+            FragColor = vec4(col.rgb, col.a * 0.35);
+            return;
+        }
+    }
+    if (uMode == 1) {
+        float ph_px = clamp(uPeakHeights[bar_i] * uGain, 0.0, 1.0) * uResolution.y;
+        if (ph_px > h_px + 1.0 && y_from_bot_px >= ph_px && y_from_bot_px < ph_px + CAP_H) {
+            FragColor = col;
+            return;
+        }
+    }
+    if (y_from_bot_px >= h_px) discard;
+    FragColor = col;
+}
+"""
+
+_BARS_VERT_300ES = """
+#version 300 es
+layout (location = 0) in vec2 aPos;
+out vec2 vUV;
+void main() {
+    vUV = (aPos + 1.0) * 0.5;
+    gl_Position = vec4(aPos, 0.0, 1.0);
+}
+"""
+
+_BARS_FRAG_300ES = """
+#version 300 es
+precision mediump float;
+in vec2 vUV;
+out vec4 FragColor;
+const int MAX_BARS = 128;
+uniform int   uNumBars;
+uniform float uHeights[MAX_BARS];
+uniform float uPeakHeights[MAX_BARS];
+uniform float uTrailHeights[MAX_BARS];
+uniform float uLeftHeights[MAX_BARS];
+uniform float uRightHeights[MAX_BARS];
+uniform vec4  uColors[MAX_BARS];
+uniform vec4  uTopColor;
+uniform vec4  uBottomColor;
+uniform vec4  uPulseColor;
+uniform float uGain;
+uniform float uSpacingPx;
+uniform float uBassLevel;
+uniform vec2  uResolution;
+uniform float uBalance;
+uniform int   uMode;
+const float CAP_H   = 3.0;
+const float WAVE_HW = 2.0;
+const float PI      = 3.14159265;
+const int CHAR_L = 1017992;
+const int CHAR_R = 642718;
+const int CHAR_M = 629241;
+const int CHAR_I = 934990;
+const int CHAR_D = 956830;
+const int CHAR_S = 923271;
+const int CHAR_E = 1019535;
+float sampleGlyph(float px, float py, float cx, float cy_bot, float sc, int glyph) {
+    float lx = (px - cx) / sc;
+    float ly = (cy_bot + 5.0*sc - py) / sc;
+    if (lx < 0.0 || lx >= 4.0 || ly < 0.0 || ly >= 5.0) return 0.0;
+    int bit = (3 - int(lx)) + int(ly) * 4;
+    return float((glyph >> bit) & 1);
+}
+void main() {
+    float x_px          = vUV.x * uResolution.x;
+    float y_from_bot_px = vUV.y * uResolution.y;
+    if (uMode == 8) {
+        float half8  = uResolution.x * 0.5;
+        float gap8   = 8.0;
+        int   half_n = max(1, uNumBars / 2);
+        float bars_w = half8 - gap8;
+        float max_h8 = uResolution.y * 0.92;
+        float meter_w  = min(120.0, uResolution.x * 0.16);
+        float meter_y  = uResolution.y * 0.92;
+        float marker_x = half8 + uBalance * meter_w * 0.5;
+        float ball_d   = length(vec2(x_px - marker_x, y_from_bot_px - meter_y));
+        if (ball_d < 4.5) {
+            FragColor = vec4(1.0, 1.0, 1.0, 0.72);
+            return;
+        }
+        if (ball_d < 10.0) {
+            vec4 gc = uBalance >= 0.0 ? uTopColor : uBottomColor;
+            FragColor = vec4(gc.rgb, 0.22 * (1.0 - (ball_d - 4.5) / 5.5));
+            return;
+        }
+        float meter_l = half8 - meter_w * 0.5;
+        float meter_r = half8 + meter_w * 0.5;
+        if (abs(y_from_bot_px - meter_y) < 0.5 && x_px >= meter_l && x_px <= meter_r) {
+            FragColor = vec4(1.0, 1.0, 1.0, 0.10);
+            return;
+        }
+        if (abs(x_px - half8) < 0.5 && abs(y_from_bot_px - meter_y) < 5.0) {
+            FragColor = vec4(1.0, 1.0, 1.0, 0.10);
+            return;
+        }
+        if (abs(x_px - half8) < 0.5) {
+            FragColor = vec4(1.0, 1.0, 1.0, 0.08);
+            return;
+        }
+        if (x_px < half8 - gap8) {
+            float sw8 = bars_w / float(half_n);
+            int   bi8 = int(x_px / sw8);
+            if (bi8 >= half_n) discard;
+            if (x_px - float(bi8) * sw8 >= max(1.0, sw8 - uSpacingPx)) discard;
+            if (y_from_bot_px >= clamp(uLeftHeights[bi8] * uGain, 0.0, 1.0) * max_h8) discard;
+            FragColor = uTopColor;
+        } else if (x_px > half8 + gap8) {
+            float local_x = x_px - (half8 + gap8);
+            float sw8 = bars_w / float(half_n);
+            int   bi8 = int(local_x / sw8);
+            if (bi8 >= half_n) discard;
+            if (local_x - float(bi8) * sw8 >= max(1.0, sw8 - uSpacingPx)) discard;
+            if (y_from_bot_px >= clamp(uRightHeights[bi8] * uGain, 0.0, 1.0) * max_h8) discard;
+            FragColor = uBottomColor;
+        } else { discard; }
+        return;
+    }
+    if (uMode == 9) {
+        vec2  center9 = uResolution * 0.5;
+        vec2  delta9  = vec2(x_px, y_from_bot_px) - center9;
+        float dist9   = length(delta9);
+        float t9      = (atan(delta9.y, delta9.x) + PI) / (2.0 * PI);
+        int   bi9     = clamp(int(t9 * float(uNumBars)), 0, uNumBars - 1);
+        float max_r9  = min(uResolution.x, uResolution.y) * 0.46;
+        float h9      = clamp(uHeights[bi9] * uGain, 0.0, 1.0) * max_r9;
+        if (dist9 >= h9 || h9 < 2.0) discard;
+        FragColor = uColors[bi9];
+        return;
+    }
+    if (uMode == 10) {
+        float step_bw = uResolution.x / float(max(uNumBars - 1, 1));
+        float t_bw    = x_px / step_bw;
+        int   i0_bw   = clamp(int(t_bw),     0, uNumBars - 1);
+        int   i1_bw   = clamp(int(t_bw) + 1, 0, uNumBars - 1);
+        float frac_bw = t_bw - float(i0_bw);
+        float lv      = mix(clamp(uLeftHeights[i0_bw]  * uGain, 0.0, 1.0),
+                            clamp(uLeftHeights[i1_bw]  * uGain, 0.0, 1.0), frac_bw);
+        float rv      = mix(clamp(uRightHeights[i0_bw] * uGain, 0.0, 1.0),
+                            clamp(uRightHeights[i1_bw] * uGain, 0.0, 1.0), frac_bw);
+        float amp_bw  = uResolution.y * 0.20;
+        float tmid_bw = uResolution.y * 0.66;
+        float bmid_bw = uResolution.y * 0.30;
+        float wave_l  = tmid_bw + (lv - 0.5) * 2.0 * amp_bw;
+        float wave_r  = bmid_bw + (rv - 0.5) * 2.0 * amp_bw;
+        if (abs(y_from_bot_px - tmid_bw) < 0.6 || abs(y_from_bot_px - bmid_bw) < 0.6) {
+            FragColor = vec4(1.0, 1.0, 1.0, 0.06);
+            return;
+        }
+        if (abs(y_from_bot_px - wave_l) <= WAVE_HW) {
+            FragColor = vec4(uTopColor.rgb, 0.90);
+            return;
+        }
+        float l_lo = min(wave_l, tmid_bw);
+        float l_hi = max(wave_l, tmid_bw);
+        if (y_from_bot_px >= l_lo && y_from_bot_px < l_hi) {
+            float t_lf = (l_hi - l_lo) > 0.5 ? abs(y_from_bot_px - wave_l) / (l_hi - l_lo) : 0.5;
+            FragColor = vec4(uTopColor.rgb, mix(0.18, 0.02, t_lf));
+            return;
+        }
+        if (abs(y_from_bot_px - wave_r) <= WAVE_HW) {
+            FragColor = vec4(uBottomColor.rgb, 0.90);
+            return;
+        }
+        float r_lo = min(wave_r, bmid_bw);
+        float r_hi = max(wave_r, bmid_bw);
+        if (y_from_bot_px >= r_lo && y_from_bot_px < r_hi) {
+            float t_rf = (r_hi - r_lo) > 0.5 ? abs(y_from_bot_px - wave_r) / (r_hi - r_lo) : 0.5;
+            FragColor = vec4(uBottomColor.rgb, mix(0.18, 0.02, t_rf));
+            return;
+        }
+        float lbl_sc   = 2.0;
+        float lbl_cy_l = tmid_bw + amp_bw + 8.0;
+        float lbl_cy_r = bmid_bw + amp_bw + 8.0;
+        if (sampleGlyph(x_px, y_from_bot_px, 14.0, lbl_cy_l, lbl_sc, CHAR_L) > 0.5) {
+            FragColor = vec4(uTopColor.rgb, 0.78);
+            return;
+        }
+        if (sampleGlyph(x_px, y_from_bot_px, 14.0, lbl_cy_r, lbl_sc, CHAR_R) > 0.5) {
+            FragColor = vec4(uBottomColor.rgb, 0.78);
+            return;
+        }
+        discard;
+        return;
+    }
+    if (uMode == 11) {
+        float step_cs = uResolution.x / float(max(uNumBars - 1, 1));
+        float t_cs    = x_px / step_cs;
+        int   i0_cs   = clamp(int(t_cs),     0, uNumBars - 1);
+        int   i1_cs   = clamp(int(t_cs) + 1, 0, uNumBars - 1);
+        float frac_cs = t_cs - float(i0_cs);
+        float lv_cs   = mix(clamp(uLeftHeights[i0_cs]  * uGain, 0.0, 1.0),
+                            clamp(uLeftHeights[i1_cs]  * uGain, 0.0, 1.0), frac_cs);
+        float rv_cs   = mix(clamp(uRightHeights[i0_cs] * uGain, 0.0, 1.0),
+                            clamp(uRightHeights[i1_cs] * uGain, 0.0, 1.0), frac_cs);
+        float mid_v   = (lv_cs + rv_cs) * 0.5;
+        float side_v  = abs(lv_cs - rv_cs);
+        float amp_cs  = uResolution.y * 0.18;
+        float tmid_cs = uResolution.y * 0.67;
+        float bmid_cs = uResolution.y * 0.28;
+        float wave_m  = tmid_cs + mid_v  * amp_cs;
+        float wave_s  = bmid_cs + side_v * amp_cs;
+        if (abs(y_from_bot_px - tmid_cs) < 0.6 || abs(y_from_bot_px - bmid_cs) < 0.6) {
+            FragColor = vec4(1.0, 1.0, 1.0, 0.06);
+            return;
+        }
+        if (abs(y_from_bot_px - wave_m) <= WAVE_HW) {
+            FragColor = vec4(uTopColor.rgb, 0.92);
+            return;
+        }
+        if (y_from_bot_px >= tmid_cs && y_from_bot_px < wave_m) {
+            float t_mf = (wave_m - tmid_cs) > 0.5 ? (y_from_bot_px - tmid_cs) / (wave_m - tmid_cs) : 0.5;
+            FragColor = vec4(uTopColor.rgb, mix(0.02, 0.22, t_mf));
+            return;
+        }
+        if (abs(y_from_bot_px - wave_s) <= WAVE_HW) {
+            FragColor = vec4(uBottomColor.rgb, 0.92);
+            return;
+        }
+        if (y_from_bot_px >= bmid_cs && y_from_bot_px < wave_s) {
+            float t_sf = (wave_s - bmid_cs) > 0.5 ? (y_from_bot_px - bmid_cs) / (wave_s - bmid_cs) : 0.5;
+            FragColor = vec4(uBottomColor.rgb, mix(0.02, 0.22, t_sf));
+            return;
+        }
+        float lbl_sc   = 2.0;
+        float adv      = 4.0*lbl_sc + 2.0;
+        float lbl_cy_m = tmid_cs + amp_cs + 8.0;
+        float lbl_cy_s = bmid_cs + amp_cs + 8.0;
+        if (sampleGlyph(x_px, y_from_bot_px, 14.0,         lbl_cy_m, lbl_sc, CHAR_M) > 0.5 ||
+            sampleGlyph(x_px, y_from_bot_px, 14.0+adv,     lbl_cy_m, lbl_sc, CHAR_I) > 0.5 ||
+            sampleGlyph(x_px, y_from_bot_px, 14.0+2.0*adv, lbl_cy_m, lbl_sc, CHAR_D) > 0.5) {
+            FragColor = vec4(uTopColor.rgb, 0.78);
+            return;
+        }
+        if (sampleGlyph(x_px, y_from_bot_px, 14.0,         lbl_cy_s, lbl_sc, CHAR_S) > 0.5 ||
+            sampleGlyph(x_px, y_from_bot_px, 14.0+adv,     lbl_cy_s, lbl_sc, CHAR_I) > 0.5 ||
+            sampleGlyph(x_px, y_from_bot_px, 14.0+2.0*adv, lbl_cy_s, lbl_sc, CHAR_D) > 0.5 ||
+            sampleGlyph(x_px, y_from_bot_px, 14.0+3.0*adv, lbl_cy_s, lbl_sc, CHAR_E) > 0.5) {
+            FragColor = vec4(uBottomColor.rgb, 0.78);
+            return;
+        }
+        discard;
+        return;
+    }
+    if (uMode == 4 || uMode == 5) {
+        float step_x   = uResolution.x / float(max(uNumBars - 1, 1));
+        float t_global = x_px / step_x;
+        int   i0 = clamp(int(t_global),     0, uNumBars - 1);
+        int   i1 = clamp(int(t_global) + 1, 0, uNumBars - 1);
+        float frac   = t_global - float(i0);
+        float h0     = clamp(uHeights[i0] * uGain, 0.0, 1.0) * uResolution.y;
+        float h1     = clamp(uHeights[i1] * uGain, 0.0, 1.0) * uResolution.y;
+        float wave_h = mix(h0, h1, frac);
+        vec4  col    = mix(uColors[i0], uColors[i1], frac);
+        if (uMode == 4) {
+            if (abs(y_from_bot_px - wave_h) > WAVE_HW) discard;
+            FragColor = col;
+        } else {
+            if (y_from_bot_px >= wave_h) discard;
+            FragColor = col;
+        }
+        return;
+    }
+    if (uMode == 6) {
+        vec2  center_px = vec2(uResolution.x * 0.5, uResolution.y * 0.58);
+        float r_px      = min(uResolution.x, uResolution.y) * (0.16 + 0.18 * uBassLevel);
+        float dist      = length(vec2(x_px, y_from_bot_px) - center_px);
+        vec4  bg        = vec4(0.0);
+        if (dist < r_px && uBassLevel > 0.02) {
+            float fade = 1.0 - smoothstep(r_px * 0.35, r_px, dist);
+            bg = vec4(uPulseColor.rgb, uPulseColor.a * 0.24 * uBassLevel * fade);
+        }
+        float slot_w2 = uResolution.x / float(uNumBars);
+        int   bar_i2  = int(x_px / slot_w2);
+        bool  in_bar  = false;
+        vec4  bar_col = vec4(0.0);
+        if (bar_i2 < uNumBars) {
+            float pos2 = x_px - float(bar_i2) * slot_w2;
+            float bw2  = max(1.0, slot_w2 - uSpacingPx);
+            float hp2  = clamp(uHeights[bar_i2] * uGain, 0.0, 1.0) * uResolution.y;
+            if (pos2 < bw2 && y_from_bot_px < hp2) {
+                in_bar  = true;
+                bar_col = uColors[bar_i2];
+            }
+        }
+        if (in_bar) {
+            FragColor = vec4(mix(bg.rgb, bar_col.rgb, bar_col.a), 1.0);
+        } else if (bg.a > 0.004) {
+            FragColor = bg;
+        } else {
+            discard;
+        }
+        return;
+    }
+    if (uMode == 7) {
+        float slot_w3 = uResolution.x / float(uNumBars);
+        int   bar_i3  = int(x_px / slot_w3);
+        if (bar_i3 >= uNumBars) discard;
+        float pos3 = x_px - float(bar_i3) * slot_w3;
+        float bw3  = max(1.0, slot_w3 - uSpacingPx);
+        if (pos3 >= bw3) discard;
+        float center = uResolution.y * 0.5;
+        if (y_from_bot_px >= center) {
+            float lh = clamp(uLeftHeights[bar_i3] * uGain, 0.0, 1.0) * uResolution.y * 0.48;
+            if ((y_from_bot_px - center) >= lh) discard;
+            FragColor = uTopColor;
+        } else {
+            float rh = clamp(uRightHeights[bar_i3] * uGain, 0.0, 1.0) * uResolution.y * 0.48;
+            if ((center - y_from_bot_px) >= rh) discard;
+            FragColor = uBottomColor;
+        }
+        return;
+    }
+    float slot_w = uResolution.x / float(uNumBars);
+    int   bar_i  = int(x_px / slot_w);
+    if (bar_i >= uNumBars) discard;
+    float pos_in_slot = x_px - float(bar_i) * slot_w;
+    float bar_w       = max(1.0, slot_w - uSpacingPx);
+    if (pos_in_slot >= bar_w) discard;
+    vec4  col  = uColors[bar_i];
+    float h_px = clamp(uHeights[bar_i] * uGain, 0.0, 1.0) * uResolution.y;
+    if (uMode == 3) {
+        float center = uResolution.y * 0.5;
+        float h_half = clamp(uHeights[bar_i] * uGain, 0.0, 1.0) * uResolution.y * 0.48;
+        if (abs(y_from_bot_px - center) >= h_half) discard;
+        FragColor = col;
+        return;
+    }
+    if (uMode == 2) {
+        float tr_px = clamp(uTrailHeights[bar_i] * uGain, 0.0, 1.0) * uResolution.y;
+        if (y_from_bot_px >= h_px && y_from_bot_px < tr_px) {
+            FragColor = vec4(col.rgb, col.a * 0.35);
+            return;
+        }
+    }
+    if (uMode == 1) {
+        float ph_px = clamp(uPeakHeights[bar_i] * uGain, 0.0, 1.0) * uResolution.y;
+        if (ph_px > h_px + 1.0 && y_from_bot_px >= ph_px && y_from_bot_px < ph_px + CAP_H) {
+            FragColor = col;
+            return;
+        }
+    }
+    if (y_from_bot_px >= h_px) discard;
+    FragColor = col;
+}
+"""
+
+# Effect name → uMode integer
+_BARS_GL_EFFECT_MODES = {
+    "Bars":          0,
+    "Peak":          1,
+    "Trail":         2,
+    "Mirror":        3,
+    "Wave":          4,
+    "Fill":          5,
+    "Pulse":         6,
+    "Stereo Mirror": 7,
+    "Burst":         9,
+    "Balance Wave":  10,
+    "Center Side":   11,
+}
+
+
+class BarsGLVisualizer(Gtk.GLArea):
+    """GL-accelerated visualizer for Bars, Peak, and Trail effects."""
+
+    def __init__(self):
+        if GL is None:
+            raise RuntimeError("PyOpenGL not available")
+        super().__init__()
+
+        proto = SpectrumVisualizer()
+        self.themes               = proto.themes
+        self.profiles             = proto.profiles
+        self._color_from_gradient = proto._color_from_gradient
+
+        self.num_bars            = 32
+        self.theme_name          = "Aurora (Default)"
+        self.profile_name        = "Dynamic"
+        self.frequency_scale_name = _FREQ_SCALE_LINEAR
+        self.frequency_scale_names = list(_FREQ_SCALE_NAMES)
+        self.effect_mode         = 0   # 0=Bars 1=Peak 2=Trail
+
+        self._profile_cfg = self.profiles["Dynamic"]
+        self._theme_cfg   = self.themes["Aurora (Default)"]
+        self._cached_gain    = float(self._theme_cfg["height_gain"]) * float(self._profile_cfg["gain_mul"])
+        self._cached_spacing = max(0.8, float(self._theme_cfg["bar_spacing"]) * float(self._profile_cfg["spacing_mul"]))
+
+        self.target_heights       = [0.0] * 128
+        self.current_heights      = [0.0] * 128
+        self.peak_holds           = [0.0] * 128
+        self.peak_ttl             = [0]   * 128
+        self.trail_heights        = [0.0] * 128
+        self.target_left_heights  = [0.0] * 128
+        self.target_right_heights = [0.0] * 128
+        self.left_heights         = [0.0] * 128
+        self.right_heights        = [0.0] * 128
+        self.bass_level           = 0.0
+        self._bass_target         = 0.0
+        self.balance              = 0.0
+        self._balance_target      = 0.0
+
+        self._h_arr  = (ctypes.c_float * 128)(*([0.0] * 128))
+        self._ph_arr = (ctypes.c_float * 128)(*([0.0] * 128))
+        self._tr_arr = (ctypes.c_float * 128)(*([0.0] * 128))
+        self._lh_arr = (ctypes.c_float * 128)(*([0.0] * 128))
+        self._rh_arr = (ctypes.c_float * 128)(*([0.0] * 128))
+        self._c_arr  = (ctypes.c_float * 512)(*([0.0] * 512))
+
+        self._program      = None
+        self._vao          = None
+        self._vbo          = None
+        self._gl_failed    = False
+        self._color_cache  = None
+        self._color_cache_key = None
+        self._dirty_static = True
+        self._cached_w     = 0
+        self._cached_h     = 0
+
+        self._active       = False
+        self._anim_source  = None
+
+        self.set_auto_render(False)
+        self.set_hexpand(True)
+        self.set_vexpand(True)
+        self.connect("realize",   self._on_realize)
+        self.connect("unrealize", self._on_unrealize)
+        self.connect("render",    self._on_render)
+        logger.info("Visualizer backend selected: GL (Bars/Peak/Trail)")
+
+    # ------------------------------------------------------------------
+    # GL lifecycle
+    # ------------------------------------------------------------------
+
+    def _on_realize(self, _area):
+        self.make_current()
+        try:
+            self._setup_gl()
+        except Exception:
+            logger.warning("BarsGL shader setup failed", exc_info=True)
+            self._gl_failed = True
+
+    def _on_unrealize(self, _area):
+        self.make_current()
+        if self._vbo:
+            GL.glDeleteBuffers(1, [self._vbo])
+        if self._vao:
+            GL.glDeleteVertexArrays(1, [self._vao])
+        self._vbo = self._vao = self._program = None
+
+    def _setup_gl(self):
+        self._program = None
+        err = None
+        for label, vs, fs in [
+            ("330 core", _BARS_VERT_330,   _BARS_FRAG_330),
+            ("300 es",   _BARS_VERT_300ES, _BARS_FRAG_300ES),
+        ]:
+            try:
+                self._program = gl_shaders.compileProgram(
+                    gl_shaders.compileShader(vs, GL.GL_VERTEX_SHADER),
+                    gl_shaders.compileShader(fs, GL.GL_FRAGMENT_SHADER),
+                )
+                logger.info("BarsGL shader: GLSL %s", label)
+                break
+            except Exception as e:
+                err = e
+        if self._program is None:
+            raise RuntimeError(f"BarsGL shader compile failed: {err}")
+
+        p = self._program
+        self._u_num_bars     = GL.glGetUniformLocation(p, "uNumBars")
+        self._u_heights      = GL.glGetUniformLocation(p, "uHeights")
+        self._u_peak_heights = GL.glGetUniformLocation(p, "uPeakHeights")
+        self._u_trail_heights= GL.glGetUniformLocation(p, "uTrailHeights")
+        self._u_left_heights = GL.glGetUniformLocation(p, "uLeftHeights")
+        self._u_right_heights= GL.glGetUniformLocation(p, "uRightHeights")
+        self._u_colors       = GL.glGetUniformLocation(p, "uColors")
+        self._u_top_color    = GL.glGetUniformLocation(p, "uTopColor")
+        self._u_bottom_color = GL.glGetUniformLocation(p, "uBottomColor")
+        self._u_pulse_color  = GL.glGetUniformLocation(p, "uPulseColor")
+        self._u_gain         = GL.glGetUniformLocation(p, "uGain")
+        self._u_spacing      = GL.glGetUniformLocation(p, "uSpacingPx")
+        self._u_bass_level   = GL.glGetUniformLocation(p, "uBassLevel")
+        self._u_balance      = GL.glGetUniformLocation(p, "uBalance")
+        self._u_resolution   = GL.glGetUniformLocation(p, "uResolution")
+        self._u_mode         = GL.glGetUniformLocation(p, "uMode")
+
+        verts = (-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0)
+        arr   = (ctypes.c_float * 8)(*verts)
+        self._vao = GL.glGenVertexArrays(1)
+        self._vbo = GL.glGenBuffers(1)
+        GL.glBindVertexArray(self._vao)
+        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self._vbo)
+        GL.glBufferData(GL.GL_ARRAY_BUFFER, ctypes.sizeof(arr), arr, GL.GL_STATIC_DRAW)
+        GL.glEnableVertexAttribArray(0)
+        GL.glVertexAttribPointer(0, 2, GL.GL_FLOAT, GL.GL_FALSE, 0, None)
+        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, 0)
+        GL.glBindVertexArray(0)
+
+    # ------------------------------------------------------------------
+    # Render
+    # ------------------------------------------------------------------
+
+    def _get_colors(self):
+        key = (self.theme_name, self.num_bars)
+        if self._color_cache_key == key and self._color_cache is not None:
+            return
+        grad = self._theme_cfg.get("gradient", [])
+        n    = self.num_bars
+        arr  = self._c_arr
+        for i in range(n):
+            t = i / float(max(1, n - 1))
+            r, g, b, a = self._color_from_gradient(grad, t)
+            base = i * 4
+            arr[base]     = r
+            arr[base + 1] = g
+            arr[base + 2] = b
+            arr[base + 3] = a
+        for i in range(n, 128):
+            base = i * 4
+            arr[base] = arr[base+1] = arr[base+2] = arr[base+3] = 0.0
+        self._color_cache_key = key
+        self._color_cache     = True
+
+    def _on_render(self, _area, _context):
+        if self._gl_failed or self._program is None:
+            return True
+        w = int(self.get_width()  or 0)
+        h = int(self.get_height() or 0)
+        if w < 1 or h < 1:
+            return True
+        sf = int(max(1, getattr(self, "get_scale_factor", lambda: 1)() or 1))
+        pw, ph = w * sf, h * sf
+        GL.glViewport(0, 0, pw, ph)
+        GL.glClearColor(0.0, 0.0, 0.0, 1.0)
+        GL.glClear(GL.GL_COLOR_BUFFER_BIT)
+        GL.glUseProgram(self._program)
+        if self._dirty_static or pw != self._cached_w or ph != self._cached_h:
+            self._get_colors()
+            grad = self._theme_cfg.get("gradient", [])
+            tc = self._color_from_gradient(grad, 0.82)
+            bc = self._color_from_gradient(grad, 0.12)
+            pc = self._color_from_gradient(grad, 0.0)
+            GL.glUniform1i(self._u_num_bars,    self.num_bars)
+            GL.glUniform4fv(self._u_colors,     128, self._c_arr)
+            GL.glUniform4f(self._u_top_color,   *tc)
+            GL.glUniform4f(self._u_bottom_color,*bc)
+            GL.glUniform4f(self._u_pulse_color, *pc)
+            GL.glUniform1f(self._u_gain,        self._cached_gain)
+            GL.glUniform1f(self._u_spacing,     self._cached_spacing)
+            GL.glUniform2f(self._u_resolution,  float(pw), float(ph))
+            GL.glUniform1i(self._u_mode,        self.effect_mode)
+            self._cached_w     = pw
+            self._cached_h     = ph
+            self._dirty_static = False
+        self._h_arr[:128]  = self.current_heights[:128]
+        self._ph_arr[:128] = self.peak_holds[:128]
+        self._tr_arr[:128] = self.trail_heights[:128]
+        self._lh_arr[:128] = self.left_heights[:128]
+        self._rh_arr[:128] = self.right_heights[:128]
+        GL.glUniform1fv(self._u_heights,        128, self._h_arr)
+        GL.glUniform1fv(self._u_peak_heights,   128, self._ph_arr)
+        GL.glUniform1fv(self._u_trail_heights,  128, self._tr_arr)
+        GL.glUniform1fv(self._u_left_heights,   128, self._lh_arr)
+        GL.glUniform1fv(self._u_right_heights,  128, self._rh_arr)
+        GL.glUniform1f(self._u_bass_level,      self.bass_level)
+        GL.glUniform1f(self._u_balance,         self.balance)
+        GL.glBindVertexArray(self._vao)
+        GL.glDrawArrays(GL.GL_TRIANGLE_STRIP, 0, 4)
+        GL.glBindVertexArray(0)
+        return True
+
+    # ------------------------------------------------------------------
+    # Animation tick
+    # ------------------------------------------------------------------
+
+    def _on_animation_tick(self):
+        if not self._active:
+            self._anim_source = None
+            return False
+        profile = self._profile_cfg
+        smooth      = float(profile["smooth"])
+        trail_decay = float(profile["trail_decay"])
+        peak_fall   = float(profile["peak_fall"])
+        peak_hold_f = int(profile["peak_hold_frames"])
+        bass_resp   = max(0.12, min(0.62, 0.28 * float(profile["beat_mul"])))
+        changed = False
+        for i in range(self.num_bars):
+            diff = self.target_heights[i] - self.current_heights[i]
+            if abs(diff) > 0.001:
+                self.current_heights[i] += diff * smooth
+                changed = True
+            ldiff = self.target_left_heights[i] - self.left_heights[i]
+            if abs(ldiff) > 0.001:
+                self.left_heights[i] += ldiff * smooth
+                changed = True
+            rdiff = self.target_right_heights[i] - self.right_heights[i]
+            if abs(rdiff) > 0.001:
+                self.right_heights[i] += rdiff * smooth
+                changed = True
+            cur = self.current_heights[i]
+            self.trail_heights[i] = max(cur, self.trail_heights[i] * trail_decay)
+            if cur >= self.peak_holds[i]:
+                self.peak_holds[i] = cur
+                self.peak_ttl[i]   = peak_hold_f
+            else:
+                if self.peak_ttl[i] > 0:
+                    self.peak_ttl[i] -= 1
+                else:
+                    self.peak_holds[i] = max(0.0, self.peak_holds[i] - peak_fall)
+        self.bass_level += (self._bass_target - self.bass_level) * bass_resp
+        self.balance    += (self._balance_target - self.balance) * smooth
+        if changed:
+            self.queue_render()
+        return True
+
+    def set_active(self, active):
+        if self._active == active:
+            return
+        self._active = active
+        if active:
+            if self._anim_source is None:
+                self._anim_source = GLib.timeout_add(16, self._on_animation_tick)
+            self.queue_render()
+        else:
+            if self._anim_source:
+                try:
+                    GLib.source_remove(self._anim_source)
+                except Exception:
+                    pass
+            self._anim_source = None
+
+    # ------------------------------------------------------------------
+    # Data ingestion
+    # ------------------------------------------------------------------
+
+    def update_data(self, magnitudes):
+        if not magnitudes:
+            return
+        if isinstance(magnitudes, dict):
+            mono_vals  = magnitudes.get("mono") or magnitudes.get("left") or ()
+            left_vals  = magnitudes.get("left")  or mono_vals
+            right_vals = magnitudes.get("right") or mono_vals
+        else:
+            mono_vals = left_vals = right_vals = magnitudes
+        mono_vals  = list(mono_vals  or [])
+        left_vals  = list(left_vals  or [])
+        right_vals = list(right_vals or [])
+
+        def _build(vals):
+            if self.frequency_scale_name == _FREQ_SCALE_LOG:
+                return _build_log_spectrum_bins(_normalize_spectrum_magnitudes(vals), self.num_bars)
+            return _build_linear_spectrum_bins(
+                vals, self.num_bars,
+                rust_core=None,
+                analysis_bands=_LINEAR_ANALYSIS_BANDS,
+                db_min=-80.0, db_range=80.0,
+            )
+
+        new_heights  = _build(mono_vals)
+        self.target_heights[:self.num_bars] = new_heights[:self.num_bars]
+
+        lh = _build(left_vals)
+        rh = _build(right_vals)
+        self.target_left_heights[:self.num_bars]  = lh[:self.num_bars]
+        self.target_right_heights[:self.num_bars] = rh[:self.num_bars]
+
+        bass_count = max(1, min(len(new_heights), self.num_bars // 8))
+        self._bass_target = sum(new_heights[:bass_count]) / float(bass_count)
+
+        left_avg  = sum(lh) / float(max(1, len(lh))) if lh else 0.0
+        right_avg = sum(rh) / float(max(1, len(rh))) if rh else 0.0
+        total = left_avg + right_avg
+        # Amplify so small L/R differences produce visible ball movement.
+        raw = (right_avg - left_avg) / total if total > 1e-6 else 0.0
+        self._balance_target = max(-1.0, min(1.0, raw * 5.0))
+
+    # ------------------------------------------------------------------
+    # Configuration
+    # ------------------------------------------------------------------
+
+    def _update_render_cache(self):
+        self._cached_gain    = (
+            float(self._theme_cfg["height_gain"])
+            * float(self._profile_cfg["gain_mul"])
+            * _display_gain_multiplier(self.frequency_scale_name)
+        )
+        self._cached_spacing = max(0.8, float(self._theme_cfg["bar_spacing"]) * float(self._profile_cfg["spacing_mul"]))
+        self._dirty_static   = True
+
+    def set_num_bars(self, count):
+        try:
+            n = int(count)
+        except Exception:
+            return
+        if n <= 0 or n == self.num_bars:
+            return
+        self.num_bars        = min(n, 128)
+        self.target_heights  = [0.0] * 128
+        self.current_heights = [0.0] * 128
+        self.peak_holds      = [0.0] * 128
+        self.peak_ttl        = [0]   * 128
+        self.trail_heights   = [0.0] * 128
+        self._color_cache    = None
+        self._dirty_static   = True
+
+    def set_theme(self, name):
+        if name in self.themes:
+            self.theme_name   = name
+            self._theme_cfg   = self.themes[name]
+            self._color_cache = None
+            self._update_render_cache()
+
+    def set_effect(self, name):
+        mode = _BARS_GL_EFFECT_MODES.get(name, 0)
+        if mode != self.effect_mode:
+            self.effect_mode   = mode
+            self._dirty_static = True
+
+    def set_profile(self, name):
+        if name in self.profiles:
+            self.profile_name = name
+            self._profile_cfg = self.profiles[name]
+            self._update_render_cache()
+
+    def set_frequency_scale(self, name):
+        if name in self.frequency_scale_names:
+            self.frequency_scale_name = name
+            self._update_render_cache()
+
+    def get_theme_names(self):
+        return list(self.themes.keys())
+
+    def get_effect_names(self):
+        return list(_BARS_GL_EFFECT_MODES.keys())
+
+    def get_profile_names(self):
+        return list(self.profiles.keys())
+
+    def get_frequency_scale_names(self):
+        return list(self.frequency_scale_names)
+
+
+class HybridVisualizer(Gtk.Stack):
+    """
+    Combined visualizer that keeps the Cairo renderer available for the full
+    effect list while exposing the GL dots path as an extra selectable effect.
+    """
+
+    GL_EFFECT_NAME   = "Dots"
+    _CAIRO_CHILD_NAME = "cairo"
+    _GL_CHILD_NAME    = "gl"
+    _BARS_GL_CHILD_NAME = "bars_gl"
+    # Effects routed to BarsGLVisualizer
+    _BARS_GL_EFFECTS = frozenset(_BARS_GL_EFFECT_MODES.keys())
+
+    def __init__(self):
+        super().__init__()
+        self.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        self.set_hexpand(True)
+        self.set_vexpand(True)
+
+        self._cairo_viz = SpectrumVisualizer()
+        self._cairo_viz.set_hexpand(True)
+        self._cairo_viz.set_vexpand(True)
+        self.add_named(self._cairo_viz, self._CAIRO_CHILD_NAME)
+
+        self._gl_viz      = None
+        self._bars_gl_viz = None
+        self._last_frame  = None
+        self._active      = False
+        self._theme_name   = str(getattr(self._cairo_viz, "theme_name",   "Aurora (Default)") or "Aurora (Default)")
+        self._profile_name = str(getattr(self._cairo_viz, "profile_name", "Dynamic") or "Dynamic")
+        self._effect_name  = str(getattr(self._cairo_viz, "effect_name",  "Bars") or "Bars")
+        try:
+            self._num_bars = int(getattr(self._cairo_viz, "num_bars", 32) or 32)
+        except Exception:
+            self._num_bars = 32
+
+        try:
+            self._gl_viz = DotsGLVisualizer()
+            self._gl_viz.set_hexpand(True)
+            self._gl_viz.set_vexpand(True)
+            self._gl_viz.set_num_bars(self._num_bars)
+            self._gl_viz.set_theme(self._theme_name)
+            self._gl_viz.set_profile(self._profile_name)
+            self.add_named(self._gl_viz, self._GL_CHILD_NAME)
+        except Exception:
+            self._gl_viz = None
+            logger.warning("DotsGL backend unavailable", exc_info=True)
+
+        try:
+            self._bars_gl_viz = BarsGLVisualizer()
+            self._bars_gl_viz.set_hexpand(True)
+            self._bars_gl_viz.set_vexpand(True)
+            self._bars_gl_viz.set_num_bars(self._num_bars)
+            self._bars_gl_viz.set_theme(self._theme_name)
+            self._bars_gl_viz.set_profile(self._profile_name)
+            self._bars_gl_viz.set_effect(self._effect_name)
+            self.add_named(self._bars_gl_viz, self._BARS_GL_CHILD_NAME)
+            logger.info("Visualizer backend selected: hybrid (cairo + gl + bars_gl)")
+        except Exception:
+            self._bars_gl_viz = None
+            logger.warning("BarsGL backend unavailable", exc_info=True)
+
+        self.set_visible_child_name(self._CAIRO_CHILD_NAME)
+        self._sync_backend_state(seed_visible=False)
+
+    @staticmethod
+    def _copy_frame(frame):
+        if isinstance(frame, dict):
+            mono = list(frame.get("mono") or [])
+            left = list(frame.get("left") or mono)
+            right = list(frame.get("right") or mono)
+            return {"mono": mono, "left": left, "right": right}
+        return list(frame or [])
+
+    def _active_child_name(self):
+        if self._effect_name == self.GL_EFFECT_NAME and self._gl_viz is not None:
+            return self._GL_CHILD_NAME
+        if self._effect_name in self._BARS_GL_EFFECTS and self._bars_gl_viz is not None:
+            return self._BARS_GL_CHILD_NAME
+        return self._CAIRO_CHILD_NAME
+
+    def _visible_backend(self):
+        name = self._active_child_name()
+        if name == self._GL_CHILD_NAME:
+            return self._gl_viz
+        if name == self._BARS_GL_CHILD_NAME:
+            return self._bars_gl_viz
+        return self._cairo_viz
+
+    def _sync_backend_state(self, seed_visible=True):
+        child_name = self._active_child_name()
+        if self.get_visible_child_name() != child_name:
+            self.set_visible_child_name(child_name)
+
+        use_cairo   = child_name == self._CAIRO_CHILD_NAME
+        use_gl      = child_name == self._GL_CHILD_NAME
+        use_bars_gl = child_name == self._BARS_GL_CHILD_NAME
+
+        self._cairo_viz.set_active(bool(self._active and use_cairo))
+        if self._gl_viz is not None:
+            self._gl_viz.set_active(bool(self._active and use_gl))
+        if self._bars_gl_viz is not None:
+            self._bars_gl_viz.set_active(bool(self._active and use_bars_gl))
+
+        if seed_visible and self._last_frame:
+            backend = self._visible_backend()
+            if backend is not None:
+                try:
+                    backend.update_data(self._last_frame)
+                except Exception:
+                    pass
+
+    def _reseed_visible_backend(self):
+        backend = self._visible_backend()
+        if backend is None or not self._last_frame:
+            return
+        try:
+            backend.update_data(self._last_frame)
+        except Exception:
+            pass
+
+    def set_active(self, active):
+        self._active = bool(active)
+        self._sync_backend_state(seed_visible=False)
+
+    def update_data(self, magnitudes):
+        if not magnitudes:
+            return
+        frame = self._copy_frame(magnitudes)
+        self._last_frame = frame
+        backend = self._visible_backend()
+        if backend is not None:
+            backend.update_data(frame)
+
+    def set_num_bars(self, count):
+        try:
+            num_bars = int(count)
+        except Exception:
+            return
+        if num_bars <= 0:
+            return
+        self._num_bars = num_bars
+        self._cairo_viz.set_num_bars(self._num_bars)
+        if self._gl_viz is not None:
+            self._gl_viz.set_num_bars(self._num_bars)
+        if self._bars_gl_viz is not None:
+            self._bars_gl_viz.set_num_bars(self._num_bars)
+        self._reseed_visible_backend()
+
+    def set_theme(self, name):
+        theme_name = str(name or "")
+        if theme_name not in (self._cairo_viz.get_theme_names() or []):
+            return
+        self._theme_name = theme_name
+        self._cairo_viz.set_theme(self._theme_name)
+        if self._gl_viz is not None:
+            self._gl_viz.set_theme(self._theme_name)
+        if self._bars_gl_viz is not None:
+            self._bars_gl_viz.set_theme(self._theme_name)
+
+    def set_profile(self, name):
+        profile_name = str(name or "")
+        if profile_name not in (self._cairo_viz.get_profile_names() or []):
+            return
+        self._profile_name = profile_name
+        self._cairo_viz.set_profile(self._profile_name)
+        if self._gl_viz is not None:
+            self._gl_viz.set_profile(self._profile_name)
+        if self._bars_gl_viz is not None:
+            self._bars_gl_viz.set_profile(self._profile_name)
+
+    def set_frequency_scale(self, name):
+        scale_name = str(name or "")
+        if scale_name not in (self._cairo_viz.get_frequency_scale_names() or []):
+            return
+        self._cairo_viz.set_frequency_scale(scale_name)
+        if self._gl_viz is not None:
+            self._gl_viz.set_frequency_scale(scale_name)
+        if self._bars_gl_viz is not None:
+            self._bars_gl_viz.set_frequency_scale(scale_name)
+        self._reseed_visible_backend()
+
+    def set_effect(self, effect_name):
+        effect_name = str(effect_name or "")
+        if effect_name == self.GL_EFFECT_NAME and self._gl_viz is not None:
+            self._effect_name = self.GL_EFFECT_NAME
+            self._sync_backend_state(seed_visible=True)
+            return
+
+        if effect_name in self._BARS_GL_EFFECTS and self._bars_gl_viz is not None:
+            self._effect_name = effect_name
+            self._bars_gl_viz.set_effect(effect_name)
+            self._sync_backend_state(seed_visible=True)
+            return
+
+        cairo_effects = self._cairo_viz.get_effect_names() or []
+        mapped_name = {
+            "Pro Bars": "Bars",
+            "Pro Line": "Wave",
+            "Pro Fall": "Fall",
+        }.get(effect_name, effect_name)
+        if mapped_name in cairo_effects:
+            self._effect_name = mapped_name
+            self._cairo_viz.set_effect(mapped_name)
+            self._sync_backend_state(seed_visible=True)
+
+    def get_theme_names(self):
+        return list(self._cairo_viz.get_theme_names() or [])
+
+    def get_effect_names(self):
+        names = list(self._cairo_viz.get_effect_names() or [])
+        # Remove Cairo duplicates for GL-backed effects (Bars/Peak/Trail/Mirror/Wave/Fill + Dots)
+        if self._bars_gl_viz is not None:
+            names = [n for n in names if n not in self._BARS_GL_EFFECTS]
+            names = list(_BARS_GL_EFFECT_MODES.keys()) + names
+        if self._gl_viz is not None:
+            names = [n for n in names if n != self.GL_EFFECT_NAME]
+            names.append(self.GL_EFFECT_NAME)
+        return sorted(names)
+
+    def get_profile_names(self):
+        return list(self._cairo_viz.get_profile_names() or [])
+
+    def get_frequency_scale_names(self):
+        return list(self._cairo_viz.get_frequency_scale_names() or [])

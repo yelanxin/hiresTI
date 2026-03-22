@@ -53,14 +53,14 @@
 use std::collections::VecDeque;
 use std::sync::OnceLock;
 use std::sync::{
-    Arc, Mutex,
     atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering},
+    Arc, Mutex,
 };
 
-use gstreamer as gst;
 use gst::glib;
 use gst::prelude::*;
 use gst::subclass::prelude::*;
+use gstreamer as gst;
 
 // ---------------------------------------------------------------------------
 // Clock mode
@@ -89,7 +89,7 @@ pub enum ClockMode {
 ///
 /// The window slides: once full, the oldest point is evicted and the running
 /// sums are updated in O(1).
-const CALIBRATOR_WINDOW: usize = 128;   // ~1 s at 8 ms/callback
+const CALIBRATOR_WINDOW: usize = 128; // ~1 s at 8 ms/callback
 const CALIBRATOR_MIN_POINTS: usize = 32; // ~256 ms warm-up
 
 #[derive(Debug)]
@@ -101,8 +101,8 @@ struct RateCalibrator {
     base_frames: u64,
     // Running sums for O(1) regression updates.
     n: f64,
-    sum_x:  f64, // Σ(ts − base_ns)
-    sum_y:  f64, // Σ(frames − base_frames)
+    sum_x: f64,  // Σ(ts − base_ns)
+    sum_y: f64,  // Σ(frames − base_frames)
     sum_xx: f64, // Σ(ts − base_ns)²
     sum_xy: f64, // Σ(ts − base_ns) × (frames − base_frames)
 }
@@ -131,29 +131,29 @@ impl RateCalibrator {
     fn push(&mut self, ts_ns: u64, cum_frames: u64) {
         // Set base on first point.
         if self.window.is_empty() {
-            self.base_ns     = ts_ns;
+            self.base_ns = ts_ns;
             self.base_frames = cum_frames;
         }
 
-        let x = (ts_ns     - self.base_ns)     as f64;
+        let x = (ts_ns - self.base_ns) as f64;
         let y = (cum_frames - self.base_frames) as f64;
 
         // Evict oldest point if window is full.
         if self.window.len() >= CALIBRATOR_WINDOW {
             let (old_ts, old_frames) = self.window.pop_front().unwrap();
-            let ox = (old_ts     - self.base_ns)     as f64;
+            let ox = (old_ts - self.base_ns) as f64;
             let oy = (old_frames - self.base_frames) as f64;
-            self.n     -= 1.0;
-            self.sum_x  -= ox;
-            self.sum_y  -= oy;
+            self.n -= 1.0;
+            self.sum_x -= ox;
+            self.sum_y -= oy;
             self.sum_xx -= ox * ox;
             self.sum_xy -= ox * oy;
         }
 
         self.window.push_back((ts_ns, cum_frames));
-        self.n     += 1.0;
-        self.sum_x  += x;
-        self.sum_y  += y;
+        self.n += 1.0;
+        self.sum_x += x;
+        self.sum_y += y;
         self.sum_xx += x * x;
         self.sum_xy += x * y;
     }
@@ -194,13 +194,13 @@ impl RateCalibrator {
 pub struct AlsaHwClockFeed {
     // ── Push clock fields ───────────────────────────────────────────────────
     /// `CLOCK_MONOTONIC` nanoseconds at the start of playback (first commit).
-    anchor_ns:    AtomicU64,
+    anchor_ns: AtomicU64,
     /// Total PCM frames committed since the anchor was set.
     total_frames: AtomicU64,
     /// Negotiated sample rate (frames per second).
-    rate:         AtomicU32,
+    rate: AtomicU32,
     /// True once `anchor()` has been called and the feed is ready.
-    valid:        AtomicBool,
+    valid: AtomicBool,
 
     // ── Pull clock fields ────────────────────────────────────────────────────
     /// Active clock mode (0 = Push, 1 = Pull).
@@ -216,6 +216,11 @@ pub struct AlsaHwClockFeed {
     pull_ns_per_frame_fp32: AtomicU64,
     /// True once the calibrator has published its first result.
     pull_ready: AtomicBool,
+    /// Calibrated nanoseconds-per-frame × 2³² (fixed-point), always updated
+    /// regardless of clock mode.  Used by RateAdapter to correct for device
+    /// crystal offset on SOF-synchronized devices that don't send UAC2 feedback.
+    /// Zero means "not calibrated yet".  Valid in both Pull and Push modes.
+    device_rate_fp32: AtomicU64,
     /// Rate calibrator — updated by the ISO OUT callback thread.
     calibrator: Mutex<RateCalibrator>,
 }
@@ -223,17 +228,18 @@ pub struct AlsaHwClockFeed {
 impl Default for AlsaHwClockFeed {
     fn default() -> Self {
         Self {
-            anchor_ns:              AtomicU64::new(0),
-            total_frames:           AtomicU64::new(0),
-            rate:                   AtomicU32::new(0),
-            valid:                  AtomicBool::new(false),
-            mode:                   AtomicU8::new(ClockMode::Push as u8),
-            buffer_depth_ns:        AtomicU64::new(128_000_000), // 128 ms fallback
-            pull_anchor_ns:         AtomicU64::new(0),
-            pull_anchor_frames:     AtomicU64::new(0),
+            anchor_ns: AtomicU64::new(0),
+            total_frames: AtomicU64::new(0),
+            rate: AtomicU32::new(0),
+            valid: AtomicBool::new(false),
+            mode: AtomicU8::new(ClockMode::Push as u8),
+            buffer_depth_ns: AtomicU64::new(128_000_000), // 128 ms fallback
+            pull_anchor_ns: AtomicU64::new(0),
+            pull_anchor_frames: AtomicU64::new(0),
             pull_ns_per_frame_fp32: AtomicU64::new(0),
-            pull_ready:             AtomicBool::new(false),
-            calibrator:             Mutex::new(RateCalibrator::default()),
+            pull_ready: AtomicBool::new(false),
+            device_rate_fp32: AtomicU64::new(0),
+            calibrator: Mutex::new(RateCalibrator::default()),
         }
     }
 }
@@ -255,6 +261,7 @@ impl AlsaHwClockFeed {
         self.pull_anchor_ns.store(0, Ordering::Relaxed);
         self.pull_anchor_frames.store(0, Ordering::Relaxed);
         self.pull_ns_per_frame_fp32.store(0, Ordering::Relaxed);
+        self.device_rate_fp32.store(0, Ordering::Relaxed);
         if let Ok(mut cal) = self.calibrator.try_lock() {
             cal.reset();
         }
@@ -286,6 +293,15 @@ impl AlsaHwClockFeed {
     ///
     /// Switching **into** [`ClockMode::Push`] takes effect immediately; the
     /// push formula needs no warm-up.
+    /// Current clock mode.
+    pub fn mode(&self) -> ClockMode {
+        if self.mode.load(Ordering::Relaxed) == ClockMode::Pull as u8 {
+            ClockMode::Pull
+        } else {
+            ClockMode::Push
+        }
+    }
+
     pub fn set_mode(&self, mode: ClockMode) {
         let old_raw = self.mode.swap(mode as u8, Ordering::Relaxed);
         if mode == ClockMode::Pull && old_raw != ClockMode::Pull as u8 {
@@ -310,17 +326,25 @@ impl AlsaHwClockFeed {
     /// Record one ISO OUT transfer completion for rate calibration.
     ///
     /// Called from the libusb event thread (inside `iso_out_callback`) once
-    /// per transfer completion (~125 Hz for 8 ms transfers).  Has no effect
-    /// in [`ClockMode::Push`].
+    /// per transfer completion (~125 Hz for 8 ms transfers).
+    ///
+    /// Always calibrates the device crystal rate (stored in `device_rate_fp32`)
+    /// so the RateAdapter can correct for SOF-synchronized devices in both Pull
+    /// and Push clock modes.  Pull clock anchor/formula updates are gated on
+    /// Pull mode being active.
     pub fn record_iso(&self, ts_ns: u64) {
-        if self.mode.load(Ordering::Relaxed) != ClockMode::Pull as u8 {
-            return;
-        }
+        let in_pull_mode = self.mode.load(Ordering::Relaxed) == ClockMode::Pull as u8;
         let cum_frames = self.total_frames.load(Ordering::Relaxed);
         let mut cal = self.calibrator.lock().unwrap_or_else(|e| e.into_inner());
         cal.push(ts_ns, cum_frames);
         let fp32 = cal.ns_per_frame_fp32();
         if fp32 > 0 {
+            // Always publish for RateAdapter use (both Pull and Push modes).
+            self.device_rate_fp32.store(fp32, Ordering::Relaxed);
+
+            if !in_pull_mode {
+                return;
+            }
             let was_ready = self.pull_ready.load(Ordering::Relaxed);
 
             // Publish anchor from the latest window point.
@@ -337,22 +361,31 @@ impl AlsaHwClockFeed {
             // All stores must complete BEFORE pull_ready is released so the
             // reader thread never sees a stale pull_anchor_ns.
             if let Some(&(anchor_ts, anchor_frames)) = cal.window.back() {
-                let final_anchor_ns = if !was_ready {
-                    let rate = self.rate.load(Ordering::Relaxed) as u64;
-                    if rate > 0 {
-                        let push_base    = self.anchor_ns.load(Ordering::Relaxed);
-                        let buffer_depth = self.buffer_depth_ns.load(Ordering::Relaxed);
-                        let push_now     = push_base
-                            .saturating_add(anchor_frames.saturating_mul(1_000_000_000) / rate);
-                        push_now.saturating_add(buffer_depth)
-                    } else {
-                        anchor_ts
-                    }
+                // On first activation: compute a seamless anchor so the pull clock
+        // is continuous with the push clock (no backwards jump).
+        // On subsequent calls: anchor is NEVER updated — only ns_per_frame
+        // changes.  This eliminates the triple-atomic race where GStreamer
+        // could read a mismatched (new anchor_ns, old anchor_frames) pair
+        // and compute a clock value that jumps by ~8 ms.
+        if !was_ready {
+            let final_anchor_ns = {
+                let rate = self.rate.load(Ordering::Relaxed) as u64;
+                if rate > 0 {
+                    let push_base = self.anchor_ns.load(Ordering::Relaxed);
+                    let buffer_depth = self.buffer_depth_ns.load(Ordering::Relaxed);
+                    let push_now = push_base
+                        .saturating_add(anchor_frames.saturating_mul(1_000_000_000) / rate);
+                    push_now.saturating_add(buffer_depth)
                 } else {
                     anchor_ts
-                };
-                self.pull_anchor_ns.store(final_anchor_ns, Ordering::Relaxed);
-                self.pull_anchor_frames.store(anchor_frames, Ordering::Relaxed);
+                }
+            };
+            self.pull_anchor_ns
+                .store(final_anchor_ns, Ordering::Relaxed);
+            self.pull_anchor_frames
+                .store(anchor_frames, Ordering::Relaxed);
+        }
+        // (else: anchor_ns and anchor_frames stay fixed forever)
             }
             self.pull_ns_per_frame_fp32.store(fp32, Ordering::Relaxed);
             // Release fence: all stores above become visible before pull_ready.
@@ -362,7 +395,8 @@ impl AlsaHwClockFeed {
                 let ns_per_frame = fp32 as f64 / (1u64 << 32) as f64;
                 let calibrated_rate = 1_000_000_000.0 / ns_per_frame;
                 let nominal_rate = self.rate.load(Ordering::Relaxed);
-                let ppm = (calibrated_rate - nominal_rate as f64) / nominal_rate as f64 * 1_000_000.0;
+                let ppm =
+                    (calibrated_rate - nominal_rate as f64) / nominal_rate as f64 * 1_000_000.0;
                 let buffer_ms = self.buffer_depth_ns.load(Ordering::Relaxed) / 1_000_000;
                 eprintln!(
                     "pull-clock: ACTIVE calibrated_rate={:.3} Hz nominal={} ppm={:+.1} buffer_depth={}ms n_points={}",
@@ -370,6 +404,24 @@ impl AlsaHwClockFeed {
                 );
             }
         }
+    }
+
+    /// Calibrated device sample rate in Hz, derived from ISO OUT timestamps.
+    ///
+    /// Valid in both Pull and Push clock modes once enough ISO completions have
+    /// been recorded (~1 second).  Returns `None` until calibration converges.
+    ///
+    /// Used by `RateAdapter` to correct for SOF-synchronized devices whose
+    /// crystal runs slightly faster or slower than the nominal rate.  Without
+    /// this correction the device FIFO drifts at a rate equal to the crystal
+    /// offset (typically 1–5 samples/second), causing a glitch after ~2 minutes.
+    pub fn calibrated_rate_hz(&self) -> Option<f64> {
+        let fp32 = self.device_rate_fp32.load(Ordering::Relaxed);
+        if fp32 == 0 {
+            return None;
+        }
+        let ns_per_frame = fp32 as f64 / (1u64 << 32) as f64;
+        Some(1_000_000_000.0 / ns_per_frame)
     }
 
     // ── Shared read path ─────────────────────────────────────────────────────
@@ -387,24 +439,23 @@ impl AlsaHwClockFeed {
         if self.mode.load(Ordering::Relaxed) == ClockMode::Pull as u8
             && self.pull_ready.load(Ordering::Acquire)
         {
-            let anchor_ns     = self.pull_anchor_ns.load(Ordering::Relaxed);
+            let anchor_ns = self.pull_anchor_ns.load(Ordering::Relaxed);
             let anchor_frames = self.pull_anchor_frames.load(Ordering::Relaxed);
-            let total_frames  = self.total_frames.load(Ordering::Relaxed);
-            let ns_per_fp32   = self.pull_ns_per_frame_fp32.load(Ordering::Relaxed);
-            let buffer_depth  = self.buffer_depth_ns.load(Ordering::Relaxed);
+            let total_frames = self.total_frames.load(Ordering::Relaxed);
+            let ns_per_fp32 = self.pull_ns_per_frame_fp32.load(Ordering::Relaxed);
+            let buffer_depth = self.buffer_depth_ns.load(Ordering::Relaxed);
 
             let elapsed_frames = total_frames.saturating_sub(anchor_frames);
             // Fixed-point multiply: (frames × ns_per_frame_fp32) >> 32
-            let elapsed_ns =
-                ((elapsed_frames as u128 * ns_per_fp32 as u128) >> 32) as u64;
+            let elapsed_ns = ((elapsed_frames as u128 * ns_per_fp32 as u128) >> 32) as u64;
             let write_ns = anchor_ns.saturating_add(elapsed_ns);
             return Some(write_ns.saturating_sub(buffer_depth));
         }
 
         // ── Push mode (default / pull warm-up fallback) ────────────────────
-        let anchor_ns    = self.anchor_ns.load(Ordering::Relaxed);
+        let anchor_ns = self.anchor_ns.load(Ordering::Relaxed);
         let total_frames = self.total_frames.load(Ordering::Relaxed);
-        let rate         = self.rate.load(Ordering::Relaxed) as u64;
+        let rate = self.rate.load(Ordering::Relaxed) as u64;
         if rate == 0 {
             return None;
         }

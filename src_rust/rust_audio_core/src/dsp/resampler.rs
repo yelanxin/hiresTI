@@ -86,7 +86,11 @@ impl ResamplerNode {
         bin.add_pad(&ghost_src)
             .map_err(|_| "failed to add resampler ghost src".to_string())?;
 
-        Ok(Self { bin, resample, capsfilter })
+        Ok(Self {
+            bin,
+            resample,
+            capsfilter,
+        })
     }
 
     pub fn element(&self) -> &gst::Element {

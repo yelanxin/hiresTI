@@ -14,8 +14,8 @@ use super::control::{
     get_cur_sample_rate_uac2, query_sample_rates_uac2, set_sample_rate_uac1, set_sample_rate_uac2,
 };
 use super::descriptor::{
-    detect_uac_version, parse_clock_id_from_ac, parse_stream_alt, EpInfo, UacStreamAlt,
-    UacVersion, USB_CLASS_AUDIO, USB_SUBCLASS_AUDIO_CONTROL, USB_SUBCLASS_AUDIO_STREAMING,
+    detect_uac_version, parse_clock_id_from_ac, parse_stream_alt, EpInfo, UacStreamAlt, UacVersion,
+    USB_CLASS_AUDIO, USB_SUBCLASS_AUDIO_CONTROL, USB_SUBCLASS_AUDIO_STREAMING,
 };
 
 // ---------------------------------------------------------------------------
@@ -187,7 +187,10 @@ fn try_parse_device<T: UsbContext>(device: &Device<T>) -> Option<UsbAudioDevice>
 
     let (name, serial) = read_string_descs(device, &dev_desc);
 
-    let is_high_speed = matches!(device.speed(), Speed::High | Speed::Super | Speed::SuperPlus);
+    let is_high_speed = matches!(
+        device.speed(),
+        Speed::High | Speed::Super | Speed::SuperPlus
+    );
 
     Some(UsbAudioDevice {
         vendor_id: dev_desc.vendor_id(),
@@ -213,8 +216,7 @@ fn read_string_descs<T: UsbContext>(
     device: &Device<T>,
     dev_desc: &rusb::DeviceDescriptor,
 ) -> (String, Option<String>) {
-    let fallback_name =
-        format!("{:04x}:{:04x}", dev_desc.vendor_id(), dev_desc.product_id());
+    let fallback_name = format!("{:04x}:{:04x}", dev_desc.vendor_id(), dev_desc.product_id());
 
     let handle = match device.open() {
         Ok(h) => h,
@@ -251,12 +253,11 @@ fn read_string_descs<T: UsbContext>(
 /// are currently active.  Constructed via [`OpenUsbDevice::open`] and
 /// configured via [`OpenUsbDevice::configure`].
 ///
-/// Drop is handled entirely by rusb's `DeviceHandle::drop()`, which calls
-/// `libusb_release_interface()` for every interface tracked in
-/// `DeviceHandle::interfaces`.  With `set_auto_detach_kernel_driver(true)`,
-/// the Linux backend's `op_release_interface()` automatically calls
-/// `op_attach_kernel_driver()` for each released interface, re-attaching
-/// `snd-usb-audio` and restoring ALSA visibility — no manual Drop needed.
+/// On drop, the streaming interface is explicitly reset to alt-setting 0
+/// (zero-bandwidth) before the interfaces are released.  This is required
+/// for `snd-usb-audio` to re-attach cleanly: if the interface is left in a
+/// non-zero alt-setting with an active isochronous endpoint, some devices
+/// refuse the kernel driver probe and never re-appear in ALSA.
 pub struct OpenUsbDevice {
     pub handle: DeviceHandle<Context>,
     pub dev: UsbAudioDevice,
@@ -264,6 +265,35 @@ pub struct OpenUsbDevice {
     pub active_alt: Option<UacStreamAlt>,
     /// Currently configured sample rate.
     pub active_rate: u32,
+}
+
+impl Drop for OpenUsbDevice {
+    fn drop(&mut self) {
+        let si = self.dev.stream_iface;
+        let ci = self.dev.ctrl_iface;
+
+        // Reset the streaming interface to alt-setting 0 (zero-bandwidth)
+        // BEFORE releasing it.  snd-usb-audio expects alt 0 when it probes the
+        // device on re-attach; leaving an active ISO alt causes its probe to fail
+        // on many DACs, preventing the ALSA device from appearing.
+        let _ = self.handle.set_alternate_setting(si, 0);
+
+        // Explicitly release interfaces before the handle closes.
+        // With set_auto_detach_kernel_driver(true) already set in configure(),
+        // release_interface() automatically calls attach_kernel_driver() inside
+        // libusb's Linux backend — no explicit attach_kernel_driver() call needed
+        // (calling it again after release would double-attach and trigger repeated
+        // snd-usb-audio probe/remove udev events).
+        let _ = self.handle.release_interface(si);
+        if self.dev.uac_version == UacVersion::V2 && ci != si {
+            let _ = self.handle.release_interface(ci);
+        }
+
+        eprintln!(
+            "usb-audio: OpenUsbDevice drop — alt reset to 0, interfaces released (si={} ci={})",
+            si, ci
+        );
+    }
 }
 
 impl OpenUsbDevice {
@@ -365,7 +395,10 @@ impl OpenUsbDevice {
         // Set sample rate
         match self.dev.uac_version {
             UacVersion::V1 => {
-                eprintln!("usb-audio: UAC1 SET_CUR rate={} ep=0x{:02x}", rate, alt.out_ep);
+                eprintln!(
+                    "usb-audio: UAC1 SET_CUR rate={} ep=0x{:02x}",
+                    rate, alt.out_ep
+                );
                 set_sample_rate_uac1(&self.handle, alt.out_ep, rate)?;
                 eprintln!("usb-audio: UAC1 SET_CUR OK");
             }
@@ -445,6 +478,30 @@ impl OpenUsbDevice {
                             return Ok(());
                         }
 
+                        // PLL clock-domain switch can take 50–200 ms on some DACs
+                        // (e.g. NXP/Freescale-class USB audio when PipeWire last
+                        // used the device at 48 kHz and we are requesting 44.1 kHz
+                        // or vice-versa).  Try once more with a longer settle window
+                        // before reading GET_CUR / falling through to the probe path.
+                        eprintln!(
+                            "usb-audio: UAC2 long-delay retry for rate={} (PLL settle)",
+                            chosen_rate
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(150));
+                        if set_sample_rate_uac2(&self.handle, ci, clock_id, chosen_rate).is_ok() {
+                            let verified =
+                                get_cur_sample_rate_uac2(&self.handle, ci, clock_id)
+                                    .filter(|&r| r >= 8_000 && r <= 768_000)
+                                    .unwrap_or(chosen_rate);
+                            eprintln!(
+                                "usb-audio: UAC2 long-delay retry OK → verified={}",
+                                verified
+                            );
+                            self.active_alt = Some(alt.clone());
+                            self.active_rate = verified;
+                            return Ok(());
+                        }
+
                         // GET_CUR — device may have a fixed clock.
                         let cur = get_cur_sample_rate_uac2(&self.handle, ci, clock_id);
                         eprintln!("usb-audio: UAC2 GET_CUR={:?}", cur);
@@ -458,8 +515,7 @@ impl OpenUsbDevice {
                         // GET_RANGE was empty and GET_CUR failed — device may
                         // accept SET_CUR only at specific rates.  Probe common
                         // audio rates (STALL responses are immediate, ~0 ms).
-                        const PROBE: &[u32] =
-                            &[44_100, 48_000, 88_200, 96_000, 176_400, 192_000];
+                        const PROBE: &[u32] = &[44_100, 48_000, 88_200, 96_000, 176_400, 192_000];
                         if supported.is_empty() {
                             for &r in PROBE {
                                 if r == chosen_rate {
@@ -479,9 +535,14 @@ impl OpenUsbDevice {
                         // devices report UAC 2.0 descriptors but implement rate
                         // control via the UAC 1.0 mechanism (SET_CUR to the ISO
                         // OUT endpoint).  Try that as a last resort.
-                        eprintln!("usb-audio: UAC2 clock control failed, trying UAC1 endpoint fallback");
+                        eprintln!(
+                            "usb-audio: UAC2 clock control failed, trying UAC1 endpoint fallback"
+                        );
                         for &r in PROBE {
-                            eprintln!("usb-audio: UAC1-fallback probing rate={} ep=0x{:02x}", r, alt.out_ep);
+                            eprintln!(
+                                "usb-audio: UAC1-fallback probing rate={} ep=0x{:02x}",
+                                r, alt.out_ep
+                            );
                             if set_sample_rate_uac1(&self.handle, alt.out_ep, r).is_ok() {
                                 eprintln!("usb-audio: UAC1-fallback OK → rate={}", r);
                                 self.active_alt = Some(alt.clone());
@@ -513,9 +574,7 @@ impl OpenUsbDevice {
             return Vec::new();
         }
         match self.dev.clock_id {
-            Some(clock_id) => {
-                query_sample_rates_uac2(&self.handle, self.dev.ctrl_iface, clock_id)
-            }
+            Some(clock_id) => query_sample_rates_uac2(&self.handle, self.dev.ctrl_iface, clock_id),
             None => Vec::new(),
         }
     }

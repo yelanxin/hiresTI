@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.8.0 - 2026-03-22
+
+### Added
+- **USB Raw-Link output driver**: Direct userspace USB Audio Class playback via libusb isochronous transfers, bypassing the kernel `snd-usb-audio` driver. Supports UAC 1.0/2.0, High-Speed and Full-Speed devices, S16LE/S24_3LE/S24LE/S32LE/F32LE sample formats, and DSD over PCM (DoP) for DSD64/DSD128 streams.
+- **Adaptive drift correction** for USB devices without a feedback endpoint (e.g. FiiO KA13): automatically detects device FIFO underflow via USB packet error monitoring and applies a parts-per-billion rate correction with hysteresis (≥ 2 errors in a 1-second window before bumping), preventing the ~143-second periodic glitch caused by host/device crystal mismatch.
+- **Xrun recovery fade-in**: after a FrameQueue underrun, the first ~2 ms of recovered audio is linearly ramped from silence to full scale, eliminating the hard silence→audio click on recovery.
+- **FrameQueue frame-alignment validation**: `debug_assert` on push to catch non-frame-aligned buffers from GStreamer early (active in debug builds only).
+- **Network buffering diagnostics**: GStreamer `Buffering` bus messages are now logged (`usb-audio: network buffering XX%`), and `pull timeout` logs include `appsink` state for easier root-cause analysis of pipeline stalls.
+- **Enhanced per-second diagnostics**: USB rawlink status line now includes drift correction (ppb), calibrated USB clock rate (Hz), clock mode (Push/Pull), and queue minimum water-level timestamp.
+- **AlsaHwClock mode getter**: `AlsaHwClockFeed::mode()` exposed for diagnostics.
+
+### Changed
+- **Increased GStreamer playbin internal buffer** to 10 seconds / 4 MiB for streaming sources (Tidal), reducing decoder starvation and xruns caused by transient network latency.
+
+### Fixed
+- **USB Audio**: UAC2 clock source selection now issues SET_CUR to the correct Clock Source entity, fixing devices that default to an unsupported sample rate.
+- **USB Audio**: ISO OUT packet layout uses tight packing (cumulative actual lengths) instead of stride=max_packet, fixing continuous crackling on devices where packet size varies per-frame.
+- **USB Audio**: `subframe_size` from the USB descriptor is now used for wire byte count (S24_3LE → 3 bytes, not 4), preventing sample corruption on 24-bit packed devices.
+- **USB Audio**: Device disconnect is now detected reliably (LIBUSB_TRANSFER_NO_DEVICE + submit failure) and propagated to the engine as an error event.
+
 ## 1.7.5 - 2026-03-17
 
 ### Added

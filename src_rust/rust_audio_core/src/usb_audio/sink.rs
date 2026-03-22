@@ -33,9 +33,8 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use libusb1_sys::{
-    libusb_alloc_transfer, libusb_cancel_transfer, libusb_device_handle,
-    libusb_fill_iso_transfer, libusb_free_transfer, libusb_set_iso_packet_lengths,
-    libusb_submit_transfer, libusb_transfer,
+    libusb_alloc_transfer, libusb_cancel_transfer, libusb_device_handle, libusb_fill_iso_transfer,
+    libusb_free_transfer, libusb_set_iso_packet_lengths, libusb_submit_transfer, libusb_transfer,
 };
 
 use rusb::UsbContext as _;
@@ -107,11 +106,7 @@ impl UsbAudioSink {
     /// Returns `(Self, AlsaHwClock)`.  Pass the clock to
     /// `pipeline.use_clock(Some(&clock))` so GStreamer paces the pipeline with
     /// the USB frame counter.
-    pub fn open(
-        device_id: &str,
-        rate: u32,
-        bit_depth: u8,
-    ) -> Result<(Self, AlsaHwClock), String> {
+    pub fn open(device_id: &str, rate: u32, bit_depth: u8) -> Result<(Self, AlsaHwClock), String> {
         // 1. Enumerate to find the requested device.
         let dev = find_device_by_id(device_id)
             .ok_or_else(|| format!("USB audio device '{}' not found", device_id))?;
@@ -159,6 +154,7 @@ impl UsbAudioSink {
         } else {
             (alt.bit_depth as usize + 7) / 8
         };
+        queue.set_frame_bytes(alt.channels as usize * bytes_per_sample);
         let packets_per_sec = iso_packets_per_sec(dev.is_high_speed, alt.out_ep_interval);
         let state = RingState::new(
             Arc::clone(&queue),
@@ -220,11 +216,16 @@ impl UsbAudioSink {
     /// buffer from the appsink).
     ///
     /// The feed is anchored inside this call at the actual negotiated rate.
+    ///
+    /// `prefill` (when provided) is pushed into the queue before the ISO ring
+    /// is started so the first submitted transfers can carry real audio rather
+    /// than startup silence.
     pub fn open_with_feed(
         device_id: &str,
         rate: u32,
         bit_depth: u8,
         feed: Arc<AlsaHwClockFeed>,
+        prefill: Option<&[u8]>,
     ) -> Result<Self, String> {
         // 1. Find device.
         let dev = find_device_by_id(device_id)
@@ -232,6 +233,17 @@ impl UsbAudioSink {
 
         // 2. Frame queue.
         let queue = FrameQueue::new();
+
+        if let Some(data) = prefill.filter(|data| !data.is_empty()) {
+            let written = queue.push(data);
+            if written < data.len() {
+                eprintln!(
+                    "usb-audio: startup prefill truncated {} -> {} bytes",
+                    data.len(),
+                    written
+                );
+            }
+        }
 
         // 3. Open device handle and configure.
         let mut open_dev = OpenUsbDevice::open(&dev)?;
@@ -264,6 +276,7 @@ impl UsbAudioSink {
         } else {
             (alt.bit_depth as usize + 7) / 8
         };
+        queue.set_frame_bytes(alt.channels as usize * bytes_per_sample);
         let packets_per_sec = iso_packets_per_sec(dev.is_high_speed, alt.out_ep_interval);
         let state = RingState::new(
             Arc::clone(&queue),
@@ -357,7 +370,10 @@ fn find_device_by_id(device_id: &str) -> Option<UsbAudioDevice> {
 
 /// Read `CLOCK_MONOTONIC` as nanoseconds via libc.
 fn clock_monotonic_ns() -> u64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     // SAFETY: valid pointer, valid clock ID.
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
@@ -370,50 +386,122 @@ fn clock_monotonic_ns() -> u64 {
 /// Context stored as `user_data` in the feedback libusb transfer.
 ///
 /// Boxed and kept alive by `FeedbackReader::_ctx` for the transfer lifetime.
+///
+/// `ema` holds the exponential moving average of feedback millisamples.
+/// It is only ever read/written from the libusb event thread (the single
+/// thread that calls `feedback_in_callback`), so no locking is needed.
 struct FeedbackCtx {
     state: Arc<RingState>,
     uac_version: UacVersion,
+    /// EMA accumulator for feedback smoothing (α = 1/16).
+    /// `None` until the first feedback packet arrives.
+    ema: Option<i64>,
+}
+
+/// Mark feedback tracking as stopped.
+///
+/// When `device_gone` is true, also publish the same fatal-disconnect state the
+/// ISO OUT ring uses so the pusher thread can surface the error.
+fn stop_feedback_tracking(state: &RingState, device_gone: bool) {
+    state.feedback_in_flight.store(false, Ordering::Release);
+    if device_gone {
+        state.error.store(true, Ordering::Release);
+        state.stop.store(true, Ordering::Release);
+    }
+}
+
+/// Handle a feedback transfer resubmit failure.
+///
+/// No future callback will arrive after a failed resubmit, so the in-flight
+/// flag must be cleared here or `IsoTransferRing::stop()` may wait forever.
+fn handle_feedback_resubmit_failure(state: &RingState, rc: c_int) {
+    let no_device = rc == libusb1_sys::constants::LIBUSB_ERROR_NO_DEVICE;
+    eprintln!(
+        "usb-audio: feedback resubmit failed rc={}{}",
+        rc,
+        if no_device {
+            " (device disconnected)"
+        } else {
+            ""
+        }
+    );
+    stop_feedback_tracking(state, no_device);
 }
 
 /// libusb ISO IN completion callback for the feedback endpoint.
 ///
-/// Parses the feedback value and updates `RingState::feedback_ms`, then
-/// resubmits the transfer unless `state.stop` is set.
+/// Parses the feedback value, applies a 1/16 EMA to smooth quantisation
+/// noise from the device's fixed-point feedback format, and updates
+/// `RingState::feedback_ms`.  Then resubmits unless `state.stop` is set.
+///
+/// # EMA smoothing
+///
+/// Raw feedback packets carry a Q16.16 (UAC 2.0) or Q10.14 (UAC 1.0)
+/// fixed-point value.  Each quantisation step causes an immediate step in
+/// the per-packet sample count which the listener can perceive as high-
+/// frequency jitter ("hardness").  An exponential moving average with
+/// α = 1/16 attenuates steps while still tracking slow crystal drift:
+///
+/// ```text
+/// ema_new = ema_old + (raw - ema_old) / 16
+/// ```
+///
+/// Time constant ≈ 16 × feedback_interval.  For a typical 8 ms feedback
+/// period this is ~128 ms — fast enough to follow ppm-level drift,
+/// slow enough to suppress packet-to-packet jitter.
 extern "system" fn feedback_in_callback(transfer: *mut libusb_transfer) {
-    // SAFETY: user_data == &FeedbackCtx; valid while FeedbackReader alive.
-    let ctx = unsafe { &*((*transfer).user_data as *const FeedbackCtx) };
+    // SAFETY: user_data == &mut FeedbackCtx; valid while FeedbackReader alive.
+    // The callback is only ever invoked from the single libusb event thread,
+    // so mutable access to `ctx.ema` is safe without additional locking.
+    let ctx = unsafe { &mut *((*transfer).user_data as *mut FeedbackCtx) };
 
     if ctx.state.stop.load(Ordering::Acquire) {
-        // Stop requested — do not resubmit.  Clear the in-flight flag so the
-        // event thread's exit condition (`!feedback_in_flight`) can be met.
-        ctx.state.feedback_in_flight.store(false, Ordering::Release);
+        // Stop requested — do not resubmit.
+        stop_feedback_tracking(&ctx.state, false);
         return;
     }
 
     let status = unsafe { (*transfer).status };
     if status != libusb1_sys::constants::LIBUSB_TRANSFER_COMPLETED {
         // Non-recoverable status (CANCELLED, NO_DEVICE, etc.) — stop tracking.
-        ctx.state.feedback_in_flight.store(false, Ordering::Release);
+        stop_feedback_tracking(
+            &ctx.state,
+            status == libusb1_sys::constants::LIBUSB_TRANSFER_NO_DEVICE,
+        );
         return;
     }
 
     // Parse only completed packets.
     let len = unsafe { (*transfer).actual_length } as usize;
-    let buf = unsafe {
-        std::slice::from_raw_parts((*transfer).buffer as *const u8, len)
-    };
+    let buf = unsafe { std::slice::from_raw_parts((*transfer).buffer as *const u8, len) };
     let ms = match ctx.uac_version {
-        UacVersion::V2 => parse_feedback_uac2(buf),
+        UacVersion::V2 => parse_feedback_uac2(buf, ctx.state.packets_per_sec),
         UacVersion::V1 => parse_feedback_uac1(buf),
     };
-    if let Some(v) = ms {
+    if let Some(raw) = ms {
+        // Apply EMA: seed with first value to avoid a slow ramp-up from zero.
+        let smoothed = match ctx.ema {
+            None => raw,
+            Some(prev) => prev + (raw - prev) / 16,
+        };
+        ctx.ema = Some(smoothed);
         if let Ok(mut lock) = ctx.state.feedback_ms.lock() {
-            *lock = Some(v);
+            *lock = Some(smoothed);
         }
     }
 
+    // Re-check stop before resubmitting to avoid re-arming the transfer after
+    // `IsoTransferRing::stop()` has already requested shutdown.
+    if ctx.state.stop.load(Ordering::Acquire) {
+        stop_feedback_tracking(&ctx.state, false);
+        return;
+    }
+
     // Resubmit for the next feedback packet.
-    unsafe { libusb_submit_transfer(transfer) };
+    let rc = unsafe { libusb_submit_transfer(transfer) };
+    if rc != 0 {
+        handle_feedback_resubmit_failure(&ctx.state, rc);
+    }
 }
 
 /// Manages a single always-resubmitting ISO IN transfer on the feedback
@@ -446,7 +534,7 @@ impl FeedbackReader {
         };
         let mut buf = vec![0u8; buf_len];
 
-        let ctx_box = Box::new(FeedbackCtx { state, uac_version });
+        let ctx_box = Box::new(FeedbackCtx { state, uac_version, ema: None });
         let ctx_ptr = ctx_box.as_ref() as *const FeedbackCtx as *mut c_void;
 
         let xfer = unsafe { libusb_alloc_transfer(1) };
@@ -480,10 +568,16 @@ impl FeedbackReader {
     pub fn start(&mut self) -> Result<(), String> {
         // Mark in-flight BEFORE submitting so the event thread's exit
         // condition sees it immediately.
-        self._ctx.state.feedback_in_flight.store(true, Ordering::Release);
+        self._ctx
+            .state
+            .feedback_in_flight
+            .store(true, Ordering::Release);
         let rc = unsafe { libusb_submit_transfer(self.transfer) };
         if rc != 0 {
-            self._ctx.state.feedback_in_flight.store(false, Ordering::Release);
+            self._ctx
+                .state
+                .feedback_in_flight
+                .store(false, Ordering::Release);
             return Err(format!("submit feedback ISO IN transfer: rc={}", rc));
         }
         Ok(())
@@ -502,5 +596,38 @@ impl Drop for FeedbackReader {
         // safety belt; `libusb_free_transfer` is then safe.
         self.cancel();
         unsafe { libusb_free_transfer(self.transfer) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn feedback_resubmit_failure_no_device_marks_disconnect_and_clears_inflight() {
+        let queue = FrameQueue::new();
+        let feed = Arc::new(AlsaHwClockFeed::default());
+        let state = RingState::new(queue, 48_000, 4, 2, 192, 8_000, feed);
+        state.feedback_in_flight.store(true, Ordering::Release);
+
+        handle_feedback_resubmit_failure(&state, libusb1_sys::constants::LIBUSB_ERROR_NO_DEVICE);
+
+        assert!(!state.feedback_in_flight.load(Ordering::Acquire));
+        assert!(state.error.load(Ordering::Acquire));
+        assert!(state.stop.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn feedback_resubmit_failure_generic_only_clears_inflight() {
+        let queue = FrameQueue::new();
+        let feed = Arc::new(AlsaHwClockFeed::default());
+        let state = RingState::new(queue, 48_000, 4, 2, 192, 8_000, feed);
+        state.feedback_in_flight.store(true, Ordering::Release);
+
+        handle_feedback_resubmit_failure(&state, libusb1_sys::constants::LIBUSB_ERROR_BUSY);
+
+        assert!(!state.feedback_in_flight.load(Ordering::Acquire));
+        assert!(!state.error.load(Ordering::Acquire));
+        assert!(!state.stop.load(Ordering::Acquire));
     }
 }

@@ -15,7 +15,7 @@ mod widener;
 pub use convolver::{ConvolverConfig, ConvolverNode};
 pub use limiter::{LimiterConfig, LimiterNode};
 pub use lufs::{LufsNode, LufsValues};
-pub use lv2::{Lv2Node, Lv2SlotConfig, lv2_scan_plugins};
+pub use lv2::{lv2_scan_plugins, Lv2Node, Lv2SlotConfig};
 pub use peq::{PeqConfig, PeqNode, PEQ_BAND_COUNT};
 pub use resampler::{ResamplerConfig, ResamplerNode};
 pub use tape::{TapeConfig, TapeNode};
@@ -190,7 +190,8 @@ impl DspGraphConfig {
     pub fn add_lv2_slot(&mut self, uri: &str) -> String {
         let slot_id = format!("lv2_{}", self.lv2_slot_counter);
         self.lv2_slot_counter += 1;
-        self.lv2_slots.push(Lv2SlotConfig::new(slot_id.clone(), uri));
+        self.lv2_slots
+            .push(Lv2SlotConfig::new(slot_id.clone(), uri));
         self.order.push(DspOrderEntry::Lv2Slot(slot_id.clone()));
         slot_id
     }
@@ -680,11 +681,16 @@ impl DspGraphRuntime {
         for p in spectrum.list_properties() {
             let pn = p.name();
             if pn == "bands" {
-                spectrum.set_property_from_str("bands", "96");
+                spectrum.set_property_from_str("bands", "512");
             } else if pn == "multi-channel" {
                 let _ = spectrum.set_property("multi-channel", true);
             } else if pn == "interval" {
                 spectrum.set_property_from_str("interval", "16000000");
+            } else if pn == "threshold" {
+                // Match our Python db_min so silent bands are reported as -80
+                // instead of the default -60, which would otherwise appear as
+                // ~12 % bar height after normalization.
+                spectrum.set_property_from_str("threshold", "-80");
             }
         }
         Ok(Some(spectrum))

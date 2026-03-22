@@ -158,7 +158,7 @@ class _BackgroundCommon:
             "Soft": {"energy_gain": 0.72, "phase_speed": 0.016, "smoothing": 0.18},
             "Dynamic": {"energy_gain": 1.15, "phase_speed": 0.034, "smoothing": 0.36},
         }
-        self._frame_interval_active_ms = 50
+        self._frame_interval_active_ms = 33
         self._frame_interval_inactive_ms = 240
         self._tick_source = 0
         self._tick_interval_ms = 0

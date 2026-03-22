@@ -288,7 +288,7 @@ def _selected_name_from_dropdown(self, dd):
     return names[idx]
 
 
-def _sync_viz_dropdown_models(self, theme_name=None, effect_name=None, profile_name=None):
+def _sync_viz_dropdown_models(self, theme_name=None, effect_name=None, profile_name=None, frequency_scale_name=None):
     self._viz_ui_syncing = True
     try:
         if self.viz_theme_dd is not None:
@@ -309,6 +309,12 @@ def _sync_viz_dropdown_models(self, theme_name=None, effect_name=None, profile_n
             if p_names:
                 idx = p_names.index(profile_name) if profile_name in p_names else min(1, len(p_names) - 1)
                 self.viz_profile_dd.set_selected(idx)
+        if self.viz_freq_scale_dd is not None and hasattr(self.viz, "get_frequency_scale_names"):
+            f_names = self.viz.get_frequency_scale_names() or []
+            self.viz_freq_scale_dd.set_model(Gtk.StringList.new(f_names))
+            if f_names:
+                idx = f_names.index(frequency_scale_name) if frequency_scale_name in f_names else 0
+                self.viz_freq_scale_dd.set_selected(idx)
     finally:
         self._viz_ui_syncing = False
 
@@ -341,6 +347,21 @@ def _apply_viz_bars_by_count(self, count, update_dropdown=False):
         self.viz_bars_dd.set_selected(self.VIZ_BAR_OPTIONS.index(c))
 
 
+def _apply_viz_frequency_scale_by_index(self, idx, update_dropdown=False):
+    if self.viz is None or not hasattr(self.viz, "get_frequency_scale_names"):
+        return
+    names = self.viz.get_frequency_scale_names() or []
+    if not names:
+        return
+    if not isinstance(idx, int) or idx < 0 or idx >= len(names):
+        idx = 0
+    self.viz.set_frequency_scale(names[idx])
+    self.settings["viz_frequency_scale"] = idx
+    self._apply_viz_bars_by_count(self.settings.get("viz_bar_count", 32), update_dropdown=False)
+    if update_dropdown and self.viz_freq_scale_dd is not None:
+        self.viz_freq_scale_dd.set_selected(idx)
+
+
 def _apply_spectrum_theme_by_index(self, idx, update_dropdown=False):
     if self.viz is None:
         return
@@ -353,6 +374,29 @@ def _apply_spectrum_theme_by_index(self, idx, update_dropdown=False):
     self.settings["spectrum_theme"] = idx
     if update_dropdown and self.viz_theme_dd is not None:
         self.viz_theme_dd.set_selected(idx)
+
+
+def on_viz_frequency_scale_changed(self, dd, _param):
+    if self._viz_ui_syncing:
+        return
+    idx = dd.get_selected()
+    if self._viz_freq_scale_apply_source:
+        try:
+            GLib.source_remove(self._viz_freq_scale_apply_source)
+        except Exception:
+            pass
+        self._viz_freq_scale_apply_source = None
+
+    def _apply_scale_later():
+        self._viz_freq_scale_apply_source = None
+        if self._viz_ui_syncing:
+            return False
+        logger.debug("Applying visualizer frequency scale (deferred): idx=%s", idx)
+        self._apply_viz_frequency_scale_by_index(idx, update_dropdown=False)
+        self.schedule_save_settings()
+        return False
+
+    self._viz_freq_scale_apply_source = GLib.idle_add(_apply_scale_later)
 
 
 def _apply_viz_effect_by_index(self, idx, update_dropdown=False):
@@ -484,6 +528,8 @@ def on_viz_page_changed(self, stack, _param):
     is_lyrics = page == "lyrics"
     is_dsp = page == "dsp"
     self.viz_theme_dd.set_visible(is_spectrum)
+    if self.viz_freq_scale_dd is not None:
+        self.viz_freq_scale_dd.set_visible(is_spectrum)
     if self.viz_bars_dd is not None:
         self.viz_bars_dd.set_visible(is_spectrum)
     if self.viz_profile_dd is not None:
@@ -643,12 +689,21 @@ def _copy_spectrum_frame(frame):
 
 
 def _spectrum_frame_channel(frame, key="mono"):
+    """Return a mutable copy of a spectrum channel (use when the caller may mutate)."""
     if isinstance(frame, dict):
         vals = frame.get(key)
         if vals is None:
             vals = frame.get("mono", [])
         return list(vals or [])
     return list(frame or [])
+
+
+def _spectrum_frame_get(frame, key="mono"):
+    """Return a spectrum channel without copying (read-only callers only)."""
+    if isinstance(frame, dict):
+        vals = frame.get(key)
+        return vals if vals is not None else (frame.get("mono") or ())
+    return frame or ()
 
 
 def _spectrum_frame_len(frame):
@@ -661,7 +716,7 @@ def on_spectrum_data(self, magnitudes, position_s=None):
     trace = str(os.getenv("HIRESTI_VIZ_TRACE", "0")).strip().lower() in ("1", "true", "yes", "on")
     now_cb = time.monotonic()
     frame = _copy_spectrum_frame(magnitudes)
-    self._last_spectrum_frame = _copy_spectrum_frame(frame)
+    self._last_spectrum_frame = frame  # reuse the same copy; callers never mutate it
     self._last_spectrum_ts = now_cb
     if trace:
         if self._viz_trace_open_ts > 0.0 and (not self._viz_trace_first_real_logged):
@@ -706,13 +761,13 @@ def _apply_viz_frame(self, frame):
         return
     current_page = self._viz_current_page
     if current_page == "lyrics" and self.bg_viz is not None:
-        self.bg_viz.update_energy(_spectrum_frame_channel(frame, "mono"))
+        self.bg_viz.update_energy(_spectrum_frame_get(frame, "mono"))
     if current_page == "spectrum" and self.viz is not None:
         self.viz.update_data(frame)
         dr_meter = getattr(self, "dr_meter", None)
         if dr_meter is not None and dr_meter.get_visible():
-            left  = _spectrum_frame_channel(frame, "left")
-            right = _spectrum_frame_channel(frame, "right")
+            left  = _spectrum_frame_get(frame, "left")
+            right = _spectrum_frame_get(frame, "right")
             dr_meter.update(left, right)
             # Poll accurate K-weighted LUFS from the Rust backend.
             try:
@@ -751,7 +806,7 @@ def _start_viz_placeholder_if_needed(self):
         n = 32
     n = max(8, min(128, n))
     if not self._viz_placeholder_frame or len(self._viz_placeholder_frame) != n:
-        self._viz_placeholder_frame = [-60.0] * n
+        self._viz_placeholder_frame = [-80.0] * n
     self._viz_placeholder_phase = 0.0
     self._viz_real_frame_streak = 0
     start_ts = now
@@ -802,12 +857,12 @@ def _start_viz_placeholder_if_needed(self):
             target = max(0.0, min(0.82, target * energy_gate))
             # Convert to dB-like spectrum values expected by visualizer path.
             # Keep in realistic range to avoid full-screen "max level" look.
-            target_db = -60.0 + (target * 48.0)  # ~[-60 dB, -12 dB]
+            target_db = -80.0 + (target * 68.0)  # ~[-80 dB, -12 dB]
             # Slightly faster response, and progressively pull to floor near the end.
             blend = 0.34 if life > 0.45 else 0.24
             floor_pull = (1.0 - life) * 0.22
             frame[i] = (frame[i] * (1.0 - blend)) + (target_db * blend)
-            frame[i] = (frame[i] * (1.0 - floor_pull)) + (-60.0 * floor_pull)
+            frame[i] = (frame[i] * (1.0 - floor_pull)) + (-80.0 * floor_pull)
         self._apply_viz_frame(frame)
         return True
 

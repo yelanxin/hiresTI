@@ -29,6 +29,10 @@ pub struct FrameQueue {
     write: AtomicUsize,
     /// Next byte to read  (consumer-owned, relaxed by producer).
     read: AtomicUsize,
+    /// Bytes per interleaved audio frame (channels × bytes_per_sample).
+    /// Used for frame-alignment validation in debug builds.
+    /// Zero means validation is disabled (not configured yet).
+    frame_bytes: AtomicUsize,
 }
 
 // SAFETY: The SPSC protocol ensures only one thread writes and one reads.
@@ -41,7 +45,14 @@ impl FrameQueue {
             buf: Box::new([0u8; QUEUE_CAP]),
             write: AtomicUsize::new(0),
             read: AtomicUsize::new(0),
+            frame_bytes: AtomicUsize::new(0),
         })
+    }
+
+    /// Set the frame size for alignment validation.
+    /// Call once after the audio format is known.
+    pub fn set_frame_bytes(&self, frame_bytes: usize) {
+        self.frame_bytes.store(frame_bytes, Ordering::Relaxed);
     }
 
     /// Number of bytes available to read.
@@ -63,6 +74,13 @@ impl FrameQueue {
     /// The producer calls this.  Writes as many bytes as there is space for;
     /// does not block.
     pub fn push(&self, data: &[u8]) -> usize {
+        let fb = self.frame_bytes.load(Ordering::Relaxed);
+        debug_assert!(
+            fb == 0 || data.len() % fb == 0,
+            "FrameQueue::push: data.len()={} not frame-aligned (frame_bytes={})",
+            data.len(),
+            fb,
+        );
         let r = self.read.load(Ordering::Acquire);
         let w = self.write.load(Ordering::Relaxed);
         let space = QUEUE_CAP - w.wrapping_sub(r);
@@ -72,9 +90,8 @@ impl FrameQueue {
         }
 
         // SAFETY: SPSC — only producer writes; indices guarantee no aliasing.
-        let buf = unsafe {
-            std::slice::from_raw_parts_mut(self.buf.as_ptr() as *mut u8, QUEUE_CAP)
-        };
+        let buf =
+            unsafe { std::slice::from_raw_parts_mut(self.buf.as_ptr() as *mut u8, QUEUE_CAP) };
         let wi = w & QUEUE_MASK;
         let end = (wi + n).min(QUEUE_CAP);
         let first = end - wi; // bytes before wrap

@@ -61,10 +61,7 @@ pub fn set_sample_rate_uac1<T: UsbContext>(
 /// Read the current sample rate from a UAC 1.0 device (best-effort).
 ///
 /// Returns `None` if the device does not support `GET_CUR` for this control.
-pub fn get_sample_rate_uac1<T: UsbContext>(
-    handle: &DeviceHandle<T>,
-    ep: u8,
-) -> Option<u32> {
+pub fn get_sample_rate_uac1<T: UsbContext>(handle: &DeviceHandle<T>, ep: u8) -> Option<u32> {
     let mut buf = [0u8; 3];
     let rt = rusb::request_type(Direction::In, RequestType::Class, Recipient::Endpoint);
     let w_value = (UAC1_CS_SAM_FREQ as u16) << 8;
@@ -180,7 +177,9 @@ pub fn query_sample_rates_uac2<T: UsbContext>(
             }
         } else {
             // Continuous range: enumerate common audio rates within [d_min, d_max]
-            for &r in &[44100u32, 48000, 88200, 96000, 176400, 192000, 352800, 384000] {
+            for &r in &[
+                44100u32, 48000, 88200, 96000, 176400, 192000, 352800, 384000,
+            ] {
                 if r >= d_min && r <= d_max && !rates.contains(&r) {
                     rates.push(r);
                 }
