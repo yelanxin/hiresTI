@@ -234,6 +234,61 @@ def _log_display_eq_gain(freq_hz):
     return max(0.50, 0.90 - 0.22 * t)
 
 
+def _draw_freq_axis_cairo(cr, width, height, frequency_scale_name,
+                          input_band_count=_DEFAULT_SPECTRUM_BANDS):
+    """Draw 9 evenly-spaced frequency tick marks and labels along the top edge.
+
+    Standalone version of SpectrumVisualizer._draw_freq_axis so it can be
+    reused by the GL overlay in HybridVisualizer.
+    """
+    TICKS = 9
+    HALF_RATE = _SPECTRUM_HALF_RATE_HZ
+    TOTAL_BANDS = float(max(2, int(input_band_count or _DEFAULT_SPECTRUM_BANDS)))
+    if frequency_scale_name == _FREQ_SCALE_LOG:
+        min_f, max_f = _log_display_frequency_range(int(TOTAL_BANDS), half_rate_hz=HALF_RATE)
+        log_min = math.log10(min_f)
+        log_span = math.log10(max_f) - log_min
+    else:
+        min_f, max_f = _linear_display_frequency_range(int(TOTAL_BANDS), half_rate_hz=HALF_RATE)
+
+    TICK_H = 4.0
+    LABEL_FONT = 9.0
+    LABEL_Y = TICK_H + LABEL_FONT + 1.0
+    TICK_ALPHA = 0.45
+    LABEL_ALPHA = 0.60
+
+    cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+    cr.set_font_size(LABEL_FONT)
+
+    for k in range(TICKS):
+        p = k / float(TICKS - 1)
+        x = p * width
+        if frequency_scale_name == _FREQ_SCALE_LOG:
+            freq = 10.0 ** (log_min + (p * log_span))
+        else:
+            freq = min_f + (p * (max_f - min_f))
+
+        if freq >= 1000.0:
+            kv = freq / 1000.0
+            label = f"{kv:.0f}k" if kv >= 10.0 else f"{kv:.1f}k"
+        else:
+            label = f"{freq:.0f}"
+
+        ext = cr.text_extents(label)
+        tx = x - ext.width * 0.5
+        tx = max(1.0, min(width - ext.width - 1.0, tx))
+
+        cr.set_source_rgba(1.0, 1.0, 1.0, TICK_ALPHA)
+        cr.set_line_width(1.0)
+        cr.move_to(x, 0.0)
+        cr.line_to(x, TICK_H)
+        cr.stroke()
+
+        cr.set_source_rgba(1.0, 1.0, 1.0, LABEL_ALPHA)
+        cr.move_to(tx, LABEL_Y)
+        cr.show_text(label)
+
+
 def _build_log_spectrum_bins(values, out_count, half_rate_hz=_SPECTRUM_HALF_RATE_HZ):
     vals = list(values or [])
     if out_count <= 0:
@@ -1043,57 +1098,8 @@ class SpectrumVisualizer(Gtk.DrawingArea):
             cr.stroke()
 
     def _draw_freq_axis(self, cr, width, height):
-        # 9 evenly-spaced frequency labels along the top edge.
-        # Log mode uses the same log10(min_f..max_f) mapping as the spectrum
-        # regrouping path so labels and columns stay consistent.
-        TICKS = 9
-        HALF_RATE = _SPECTRUM_HALF_RATE_HZ
-        TOTAL_BANDS = float(max(2, int(getattr(self, "_input_band_count", _DEFAULT_SPECTRUM_BANDS) or _DEFAULT_SPECTRUM_BANDS)))
-        if self.frequency_scale_name == _FREQ_SCALE_LOG:
-            min_f, max_f = _log_display_frequency_range(int(TOTAL_BANDS), half_rate_hz=HALF_RATE)
-            log_min = math.log10(min_f)
-            log_span = math.log10(max_f) - log_min
-        else:
-            min_f, max_f = _linear_display_frequency_range(int(TOTAL_BANDS), half_rate_hz=HALF_RATE)
-
-        TICK_H = 4.0
-        LABEL_FONT = 9.0
-        LABEL_Y = TICK_H + LABEL_FONT + 1.0   # baseline below the tick
-        TICK_ALPHA = 0.45
-        LABEL_ALPHA = 0.60
-
-        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
-        cr.set_font_size(LABEL_FONT)
-
-        for k in range(TICKS):
-            p = k / float(TICKS - 1)
-            x = p * width
-            if self.frequency_scale_name == _FREQ_SCALE_LOG:
-                freq = 10.0 ** (log_min + (p * log_span))
-            else:
-                freq = min_f + (p * (max_f - min_f))
-
-            if freq >= 1000.0:
-                kv = freq / 1000.0
-                label = f"{kv:.0f}k" if kv >= 10.0 else f"{kv:.1f}k"
-            else:
-                label = f"{freq:.0f}"
-
-            ext = cr.text_extents(label)
-            tx = x - ext.width * 0.5
-            tx = max(1.0, min(width - ext.width - 1.0, tx))
-
-            # tick line
-            cr.set_source_rgba(1.0, 1.0, 1.0, TICK_ALPHA)
-            cr.set_line_width(1.0)
-            cr.move_to(x, 0.0)
-            cr.line_to(x, TICK_H)
-            cr.stroke()
-
-            # label
-            cr.set_source_rgba(1.0, 1.0, 1.0, LABEL_ALPHA)
-            cr.move_to(tx, LABEL_Y)
-            cr.show_text(label)
+        band_count = int(getattr(self, "_input_band_count", _DEFAULT_SPECTRUM_BANDS) or _DEFAULT_SPECTRUM_BANDS)
+        _draw_freq_axis_cairo(cr, width, height, self.frequency_scale_name, band_count)
 
     def _make_gradient(self, height, theme):
         key = (height, self.theme_name)
@@ -3431,7 +3437,7 @@ _DOTS_FRAG_330 = """
 #version 330 core
 in vec2 vUV;
 out vec4 FragColor;
-const int MAX_BARS = 128;
+const int MAX_BARS = 512;
 uniform int   uNumBars;
 uniform float uHeights[MAX_BARS];
 uniform vec4  uColors[MAX_BARS];
@@ -3470,7 +3476,7 @@ _DOTS_FRAG_300ES = """
 precision mediump float;
 in vec2 vUV;
 out vec4 FragColor;
-const int MAX_BARS = 128;
+const int MAX_BARS = 512;
 uniform int   uNumBars;
 uniform float uHeights[MAX_BARS];
 uniform vec4  uColors[MAX_BARS];
@@ -3528,8 +3534,8 @@ class DotsGLVisualizer(Gtk.GLArea):
         self._theme_cfg   = self.themes[self.theme_name]
         self._profile_cfg = self.profiles[self.profile_name]
 
-        self.target_heights  = [0.0] * 128
-        self.current_heights = [0.0] * 128
+        self.target_heights  = [0.0] * 512
+        self.current_heights = [0.0] * 512
         self._active      = False
         self._anim_source = None
 
@@ -3552,8 +3558,8 @@ class DotsGLVisualizer(Gtk.GLArea):
         self._logged_python_bins = False
 
         # Pre-allocated ctypes arrays reused every frame to avoid GC churn
-        self._h_arr = (ctypes.c_float * 128)(*([0.0] * 128))
-        self._c_arr = (ctypes.c_float * 512)(*([0.0] * 512))
+        self._h_arr = (ctypes.c_float * 512)(*([0.0] * 512))
+        self._c_arr = (ctypes.c_float * 2048)(*([0.0] * 2048))
 
         # Cached per-frame scalars — recomputed only on theme/profile change
         self._cached_gain    = 0.0
@@ -3662,15 +3668,15 @@ class DotsGLVisualizer(Gtk.GLArea):
             self._cached_h = h
             self._get_colors()   # rebuilds _c_arr if theme/bars changed
             GL.glUniform1i (self._u_num_bars,   self.num_bars)
-            GL.glUniform4fv(self._u_colors,     128, self._c_arr)
+            GL.glUniform4fv(self._u_colors,     512, self._c_arr)
             GL.glUniform1f (self._u_gain,       self._cached_gain)
             GL.glUniform1f (self._u_spacing,    self._cached_spacing)
             GL.glUniform2f (self._u_resolution, float(w), float(h))
             self._dirty_static = False
 
         # Heights change every animated frame
-        self._h_arr[:128] = self.current_heights[:128]
-        GL.glUniform1fv(self._u_heights, 128, self._h_arr)
+        self._h_arr[:512] = self.current_heights[:512]
+        GL.glUniform1fv(self._u_heights, 512, self._h_arr)
 
         GL.glBindVertexArray(self._vao)
         GL.glDrawArrays(GL.GL_TRIANGLE_STRIP, 0, 4)
@@ -3711,7 +3717,7 @@ class DotsGLVisualizer(Gtk.GLArea):
                 for i in range(n)
             ]
             self._color_cache_key = key
-            # Rebuild the pre-allocated flat ctypes array (vec4 × 128)
+            # Rebuild the pre-allocated flat ctypes array (vec4 × 512)
             off = 0
             for r, g, b, a in self._color_cache:
                 self._c_arr[off]     = r
@@ -3720,7 +3726,7 @@ class DotsGLVisualizer(Gtk.GLArea):
                 self._c_arr[off + 3] = a
                 off += 4
             # Zero-pad remaining slots
-            for i in range(off, 512):
+            for i in range(off, 2048):
                 self._c_arr[i] = 0.0
         return self._color_cache
 
@@ -3811,9 +3817,9 @@ class DotsGLVisualizer(Gtk.GLArea):
             return
         if n <= 0 or n == self.num_bars:
             return
-        self.num_bars = min(n, 128)
-        self.target_heights  = [0.0] * 128
-        self.current_heights = [0.0] * 128
+        self.num_bars = min(n, 512)
+        self.target_heights  = [0.0] * 512
+        self.current_heights = [0.0] * 512
         self._color_cache    = None
         self._dirty_static   = True
 
@@ -3871,7 +3877,7 @@ _BARS_FRAG_330 = """
 #version 330 core
 in vec2 vUV;
 out vec4 FragColor;
-const int MAX_BARS = 128;
+const int MAX_BARS = 512;
 uniform int   uNumBars;
 uniform float uHeights[MAX_BARS];
 uniform float uPeakHeights[MAX_BARS];
@@ -4220,7 +4226,7 @@ _BARS_FRAG_300ES = """
 precision mediump float;
 in vec2 vUV;
 out vec4 FragColor;
-const int MAX_BARS = 128;
+const int MAX_BARS = 512;
 uniform int   uNumBars;
 uniform float uHeights[MAX_BARS];
 uniform float uPeakHeights[MAX_BARS];
@@ -4578,26 +4584,26 @@ class BarsGLVisualizer(Gtk.GLArea):
         self._cached_gain    = float(self._theme_cfg["height_gain"]) * float(self._profile_cfg["gain_mul"])
         self._cached_spacing = max(0.8, float(self._theme_cfg["bar_spacing"]) * float(self._profile_cfg["spacing_mul"]))
 
-        self.target_heights       = [0.0] * 128
-        self.current_heights      = [0.0] * 128
-        self.peak_holds           = [0.0] * 128
-        self.peak_ttl             = [0]   * 128
-        self.trail_heights        = [0.0] * 128
-        self.target_left_heights  = [0.0] * 128
-        self.target_right_heights = [0.0] * 128
-        self.left_heights         = [0.0] * 128
-        self.right_heights        = [0.0] * 128
+        self.target_heights       = [0.0] * 512
+        self.current_heights      = [0.0] * 512
+        self.peak_holds           = [0.0] * 512
+        self.peak_ttl             = [0]   * 512
+        self.trail_heights        = [0.0] * 512
+        self.target_left_heights  = [0.0] * 512
+        self.target_right_heights = [0.0] * 512
+        self.left_heights         = [0.0] * 512
+        self.right_heights        = [0.0] * 512
         self.bass_level           = 0.0
         self._bass_target         = 0.0
         self.balance              = 0.0
         self._balance_target      = 0.0
 
-        self._h_arr  = (ctypes.c_float * 128)(*([0.0] * 128))
-        self._ph_arr = (ctypes.c_float * 128)(*([0.0] * 128))
-        self._tr_arr = (ctypes.c_float * 128)(*([0.0] * 128))
-        self._lh_arr = (ctypes.c_float * 128)(*([0.0] * 128))
-        self._rh_arr = (ctypes.c_float * 128)(*([0.0] * 128))
-        self._c_arr  = (ctypes.c_float * 512)(*([0.0] * 512))
+        self._h_arr  = (ctypes.c_float * 512)(*([0.0] * 512))
+        self._ph_arr = (ctypes.c_float * 512)(*([0.0] * 512))
+        self._tr_arr = (ctypes.c_float * 512)(*([0.0] * 512))
+        self._lh_arr = (ctypes.c_float * 512)(*([0.0] * 512))
+        self._rh_arr = (ctypes.c_float * 512)(*([0.0] * 512))
+        self._c_arr  = (ctypes.c_float * 2048)(*([0.0] * 2048))
 
         self._program      = None
         self._vao          = None
@@ -4708,7 +4714,7 @@ class BarsGLVisualizer(Gtk.GLArea):
             arr[base + 1] = g
             arr[base + 2] = b
             arr[base + 3] = a
-        for i in range(n, 128):
+        for i in range(n, 512):
             base = i * 4
             arr[base] = arr[base+1] = arr[base+2] = arr[base+3] = 0.0
         self._color_cache_key = key
@@ -4734,7 +4740,7 @@ class BarsGLVisualizer(Gtk.GLArea):
             bc = self._color_from_gradient(grad, 0.12)
             pc = self._color_from_gradient(grad, 0.0)
             GL.glUniform1i(self._u_num_bars,    self.num_bars)
-            GL.glUniform4fv(self._u_colors,     128, self._c_arr)
+            GL.glUniform4fv(self._u_colors,     512, self._c_arr)
             GL.glUniform4f(self._u_top_color,   *tc)
             GL.glUniform4f(self._u_bottom_color,*bc)
             GL.glUniform4f(self._u_pulse_color, *pc)
@@ -4745,16 +4751,16 @@ class BarsGLVisualizer(Gtk.GLArea):
             self._cached_w     = pw
             self._cached_h     = ph
             self._dirty_static = False
-        self._h_arr[:128]  = self.current_heights[:128]
-        self._ph_arr[:128] = self.peak_holds[:128]
-        self._tr_arr[:128] = self.trail_heights[:128]
-        self._lh_arr[:128] = self.left_heights[:128]
-        self._rh_arr[:128] = self.right_heights[:128]
-        GL.glUniform1fv(self._u_heights,        128, self._h_arr)
-        GL.glUniform1fv(self._u_peak_heights,   128, self._ph_arr)
-        GL.glUniform1fv(self._u_trail_heights,  128, self._tr_arr)
-        GL.glUniform1fv(self._u_left_heights,   128, self._lh_arr)
-        GL.glUniform1fv(self._u_right_heights,  128, self._rh_arr)
+        self._h_arr[:512]  = self.current_heights[:512]
+        self._ph_arr[:512] = self.peak_holds[:512]
+        self._tr_arr[:512] = self.trail_heights[:512]
+        self._lh_arr[:512] = self.left_heights[:512]
+        self._rh_arr[:512] = self.right_heights[:512]
+        GL.glUniform1fv(self._u_heights,        512, self._h_arr)
+        GL.glUniform1fv(self._u_peak_heights,   512, self._ph_arr)
+        GL.glUniform1fv(self._u_trail_heights,  512, self._tr_arr)
+        GL.glUniform1fv(self._u_left_heights,   512, self._lh_arr)
+        GL.glUniform1fv(self._u_right_heights,  512, self._rh_arr)
         GL.glUniform1f(self._u_bass_level,      self.bass_level)
         GL.glUniform1f(self._u_balance,         self.balance)
         GL.glBindVertexArray(self._vao)
@@ -4887,12 +4893,12 @@ class BarsGLVisualizer(Gtk.GLArea):
             return
         if n <= 0 or n == self.num_bars:
             return
-        self.num_bars        = min(n, 128)
-        self.target_heights  = [0.0] * 128
-        self.current_heights = [0.0] * 128
-        self.peak_holds      = [0.0] * 128
-        self.peak_ttl        = [0]   * 128
-        self.trail_heights   = [0.0] * 128
+        self.num_bars        = min(n, 512)
+        self.target_heights  = [0.0] * 512
+        self.current_heights = [0.0] * 512
+        self.peak_holds      = [0.0] * 512
+        self.peak_ttl        = [0]   * 512
+        self.trail_heights   = [0.0] * 512
         self._color_cache    = None
         self._dirty_static   = True
 
@@ -4933,10 +4939,15 @@ class BarsGLVisualizer(Gtk.GLArea):
         return list(self.frequency_scale_names)
 
 
-class HybridVisualizer(Gtk.Stack):
+class HybridVisualizer(Gtk.Overlay):
     """
     Combined visualizer that keeps the Cairo renderer available for the full
     effect list while exposing the GL dots path as an extra selectable effect.
+
+    Uses a Gtk.Overlay so a transparent frequency-axis DrawingArea can be
+    layered on top of the GL renderers (which cannot draw text natively).
+    The Cairo renderer draws its own axis, so the overlay is hidden when the
+    Cairo backend is active.
     """
 
     GL_EFFECT_NAME   = "Dots"
@@ -4948,19 +4959,26 @@ class HybridVisualizer(Gtk.Stack):
 
     def __init__(self):
         super().__init__()
-        self.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
         self.set_hexpand(True)
         self.set_vexpand(True)
+
+        # Internal stack holds Cairo / GL / BarsGL backends.
+        self._stack = Gtk.Stack()
+        self._stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        self._stack.set_hexpand(True)
+        self._stack.set_vexpand(True)
+        self.set_child(self._stack)
 
         self._cairo_viz = SpectrumVisualizer()
         self._cairo_viz.set_hexpand(True)
         self._cairo_viz.set_vexpand(True)
-        self.add_named(self._cairo_viz, self._CAIRO_CHILD_NAME)
+        self._stack.add_named(self._cairo_viz, self._CAIRO_CHILD_NAME)
 
         self._gl_viz      = None
         self._bars_gl_viz = None
         self._last_frame  = None
         self._active      = False
+        self._freq_scale_name = _FREQ_SCALE_LINEAR
         self._theme_name   = str(getattr(self._cairo_viz, "theme_name",   "Aurora (Default)") or "Aurora (Default)")
         self._profile_name = str(getattr(self._cairo_viz, "profile_name", "Dynamic") or "Dynamic")
         self._effect_name  = str(getattr(self._cairo_viz, "effect_name",  "Bars") or "Bars")
@@ -4976,7 +4994,7 @@ class HybridVisualizer(Gtk.Stack):
             self._gl_viz.set_num_bars(self._num_bars)
             self._gl_viz.set_theme(self._theme_name)
             self._gl_viz.set_profile(self._profile_name)
-            self.add_named(self._gl_viz, self._GL_CHILD_NAME)
+            self._stack.add_named(self._gl_viz, self._GL_CHILD_NAME)
         except Exception:
             self._gl_viz = None
             logger.warning("DotsGL backend unavailable", exc_info=True)
@@ -4989,13 +5007,23 @@ class HybridVisualizer(Gtk.Stack):
             self._bars_gl_viz.set_theme(self._theme_name)
             self._bars_gl_viz.set_profile(self._profile_name)
             self._bars_gl_viz.set_effect(self._effect_name)
-            self.add_named(self._bars_gl_viz, self._BARS_GL_CHILD_NAME)
+            self._stack.add_named(self._bars_gl_viz, self._BARS_GL_CHILD_NAME)
             logger.info("Visualizer backend selected: hybrid (cairo + gl + bars_gl)")
         except Exception:
             self._bars_gl_viz = None
             logger.warning("BarsGL backend unavailable", exc_info=True)
 
-        self.set_visible_child_name(self._CAIRO_CHILD_NAME)
+        # Transparent frequency-axis overlay — visible only when a GL backend
+        # is active (the Cairo renderer draws its own axis).
+        self._freq_axis_da = Gtk.DrawingArea()
+        self._freq_axis_da.set_hexpand(True)
+        self._freq_axis_da.set_vexpand(True)
+        self._freq_axis_da.set_draw_func(self._draw_freq_axis_overlay)
+        self._freq_axis_da.set_can_target(False)  # pass-through mouse events
+        self._freq_axis_da.set_visible(False)
+        self.add_overlay(self._freq_axis_da)
+
+        self._stack.set_visible_child_name(self._CAIRO_CHILD_NAME)
         self._sync_backend_state(seed_visible=False)
 
     @staticmethod
@@ -5006,6 +5034,10 @@ class HybridVisualizer(Gtk.Stack):
             right = list(frame.get("right") or mono)
             return {"mono": mono, "left": left, "right": right}
         return list(frame or [])
+
+    def _draw_freq_axis_overlay(self, _da, cr, width, height):
+        """Draw frequency ticks on the transparent overlay above GL backends."""
+        _draw_freq_axis_cairo(cr, width, height, self._freq_scale_name)
 
     def _active_child_name(self):
         if self._effect_name == self.GL_EFFECT_NAME and self._gl_viz is not None:
@@ -5024,12 +5056,16 @@ class HybridVisualizer(Gtk.Stack):
 
     def _sync_backend_state(self, seed_visible=True):
         child_name = self._active_child_name()
-        if self.get_visible_child_name() != child_name:
-            self.set_visible_child_name(child_name)
+        if self._stack.get_visible_child_name() != child_name:
+            self._stack.set_visible_child_name(child_name)
 
         use_cairo   = child_name == self._CAIRO_CHILD_NAME
         use_gl      = child_name == self._GL_CHILD_NAME
         use_bars_gl = child_name == self._BARS_GL_CHILD_NAME
+
+        # Show the frequency axis overlay only for GL backends (Cairo draws
+        # its own axis).
+        self._freq_axis_da.set_visible(use_gl or use_bars_gl)
 
         self._cairo_viz.set_active(bool(self._active and use_cairo))
         if self._gl_viz is not None:
@@ -5108,11 +5144,13 @@ class HybridVisualizer(Gtk.Stack):
         scale_name = str(name or "")
         if scale_name not in (self._cairo_viz.get_frequency_scale_names() or []):
             return
+        self._freq_scale_name = scale_name
         self._cairo_viz.set_frequency_scale(scale_name)
         if self._gl_viz is not None:
             self._gl_viz.set_frequency_scale(scale_name)
         if self._bars_gl_viz is not None:
             self._bars_gl_viz.set_frequency_scale(scale_name)
+        self._freq_axis_da.queue_draw()
         self._reseed_visible_backend()
 
     def set_effect(self, effect_name):

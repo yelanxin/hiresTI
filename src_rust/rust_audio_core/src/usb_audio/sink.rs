@@ -92,6 +92,14 @@ impl UsbAudioSink {
     pub fn xrun_count(&self) -> u64 {
         self.state.xruns.load(std::sync::atomic::Ordering::Relaxed)
     }
+
+    /// Mark the device to skip interface release on drop.  When set, the USB
+    /// interface stays claimed after the sink is dropped, preventing the
+    /// kernel driver (snd-usb-audio) from re-attaching and locking the device
+    /// to 48 kHz.  Use this before dropping the sink on track switches.
+    pub fn set_skip_release_on_drop(&mut self, skip: bool) {
+        self._open_dev.skip_release_on_drop = skip;
+    }
 }
 
 impl UsbAudioSink {
@@ -324,6 +332,122 @@ impl UsbAudioSink {
             _feedback: feedback,
             _open_dev: open_dev,
         })
+    }
+
+    /// Reconfigure the sink for a new sample rate **without releasing the USB
+    /// device**.  This keeps the kernel driver detached so the system cannot
+    /// reclaim the device (and lock it to 48 kHz) during track switches.
+    ///
+    /// Steps: stop ISO ring → clear queue → reconfigure alt-setting + rate →
+    /// push prefill → create new ring + feedback → start.
+    pub fn reconfigure(
+        &mut self,
+        rate: u32,
+        bit_depth: u8,
+        prefill: Option<&[u8]>,
+    ) -> Result<(), String> {
+        // 1. Stop ring FIRST — this cancels all ISO OUT transfers AND the
+        //    feedback IN transfer, then joins the event thread.  Only after
+        //    the event thread has fully exited is it safe to free transfers.
+        self.ring.stop();
+        // 2. Drop feedback reader (frees its libusb_transfer).  Safe now
+        //    because the event thread is no longer running.
+        self._feedback = None;
+        // 3. Free ring's libusb transfer objects while the context is
+        //    quiescent.  This prevents the later `self.ring = ring` drop
+        //    from freeing them while the NEW event thread is running.
+        self.ring.free_transfers();
+
+        // 2. Clear the old queue and create a fresh one.
+        let queue = FrameQueue::new();
+
+        if let Some(data) = prefill.filter(|d| !d.is_empty()) {
+            let written = queue.push(data);
+            if written < data.len() {
+                eprintln!(
+                    "usb-audio: reconfigure prefill truncated {} -> {} bytes",
+                    data.len(), written
+                );
+            }
+        }
+
+        // 3. Reconfigure device (alt-setting + rate) — reuses claimed interface.
+        let alt = self._open_dev
+            .best_alt(rate, bit_depth)
+            .ok_or_else(|| {
+                format!(
+                    "no alt-setting for rate={} bit_depth={} on reconfigure",
+                    rate, bit_depth
+                )
+            })?
+            .clone();
+
+        self._open_dev.configure(&alt, rate)?;
+
+        let actual_rate = self._open_dev.active_rate;
+        eprintln!(
+            "usb-audio: reconfigure requested_rate={} actual_rate={} bit_depth={} channels={}",
+            rate, actual_rate, bit_depth, alt.channels
+        );
+
+        // 4. Raw handles (still valid — same open_dev).
+        let dev_handle_raw = self._open_dev.handle.as_raw();
+        let ctx_raw = self._open_dev.handle.context().as_raw();
+
+        // 5. New ring state.
+        let bytes_per_sample = if alt.subframe_size > 0 {
+            alt.subframe_size as usize
+        } else {
+            (alt.bit_depth as usize + 7) / 8
+        };
+        queue.set_frame_bytes(alt.channels as usize * bytes_per_sample);
+        let packets_per_sec = iso_packets_per_sec(
+            self._open_dev.dev.is_high_speed,
+            alt.out_ep_interval,
+        );
+        let state = RingState::new(
+            Arc::clone(&queue),
+            actual_rate,
+            bytes_per_sample,
+            alt.channels as usize,
+            alt.max_packet as usize,
+            packets_per_sec,
+            alt.feedback_ep.is_some(),
+            Arc::clone(&self.feed),
+        );
+
+        // 6. Anchor clock and start new ring.
+        let anchor_ns = clock_monotonic_ns();
+        self.feed.anchor(anchor_ns, actual_rate);
+
+        let mut ring =
+            IsoTransferRing::new(dev_handle_raw, ctx_raw, alt.out_ep, Arc::clone(&state))?;
+        ring.start()?;
+
+        // 7. Feedback reader.
+        let feedback = alt
+            .feedback_ep
+            .map(|ep| {
+                FeedbackReader::new(dev_handle_raw, ep, Arc::clone(&state), self._open_dev.dev.uac_version)
+                    .and_then(|mut fr| {
+                        fr.start()?;
+                        Ok(fr)
+                    })
+            })
+            .transpose()?;
+
+        if let Some(ref fb) = feedback {
+            ring.feedback_xfer = Some(fb.transfer);
+        }
+
+        // 8. Swap in new state.
+        self.queue = Arc::clone(&queue);
+        self.state = state;
+        self.actual_rate = actual_rate;
+        self.ring = ring;
+        self._feedback = feedback;
+
+        Ok(())
     }
 }
 

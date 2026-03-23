@@ -276,12 +276,25 @@ pub struct OpenUsbDevice {
     pub active_alt: Option<UacStreamAlt>,
     /// Currently configured sample rate.
     pub active_rate: u32,
+    /// When true, `drop()` skips `release_interface` and `set_alternate_setting(0)`.
+    /// This keeps the kernel driver detached so the system cannot reclaim the
+    /// device (and lock it to 48 kHz) between track switches.
+    pub skip_release_on_drop: bool,
 }
 
 impl Drop for OpenUsbDevice {
     fn drop(&mut self) {
         let si = self.dev.stream_iface;
         let ci = self.dev.ctrl_iface;
+
+        if self.skip_release_on_drop {
+            eprintln!(
+                "usb-audio: OpenUsbDevice drop — skip_release_on_drop=true, \
+                 keeping interfaces claimed (si={} ci={})",
+                si, ci
+            );
+            return;
+        }
 
         // Reset the streaming interface to alt-setting 0 (zero-bandwidth)
         // BEFORE releasing it.  snd-usb-audio expects alt 0 when it probes the
@@ -347,6 +360,7 @@ impl OpenUsbDevice {
                     dev: dev.clone(),
                     active_alt: None,
                     active_rate: 0,
+                    skip_release_on_drop: false,
                 });
             }
 
@@ -361,6 +375,7 @@ impl OpenUsbDevice {
                 dev: dev.clone(),
                 active_alt: None,
                 active_rate: 0,
+                skip_release_on_drop: false,
             });
         }
 
@@ -395,9 +410,15 @@ impl OpenUsbDevice {
             let _ = self.handle.claim_interface(ci);
         }
 
-        self.handle
-            .claim_interface(si)
-            .map_err(|e| format!("claim interface {}: {}", si, e))?;
+        // claim_interface may return BUSY if already claimed (e.g. reconfigure
+        // after track switch without releasing).  That is fine — proceed.
+        if let Err(e) = self.handle.claim_interface(si) {
+            if e == rusb::Error::Busy {
+                eprintln!("usb-audio: interface {} already claimed — continuing", si);
+            } else {
+                return Err(format!("claim interface {}: {}", si, e));
+            }
+        }
 
         self.handle
             .set_alternate_setting(si, alt.alt_setting)

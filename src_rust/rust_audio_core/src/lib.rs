@@ -21,7 +21,7 @@ use std::os::raw::{c_char, c_double, c_int, c_uint, c_void};
 use std::path::Path;
 use std::ptr;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::thread;
 use std::time::Duration;
@@ -831,6 +831,16 @@ struct UsbSinkHandle {
     /// Set by `rac_set_uri` to signal the pusher thread to close the device
     /// so it re-opens at the new track's sample rate.
     reset_pending: Arc<AtomicBool>,
+    /// Set by the pusher thread after it re-opens the device on a track switch.
+    /// The engine checks this in `drain_usb_events` and calls
+    /// `reset_spectrum_timeline()` so stale spectrum frames accumulated during
+    /// the startup-prefill + ISO-ring fill period are discarded.
+    spectrum_reset_after_open: Arc<AtomicBool>,
+    /// Stream position (nanoseconds) at the moment the USB device was opened
+    /// and the clock was anchored.  Set by the pusher thread from
+    /// `query_position` right after `feed.anchor()`.  Used by `probe_latency`
+    /// to compute the real gap between pipeline decode head and DAC output.
+    anchor_stream_pos_ns: Arc<AtomicU64>,
     /// Wire bit depth selected at build time (e.g. 16, 24, 32).
     /// Used by `rac_get_runtime_snapshot` for the signal-path display.
     bit_depth: u8,
@@ -893,6 +903,10 @@ struct LazyUsbOpen {
     clock_mode: Arc<AtomicU8>,
     /// Shared with `UsbSinkHandle::reset_pending`.
     reset_pending: Arc<AtomicBool>,
+    /// Shared with `UsbSinkHandle::spectrum_reset_after_open`.
+    spectrum_reset_after_open: Arc<AtomicBool>,
+    /// Shared with `UsbSinkHandle::anchor_stream_pos_ns`.
+    anchor_stream_pos_ns: Arc<AtomicU64>,
 }
 
 /// Background thread: drains the GStreamer appsink and pushes PCM bytes into
@@ -1007,6 +1021,10 @@ fn usb_audio_pusher_thread(
     let mut click_hist: [[i32; 2]; 2] = [[0; 2]; 2]; // [ch][prev2, prev1]
     let mut click_hist_count: u32 = 0; // how many samples fed so far (0,1,2+)
     let mut click_count: u64 = 0;
+    // Track whether the device has been opened at least once.  On re-opens
+    // (track switch) we signal the engine to reset the spectrum timeline so
+    // stale frames accumulated during startup prefill are discarded.
+    let mut has_opened_once = false;
 
     // Exponential back-off sleep duration for the idle (no-sample) path.
     // Resets to MIN_IDLE_MS on each real sample; caps at MAX_IDLE_MS.
@@ -1017,11 +1035,12 @@ fn usb_audio_pusher_thread(
     const MIN_IDLE_MS: u64 = 10;
     const MAX_IDLE_MS: u64 = 100;
     let mut idle_sleep_ms: u64 = MIN_IDLE_MS;
-    // Accumulates non-PLAYING time while the USB sink is open.  After 3 s the
-    // sink is closed to stop the ISO ring (which otherwise burns ~20 % CPU
-    // filling silence into the transfer ring every 8 ms while paused).
+    // Accumulates non-PLAYING time while the USB sink is open.  Close quickly
+    // to stop the ISO ring (which otherwise generates thousands of xrun log
+    // lines filling silence).  With skip_release_on_drop the USB interface
+    // stays claimed, so re-open is cheap and the kernel driver won't re-attach.
     let mut idle_with_sink_ms: u64 = 0;
-    const IDLE_SINK_CLOSE_MS: u64 = 3_000;
+    const IDLE_SINK_CLOSE_MS: u64 = 0;
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -1066,6 +1085,9 @@ fn usb_audio_pusher_thread(
                         "usb-audio: closing idle USB sink (non-PLAYING for ~{}s)",
                         idle_with_sink_ms / 1000
                     );
+                    if let Some(ref mut s) = sink {
+                        s.set_skip_release_on_drop(true);
+                    }
                     sink = None;
                     dop_enc = None;
                     buf_count = 0;
@@ -1173,11 +1195,14 @@ fn usb_audio_pusher_thread(
                 sample_caps_rate
             );
             // Invalidate the clock feed BEFORE dropping the sink so the
-            // AlsaHwClock falls back to CLOCK_MONOTONIC immediately.  Without
-            // this, the GStreamer pipeline clock freezes while the ISO ring is
-            // being stopped/joined (~8-100 ms), preventing further sample
-            // delivery and deadlocking the lazy re-open.
+            // AlsaHwClock falls back to CLOCK_MONOTONIC immediately.
             lazy.feed.invalidate();
+            // Set skip_release_on_drop so the USB interface stays claimed
+            // after the sink is dropped — prevents snd-usb-audio from
+            // re-attaching and locking the device to 48 kHz.
+            if let Some(ref mut s) = sink {
+                s.set_skip_release_on_drop(true);
+            }
             sink = None;
             dop_enc = None;
             buf_count = 0;
@@ -1195,6 +1220,9 @@ fn usb_audio_pusher_thread(
                     s.actual_rate, new_rate
                 );
                 lazy.feed.invalidate();
+                if let Some(ref mut s) = sink {
+                    s.set_skip_release_on_drop(true);
+                }
                 sink = None;
                 dop_enc = None;
                 buf_count = 0;
@@ -1308,6 +1336,16 @@ fn usb_audio_pusher_thread(
                         startup_prefill.clear();
                         buf_count = 0;
                     }
+                    // Record the PTS of the FIRST prefill buffer.  This is the
+                    // true stream-time start of what the DAC will play, and must
+                    // be used (not query_position at device-open time, which has
+                    // already advanced past the prefill data) so probe_latency
+                    // computes the correct pipeline→DAC gap.
+                    if startup_prefill.is_empty() {
+                        let first_pts_ns = buf.pts().map(|p| p.nseconds()).unwrap_or(0);
+                        lazy.anchor_stream_pos_ns
+                            .store(first_pts_ns, Ordering::Release);
+                    }
                     startup_prefill_rate = open_rate;
                     startup_prefill.extend_from_slice(data);
                     let prefill_target = usb_audio_startup_prefill_target_bytes(
@@ -1345,22 +1383,8 @@ fn usb_audio_pusher_thread(
                                 * 1_000_000_000
                                 / pps as u64;
                             let clock_mode = current_usb_clock_mode(&lazy.clock_mode);
-                            // appsink has sync=true, so GStreamer releases buffers when
-                            // clock ≥ base_time + buffer.pts.  Lead-time before play =
-                            //   ring_write_ahead - buffer_depth
-                            // Push (buffer_depth = ring_buf_ns ≈ 128 ms):
-                            //   lead = 128 - 128 = 0 ms — just-in-time, but push clock
-                            //   *represents* write_pos which is 128 ms ahead of play_pos,
-                            //   so GStreamer actually delivers 128 ms early. ✓
-                            // Pull with buffer_depth = 0:
-                            //   clock = calibrated write_pos (same timing as push clock)
-                            //   → 128 ms lead → same margin as push. ✓
-                            // Pull with buffer_depth = 128 ms (original):
-                            //   clock = play_pos → 0 ms lead → any 10 ms jitter → xrun. ✗
-                            // Pull with buffer_depth = 256 ms (wrong fix):
-                            //   clock = play_pos − 128 ms → −128 ms lead → always late. ✗✗
                             let buf_ns = if clock_mode == alsa_clock::ClockMode::Pull {
-                                0 // clock = calibrated write_pos; GStreamer delivers 128 ms early
+                                0
                             } else {
                                 ring_buf_ns
                             };
@@ -1374,6 +1398,15 @@ fn usb_audio_pusher_thread(
                                 buf_ns / 1_000_000
                             );
                             sink = Some(s);
+                            // anchor_stream_pos_ns was already recorded when the
+                            // first prefill sample arrived — that is the true DAC
+                            // start position.  Do NOT overwrite it here (pipeline
+                            // has advanced past the prefill data by now).
+                            if has_opened_once {
+                                lazy.spectrum_reset_after_open
+                                    .store(true, Ordering::Release);
+                            }
+                            has_opened_once = true;
                             startup_prefill.clear();
                             startup_prefill_rate = 0;
                             continue;
@@ -2159,6 +2192,10 @@ pub struct Engine {
     spectrum_ring_count: usize,
     spectrum_seen_msgs: u64,
     spectrum_msg_count: u64,
+    /// Smoothed delta (ms) between spectrum endtime and query_position.
+    /// Positive means spectrum is ahead of the sink's consumption point.
+    /// Used by `probe_latency` for USB rawlink delay compensation.
+    spectrum_lead_ms: f64,
     element_msg_seen: u64,
     fmt_probe_tick: u64,
     last_codec: String,
@@ -2850,6 +2887,7 @@ impl Engine {
 
     fn reset_spectrum_timeline(&mut self) {
         self.spectrum_pos_s = 0.0;
+        self.spectrum_lead_ms = 0.0;
         self.spectrum_len = 0;
         self.spectrum_ring_write = 0;
         self.spectrum_ring_count = 0;
@@ -3764,28 +3802,26 @@ impl Engine {
         self.spectrum_ring_write = (self.spectrum_ring_write + 1) % SPECTRUM_RING_CAP;
         self.spectrum_ring_count = (self.spectrum_ring_count + 1).min(SPECTRUM_RING_CAP);
         self.spectrum_msg_count = self.spectrum_msg_count.wrapping_add(1);
-        if self.spectrum_msg_count % 120 == 0 {
-            let q_s = self
-                .playbin
-                .query_position::<gst::ClockTime>()
-                .map(|p| (p.nseconds() as f64) / 1_000_000_000.0)
-                .unwrap_or(-1.0);
-            self.emit_event(
-                EVT_STATE,
-                &format!(
-                    "spectrum-ts src={} frame={:.3}s query={:.3}s delta={:.3}s",
-                    ts_src,
-                    frame_pos_s,
-                    q_s,
-                    if q_s >= 0.0 { q_s - frame_pos_s } else { -1.0 }
-                ),
-            );
-        }
-        if self.spectrum_msg_count % 120 == 0 {
-            self.emit_event(
-                EVT_STATE,
-                &format!("spectrum-frames={}", self.spectrum_msg_count),
-            );
+        // Track how far ahead the spectrum endtime is vs. query_position.
+        // This captures the pipeline-internal buffering (playbin multiqueue)
+        // that separates the spectrum tap from the appsink consumption point.
+        if let Some(q_pos) = self
+            .playbin
+            .query_position::<gst::ClockTime>()
+            .map(|p| (p.nseconds() as f64) / 1_000_000_000.0)
+        {
+            if q_pos >= 0.0 && frame_pos_s >= 0.0 {
+                let lead_ms = (frame_pos_s - q_pos) * 1000.0;
+                if lead_ms > 0.0 {
+                    // EMA smooth (α=0.1) to avoid jitter
+                    if self.spectrum_lead_ms <= 0.0 {
+                        self.spectrum_lead_ms = lead_ms;
+                    } else {
+                        self.spectrum_lead_ms =
+                            self.spectrum_lead_ms * 0.9 + lead_ms * 0.1;
+                    }
+                }
+            }
         }
     }
 
@@ -3881,6 +3917,7 @@ impl Engine {
             spectrum_ring_count: 0,
             spectrum_seen_msgs: 0,
             spectrum_msg_count: 0,
+            spectrum_lead_ms: 0.0,
             element_msg_seen: 0,
             fmt_probe_tick: 0,
             last_codec: String::new(),
@@ -3953,9 +3990,21 @@ impl Engine {
     }
 
     fn drain_usb_events(&mut self) {
-        let Some(events) = self.usb_sink.as_ref().map(|us| us.events.clone()) else {
+        let Some(us) = self.usb_sink.as_ref() else {
             return;
         };
+        // Clone what we need before dropping the immutable borrow on self.
+        let spectrum_reset = Arc::clone(&us.spectrum_reset_after_open);
+        let events = us.events.clone();
+
+        // After a track-switch re-open the pusher thread signals that the
+        // device is live again.  Reset the spectrum timeline so stale frames
+        // accumulated during startup prefill are discarded — this keeps the
+        // waveform visualizer in sync with actual audio output.
+        if spectrum_reset.swap(false, Ordering::Acquire) {
+            self.reset_spectrum_timeline();
+        }
+
         let drained: Vec<(c_int, String)> = match events.lock() {
             Ok(mut pending) => pending.drain(..).collect(),
             Err(_) => return,
@@ -4233,6 +4282,10 @@ impl Engine {
         let stop_clone = Arc::clone(&stop);
         let reset_pending = Arc::new(AtomicBool::new(false));
         let reset_pending_clone = Arc::clone(&reset_pending);
+        let spectrum_reset_after_open = Arc::new(AtomicBool::new(false));
+        let spectrum_reset_clone = Arc::clone(&spectrum_reset_after_open);
+        let anchor_stream_pos = Arc::new(AtomicU64::new(0));
+        let anchor_stream_pos_clone = Arc::clone(&anchor_stream_pos);
         let clock_mode = Arc::new(AtomicU8::new(self.usb_clock_mode));
         let events: ThreadEventQueue = Arc::new(Mutex::new(VecDeque::new()));
         let events_clone = Arc::clone(&events);
@@ -4247,6 +4300,8 @@ impl Engine {
             channels: alt.channels as usize,
             clock_mode: Arc::clone(&clock_mode),
             reset_pending: reset_pending_clone,
+            spectrum_reset_after_open: spectrum_reset_clone,
+            anchor_stream_pos_ns: anchor_stream_pos_clone,
         };
         let buffering_clone = Arc::clone(&self.buffering_pct);
         let thread = thread::spawn(move || {
@@ -4272,6 +4327,8 @@ impl Engine {
                 appsink,
                 base_caps: caps,
                 reset_pending,
+                spectrum_reset_after_open,
+                anchor_stream_pos_ns: anchor_stream_pos,
                 bit_depth: alt.bit_depth,
                 device_name: dev.name.clone(),
             },
@@ -6699,6 +6756,39 @@ pub extern "C" fn rac_get_duration(ptr: *const Engine, dur_out: *mut c_double) -
 }
 
 fn probe_latency(engine: &Engine) -> (f64, &'static str) {
+    // USB rawlink: appsink does not participate in GStreamer latency queries,
+    // so the pipeline always reports 0.  Instead, measure the real gap between
+    // query_position (pipeline decode head) and the DAC play position derived
+    // from frame counting: dac_pos = anchor_stream_pos + total_frames / rate.
+    if let Some(ref us) = engine.usb_sink {
+        let rate = us.feed.rate.load(Ordering::Relaxed) as u64;
+        if rate > 0 {
+            let total_frames = us.feed.total_frames.load(Ordering::Relaxed);
+            let anchor_pos_ns = us.anchor_stream_pos_ns.load(Ordering::Acquire);
+            // DAC has played total_frames since anchor — convert to stream ns.
+            let dac_played_ns = total_frames.saturating_mul(1_000_000_000) / rate;
+            let dac_stream_ns = anchor_pos_ns.saturating_add(dac_played_ns);
+
+            if let Some(q_pos_ns) = engine
+                .playbin
+                .query_position::<gst::ClockTime>()
+                .map(|p| p.nseconds())
+            {
+                if q_pos_ns > dac_stream_ns {
+                    let delta_s = (q_pos_ns - dac_stream_ns) as f64 / 1_000_000_000.0;
+                    if delta_s > 0.0 && delta_s < 5.0 {
+                        return (delta_s, "usb-rawlink-measured");
+                    }
+                }
+            }
+        }
+        // Fallback before clock is anchored (first samples not yet sent):
+        // use the ISO ring depth as a conservative estimate.
+        let ring_ms = (usb_audio::transfer::N_TRANSFERS
+            * usb_audio::transfer::N_PACKETS_TARGET_MS) as f64;
+        return (ring_ms / 1000.0, "usb-rawlink-ring-fallback");
+    }
+
     // Primary path: standard GStreamer latency query.
     let mut q = gst::query::Latency::new();
     if engine.playbin.query(&mut q) {

@@ -334,10 +334,6 @@ unsafe fn fill_transfer(state: &RingState, transfer: *mut libusb_transfer) {
 
     let frame_bytes = state.channels * state.bytes_per_sample;
 
-    // Snapshot queue depth *before* draining so the log reflects what was
-    // available when this transfer was filled (useful for diagnosing xruns).
-    let queue_avail_before = state.queue.available_read();
-
     // ISO packets must be laid out tightly (no gaps) in the transfer buffer.
     // libusb/usbfs computes each packet's start offset as the cumulative sum
     // of the *actual* lengths of all preceding packets — NOT as i * max_packet.
@@ -348,7 +344,6 @@ unsafe fn fill_transfer(state: &RingState, transfer: *mut libusb_transfer) {
     let mut total_frames: u64 = 0;
     let mut total_bytes: u64 = 0;
     let mut xrun_packets: u64 = 0;
-    let mut xrun_bytes_missing: usize = 0;
     let mut fadein_rem = state.fadein_remaining.load(Ordering::Relaxed);
     let mut fadein_armed = false;
     for i in 0..n_packets {
@@ -367,7 +362,6 @@ unsafe fn fill_transfer(state: &RingState, transfer: *mut libusb_transfer) {
         if got < packet_bytes {
             pkt_buf[got..].fill(0);
             xrun_packets += 1;
-            xrun_bytes_missing += packet_bytes - got;
             // Arm fade-in for the recovery after this xrun.
             fadein_armed = true;
         }
@@ -416,24 +410,26 @@ unsafe fn fill_transfer(state: &RingState, transfer: *mut libusb_transfer) {
     state.fadein_remaining.store(fadein_rem, Ordering::Relaxed);
 
     if xrun_packets > 0 {
-        let total_xruns_before = state.xruns.load(Ordering::Relaxed);
-        let bytes_drained = state.bytes_drained_total.load(Ordering::Relaxed);
-        // bytes_per_ms = rate * frame_bytes / 1000  (e.g. 44100 * 8 / 1000 = 352)
-        let bytes_per_ms = state.rate as u64 * frame_bytes as u64 / 1000;
-        let ms_drained = if bytes_per_ms > 0 { bytes_drained / bytes_per_ms } else { 0 };
-        let queue_ms    = if bytes_per_ms > 0 { queue_avail_before as u64 / bytes_per_ms } else { 0 };
-        eprintln!(
-            "usb-audio: xrun transfer={}/{} pkt  queue={} B (~{} ms)  missing={} B  \
-             feedback={:?} ms  xruns_total={}  playback_ms={}",
-            xrun_packets,
-            n_packets,
-            queue_avail_before,
-            queue_ms,
-            xrun_bytes_missing,
-            feedback.map(|v| v / 1000),
-            total_xruns_before,
-            ms_drained,
-        );
+        // Xrun logging is intentionally suppressed.  During pause/idle the ISO
+        // ring continues draining the (empty) queue until the pusher thread
+        // closes the sink, producing thousands of harmless xrun packets.
+        // The pusher thread already reports aggregate xrun counts via
+        // EVT_STATE "usb-xruns=N", so per-transfer logging is redundant.
+        // Uncomment the block below only when debugging queue underruns
+        // during active playback.
+        //
+        // let total_xruns_before = state.xruns.load(Ordering::Relaxed);
+        // let bytes_drained = state.bytes_drained_total.load(Ordering::Relaxed);
+        // let bytes_per_ms = state.rate as u64 * frame_bytes as u64 / 1000;
+        // let ms_drained = if bytes_per_ms > 0 { bytes_drained / bytes_per_ms } else { 0 };
+        // let queue_ms    = if bytes_per_ms > 0 { queue_avail_before as u64 / bytes_per_ms } else { 0 };
+        // eprintln!(
+        //     "usb-audio: xrun transfer={}/{} pkt  queue={} B (~{} ms)  missing={} B  \
+        //      feedback={:?} ms  xruns_total={}  playback_ms={}",
+        //     xrun_packets, n_packets, queue_avail_before, queue_ms,
+        //     xrun_bytes_missing, feedback.map(|v| v / 1000),
+        //     total_xruns_before, ms_drained,
+        // );
     }
 
     if total_bytes > 0 {
@@ -828,6 +824,21 @@ impl IsoTransferRing {
         if let Some(t) = self.event_thread.take() {
             let _ = t.join();
         }
+    }
+}
+
+impl IsoTransferRing {
+    /// Free all libusb transfer objects and their backing buffers.  Must be
+    /// called AFTER `stop()` (which cancels in-flight transfers and joins
+    /// the event thread).  After this call, `drop()` becomes a no-op for
+    /// transfers — safe to create a new ring on the same libusb context
+    /// without mutex contention.
+    pub fn free_transfers(&mut self) {
+        for &xfer in &self.transfers {
+            unsafe { libusb_free_transfer(xfer) };
+        }
+        self.transfers.clear();
+        self._bufs.clear();
     }
 }
 

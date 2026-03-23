@@ -196,7 +196,7 @@ pub struct AlsaHwClockFeed {
     /// `CLOCK_MONOTONIC` nanoseconds at the start of playback (first commit).
     anchor_ns: AtomicU64,
     /// Total PCM frames committed since the anchor was set.
-    total_frames: AtomicU64,
+    pub(crate) total_frames: AtomicU64,
     /// Negotiated sample rate (frames per second).
     pub(crate) rate: AtomicU32,
     /// True once `anchor()` has been called and the feed is ready.
