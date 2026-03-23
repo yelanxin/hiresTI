@@ -5,6 +5,8 @@
 //! For UAC 2.0, sample rates live in the Clock Source entity and must be
 //! queried at open time; [`UacStreamAlt::sample_rates`] is left empty here.
 
+use rusb::{SyncType, UsageType};
+
 // ---------------------------------------------------------------------------
 // USB Audio Class constants
 // ---------------------------------------------------------------------------
@@ -159,6 +161,12 @@ pub struct EpInfo {
     /// For HS ISO: interval = 2^(bInterval-1) × 125 µs.
     /// For FS ISO: interval = bInterval × 1 ms.
     pub b_interval: u8,
+    /// Isochronous synchronisation mode.
+    pub sync_type: SyncType,
+    /// Isochronous usage type.
+    pub usage_type: UsageType,
+    /// Audio-only: explicit synch endpoint address advertised by this endpoint.
+    pub synch_address: u8,
 }
 
 /// Parse one AS interface alt-setting into a [`UacStreamAlt`].
@@ -284,8 +292,9 @@ pub fn parse_stream_alt(
         return None;
     }
 
-    // Find ISO OUT endpoint (required) and optional feedback IN endpoint
-    let mut out_ep: Option<(u8, u16, u8)> = None; // (address, max_packet, b_interval)
+    // Find ISO OUT endpoint (required) and optional feedback IN endpoint.
+    // Prefer the OUT endpoint's bSynchAddress (explicit feedback binding).
+    let mut out_ep: Option<&EpInfo> = None;
     let mut feedback_ep: Option<u8> = None;
 
     for ep in endpoints {
@@ -293,14 +302,22 @@ pub fn parse_stream_alt(
             continue;
         }
         if ep.is_out {
-            out_ep = Some((ep.address, ep.max_packet, ep.b_interval));
-        } else {
-            // ISO IN on an audio streaming interface = feedback endpoint
+            out_ep = Some(ep);
+        } else if ep.usage_type == UsageType::Feedback {
             feedback_ep = Some(ep.address);
         }
     }
 
-    let (out_ep_addr, max_packet, out_ep_interval) = out_ep?;
+    let out_ep = out_ep?;
+    let out_ep_addr = out_ep.address;
+    let max_packet = out_ep.max_packet;
+    let out_ep_interval = out_ep.b_interval;
+    if out_ep.synch_address != 0 {
+        feedback_ep = endpoints
+            .iter()
+            .find(|ep| !ep.is_out && ep.is_iso && ep.address == out_ep.synch_address)
+            .map(|ep| ep.address);
+    }
 
     // Fallback: derive subframe_size from bit_depth when the descriptor did not
     // provide it (should not happen for a well-formed device).

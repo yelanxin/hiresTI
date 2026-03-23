@@ -8,7 +8,7 @@
 
 use std::time::Duration;
 
-use rusb::{Context, Device, DeviceHandle, Direction, Speed, TransferType, UsbContext};
+use rusb::{Context, Device, DeviceHandle, Direction, Speed, SyncType, TransferType, UsageType, UsbContext};
 
 use super::control::{
     get_cur_sample_rate_uac2, query_sample_rates_uac2, set_sample_rate_uac1, set_sample_rate_uac2,
@@ -158,6 +158,17 @@ fn try_parse_device<T: UsbContext>(device: &Device<T>) -> Option<UsbAudioDevice>
                     is_iso: ep.transfer_type() == TransferType::Isochronous,
                     max_packet: ep.max_packet_size(),
                     b_interval: ep.interval(),
+                    sync_type: if ep.transfer_type() == TransferType::Isochronous {
+                        ep.sync_type()
+                    } else {
+                        SyncType::NoSync
+                    },
+                    usage_type: if ep.transfer_type() == TransferType::Isochronous {
+                        ep.usage_type()
+                    } else {
+                        UsageType::Data
+                    },
+                    synch_address: ep.synch_address(),
                 })
                 .collect();
 

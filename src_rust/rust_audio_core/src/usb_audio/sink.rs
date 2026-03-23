@@ -163,6 +163,7 @@ impl UsbAudioSink {
             alt.channels as usize,
             alt.max_packet as usize,
             packets_per_sec,
+            alt.feedback_ep.is_some(),
             Arc::clone(&feed),
         );
 
@@ -285,6 +286,7 @@ impl UsbAudioSink {
             alt.channels as usize,
             alt.max_packet as usize,
             packets_per_sec,
+            alt.feedback_ep.is_some(),
             Arc::clone(&feed),
         );
 
@@ -393,9 +395,19 @@ fn clock_monotonic_ns() -> u64 {
 struct FeedbackCtx {
     state: Arc<RingState>,
     uac_version: UacVersion,
+    ep: u8,
     /// EMA accumulator for feedback smoothing (α = 1/16).
     /// `None` until the first feedback packet arrives.
     ema: Option<i64>,
+    callbacks: u64,
+    parse_failures: u64,
+    rejected_outliers: u64,
+    /// Consecutive rejected feedback packets.  When this exceeds
+    /// `CONSECUTIVE_REJECT_THRESHOLD` the stale EMA value is cleared from
+    /// `feedback_ms` so `fill_transfer` falls back to the calibrated
+    /// clock rate — preventing device-side FIFO overflow from a stale
+    /// (slightly too-high) feedback value.
+    consecutive_rejects: u64,
 }
 
 /// Mark feedback tracking as stopped.
@@ -428,6 +440,22 @@ fn handle_feedback_resubmit_failure(state: &RingState, rc: c_int) {
     stop_feedback_tracking(state, no_device);
 }
 
+fn format_feedback_bytes(buf: &[u8]) -> String {
+    let mut out = String::new();
+    for (idx, byte) in buf.iter().enumerate() {
+        if idx > 0 {
+            out.push(' ');
+        }
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{:02x}", byte);
+    }
+    out
+}
+
+fn feedback_rate_hz(ms: i64, packets_per_sec: u32) -> f64 {
+    ms as f64 / 1_000_000.0 * packets_per_sec as f64
+}
+
 /// libusb ISO IN completion callback for the feedback endpoint.
 ///
 /// Parses the feedback value, applies a 1/16 EMA to smooth quantisation
@@ -454,6 +482,7 @@ extern "system" fn feedback_in_callback(transfer: *mut libusb_transfer) {
     // The callback is only ever invoked from the single libusb event thread,
     // so mutable access to `ctx.ema` is safe without additional locking.
     let ctx = unsafe { &mut *((*transfer).user_data as *mut FeedbackCtx) };
+    ctx.callbacks = ctx.callbacks.saturating_add(1);
 
     if ctx.state.stop.load(Ordering::Acquire) {
         // Stop requested — do not resubmit.
@@ -464,6 +493,12 @@ extern "system" fn feedback_in_callback(transfer: *mut libusb_transfer) {
     let status = unsafe { (*transfer).status };
     if status != libusb1_sys::constants::LIBUSB_TRANSFER_COMPLETED {
         // Non-recoverable status (CANCELLED, NO_DEVICE, etc.) — stop tracking.
+        eprintln!(
+            "usb-audio: feedback callback ep=0x{:02x} status={} callbacks={}",
+            ctx.ep,
+            status,
+            ctx.callbacks,
+        );
         stop_feedback_tracking(
             &ctx.state,
             status == libusb1_sys::constants::LIBUSB_TRANSFER_NO_DEVICE,
@@ -471,22 +506,106 @@ extern "system" fn feedback_in_callback(transfer: *mut libusb_transfer) {
         return;
     }
 
-    // Parse only completed packets.
-    let len = unsafe { (*transfer).actual_length } as usize;
-    let buf = unsafe { std::slice::from_raw_parts((*transfer).buffer as *const u8, len) };
+    // Parse only completed packets.  For ISO IN transfers, log both the
+    // top-level transfer length and the per-packet descriptor length so we can
+    // see whether libusb is reporting payload only via the packet descriptor.
+    let transfer_len = unsafe { (*transfer).actual_length } as usize;
+    let pkt_desc = unsafe { &*(*transfer).iso_packet_desc.as_ptr() };
+    let pkt_actual_len = pkt_desc.actual_length as usize;
+    let pkt_configured_len = pkt_desc.length as usize;
+    let _pkt_status = pkt_desc.status;
+    let raw_storage = unsafe {
+        std::slice::from_raw_parts(
+            (*transfer).buffer as *const u8,
+            pkt_configured_len.min(16),
+        )
+    };
+    // For ISO IN transfers libusb reports the real payload length per packet in
+    // iso_packet_desc[i].actual_length.  The top-level transfer.actual_length
+    // may remain zero even when packet payload is present.
+    let payload_len = if pkt_actual_len > 0 {
+        pkt_actual_len.min(pkt_configured_len)
+    } else {
+        transfer_len.min(pkt_configured_len)
+    };
+    let buf = unsafe {
+        std::slice::from_raw_parts(
+            (*transfer).buffer as *const u8,
+            payload_len,
+        )
+    };
     let ms = match ctx.uac_version {
         UacVersion::V2 => parse_feedback_uac2(buf, ctx.state.packets_per_sec),
         UacVersion::V1 => parse_feedback_uac1(buf),
     };
     if let Some(raw) = ms {
-        // Apply EMA: seed with first value to avoid a slow ramp-up from zero.
-        let smoothed = match ctx.ema {
-            None => raw,
-            Some(prev) => prev + (raw - prev) / 16,
+        let raw_rate_hz = feedback_rate_hz(raw, ctx.state.packets_per_sec);
+        let nominal_rate_hz = ctx.state.rate as f64;
+        let raw_ppm = if nominal_rate_hz > 0.0 {
+            (raw_rate_hz - nominal_rate_hz) / nominal_rate_hz * 1_000_000.0
+        } else {
+            0.0
         };
-        ctx.ema = Some(smoothed);
-        if let Ok(mut lock) = ctx.state.feedback_ms.lock() {
-            *lock = Some(smoothed);
+        // USB audio feedback should stay very close to nominal/sample-clock
+        // reality. Reject obviously bogus packets (observed as transient 48 kHz
+        // or ~44.32 kHz jumps on a 44.1 kHz stream) and keep the previous
+        // stable value instead of letting one bad packet perturb pacing.
+        const FEEDBACK_SANITY_MAX_PPM: f64 = 1000.0;
+        let rejected = nominal_rate_hz > 0.0 && raw_ppm.abs() > FEEDBACK_SANITY_MAX_PPM;
+        if rejected {
+            ctx.rejected_outliers = ctx.rejected_outliers.saturating_add(1);
+            ctx.consecutive_rejects = ctx.consecutive_rejects.saturating_add(1);
+            if ctx.rejected_outliers <= 2 || (ctx.rejected_outliers % 4096 == 0) {
+                eprintln!(
+                    "usb-audio: feedback reject ep=0x{:02x} cb#{} reject#{} consec={} raw=[{}] rate={:.3}Hz ppm={:+.1}",
+                    ctx.ep,
+                    ctx.callbacks,
+                    ctx.rejected_outliers,
+                    ctx.consecutive_rejects,
+                    format_feedback_bytes(raw_storage),
+                    raw_rate_hz,
+                    raw_ppm,
+                );
+            }
+            // NOTE: we intentionally keep the stale EMA in feedback_ms.
+            // The last good value (~44099.968 Hz) is much closer to the real
+            // device consumption rate than nominal (44100 Hz).  Clearing it
+            // would cause fill_transfer to use nominal, which over-delivers
+            // and makes the queue grow rapidly (~6 ms/s vs ~0.06 ms/s).
+        } else {
+            ctx.consecutive_rejects = 0;
+            // Apply EMA: seed with first value to avoid a slow ramp-up from zero.
+            let smoothed = match ctx.ema {
+                None => raw,
+                Some(prev) => prev + (raw - prev) / 16,
+            };
+            ctx.ema = Some(smoothed);
+            if ctx.callbacks <= 1 {
+                let rate_hz = feedback_rate_hz(smoothed, ctx.state.packets_per_sec);
+                eprintln!(
+                    "usb-audio: feedback ep=0x{:02x} cb#{} raw=[{}] smoothed_ms={} rate={:.3}Hz",
+                    ctx.ep,
+                    ctx.callbacks,
+                    format_feedback_bytes(raw_storage),
+                    smoothed,
+                    rate_hz,
+                );
+            }
+            if let Ok(mut lock) = ctx.state.feedback_ms.lock() {
+                *lock = Some(smoothed);
+            }
+        }
+    } else {
+        ctx.parse_failures = ctx.parse_failures.saturating_add(1);
+        if ctx.parse_failures <= 2 || (ctx.parse_failures % 4096 == 0) {
+            eprintln!(
+                "usb-audio: feedback parse failed ep=0x{:02x} cb#{} fail#{} pkt_actual={} raw=[{}]",
+                ctx.ep,
+                ctx.callbacks,
+                ctx.parse_failures,
+                pkt_actual_len,
+                format_feedback_bytes(raw_storage),
+            );
         }
     }
 
@@ -534,7 +653,16 @@ impl FeedbackReader {
         };
         let mut buf = vec![0u8; buf_len];
 
-        let ctx_box = Box::new(FeedbackCtx { state, uac_version, ema: None });
+        let ctx_box = Box::new(FeedbackCtx {
+            state,
+            uac_version,
+            ep,
+            ema: None,
+            callbacks: 0,
+            parse_failures: 0,
+            rejected_outliers: 0,
+            consecutive_rejects: 0,
+        });
         let ctx_ptr = ctx_box.as_ref() as *const FeedbackCtx as *mut c_void;
 
         let xfer = unsafe { libusb_alloc_transfer(1) };
@@ -572,6 +700,11 @@ impl FeedbackReader {
             .state
             .feedback_in_flight
             .store(true, Ordering::Release);
+        eprintln!(
+            "usb-audio: feedback start ep=0x{:02x} uac={:?}",
+            self._ctx.ep,
+            self._ctx.uac_version,
+        );
         let rc = unsafe { libusb_submit_transfer(self.transfer) };
         if rc != 0 {
             self._ctx
@@ -607,7 +740,7 @@ mod tests {
     fn feedback_resubmit_failure_no_device_marks_disconnect_and_clears_inflight() {
         let queue = FrameQueue::new();
         let feed = Arc::new(AlsaHwClockFeed::default());
-        let state = RingState::new(queue, 48_000, 4, 2, 192, 8_000, feed);
+        let state = RingState::new(queue, 48_000, 4, 2, 192, 8_000, false, feed);
         state.feedback_in_flight.store(true, Ordering::Release);
 
         handle_feedback_resubmit_failure(&state, libusb1_sys::constants::LIBUSB_ERROR_NO_DEVICE);
@@ -621,7 +754,7 @@ mod tests {
     fn feedback_resubmit_failure_generic_only_clears_inflight() {
         let queue = FrameQueue::new();
         let feed = Arc::new(AlsaHwClockFeed::default());
-        let state = RingState::new(queue, 48_000, 4, 2, 192, 8_000, feed);
+        let state = RingState::new(queue, 48_000, 4, 2, 192, 8_000, false, feed);
         state.feedback_in_flight.store(true, Ordering::Release);
 
         handle_feedback_resubmit_failure(&state, libusb1_sys::constants::LIBUSB_ERROR_BUSY);

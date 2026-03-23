@@ -90,6 +90,16 @@ pub const N_PACKETS_TARGET_MS: usize = 8;
 /// suppress the hard silence→audio transition click.
 const XRUN_FADEIN_SAMPLES: u32 = 96;
 
+fn usb_audio_ignore_feedback_enabled() -> bool {
+    std::env::var("HIRESTI_USB_IGNORE_FEEDBACK")
+        .ok()
+        .map(|v| {
+            let text = v.trim().to_ascii_lowercase();
+            !text.is_empty() && text != "0" && text != "false" && text != "off"
+        })
+        .unwrap_or(false)
+}
+
 pub struct RingState {
     pub queue: Arc<FrameQueue>,
     pub stop: AtomicBool,
@@ -98,6 +108,8 @@ pub struct RingState {
     pub rate_adapter: Mutex<RateAdapter>,
     /// Latest feedback value in millisamples (updated from feedback callback).
     pub feedback_ms: Mutex<Option<i64>>,
+    /// Whether the device exposes an explicit feedback endpoint.
+    pub has_feedback_ep: bool,
     /// Remaining fade-in samples after an xrun recovery.
     /// Decremented in `fill_transfer`; when >0, each sample is scaled by
     /// `(XRUN_FADEIN_SAMPLES - remaining) / XRUN_FADEIN_SAMPLES`.
@@ -159,6 +171,27 @@ pub struct RingState {
     drift_window_start_ns: AtomicU64,
     /// Count of error events within the current hysteresis window.
     drift_window_count: AtomicU32,
+
+    // ── ISO completion jitter tracking ──────────────────────────────────
+    /// Monotonic timestamp (ns) of the last ISO OUT transfer completion.
+    /// Zero means no completion recorded yet.
+    pub last_completion_ns: AtomicU64,
+    /// Count of transfer completions where the inter-completion interval
+    /// deviated by more than 50% from the expected ~8 ms.
+    /// Polled by the pusher thread for the per-second diagnostic log.
+    pub iso_jitter_events: AtomicU64,
+    /// Maximum observed inter-completion interval (µs) since last diagnostic
+    /// snapshot.  Reset to zero by the pusher thread after each log line.
+    pub iso_interval_max_us: AtomicU64,
+    /// Minimum observed inter-completion interval (µs) since last diagnostic
+    /// snapshot.  Reset to u64::MAX by the pusher thread after each log line.
+    pub iso_interval_min_us: AtomicU64,
+    /// Maximum callback latency (µs) — time spent inside `iso_out_callback`
+    /// from entry to post-resubmit.  Reset by the pusher thread after each
+    /// diagnostic snapshot.  A high value indicates the event thread was
+    /// delayed (lock contention, preemption) and may have caused a gap in
+    /// the ISO schedule.
+    pub callback_max_us: AtomicU64,
 }
 
 impl RingState {
@@ -169,11 +202,12 @@ impl RingState {
         channels: usize,
         max_packet: usize,
         packets_per_sec: u32,
+        has_feedback_ep: bool,
         clock_feed: Arc<AlsaHwClockFeed>,
     ) -> Arc<Self> {
         eprintln!(
-            "usb-audio: RingState rate={} ch={} bps={} max_packet={} packets_per_sec={}",
-            rate, channels, bytes_per_sample, max_packet, packets_per_sec
+            "usb-audio: RingState rate={} ch={} bps={} max_packet={} packets_per_sec={} feedback_ep={}",
+            rate, channels, bytes_per_sample, max_packet, packets_per_sec, has_feedback_ep
         );
 
         Arc::new(Self {
@@ -181,6 +215,7 @@ impl RingState {
             stop: AtomicBool::new(false),
             rate_adapter: Mutex::new(RateAdapter::new(rate, packets_per_sec)),
             feedback_ms: Mutex::new(None),
+            has_feedback_ep,
             fadein_remaining: AtomicU32::new(0),
             rate,
             bytes_per_sample,
@@ -197,6 +232,11 @@ impl RingState {
             feedback_in_flight: AtomicBool::new(false),
             drift_window_start_ns: AtomicU64::new(0),
             drift_window_count: AtomicU32::new(0),
+            last_completion_ns: AtomicU64::new(0),
+            iso_jitter_events: AtomicU64::new(0),
+            iso_interval_max_us: AtomicU64::new(0),
+            iso_interval_min_us: AtomicU64::new(u64::MAX),
+            callback_max_us: AtomicU64::new(0),
         })
     }
 }
@@ -271,8 +311,26 @@ unsafe fn fill_transfer(state: &RingState, transfer: *mut libusb_transfer) {
     let buf_base = (*transfer).buffer as *mut u8;
     let buf_len = ((*transfer).length) as usize;
 
-    let feedback = *state.feedback_ms.lock().unwrap_or_else(|e| e.into_inner());
+    let mut feedback = *state.feedback_ms.lock().unwrap_or_else(|e| e.into_inner());
+    let ignore_feedback = usb_audio_ignore_feedback_enabled();
+    if ignore_feedback {
+        feedback = None;
+    }
     let mut adapter = state.rate_adapter.lock().unwrap_or_else(|e| e.into_inner());
+    if feedback.is_none() && (ignore_feedback || !state.has_feedback_ep) {
+        let calibrated_fp32 = state.clock_feed
+            .calibrated_rate_hz()
+            .map(|rate_hz| rate_hz * 1_000_000.0 / state.packets_per_sec as f64);
+        if let Some(calibrated_ms) = calibrated_fp32 {
+            let clamped = calibrated_ms
+                .round()
+                .clamp(i64::MIN as f64, i64::MAX as f64) as i64;
+            state.calibrated_ms.store(clamped.max(0) as u64, Ordering::Relaxed);
+            if clamped > 0 {
+                feedback = Some(clamped);
+            }
+        }
+    }
 
     let frame_bytes = state.channels * state.bytes_per_sample;
 
@@ -391,10 +449,13 @@ unsafe fn fill_transfer(state: &RingState, transfer: *mut libusb_transfer) {
     if total_frames > 0 {
         state.clock_feed.advance(total_frames);
     }
+
 }
 
 /// libusb ISO OUT transfer completion callback.
 extern "system" fn iso_out_callback(transfer: *mut libusb_transfer) {
+    let cb_entry_ns = clock_monotonic_ns();
+
     // SAFETY: user_data == Arc::as_ptr(&state); valid while IsoTransferRing alive.
     let state = unsafe { &*((*transfer).user_data as *const RingState) };
 
@@ -419,13 +480,25 @@ extern "system" fn iso_out_callback(transfer: *mut libusb_transfer) {
     // Check each individual ISO packet's completion status from the *just-completed*
     // transfer.  For OUT transfers, a per-packet error means that 0.125 ms slot
     // was not delivered to the device — audible as a brief pop without any xrun.
+    // Also check for short packets (actual_length < length) which indicate the
+    // xHCI did not transmit all bytes — the device would receive truncated audio.
     let n_pkt = unsafe { (*transfer).num_iso_packets } as usize;
     let mut bad_pkts: u64 = 0;
+    let mut short_pkts: u64 = 0;
     for i in 0..n_pkt {
-        let pkt_status = unsafe { (*(*transfer).iso_packet_desc.as_ptr().add(i)).status };
-        if pkt_status != libusb1_sys::constants::LIBUSB_TRANSFER_COMPLETED {
+        let pkt = unsafe { &*(*transfer).iso_packet_desc.as_ptr().add(i) };
+        if pkt.status != libusb1_sys::constants::LIBUSB_TRANSFER_COMPLETED {
             bad_pkts += 1;
         }
+        if pkt.actual_length < pkt.length && pkt.length > 0 {
+            short_pkts += 1;
+        }
+    }
+    if short_pkts > 0 {
+        eprintln!(
+            "usb-audio: ISO OUT short packets: {}/{} in this transfer (queue={} B)",
+            short_pkts, n_pkt, state.queue.available_read(),
+        );
     }
     if bad_pkts > 0 {
         let total_errors_before = state.usb_pkt_errors.fetch_add(bad_pkts, Ordering::Relaxed);
@@ -487,13 +560,56 @@ extern "system" fn iso_out_callback(transfer: *mut libusb_transfer) {
         }
     }
 
+    // ── ISO completion jitter measurement ──────────────────────────────
+    // Each transfer covers ~8 ms of audio.  Measure inter-completion interval
+    // and flag outliers (> 50% deviation from expected).  This detects xHCI
+    // scheduling hiccups that could cause device-side FIFO gaps.
+    {
+        let now_ns = clock_monotonic_ns();
+        let prev_ns = state.last_completion_ns.swap(now_ns, Ordering::Relaxed);
+        if prev_ns != 0 {
+            let delta_ns = now_ns.saturating_sub(prev_ns);
+            let delta_us = delta_ns / 1_000;
+            // Expected interval: n_packets * 1_000_000 / packets_per_sec µs
+            // For 64 packets @ 8000 pkt/s = 8000 µs (8 ms)
+            let expected_us = n_pkt as u64 * 1_000_000 / state.packets_per_sec as u64;
+            let threshold_lo = expected_us / 2; // 4 ms
+            let threshold_hi = expected_us * 3 / 2; // 12 ms
+
+            // Update min/max atomically (best-effort, no CAS loop needed for diagnostics).
+            let cur_max = state.iso_interval_max_us.load(Ordering::Relaxed);
+            if delta_us > cur_max {
+                state.iso_interval_max_us.store(delta_us, Ordering::Relaxed);
+            }
+            let cur_min = state.iso_interval_min_us.load(Ordering::Relaxed);
+            if delta_us < cur_min {
+                state.iso_interval_min_us.store(delta_us, Ordering::Relaxed);
+            }
+
+            if delta_us < threshold_lo || delta_us > threshold_hi {
+                let jitter_count = state.iso_jitter_events.fetch_add(1, Ordering::Relaxed) + 1;
+                // Log first 8 jitter events, then every 64th to avoid flooding.
+                if jitter_count <= 8 || (jitter_count % 64 == 0) {
+                    let queue_bytes = state.queue.available_read();
+                    eprintln!(
+                        "usb-audio: ISO jitter #{}: interval={}µs expected={}µs (delta={:+}µs) queue={} B",
+                        jitter_count,
+                        delta_us,
+                        expected_us,
+                        delta_us as i64 - expected_us as i64,
+                        queue_bytes,
+                    );
+                }
+            }
+        }
+    }
+
     // Refill the transfer buffer with fresh audio from the queue and resubmit.
     unsafe { fill_transfer(state, transfer) };
 
     // Record ISO completion timestamp for rate calibration.
     // Called after fill_transfer so total_frames reflects the just-written batch.
     state.clock_feed.record_iso(clock_monotonic_ns());
-
 
     let rc = unsafe { libusb_submit_transfer(transfer) };
     if rc == 0 {
@@ -505,6 +621,13 @@ extern "system" fn iso_out_callback(transfer: *mut libusb_transfer) {
     }
     // Other submit failures: in_flight stays decremented; the ring self-heals
     // if other transfers are still running, or stop() will clean up.
+
+    // ── Callback latency measurement ─────────────────────────────────────
+    let cb_elapsed_us = clock_monotonic_ns().saturating_sub(cb_entry_ns) / 1_000;
+    let prev_max = state.callback_max_us.load(Ordering::Relaxed);
+    if cb_elapsed_us > prev_max {
+        state.callback_max_us.store(cb_elapsed_us, Ordering::Relaxed);
+    }
 }
 
 // ---------------------------------------------------------------------------

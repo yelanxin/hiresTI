@@ -378,7 +378,10 @@ def build_settings_page(app):
         "and uses the same rate/depth verdict rules as ALSA Exclusive, but audio "
         "still passes through the system mixer.\n\n"
         "• <b>ALSA（auto）/ALSA（mmap） + Exclusive mode:</b> bypasses the system mixer and is treated as "
-        "true bit-perfect playback."
+        "true bit-perfect playback.\n\n"
+        "• <b>USB Rawlink:</b> bypasses the kernel USB audio driver and lets hiresTI "
+        "talk directly to a compatible external USB DAC. With Bit-Perfect Mode on, "
+        "Rawlink uses the app's most direct player-to-device playback path."
     )
     bp_pop_box = Gtk.Box(margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
     bp_pop_box.append(bp_pop_content)
@@ -386,7 +389,7 @@ def build_settings_page(app):
     bp_help_btn.connect("clicked", lambda x: bp_help_pop.popup())
     bp_title_box.append(bp_help_btn)
     bp_info.append(bp_title_box)
-    bp_info.append(Gtk.Label(label="Bypass app EQ/volume; follow source rate when possible", xalign=0, css_classes=["dim-label"]))
+    bp_info.append(Gtk.Label(label="Bypass app EQ/volume; direct device path in USB Rawlink", xalign=0, css_classes=["dim-label"]))
     row_bp.append(bp_info)
     row_bp.append(Gtk.Box(hexpand=True))
     app.bp_switch = Gtk.Switch(valign=Gtk.Align.CENTER)
@@ -509,9 +512,9 @@ def build_settings_page(app):
     drv_pop_content = Gtk.Label(wrap=True, max_width_chars=44, xalign=0)
     drv_pop_content.set_markup(
         "<b>Audio Driver Modes</b>\n\n"
-        "• <b>ALSA（auto）:</b> Standard ALSA output. Automatically selects RW or MMAP transfer mode.\n\n"
-        "• <b>ALSA（mmap）:</b> ALSA output with MMAP transfer forced. Lower copy overhead; some devices work better with auto.\n\n"
-        "• <b>USB Rawlink:</b> Bypasses the kernel audio stack and drives the USB device directly via libusb. Requires a compatible UAC 1.0/2.0 device."
+        "• <b>ALSA（auto）:</b> Recommended for most setups. hiresTI chooses the most compatible ALSA path for your device automatically.\n\n"
+        "• <b>ALSA（mmap）:</b> A zero-copy ALSA path with a more direct handoff to the device. Best for users who want a leaner playback path or prefer MMAP on their hardware.\n\n"
+        "• <b>USB Rawlink:</b> Bypasses the kernel USB audio driver and lets hiresTI talk directly to the USB device for playback. Best for users who want the most direct player-to-DAC path on a compatible external USB DAC."
     )
     drv_pop_box = Gtk.Box(margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
     drv_pop_box.append(drv_pop_content)
@@ -520,7 +523,7 @@ def build_settings_page(app):
     drv_title_box.append(drv_help_btn)
     drv_info.append(drv_title_box)
     drv_desc = Gtk.Label(
-        label="ALSA（auto） auto-selects RW/MMAP. ALSA（mmap） forces MMAP. USB Rawlink bypasses the kernel stack.",
+        label="ALSA（auto） for most setups. ALSA（mmap） for zero-copy tuning. USB Rawlink for direct USB playback.",
         xalign=0,
         css_classes=["dim-label"],
     )

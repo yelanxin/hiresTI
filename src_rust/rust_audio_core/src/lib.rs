@@ -21,7 +21,7 @@ use std::os::raw::{c_char, c_double, c_int, c_uint, c_void};
 use std::path::Path;
 use std::ptr;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::thread;
 use std::time::Duration;
@@ -933,6 +933,7 @@ fn usb_audio_pusher_thread(
     lazy: LazyUsbOpen,
     events: ThreadEventQueue,
     stop: Arc<AtomicBool>,
+    buffering_pct: Arc<AtomicI32>,
 ) {
     // Elevate the pusher thread so queue fills are never starved by normal
     // priority work (Python UI, GLib main loop, GStreamer decode threads).
@@ -950,7 +951,30 @@ fn usb_audio_pusher_thread(
     let mut last_drain_snapshot: u64 = 0;
     let mut last_xrun_snapshot: u64 = 0;
     let mut last_log_time = std::time::Instant::now();
+    let mut last_no_feedback_drift_log =
+        std::time::Instant::now() - std::time::Duration::from_secs(60);
     let diag_enabled = usb_audio_diag_enabled();
+
+    // ── PCM dump: write raw PCM to file for offline analysis ────────────
+    // Enabled by HIRESTI_USB_PCM_DUMP=/path/to/output.raw
+    // Format: S32LE interleaved stereo, same rate as playback.
+    // Import in Audacity: File → Import → Raw Data → Signed 32-bit LE, Stereo, rate.
+    let mut pcm_dump: Option<std::io::BufWriter<std::fs::File>> = std::env::var("HIRESTI_USB_PCM_DUMP")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .and_then(|path| {
+            match std::fs::File::create(&path) {
+                Ok(f) => {
+                    eprintln!("usb-audio: PCM dump enabled → {}", path);
+                    Some(std::io::BufWriter::with_capacity(256 * 1024, f))
+                }
+                Err(e) => {
+                    eprintln!("usb-audio: PCM dump failed to open {}: {}", path, e);
+                    None
+                }
+            }
+        });
+
     // Queue depth trend tracking: sample min/max each period + session-wide min.
     let mut queue_min: usize = usize::MAX;
     let mut queue_max: usize = 0;
@@ -963,6 +987,21 @@ fn usb_audio_pusher_thread(
     // Count DISCONT-flagged buffers: a DISCONT indicates a PCM timeline gap that
     // can cause a phase discontinuity (audible pop) without any xrun.
     let mut discont_count: u64 = 0;
+    let mut pull_timeout_count: u64 = 0;
+
+    // ── PCM click (spike) detector ─────────────────────────────────────
+    // Detects single-sample spikes: a sample that deviates far from the
+    // midpoint of its neighbours.  This catches discontinuities (pops)
+    // while ignoring legitimate loud transients (drums, percussion).
+    //
+    // For each channel, keep a 2-sample history [prev2, prev1].
+    // When a new sample `cur` arrives, check if `prev1` is a spike:
+    //   spike = |prev1 - (prev2 + cur) / 2|  >  threshold
+    // Threshold: 50% of full-scale i32.
+    const CLICK_SPIKE_THRESHOLD: i64 = (i32::MAX as i64) / 2;
+    let mut click_hist: [[i32; 2]; 2] = [[0; 2]; 2]; // [ch][prev2, prev1]
+    let mut click_hist_count: u32 = 0; // how many samples fed so far (0,1,2+)
+    let mut click_count: u64 = 0;
 
     // Exponential back-off sleep duration for the idle (no-sample) path.
     // Resets to MIN_IDLE_MS on each real sample; caps at MAX_IDLE_MS.
@@ -1077,18 +1116,21 @@ fn usb_audio_pusher_thread(
             // This means the GStreamer decoder produced no output for at least 100 ms —
             // a strong indicator of a network rebuffer or decoder stall.  Log it so
             // we can correlate with user-reported "卡一下" glitches.
-            let q_ms = sink.as_ref().map_or(0, |s| {
-                s.queue.available_read() as u64 * 1000
-                    / (s.state.rate as u64
-                        * s.state.channels as u64
-                        * s.state.bytes_per_sample as u64)
-                        .max(1)
-            });
-            let state = appsink.current_state();
-            eprintln!(
-                "usb-audio: pull timeout (pipeline stalled ≥100ms, queue={}ms, appsink={:?})",
-                q_ms, state,
-            );
+            pull_timeout_count += 1;
+            if pull_timeout_count <= 2 || (pull_timeout_count % 32 == 0) {
+                let q_ms = sink.as_ref().map_or(0, |s| {
+                    s.queue.available_read() as u64 * 1000
+                        / (s.state.rate as u64
+                            * s.state.channels as u64
+                            * s.state.bytes_per_sample as u64)
+                            .max(1)
+                });
+                let state = appsink.current_state();
+                eprintln!(
+                    "usb-audio: pull timeout #{} (pipeline stalled ≥100ms, queue={}ms, appsink={:?})",
+                    pull_timeout_count, q_ms, state,
+                );
+            }
             thread::sleep(std::time::Duration::from_millis(idle_sleep_ms));
             idle_sleep_ms = (idle_sleep_ms * 2).min(MAX_IDLE_MS);
             continue;
@@ -1136,6 +1178,7 @@ fn usb_audio_pusher_thread(
             buf_count = 0;
             startup_prefill.clear();
             startup_prefill_rate = 0;
+            click_hist_count = 0;
         }
 
         // ── Rate-change backup: close and re-open if caps rate changed ───────
@@ -1202,6 +1245,52 @@ fn usb_audio_pusher_thread(
                 } else {
                     map.as_slice()
                 };
+
+                // ── PCM spike detection ─────────────────────────────────
+                // Detect single-sample spikes (pops) in S32LE interleaved
+                // PCM.  A spike is a sample that deviates far from the
+                // midpoint of its two neighbours — catches discontinuities
+                // while ignoring legitimate loud transients.
+                if diag_enabled && data.len() >= 8 && lazy.channels <= 2 {
+                    let bps = 4usize; // S32LE
+                    let ch = lazy.channels as usize;
+                    let frame_bytes = ch * bps;
+                    let n_frames = data.len() / frame_bytes;
+                    for f in 0..n_frames {
+                        for c in 0..ch {
+                            let off = f * frame_bytes + c * bps;
+                            let cur = i32::from_le_bytes([
+                                data[off], data[off + 1], data[off + 2], data[off + 3],
+                            ]);
+                            if click_hist_count >= 2 {
+                                // Check if prev1 (click_hist[c][1]) is a spike:
+                                // midpoint of prev2 and cur
+                                let prev2 = click_hist[c][0] as i64;
+                                let prev1 = click_hist[c][1] as i64;
+                                let mid = (prev2 + cur as i64) / 2;
+                                let deviation = (prev1 - mid).abs();
+                                if deviation > CLICK_SPIKE_THRESHOLD {
+                                    click_count += 1;
+                                    if click_count <= 32 || (click_count % 128 == 0) {
+                                        let playback_sec = session_start.elapsed().as_secs_f64();
+                                        eprintln!(
+                                            "usb-audio: PCM spike #{} ch={} frame={}/{} samples=[{}, {}, {}] dev={} buf#{} @{:.1}s",
+                                            click_count, c, f, n_frames,
+                                            click_hist[c][0], click_hist[c][1], cur,
+                                            deviation, buf_count, playback_sec,
+                                        );
+                                    }
+                                }
+                            }
+                            // Shift history: prev2 ← prev1, prev1 ← cur
+                            click_hist[c][0] = click_hist[c][1];
+                            click_hist[c][1] = cur;
+                        }
+                        if click_hist_count < 2 {
+                            click_hist_count += 1;
+                        }
+                    }
+                }
 
                 if sink.is_none() {
                     let rate = sample_caps_rate.unwrap_or(48_000);
@@ -1296,6 +1385,13 @@ fn usb_audio_pusher_thread(
                     }
                 }
 
+                // Write PCM data to dump file (before queue push, captures
+                // exactly what the USB device will receive).
+                if let Some(ref mut w) = pcm_dump {
+                    use std::io::Write;
+                    let _ = w.write_all(data);
+                }
+
                 let s = sink
                     .as_ref()
                     .expect("startup prefill opens sink before push");
@@ -1363,6 +1459,22 @@ fn usb_audio_pusher_thread(
                 let usb_errs = s.state.usb_pkt_errors.load(Ordering::Relaxed);
                 let queue_now = s.queue.available_read();
                 let feedback_val = s.state.feedback_ms.lock().ok().and_then(|g| *g);
+                let ignore_feedback = usb_audio_ignore_feedback_enabled();
+                let feedback_tracking = s.state.feedback_in_flight.load(Ordering::Acquire);
+                let feedback_mode = if feedback_val.is_some() {
+                    "live"
+                } else if s.state.has_feedback_ep {
+                    if feedback_tracking { "armed" } else { "lost" }
+                } else {
+                    "none"
+                };
+                let feedback_source = if ignore_feedback {
+                    "cal"
+                } else if feedback_val.is_some() {
+                    "ep"
+                } else {
+                    "nom"
+                };
                 // Convert queue bytes to ms for readability.
                 let bytes_per_ms = (expected / 1000).max(1);
                 let q_now_ms = queue_now as u64 / bytes_per_ms;
@@ -1373,19 +1485,43 @@ fn usb_audio_pusher_thread(
                 let feedback_hz = feedback_val.map(|ms| {
                     ms as f64 / 1_000_000.0 * s.state.packets_per_sec as f64
                 });
-                // Drift correction and calibrated rate from the clock feed.
-                let drift_ppb = s.state.rate_adapter
+                // Drift correction and packet scheduler target from RateAdapter.
+                let nominal_rate_hz = s.state.rate as f64;
+                let nominal_ms = nominal_rate_hz * 1_000_000.0 / s.state.packets_per_sec as f64;
+                let (drift_ppb, sched_ms) = s.state.rate_adapter
                     .lock()
                     .ok()
-                    .map(|a| a.drift_correction_ppb())
-                    .unwrap_or(0);
+                    .map(|a| (a.drift_correction_ppb(), a.target_millisamples(feedback_val) as f64))
+                    .unwrap_or((0, nominal_ms));
+                let sched_rate_hz = sched_ms * s.state.packets_per_sec as f64 / 1_000_000.0;
+                let sched_ppm = if nominal_rate_hz > 0.0 {
+                    (sched_rate_hz - nominal_rate_hz) / nominal_rate_hz * 1_000_000.0
+                } else {
+                    0.0
+                };
                 let cal_rate = s.feed.calibrated_rate_hz();
+                let cal_ppm = cal_rate.map(|rate| {
+                    if nominal_rate_hz > 0.0 {
+                        (rate - nominal_rate_hz) / nominal_rate_hz * 1_000_000.0
+                    } else {
+                        0.0
+                    }
+                });
+                let sample_debt_per_sec = cal_rate.map(|rate| rate - sched_rate_hz);
                 let clock_mode = s.feed.mode();
+                let buf_pct = buffering_pct.load(Ordering::Relaxed);
+                // Snapshot and reset ISO completion jitter stats.
+                let jitter_events = s.state.iso_jitter_events.load(Ordering::Relaxed);
+                let iso_max_us = s.state.iso_interval_max_us.swap(0, Ordering::Relaxed);
+                let iso_min_us = s.state.iso_interval_min_us.swap(u64::MAX, Ordering::Relaxed);
+                let iso_min_display = if iso_min_us == u64::MAX { 0 } else { iso_min_us };
+                let cb_max_us = s.state.callback_max_us.swap(0, Ordering::Relaxed);
                 eprintln!(
                     "usb-audio: push={:.0} drain={:.0} expected={} B/s | \
                      queue={}ms [min={}ms@{:.1}s max={}ms session_min={}ms] \
-                     xruns+{}({}) usb_errs={} discont={} feedback={:?}Hz | \
-                     drift={}ppb cal={:.3}Hz {:?}",
+                     xruns+{}({}) usb_errs={} discont={} feedback={}({:?}Hz) fbsrc={} | \
+                     drift={}ppb sched={:.3}Hz({:+.1}ppm) cal={:.3}Hz({:+.1}ppm) debt={:+.3}sps {:?} buf={}% \
+                     iso=[{}..{}µs] jitter={} cb_max={}µs clicks={}",
                     push_bytes_window as f64 / secs,
                     drain_delta as f64 / secs,
                     expected,
@@ -1398,11 +1534,42 @@ fn usb_audio_pusher_thread(
                     xrun_total,
                     usb_errs,
                     discont_count,
+                    feedback_mode,
                     feedback_hz.map(|f| format!("{:.3}", f)),
+                    feedback_source,
                     drift_ppb,
+                    sched_rate_hz,
+                    sched_ppm,
                     cal_rate.unwrap_or(0.0),
+                    cal_ppm.unwrap_or(0.0),
+                    sample_debt_per_sec.unwrap_or(0.0),
                     clock_mode,
+                    buf_pct,
+                    iso_min_display,
+                    iso_max_us,
+                    jitter_events,
+                    cb_max_us,
+                    click_count,
                 );
+                if !s.state.has_feedback_ep {
+                    if let (Some(cal_rate_hz), Some(sample_debt)) = (cal_rate, sample_debt_per_sec) {
+                        if sample_debt.abs() >= 0.5
+                            && last_no_feedback_drift_log.elapsed().as_secs_f64() >= 5.0
+                        {
+                            eprintln!(
+                                "usb-audio: no-feedback rate divergence nominal={}Hz sched={:.3}Hz cal={:.3}Hz debt={:+.3}sps queue={}ms drift={}ppb {:?}",
+                                s.state.rate,
+                                sched_rate_hz,
+                                cal_rate_hz,
+                                sample_debt,
+                                q_now_ms,
+                                drift_ppb,
+                                clock_mode,
+                            );
+                            last_no_feedback_drift_log = std::time::Instant::now();
+                        }
+                    }
+                }
                 last_drain_snapshot = drain_total;
                 last_xrun_snapshot = xrun_total;
             }
@@ -1449,6 +1616,16 @@ fn current_usb_clock_mode(raw: &AtomicU8) -> alsa_clock::ClockMode {
 
 fn usb_audio_diag_enabled() -> bool {
     env::var("HIRESTI_USB_AUDIO_DIAG")
+        .ok()
+        .map(|v| {
+            let text = v.trim().to_ascii_lowercase();
+            !text.is_empty() && text != "0" && text != "false" && text != "off"
+        })
+        .unwrap_or(false)
+}
+
+fn usb_audio_ignore_feedback_enabled() -> bool {
+    env::var("HIRESTI_USB_IGNORE_FEEDBACK")
         .ok()
         .map(|v| {
             let text = v.trim().to_ascii_lowercase();
@@ -1997,6 +2174,9 @@ pub struct Engine {
     output_buffer_us: i32,
     output_latency_us: i32,
     output_exclusive: bool,
+    /// Latest GStreamer buffering percentage (0–100) from HTTP source.
+    /// Updated in `pump_events`, read by USB pusher thread for diagnostics.
+    buffering_pct: Arc<AtomicI32>,
 }
 
 impl Engine {
@@ -3715,6 +3895,7 @@ impl Engine {
             output_buffer_us: 100_000,
             output_latency_us: 10_000,
             output_exclusive: false,
+            buffering_pct: Arc::new(AtomicI32::new(100)),
         })
     }
 
@@ -3832,10 +4013,13 @@ impl Engine {
                 }
                 gst::MessageView::Buffering(b) => {
                     let percent = b.percent();
-                    eprintln!(
-                        "usb-audio: network buffering {}%",
-                        percent,
-                    );
+                    let prev_pct = self.buffering_pct.swap(percent, Ordering::Relaxed);
+                    if percent == 0 || percent == 100 || (prev_pct < 100 && percent >= 100) {
+                        eprintln!(
+                            "usb-audio: network buffering {}%",
+                            percent,
+                        );
+                    }
                     self.emit_event(EVT_STATE, &format!("buffering={}", percent));
                 }
                 gst::MessageView::Tag(t) => {
@@ -4059,8 +4243,9 @@ impl Engine {
             clock_mode: Arc::clone(&clock_mode),
             reset_pending: reset_pending_clone,
         };
+        let buffering_clone = Arc::clone(&self.buffering_pct);
         let thread = thread::spawn(move || {
-            usb_audio_pusher_thread(appsink_clone, lazy, events_clone, stop_clone);
+            usb_audio_pusher_thread(appsink_clone, lazy, events_clone, stop_clone, buffering_clone);
         });
 
         self.emit_event(

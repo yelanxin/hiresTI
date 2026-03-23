@@ -117,7 +117,7 @@ impl RateAdapter {
     ///
     /// Returns at least 1 sample to prevent zero-length ISO packets.
     pub fn samples_this_packet(&mut self, feedback_millisamples: Option<i64>) -> u32 {
-        let base = feedback_millisamples.unwrap_or(self.nominal_millisamples);
+        let base = self.target_millisamples(feedback_millisamples);
         // Apply drift correction only when running without device feedback.
         let delta = if feedback_millisamples.is_none() && self.drift_correction_ppb != 0 {
             // correction = nominal_ms * ppb / 1_000_000_000
@@ -139,6 +139,16 @@ impl RateAdapter {
         }
 
         n as u32
+    }
+
+    /// Nominal samples-per-packet in 1/1_000_000 sample units.
+    pub fn nominal_millisamples(&self) -> i64 {
+        self.nominal_millisamples
+    }
+
+    /// Effective target samples-per-packet before accumulator quantisation.
+    pub fn target_millisamples(&self, feedback_millisamples: Option<i64>) -> i64 {
+        feedback_millisamples.unwrap_or(self.nominal_millisamples)
     }
 
     /// Bump the drift correction upward (device FIFO underflow detected).
