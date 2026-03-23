@@ -3759,18 +3759,14 @@ impl Engine {
         // Prefer spectrum-structure carried timeline. Fallback to message ts, then
         // to pull-time query_position.
         let mut frame_pos_s = self.spectrum_pos_s;
-        let mut ts_src = "last";
-        if let Some((ts, src)) = Self::spectrum_time_from_structure(s) {
+        if let Some((ts, _src)) = Self::spectrum_time_from_structure(s) {
             frame_pos_s = ts;
-            ts_src = src;
         } else if let Some(ts) = msg_ts_s {
             if ts.is_finite() && ts >= 0.0 {
                 frame_pos_s = ts;
-                ts_src = "msg-ts";
             }
         } else if let Some(pos) = self.playbin.query_position::<gst::ClockTime>() {
             frame_pos_s = (pos.nseconds() as f64) / 1_000_000_000.0;
-            ts_src = "query-pos";
         }
         // New track / backward seek can leave a few stale spectrum messages in the
         // bus after the caller has already reset its local cursor. Drop the old
