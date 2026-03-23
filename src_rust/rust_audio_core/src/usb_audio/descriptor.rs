@@ -1,0 +1,403 @@
+//! UAC 1.0 / 2.0 Audio Class descriptor parsing.
+//!
+//! Operates on raw `extra()` byte slices from rusb — no USB control
+//! transfers are required for UAC 1.0 (sample rates are in the descriptor).
+//! For UAC 2.0, sample rates live in the Clock Source entity and must be
+//! queried at open time; [`UacStreamAlt::sample_rates`] is left empty here.
+
+use rusb::{SyncType, UsageType};
+
+// ---------------------------------------------------------------------------
+// USB Audio Class constants
+// ---------------------------------------------------------------------------
+
+pub const USB_CLASS_AUDIO: u8 = 0x01;
+pub const USB_SUBCLASS_AUDIO_CONTROL: u8 = 0x01;
+pub const USB_SUBCLASS_AUDIO_STREAMING: u8 = 0x02;
+
+/// bDescriptorType for class-specific interface/endpoint descriptors.
+const CS_INTERFACE: u8 = 0x24;
+
+/// AC interface descriptor subtypes.
+const AC_HEADER: u8 = 0x01;
+const AC_OUTPUT_TERMINAL: u8 = 0x03;
+const AC_CLOCK_SELECTOR: u8 = 0x0B;
+
+/// AS interface descriptor subtypes.
+const AS_GENERAL: u8 = 0x01;
+const AS_FORMAT_TYPE: u8 = 0x02;
+
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
+
+/// UAC protocol version detected from the Audio Control header descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UacVersion {
+    V1,
+    V2,
+}
+
+/// PCM format tag / format bitmap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UacFormat {
+    Pcm,
+    Pcm8,
+    Float32,
+    Unknown,
+}
+
+/// One active alt-setting on a USB Audio Streaming interface.
+///
+/// Alt-setting 0 (zero-bandwidth) is excluded; only alt-settings that carry
+/// audio data and expose a valid ISO OUT endpoint are included.
+#[derive(Debug, Clone)]
+pub struct UacStreamAlt {
+    /// USB alternate setting number (≥ 1).
+    pub alt_setting: u8,
+    /// PCM format declared by the device.
+    pub format: UacFormat,
+    /// Bit resolution (16 / 24 / 32).  Matches `bBitResolution` in the
+    /// Format Type I descriptor.
+    pub bit_depth: u8,
+    /// Container size in bytes per sample per channel.  Matches `bSubFrameSize`
+    /// (UAC 1.0) or `bSubSlotSize` (UAC 2.0).
+    ///
+    /// Critical for 24-bit devices: `subframe_size=3` → packed S24_3LE;
+    /// `subframe_size=4` → S24LE (24-bit value in a 32-bit container).
+    /// Falls back to `(bit_depth + 7) / 8` when the descriptor omits it.
+    pub subframe_size: u8,
+    /// Number of audio channels.
+    pub channels: u8,
+    /// Supported sample rates in Hz.
+    /// Populated for UAC 1.0 (from the Format Type descriptor).
+    /// Empty for UAC 2.0 (must be queried via Clock Source control transfer).
+    pub sample_rates: Vec<u32>,
+    /// ISO OUT endpoint address (direction bit already set).
+    pub out_ep: u8,
+    /// UAC 2.0 feedback (async) IN endpoint address, if present.
+    pub feedback_ep: Option<u8>,
+    /// `wMaxPacketSize` of the ISO OUT endpoint.
+    pub max_packet: u16,
+    /// `bInterval` of the ISO OUT endpoint (verbatim from the descriptor).
+    /// Interpret together with the bus speed to get the actual packet period.
+    pub out_ep_interval: u8,
+}
+
+// ---------------------------------------------------------------------------
+// Internal: iterate class-specific sub-descriptors inside an `extra()` blob
+// ---------------------------------------------------------------------------
+
+pub(crate) struct CsDescIter<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> CsDescIter<'a> {
+    pub(crate) fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+}
+
+impl<'a> Iterator for CsDescIter<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<&'a [u8]> {
+        loop {
+            let buf = self.buf.get(self.pos..)?;
+            if buf.len() < 2 {
+                return None;
+            }
+            let len = buf[0] as usize;
+            if len < 2 || len > buf.len() {
+                return None;
+            }
+            self.pos += len;
+            return Some(&buf[..len]);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UAC version detection from the Audio Control interface extra bytes
+// ---------------------------------------------------------------------------
+
+/// Returns the UAC version if `ac_extra` contains a valid AC Header descriptor.
+///
+/// Looks for `[bLength, 0x24, 0x01, bcdADC_lo, bcdADC_hi, ...]` and decodes
+/// the BCD version field:
+/// - `0x0100` → UAC 1.0
+/// - `0x0200` → UAC 2.0
+pub fn detect_uac_version(ac_extra: &[u8]) -> Option<UacVersion> {
+    for desc in CsDescIter::new(ac_extra) {
+        // Need at least: bLength, bDescriptorType, bDescriptorSubtype, bcdADC (2B)
+        if desc.len() < 5 {
+            continue;
+        }
+        if desc[1] != CS_INTERFACE || desc[2] != AC_HEADER {
+            continue;
+        }
+        let bcd = u16::from_le_bytes([desc[3], desc[4]]);
+        return Some(if bcd >= 0x0200 {
+            UacVersion::V2
+        } else {
+            UacVersion::V1
+        });
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Audio Streaming alt-setting parsing
+// ---------------------------------------------------------------------------
+
+/// Endpoint metadata extracted from a rusb `EndpointDescriptor`.
+pub struct EpInfo {
+    pub address: u8,
+    pub is_out: bool,
+    pub is_iso: bool,
+    pub max_packet: u16,
+    /// `bInterval` from the endpoint descriptor.
+    /// For HS ISO: interval = 2^(bInterval-1) × 125 µs.
+    /// For FS ISO: interval = bInterval × 1 ms.
+    pub b_interval: u8,
+    /// Isochronous synchronisation mode.
+    pub sync_type: SyncType,
+    /// Isochronous usage type.
+    pub usage_type: UsageType,
+    /// Audio-only: explicit synch endpoint address advertised by this endpoint.
+    pub synch_address: u8,
+}
+
+/// Parse one AS interface alt-setting into a [`UacStreamAlt`].
+///
+/// Returns `None` if the alt-setting does not describe a usable audio stream
+/// (wrong format type, missing OUT endpoint, zero bit-depth, etc.).
+pub fn parse_stream_alt(
+    alt_setting: u8,
+    as_extra: &[u8],
+    endpoints: &[EpInfo],
+    uac_version: UacVersion,
+) -> Option<UacStreamAlt> {
+    let mut format = UacFormat::Unknown;
+    let mut channels: u8 = 2;
+    let mut bit_depth: u8 = 0;
+    let mut subframe_size: u8 = 0;
+    let mut sample_rates: Vec<u32> = Vec::new();
+    let mut found_general = false;
+    let mut found_format = false;
+
+    for desc in CsDescIter::new(as_extra) {
+        if desc.len() < 3 || desc[1] != CS_INTERFACE {
+            continue;
+        }
+        let subtype = desc[2];
+
+        if subtype == AS_GENERAL {
+            match uac_version {
+                UacVersion::V1 => {
+                    // [len, 0x24, 0x01, bTermLink, bDelay, wFormatTag(2B)]
+                    if desc.len() < 7 {
+                        continue;
+                    }
+                    let fmt_tag = u16::from_le_bytes([desc[5], desc[6]]);
+                    format = match fmt_tag {
+                        0x0001 => UacFormat::Pcm,
+                        0x0002 => UacFormat::Pcm8,
+                        0x0003 => UacFormat::Float32,
+                        _ => UacFormat::Unknown,
+                    };
+                    found_general = true;
+                }
+                UacVersion::V2 => {
+                    // [len, 0x24, 0x01, bTermLink, bmControls, bFormatType,
+                    //  bmFormats(4B), bNrChannels, bmChannelConfig(4B), iChannelNames]
+                    if desc.len() < 11 {
+                        continue;
+                    }
+                    let bm_formats = u32::from_le_bytes([desc[6], desc[7], desc[8], desc[9]]);
+                    format = if bm_formats & 0x01 != 0 {
+                        UacFormat::Pcm
+                    } else if bm_formats & 0x04 != 0 {
+                        UacFormat::Float32
+                    } else if bm_formats & 0x02 != 0 {
+                        UacFormat::Pcm8
+                    } else {
+                        UacFormat::Unknown
+                    };
+                    channels = desc[10];
+                    found_general = true;
+                }
+            }
+        } else if subtype == AS_FORMAT_TYPE {
+            match uac_version {
+                UacVersion::V1 => {
+                    // [len, 0x24, 0x02, bFormatType, bNrChannels, bSubFrameSize,
+                    //  bBitResolution, bSamFreqType, freqs...]
+                    if desc.len() < 8 || desc[3] != 0x01 {
+                        // Only FORMAT_TYPE_I (0x01) supported
+                        continue;
+                    }
+                    channels = desc[4];
+                    subframe_size = desc[5]; // bSubFrameSize — wire bytes per sample
+                    bit_depth = desc[6]; // bBitResolution — used bits
+                    let freq_type = desc[7];
+                    if freq_type == 0 {
+                        // Continuous: tLower(3B) tUpper(3B) — record both endpoints
+                        if desc.len() >= 11 {
+                            let lo = u32::from_le_bytes([desc[8], desc[9], desc[10], 0]);
+                            if lo > 0 {
+                                sample_rates.push(lo);
+                            }
+                        }
+                        if desc.len() >= 14 {
+                            let hi = u32::from_le_bytes([desc[11], desc[12], desc[13], 0]);
+                            if hi > 0 && sample_rates.last() != Some(&hi) {
+                                sample_rates.push(hi);
+                            }
+                        }
+                    } else {
+                        // Discrete: freq_type × 3-byte frequencies
+                        let n = freq_type as usize;
+                        for i in 0..n {
+                            let off = 8 + i * 3;
+                            if off + 3 > desc.len() {
+                                break;
+                            }
+                            let hz =
+                                u32::from_le_bytes([desc[off], desc[off + 1], desc[off + 2], 0]);
+                            if hz > 0 {
+                                sample_rates.push(hz);
+                            }
+                        }
+                    }
+                    found_format = true;
+                }
+                UacVersion::V2 => {
+                    // [len, 0x24, 0x02, bFormatType, bSubSlotSize, bBitResolution]
+                    if desc.len() < 6 || desc[3] != 0x01 {
+                        continue;
+                    }
+                    subframe_size = desc[4]; // bSubSlotSize — wire bytes per sample
+                    bit_depth = desc[5]; // bBitResolution — used bits
+                                         // UAC 2.0 sample rates queried at open via Clock Source control transfer
+                    found_format = true;
+                }
+            }
+        }
+    }
+
+    // Validity check
+    if !found_general || !found_format || bit_depth == 0 || format == UacFormat::Unknown {
+        return None;
+    }
+
+    // Find ISO OUT endpoint (required) and optional feedback IN endpoint.
+    // Prefer the OUT endpoint's bSynchAddress (explicit feedback binding).
+    let mut out_ep: Option<&EpInfo> = None;
+    let mut feedback_ep: Option<u8> = None;
+
+    for ep in endpoints {
+        if !ep.is_iso {
+            continue;
+        }
+        if ep.is_out {
+            out_ep = Some(ep);
+        } else if ep.usage_type == UsageType::Feedback {
+            feedback_ep = Some(ep.address);
+        }
+    }
+
+    let out_ep = out_ep?;
+    let out_ep_addr = out_ep.address;
+    let max_packet = out_ep.max_packet;
+    let out_ep_interval = out_ep.b_interval;
+    if out_ep.synch_address != 0 {
+        feedback_ep = endpoints
+            .iter()
+            .find(|ep| !ep.is_out && ep.is_iso && ep.address == out_ep.synch_address)
+            .map(|ep| ep.address);
+    }
+
+    // Fallback: derive subframe_size from bit_depth when the descriptor did not
+    // provide it (should not happen for a well-formed device).
+    let subframe_size = if subframe_size > 0 {
+        subframe_size
+    } else {
+        (bit_depth + 7) / 8
+    };
+
+    Some(UacStreamAlt {
+        alt_setting,
+        format,
+        bit_depth,
+        subframe_size,
+        channels,
+        sample_rates,
+        out_ep: out_ep_addr,
+        feedback_ep,
+        max_packet,
+        out_ep_interval,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// UAC 2.0 Clock Source ID extraction
+// ---------------------------------------------------------------------------
+
+/// Extract the Clock Source entity ID from the Audio Control interface descriptors.
+///
+/// UAC 2.0 OUTPUT_TERMINAL carries a `bCSourceID` field (byte 8) that may point
+/// to either a Clock Source (subtype 0x0A) directly, or to a Clock Selector
+/// (subtype 0x0B).  Control transfers for sample rate (SET_CUR / GET_RANGE) must
+/// target a Clock **Source**, not a Selector — addressing a Selector is ignored
+/// by most devices, causing SET_CUR to fail silently and the device to play at
+/// an incorrect rate (wrong pitch / crackling).
+///
+/// This function resolves the chain:
+///   OUTPUT_TERMINAL.bCSourceID
+///     → if Clock Selector: follow baCSourceID[0] to reach the Clock Source
+///     → if already a Clock Source: return as-is
+///
+/// Returns `None` if no OUTPUT_TERMINAL with a valid `bCSourceID` is found.
+pub fn parse_clock_id_from_ac(ac_extra: &[u8]) -> Option<u8> {
+    // Pass 1: find bCSourceID from the (first) OUTPUT_TERMINAL.
+    let mut initial_id: Option<u8> = None;
+    for desc in CsDescIter::new(ac_extra) {
+        // UAC 2.0 OUTPUT_TERMINAL (12 bytes):
+        // [0] bLength, [1] 0x24, [2] 0x03 (OUTPUT_TERMINAL),
+        // [3] bTerminalID, [4..5] wTerminalType, [6] bAssocTerminal,
+        // [7] bSourceID, [8] bCSourceID, [9..10] bmControls, [11] iTerminal
+        if desc.len() < 9 || desc[1] != CS_INTERFACE || desc[2] != AC_OUTPUT_TERMINAL {
+            continue;
+        }
+        let id = desc[8]; // bCSourceID
+        if id != 0 {
+            initial_id = Some(id);
+            break;
+        }
+    }
+    let initial_id = initial_id?;
+
+    // Pass 2: if initial_id is a Clock Selector, follow it to the Clock Source.
+    // UAC 2.0 Clock Selector descriptor:
+    // [0] bLength, [1] 0x24, [2] 0x0B (CLOCK_SELECTOR),
+    // [3] bClockID, [4] bNrInPins, [5..] baCSourceID[0..bNrInPins-1], ...
+    for desc in CsDescIter::new(ac_extra) {
+        if desc.len() < 6 || desc[1] != CS_INTERFACE || desc[2] != AC_CLOCK_SELECTOR {
+            continue;
+        }
+        if desc[3] != initial_id {
+            continue; // not the selector we're looking for
+        }
+        let n_pins = desc[4] as usize;
+        if n_pins > 0 && desc.len() >= 6 {
+            // Return the first (and normally only) input pin — the programmable
+            // Clock Source that accepts SET_CUR frequency commands.
+            return Some(desc[5]); // baCSourceID[0]
+        }
+    }
+
+    // initial_id was not a Clock Selector — it is the Clock Source itself.
+    Some(initial_id)
+}

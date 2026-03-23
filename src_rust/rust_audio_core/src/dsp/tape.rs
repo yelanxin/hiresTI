@@ -1,6 +1,6 @@
+use gst::prelude::*;
 use gst::PadProbeReturn;
 use gst::PadProbeType;
-use gst::prelude::*;
 use gstreamer as gst;
 use std::f64::consts::PI;
 use std::sync::{Arc, Mutex};
@@ -20,7 +20,12 @@ pub struct TapeConfig {
 
 impl Default for TapeConfig {
     fn default() -> Self {
-        Self { enabled: false, drive: 30, tone: 60, warmth: 40 }
+        Self {
+            enabled: false,
+            drive: 30,
+            tone: 60,
+            warmth: 40,
+        }
     }
 }
 
@@ -28,25 +33,45 @@ impl TapeConfig {
     pub fn is_active(&self) -> bool {
         self.enabled
     }
-    pub fn set_enabled(&mut self, v: bool) { self.enabled = v; }
-    pub fn set_drive(&mut self, v: i32)   { self.drive   = v.clamp(0, 100); }
-    pub fn set_tone(&mut self, v: i32)    { self.tone    = v.clamp(0, 100); }
-    pub fn set_warmth(&mut self, v: i32)  { self.warmth  = v.clamp(0, 100); }
+    pub fn set_enabled(&mut self, v: bool) {
+        self.enabled = v;
+    }
+    pub fn set_drive(&mut self, v: i32) {
+        self.drive = v.clamp(0, 100);
+    }
+    pub fn set_tone(&mut self, v: i32) {
+        self.tone = v.clamp(0, 100);
+    }
+    pub fn set_warmth(&mut self, v: i32) {
+        self.warmth = v.clamp(0, 100);
+    }
 }
 
 // ── Biquad (transposed direct form II) ───────────────────────────────────────
 
 #[derive(Debug, Clone)]
 struct Biquad {
-    b0: f64, b1: f64, b2: f64,
-    a1: f64, a2: f64,
-    z1: f64, z2: f64,
+    b0: f64,
+    b1: f64,
+    b2: f64,
+    a1: f64,
+    a2: f64,
+    z1: f64,
+    z2: f64,
 }
 
 impl Default for Biquad {
     fn default() -> Self {
         // Identity (pass-through).
-        Self { b0: 1.0, b1: 0.0, b2: 0.0, a1: 0.0, a2: 0.0, z1: 0.0, z2: 0.0 }
+        Self {
+            b0: 1.0,
+            b1: 0.0,
+            b2: 0.0,
+            a1: 0.0,
+            a2: 0.0,
+            z1: 0.0,
+            z2: 0.0,
+        }
     }
 }
 
@@ -62,7 +87,11 @@ impl Biquad {
     /// First-order RC low-pass. `fc` in Hz, `sr` in Hz.
     fn lowpass_1st(fc: f64, sr: f64) -> Self {
         let a = (-2.0 * PI * fc / sr).exp();
-        Self { b0: 1.0 - a, a1: -a, ..Default::default() }
+        Self {
+            b0: 1.0 - a,
+            a1: -a,
+            ..Default::default()
+        }
     }
 
     /// Second-order low-shelf (Audio EQ Cookbook, shelf-slope S = 1).
@@ -78,16 +107,19 @@ impl Biquad {
         let alpha = w0.sin() / std::f64::consts::SQRT_2;
         let sqrt_a = a.sqrt();
 
-        let b0 =   a * ((a + 1.0) - (a - 1.0) * cos_w0 + 2.0 * sqrt_a * alpha);
+        let b0 = a * ((a + 1.0) - (a - 1.0) * cos_w0 + 2.0 * sqrt_a * alpha);
         let b1 = 2.0 * a * ((a - 1.0) - (a + 1.0) * cos_w0);
-        let b2 =   a * ((a + 1.0) - (a - 1.0) * cos_w0 - 2.0 * sqrt_a * alpha);
-        let a0 =       (a + 1.0) + (a - 1.0) * cos_w0 + 2.0 * sqrt_a * alpha;
+        let b2 = a * ((a + 1.0) - (a - 1.0) * cos_w0 - 2.0 * sqrt_a * alpha);
+        let a0 = (a + 1.0) + (a - 1.0) * cos_w0 + 2.0 * sqrt_a * alpha;
         let a1 = -2.0 * ((a - 1.0) + (a + 1.0) * cos_w0);
-        let a2 =        (a + 1.0) + (a - 1.0) * cos_w0 - 2.0 * sqrt_a * alpha;
+        let a2 = (a + 1.0) + (a - 1.0) * cos_w0 - 2.0 * sqrt_a * alpha;
 
         Self {
-            b0: b0 / a0, b1: b1 / a0, b2: b2 / a0,
-            a1: a1 / a0, a2: a2 / a0,
+            b0: b0 / a0,
+            b1: b1 / a0,
+            b2: b2 / a0,
+            a1: a1 / a0,
+            a2: a2 / a0,
             ..Default::default()
         }
     }
@@ -158,21 +190,25 @@ impl TapeState {
     }
 
     fn update_rate(&mut self, rate: u32) {
-        if rate == 0 || rate == self.stream_rate { return; }
+        if rate == 0 || rate == self.stream_rate {
+            return;
+        }
         self.stream_rate = rate;
         self.rebuild_filters();
     }
 
     fn apply_config(&mut self, config: &TapeConfig) {
         self.enabled = config.enabled;
-        self.drive  = config.drive  as f64 / 100.0;
-        self.tone   = config.tone   as f64 / 100.0;
+        self.drive = config.drive as f64 / 100.0;
+        self.tone = config.tone as f64 / 100.0;
         self.warmth = config.warmth as f64 / 100.0;
         self.rebuild_filters();
     }
 
     fn process(&mut self, samples: &mut [f64], channels: usize) {
-        if !self.enabled || channels == 0 || samples.is_empty() { return; }
+        if !self.enabled || channels == 0 || samples.is_empty() {
+            return;
+        }
         let frames = samples.len() / channels;
         let drive = self.drive;
 
@@ -244,10 +280,7 @@ impl TapeNode {
             }
             // Reinterpret as f64 samples (pipeline runs F64LE after in_convert).
             let samples: &mut [f64] = unsafe {
-                std::slice::from_raw_parts_mut(
-                    bytes.as_mut_ptr() as *mut f64,
-                    bytes.len() / 8,
-                )
+                std::slice::from_raw_parts_mut(bytes.as_mut_ptr() as *mut f64, bytes.len() / 8)
             };
             // Get channel count from caps.
             let channels = if let Some(caps) = pad.current_caps() {
@@ -264,11 +297,11 @@ impl TapeNode {
         });
 
         let sink_pad = identity.static_pad("sink").ok_or("tape missing sink pad")?;
-        let src_pad  = identity.static_pad("src").ok_or("tape missing src pad")?;
+        let src_pad = identity.static_pad("src").ok_or("tape missing src pad")?;
 
         let ghost_sink = gst::GhostPad::with_target(&sink_pad)
             .map_err(|_| "failed to create tape ghost sink".to_string())?;
-        let ghost_src  = gst::GhostPad::with_target(&src_pad)
+        let ghost_src = gst::GhostPad::with_target(&src_pad)
             .map_err(|_| "failed to create tape ghost src".to_string())?;
 
         bin.add_pad(&ghost_sink)

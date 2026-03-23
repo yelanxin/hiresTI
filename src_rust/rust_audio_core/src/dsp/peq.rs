@@ -6,8 +6,9 @@ pub const PEQ_BAND_COUNT: usize = 10;
 
 const PEQ_MIN_GAIN_DB: f64 = -24.0;
 const PEQ_MAX_GAIN_DB: f64 = 12.0;
-const PEQ_CENTER_FREQS_HZ: [f64; PEQ_BAND_COUNT] =
-    [30.0, 60.0, 120.0, 240.0, 480.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0];
+const PEQ_CENTER_FREQS_HZ: [f64; PEQ_BAND_COUNT] = [
+    30.0, 60.0, 120.0, 240.0, 480.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0,
+];
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PeqConfig {

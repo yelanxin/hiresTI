@@ -9,6 +9,7 @@ def bind_action_delegates(TidalApp, seen=None):
         on_driver_changed,
         on_latency_changed,
         on_mmap_realtime_priority_changed,
+        on_usb_clock_mode_changed,
         update_output_status_ui,
     )
     from actions.lyrics_playback_actions import (
@@ -90,6 +91,7 @@ def bind_action_delegates(TidalApp, seen=None):
         ("_load_cover_art", load_cover_art),
         ("on_latency_changed", on_latency_changed),
         ("on_mmap_realtime_priority_changed", on_mmap_realtime_priority_changed),
+        ("on_usb_clock_mode_changed", on_usb_clock_mode_changed),
         ("on_driver_changed", on_driver_changed),
         ("on_device_changed", on_device_changed),
         ("_refresh_output_status_loop", update_output_status_ui),
@@ -175,4 +177,5 @@ def bind_audio_settings_extras(TidalApp, seen=None):
         ("_force_driver_selection", _force_driver_selection),
         ("update_tech_label", update_tech_label),
         ("on_recover_output_clicked", lambda self, btn: audio_settings_actions.on_recover_output_clicked(self, btn)),
+        ("on_usb_fix_permissions_clicked", lambda self, btn: audio_settings_actions.on_usb_fix_permissions_clicked(self, btn)),
     ], seen=seen)

@@ -83,3 +83,65 @@ def test_get_genre_section_builds_category_sections_from_page_items():
     assert section["categories"][0]["items"][0]["type"] == "Album"
     assert section["categories"][1]["items"][0]["name"] == "Editor Picks"
     assert section["categories"][1]["items"][0]["type"] == "PageLink"
+
+
+def test_get_genre_section_skips_untitled_editorial_items_without_generic_unknown_fallback():
+    backend = object.__new__(TidalBackend)
+    untitled_page_item = SimpleNamespace(
+        header="",
+        short_header="",
+        short_sub_header="Editorial copy",
+        image_id="abc-def",
+        type="ALBUM",
+    )
+    backend.session = SimpleNamespace(
+        page=SimpleNamespace(
+            get=lambda path, params=None: SimpleNamespace(
+                categories=[
+                    SimpleNamespace(title="Highlights", items=[untitled_page_item], _more=None),
+                ]
+            )
+        )
+    )
+    backend._process_generic_item = lambda _item: {
+        "obj": _item,
+        "name": "Unknown",
+        "sub_title": "",
+        "image_url": None,
+        "type": "Fallback",
+    }
+
+    section = backend.get_genre_section("Women's History Month", "pages/moods/whm")
+
+    assert section is None
+
+
+def test_get_moods_page_filters_tabs_with_no_renderable_content():
+    backend = object.__new__(TidalBackend)
+    moods_page = SimpleNamespace(
+        categories=[
+            SimpleNamespace(
+                items=[
+                    SimpleNamespace(title="Women's History Month", api_path="/pages/moods/whm"),
+                    SimpleNamespace(title="For DJs", api_path="/pages/moods/for-djs"),
+                    SimpleNamespace(title="TIDAL Magazine", api_path="/pages/moods/magazine"),
+                ]
+            )
+        ]
+    )
+    backend.session = SimpleNamespace(
+        page=SimpleNamespace(get=lambda path, params=None: moods_page)
+    )
+    backend.get_genre_section = lambda label, path: (
+        None
+        if label == "Women's History Month"
+        else {"title": label, "categories": [{"title": "", "items": [{"name": label}]}]}
+    )
+
+    definitions, eager = backend.get_moods_page()
+
+    assert definitions == [
+        ("For DJs", "pages/moods/for-djs"),
+        ("TIDAL Magazine", "pages/moods/magazine"),
+    ]
+    assert [sec["title"] for sec in eager] == ["For DJs", "TIDAL Magazine"]

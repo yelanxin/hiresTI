@@ -298,6 +298,7 @@ class AudioSignalPathWindow(Adw.Window):
         if pop is not None:
             try:
                 pop.popdown()
+                pop.unparent()
             except Exception:
                 pass
         return False
@@ -368,30 +369,37 @@ class AudioSignalPathWindow(Adw.Window):
             card.content_box.append(row)
 
     def _build_bitperfect_verdict_help_text(self):
+        driver = self._get_current_driver()
         lines = [
-            "Bit-Perfect Verdict\n\n",
             "A Yes verdict means these checks passed:\n",
             "- Bit-Perfect mode is enabled\n",
             "- Output state is Active\n",
             "- Source and output sample rates match\n",
             "- Output bit depth is not lower than the source\n",
         ]
-        lines.append("\n")
-        lines.append(
-            "PipeWire note: Even when playback follows the music sample rate, "
-            "shared PipeWire output still goes through the system mixer. System volume "
-            "changes or other mixer processing can break true end-to-end bit-perfect "
-            "playback.\n\n"
-        )
-        lines.append(
-            "ALSA note: this player's ALSA path opens the selected hw:* device directly, "
-            "so the verdict checks source/output format alignment without requiring the "
-            "Exclusive toggle."
-        )
+        if driver == "USB Rawlink":
+            lines.append(
+                "\nUSB Rawlink bypasses the kernel USB audio driver "
+                "and sends PCM directly to the DAC via libusb — "
+                "the most direct player-to-device path."
+            )
+        elif driver == "PipeWire":
+            lines.append(
+                "\nPipeWire shared output still goes through the "
+                "system mixer. Volume changes or mixer processing "
+                "can break true bit-perfect playback."
+            )
+        elif driver in ("ALSA", "ALSA（auto）", "ALSA (mmap)", "ALSA（mmap）"):
+            lines.append(
+                "\nALSA opens the hw:* device directly, so the "
+                "verdict checks source/output format alignment "
+                "without requiring the Exclusive toggle."
+            )
         return "".join(lines)
 
     def _init_bitperfect_help_button(self):
-        btn = Gtk.MenuButton(icon_name="dialog-question-symbolic", css_classes=["flat"])
+        btn = Gtk.Button(css_classes=["flat"])
+        btn.set_child(Gtk.Image.new_from_icon_name("dialog-question-symbolic"))
         btn.add_css_class("signal-terminal-help-button")
         btn.set_valign(Gtk.Align.CENTER)
         btn.set_tooltip_text("Explain bit-perfect verdict")
@@ -431,7 +439,15 @@ class AudioSignalPathWindow(Adw.Window):
         pop_label.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
         pop_box.append(pop_label)
         pop.set_child(pop_box)
-        btn.set_popover(pop)
+
+        def _on_help_clicked(_b):
+            # Ensure popover is parented to the button so it appears next to it.
+            if pop.get_parent() is not _b:
+                if pop.get_parent() is not None:
+                    pop.unparent()
+                pop.set_parent(_b)
+            pop.popup()
+        btn.connect("clicked", _on_help_clicked)
 
         self.bitperfect_verdict_help_btn = btn
         self.bitperfect_verdict_help_pop = pop
@@ -509,8 +525,10 @@ class AudioSignalPathWindow(Adw.Window):
             return f"{src_depth}-bit"
         return "Unknown"
 
-    def _display_latency(self, driver_name, is_exclusive, latency_sec, pw_latency_ms, is_playing):
+    def _display_latency(self, driver_name, is_exclusive, latency_sec, pw_latency_ms, is_playing, usb_latency_ms=None):
         driver = str(driver_name or "").strip()
+        if driver == "USB Rawlink" and usb_latency_ms is not None and usb_latency_ms > 0:
+            return f"{usb_latency_ms:.1f} ms (ISO Ring)", usb_latency_ms
         if driver in ("ALSA", "ALSA（auto）", "ALSA (mmap)", "ALSA（mmap）"):
             try:
                 cfg_buf_us = int(getattr(self.player, "alsa_buffer_time", 0) or 0)
@@ -557,9 +575,14 @@ class AudioSignalPathWindow(Adw.Window):
     @staticmethod
     def _display_output_path(driver_name, is_exclusive, device_id=""):
         if bool(is_exclusive):
+            driver = str(driver_name or "").strip()
+            if driver == "USB Rawlink":
+                return "Direct USB Hardware (libusb)"
             return "Direct ALSA Hardware"
         driver = str(driver_name or "").strip()
         dev = str(device_id or "").strip().lower()
+        if driver == "USB Rawlink":
+            return "Direct USB Hardware (libusb)"
         if driver == "PipeWire":
             return "PipeWire Shared Graph"
         if driver == "PulseAudio":
@@ -655,7 +678,12 @@ class AudioSignalPathWindow(Adw.Window):
         pw_runtime = self._merge_pw_runtime_with_fallback(current_driver)
         
         engine_rows = []
-        if is_exclusive:
+        is_rawlink = current_driver == "USB Rawlink"
+        if is_rawlink and is_bp:
+            engine_rows.append(("Mode", "USB Rawlink Direct 🔒", True))
+            engine_rows.append(("Software Mixer", "Bypassed (Direct USB)", True))
+            engine_rows.append(("Resampler", "Inactive (Bit-Perfect)", True))
+        elif is_exclusive:
             engine_rows.append(("Mode", "Hardware Exclusive 🔒", True))
             engine_rows.append(("Software Mixer", "Bypassed (Direct)", True))
             engine_rows.append(("Resampler", "Inactive (Bit-Perfect)", True))
@@ -666,6 +694,9 @@ class AudioSignalPathWindow(Adw.Window):
                 engine_rows.append(("Clock Source", f"PipeWire Forced ({pw_force_rate} Hz)" if pw_force_rate > 0 else "PipeWire Auto", False))
             else:
                 engine_rows.append(("Clock Source", "Auto-Adjusted", False))
+        elif is_rawlink:
+            engine_rows.append(("Mode", "USB Rawlink Direct", False))
+            engine_rows.append(("Software Mixer", "Bypassed (Direct USB)", True))
         else:
             # [优化] 根据驱动显示不同文案
             if current_driver == "PipeWire":
@@ -691,17 +722,40 @@ class AudioSignalPathWindow(Adw.Window):
         latency_sec = self.player.get_latency()
         pw_latency_ms = self._get_pipewire_runtime_latency_ms()
         is_playing = self.player.is_playing()
+        _snap_usb_lat = snap.get("usb_rawlink") if isinstance(snap, dict) else None
+        _usb_lat_ms = float(_snap_usb_lat.get("latency_ms", 0) or 0) if isinstance(_snap_usb_lat, dict) else None
         lat_str, latency_ms_value = self._display_latency(
             current_driver,
             is_exclusive,
             latency_sec,
             pw_latency_ms,
             is_playing,
+            usb_latency_ms=_usb_lat_ms,
         )
         output_rows.append(("Latency", lat_str, bool(latency_ms_value is not None and latency_ms_value < 15.0)))
 
         # 输出路径描述
-        if is_exclusive:
+        snap_usb = snap.get("usb_rawlink") if isinstance(snap, dict) else None
+        if current_driver == "USB Rawlink" and isinstance(snap_usb, dict):
+            usb_rate = int(snap_usb.get("rate", 0) or 0)
+            usb_depth = int(snap_usb.get("depth", 0) or 0)
+            usb_dev_name = str(snap_usb.get("device_name", "") or "")
+            output_rate = self._format_rate_hz(usb_rate) if usb_rate > 0 else "Unknown"
+            output_depth = self._parse_pw_depth(f"S{usb_depth}LE") if usb_depth > 0 else "Unknown"
+            output_rate = self._display_output_rate(output_rate)
+            if usb_dev_name:
+                display_usb_dev = usb_dev_name[:25] + ".." if len(usb_dev_name) > 25 else usb_dev_name
+                output_rows.append(("USB Device", display_usb_dev, True))
+            output_rows.append(("Output Depth", output_depth, True))
+            output_rows.append(("Output Rate", output_rate, True))
+            output_rows.append(
+                (
+                    "Output Path",
+                    self._display_output_path(current_driver, is_exclusive, getattr(self.player, "current_device_id", "")),
+                    True,
+                )
+            )
+        elif is_exclusive:
             # Exclusive mode should display hardware runtime values from Rust snapshot.
             output_depth = ""
             output_rate = ""
@@ -808,7 +862,13 @@ class AudioSignalPathWindow(Adw.Window):
 
         output_rate = "Unknown"
         output_depth = "Unknown"
-        if exclusive:
+        snap_usb = snap.get("usb_rawlink") if isinstance(snap, dict) else None
+        if driver == "USB Rawlink" and isinstance(snap_usb, dict):
+            usb_rate = int(snap_usb.get("rate", 0) or 0)
+            usb_depth = int(snap_usb.get("depth", 0) or 0)
+            output_rate = self._format_rate_hz(usb_rate) if usb_rate > 0 else "Unknown"
+            output_depth = self._parse_pw_depth(f"S{usb_depth}LE") if usb_depth > 0 else "Unknown"
+        elif exclusive:
             hw_rate = int(snap_out.get("hardware_rate", 0) or 0)
             hw_depth = int(snap_out.get("hardware_depth", 0) or 0)
             output_rate = self._format_rate_hz(hw_rate) if hw_rate > 0 else "Unknown"
@@ -867,7 +927,7 @@ class AudioSignalPathWindow(Adw.Window):
         reasons = []
         driver = self._get_current_driver()
         bit_perfect = bool(getattr(self.player, "bit_perfect_mode", False))
-        supported_driver = driver in ("ALSA", "ALSA（auto）", "ALSA (mmap)", "ALSA（mmap）", "PipeWire")
+        supported_driver = driver in ("ALSA", "ALSA（auto）", "ALSA (mmap)", "ALSA（mmap）", "PipeWire", "USB Rawlink")
 
         if not bit_perfect:
             reasons.append("Bit-Perfect mode disabled")
@@ -887,6 +947,11 @@ class AudioSignalPathWindow(Adw.Window):
         elif driver == "PipeWire":
             if bool(getattr(self.player, "_pipewire_rate_blocked", False)):
                 reasons.append("PipeWire rate blocked")
+            if not rate_match:
+                reasons.append("Sample-rate mismatch")
+            if not depth_match:
+                reasons.append("Output bit depth narrower than source")
+        elif driver == "USB Rawlink":
             if not rate_match:
                 reasons.append("Sample-rate mismatch")
             if not depth_match:
@@ -1243,7 +1308,13 @@ class AudioSignalPathWindow(Adw.Window):
             bit_depth = f"{src_depth}-bit"
         output_rate = "Server Controlled"
         output_depth = "16/32 bit (Float)"
-        if self.player.exclusive_lock_mode:
+        snap_usb = snap.get("usb_rawlink") if isinstance(snap, dict) else None
+        if driver == "USB Rawlink" and isinstance(snap_usb, dict):
+            usb_rate = int(snap_usb.get("rate", 0) or 0)
+            usb_depth = int(snap_usb.get("depth", 0) or 0)
+            output_rate = self._format_rate_hz(usb_rate) if usb_rate > 0 else "Unknown"
+            output_depth = self._parse_pw_depth(f"S{usb_depth}LE") if usb_depth > 0 else "Unknown"
+        elif self.player.exclusive_lock_mode:
             hw_rate = int(snap_out.get("hardware_rate", 0) or 0)
             hw_depth = int(snap_out.get("hardware_depth", 0) or 0)
             output_rate = self._format_rate_hz(hw_rate) if hw_rate > 0 else "Unknown"
@@ -1283,6 +1354,11 @@ class AudioSignalPathWindow(Adw.Window):
             f"Output Format: {output_rate} / {output_depth}",
         ]
         lines.append(f"DSP Master: {dsp_snapshot['master_state']}")
+        if driver == "USB Rawlink" and isinstance(snap_usb, dict):
+            usb_dev_name = snap_usb.get("device_name", "")
+            if usb_dev_name:
+                lines.append(f"USB Device: {usb_dev_name}")
+            lines.append(f"Output Path: Direct USB Hardware (libusb)")
         if driver == "PipeWire":
             lines.append(f"PipeWire Force Rate: {force_rate if force_rate else '0'} Hz")
             if allowed_raw:

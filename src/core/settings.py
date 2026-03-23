@@ -31,6 +31,7 @@ class SettingsSchema:
     last_view: str = "grid_view"
     viz_expanded: bool = False
     spectrum_theme: int = 0
+    viz_frequency_scale: int = 0
     viz_bar_count: int = 32
     viz_profile: int = 2
     viz_effect: int = 3
@@ -70,6 +71,7 @@ class SettingsSchema:
     dsp_limiter_enabled: bool = False
     dsp_limiter_threshold: int = 85
     dsp_limiter_ratio: int = 20
+    usb_clock_mode: str = "Push"
     output_auto_rebind_once: bool = False
     remote_api_enabled: bool = False
     remote_api_access_mode: str = "local"
@@ -98,6 +100,7 @@ DEFAULT_SETTINGS = {
     "last_view": "grid_view",
     "viz_expanded": False,
     "spectrum_theme": 0,
+    "viz_frequency_scale": 0,
     "viz_bar_count": 32,
     "viz_profile": 2,
     "viz_effect": 3,
@@ -137,6 +140,7 @@ DEFAULT_SETTINGS = {
     "dsp_limiter_enabled": False,
     "dsp_limiter_threshold": 85,
     "dsp_limiter_ratio": 20,
+    "usb_clock_mode": "Push",
     "output_auto_rebind_once": False,
     "remote_api_enabled": False,
     "remote_api_access_mode": "local",
@@ -167,9 +171,10 @@ _VALIDATION_RULES = {
     "last_view": (str, None, None, "grid_view"),
     "viz_expanded": (bool, None, None, False),
     "spectrum_theme": (int, 0, 64, 0),
+    "viz_frequency_scale": (int, 0, 1, 0),
     "viz_bar_count": (int, 4, 128, 32),
     "viz_profile": (int, 0, 4, 2),
-    "viz_effect": (int, 0, 23, 3),
+    "viz_effect": (int, 0, 24, 3),
     "lyrics_font_preset": (int, 0, 2, 1),
     "lyrics_bg_motion": (int, 0, 2, 1),
     "lyrics_user_offset_ms": (int, -2000, 2000, 0),
@@ -375,6 +380,7 @@ def normalize_settings(raw: Optional[dict[str, Any]]) -> dict[str, Any]:
     normalized["last_view"] = _as_str(raw.get("last_view"), DEFAULT_SETTINGS["last_view"])
     normalized["viz_expanded"] = _as_bool(raw.get("viz_expanded"), DEFAULT_SETTINGS["viz_expanded"])
     normalized["spectrum_theme"] = _as_int(raw.get("spectrum_theme"), DEFAULT_SETTINGS["spectrum_theme"], minimum=0, maximum=64)
+    normalized["viz_frequency_scale"] = _as_int(raw.get("viz_frequency_scale"), DEFAULT_SETTINGS["viz_frequency_scale"], minimum=0, maximum=1)
     normalized["viz_bar_count"] = _as_int(raw.get("viz_bar_count"), DEFAULT_SETTINGS["viz_bar_count"], minimum=4, maximum=128)
     if normalized["viz_bar_count"] not in VisualizerSettings.BAR_OPTIONS:
         normalized["viz_bar_count"] = DEFAULT_SETTINGS["viz_bar_count"]
@@ -385,8 +391,9 @@ def normalize_settings(raw: Optional[dict[str, Any]]) -> dict[str, Any]:
     normalized["viz_profile"] = _as_int(raw_viz_profile, DEFAULT_SETTINGS["viz_profile"], minimum=0, maximum=4)
     # Current effect options after removing Radial, legacy Fall, Pro Bars,
     # and Pro Line, then adding Orbit, Shards, Stereo Mirror, Lissajous,
-    # Stereo Scope, Balance Wave, Center Side, Phase Flower, and Stereo Meter:
-    # 24 entries => 0..23
+    # Stereo Scope, Balance Wave, Center Side, Phase Flower, Stereo Meter,
+    # and the appended optional GL Dots slot:
+    # 25 entries => 0..24
     raw_viz_effect = raw.get("viz_effect")
     if isinstance(raw_viz_effect, int):
         if raw_settings_version < 1 and raw_viz_effect >= 6:
@@ -401,7 +408,7 @@ def normalize_settings(raw: Optional[dict[str, Any]]) -> dict[str, Any]:
                 15: 1,   # Pro Line -> Wave
                 16: 14,  # Pro Fall -> Fall
             }.get(raw_viz_effect, raw_viz_effect)
-    normalized["viz_effect"] = _as_int(raw_viz_effect, DEFAULT_SETTINGS["viz_effect"], minimum=0, maximum=23)
+    normalized["viz_effect"] = _as_int(raw_viz_effect, DEFAULT_SETTINGS["viz_effect"], minimum=0, maximum=24)
     normalized["lyrics_font_preset"] = _as_int(raw.get("lyrics_font_preset"), DEFAULT_SETTINGS["lyrics_font_preset"], minimum=0, maximum=2)
     normalized["lyrics_bg_motion"] = _as_int(raw.get("lyrics_bg_motion"), DEFAULT_SETTINGS["lyrics_bg_motion"], minimum=0, maximum=2)
     normalized["lyrics_user_offset_ms"] = _as_int(raw.get("lyrics_user_offset_ms"), DEFAULT_SETTINGS["lyrics_user_offset_ms"], minimum=-2000, maximum=2000)
@@ -446,6 +453,8 @@ def normalize_settings(raw: Optional[dict[str, Any]]) -> dict[str, Any]:
     normalized["dsp_limiter_enabled"] = _as_bool(raw.get("dsp_limiter_enabled"), DEFAULT_SETTINGS["dsp_limiter_enabled"])
     normalized["dsp_limiter_threshold"] = _as_int(raw.get("dsp_limiter_threshold"), DEFAULT_SETTINGS["dsp_limiter_threshold"], minimum=0, maximum=100)
     normalized["dsp_limiter_ratio"] = _as_int(raw.get("dsp_limiter_ratio"), DEFAULT_SETTINGS["dsp_limiter_ratio"], minimum=1, maximum=60)
+    _usb_clk = _as_str(raw.get("usb_clock_mode"), DEFAULT_SETTINGS["usb_clock_mode"])
+    normalized["usb_clock_mode"] = _usb_clk if _usb_clk in ("Push", "Pull") else DEFAULT_SETTINGS["usb_clock_mode"]
     normalized["output_auto_rebind_once"] = _as_bool(raw.get("output_auto_rebind_once"), DEFAULT_SETTINGS["output_auto_rebind_once"])
     normalized["remote_api_enabled"] = _as_bool(raw.get("remote_api_enabled"), DEFAULT_SETTINGS["remote_api_enabled"])
     remote_mode = _as_str(raw.get("remote_api_access_mode"), DEFAULT_SETTINGS["remote_api_access_mode"]).lower()

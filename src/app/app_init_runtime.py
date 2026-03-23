@@ -111,6 +111,14 @@ def _init_audio_and_data_services(self):
         saved_profile,
     )
 
+    from actions.audio_settings_actions import USB_CLOCK_DEFAULT, _USB_CLOCK_MODE_MAP
+    saved_usb_clock = self.settings.get("usb_clock_mode", USB_CLOCK_DEFAULT)
+    if saved_usb_clock not in _USB_CLOCK_MODE_MAP:
+        saved_usb_clock = USB_CLOCK_DEFAULT
+    if hasattr(self.player, "set_usb_clock_mode"):
+        self.player.set_usb_clock_mode(_USB_CLOCK_MODE_MAP[saved_usb_clock])
+        logger.info("USB clock mode applied: %s (startup)", saved_usb_clock)
+
     self.history_mgr = HistoryManager(base_dir=self._cache_root, scope_key=self._account_scope)
     self.playlist_mgr = PlaylistManager(base_dir=self._cache_root, scope_key=self._account_scope)
     self.dsp_preset_mgr = DspPresetManager(config_dir=self._config_root)

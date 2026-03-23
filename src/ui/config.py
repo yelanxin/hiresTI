@@ -908,7 +908,7 @@ window.undecorated { background-color: transparent; }
 .card-bar.mini-state .player-ctrls-box .pill:hover { filter: brightness(1.1); transform: scale(1.05); }
 .card-bar.mini-state .player-ctrls-box button image { -gtk-icon-size: 16px; }
 .card-bar.mini-state .player-ctrls-box .pill image { -gtk-icon-size: 20px; }
-.eq-btn image { -gtk-icon-size: 24px; }
+.eq-btn image { -gtk-icon-size: 20px; }
 .eq-btn { min-width: 36px; min-height: 36px; padding: 0; }
 .card-bar scale.horizontal { margin: 0; padding: 0; }
 .card-bar scale trough { min-height: 4px; }
@@ -1055,7 +1055,7 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
     padding: 2px;
 }
 .player-side-btn.eq-btn image {
-    -gtk-icon-size: 20px;
+    -gtk-icon-size: 18px;
 }
 .album-cover-img { border-radius: 8px; -gtk-icon-transform: scale(1);}
 .header-art { border-radius: 12px; }
@@ -1316,7 +1316,7 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
     opacity: 1;
 }
 .now-playing-tool-btn.eq-btn image {
-    -gtk-icon-size: 20px;
+    -gtk-icon-size: 18px;
 }
 .now-playing-progress-box {
     margin-top: 0;

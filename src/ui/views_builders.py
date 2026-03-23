@@ -378,7 +378,10 @@ def build_settings_page(app):
         "and uses the same rate/depth verdict rules as ALSA Exclusive, but audio "
         "still passes through the system mixer.\n\n"
         "• <b>ALSA（auto）/ALSA（mmap） + Exclusive mode:</b> bypasses the system mixer and is treated as "
-        "true bit-perfect playback."
+        "true bit-perfect playback.\n\n"
+        "• <b>USB Rawlink:</b> bypasses the kernel USB audio driver and lets hiresTI "
+        "talk directly to a compatible external USB DAC. With Bit-Perfect Mode on, "
+        "Rawlink uses the app's most direct player-to-device playback path."
     )
     bp_pop_box = Gtk.Box(margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
     bp_pop_box.append(bp_pop_content)
@@ -386,7 +389,7 @@ def build_settings_page(app):
     bp_help_btn.connect("clicked", lambda x: bp_help_pop.popup())
     bp_title_box.append(bp_help_btn)
     bp_info.append(bp_title_box)
-    bp_info.append(Gtk.Label(label="Bypass app EQ/volume; follow source rate when possible", xalign=0, css_classes=["dim-label"]))
+    bp_info.append(Gtk.Label(label="Bypass app EQ/volume; direct device path in USB Rawlink", xalign=0, css_classes=["dim-label"]))
     row_bp.append(bp_info)
     row_bp.append(Gtk.Box(hexpand=True))
     app.bp_switch = Gtk.Switch(valign=Gtk.Align.CENTER)
@@ -508,11 +511,10 @@ def build_settings_page(app):
     drv_help_pop.set_autohide(True)
     drv_pop_content = Gtk.Label(wrap=True, max_width_chars=44, xalign=0)
     drv_pop_content.set_markup(
-        "<b>ALSA Driver Modes</b>\n\n"
-        "• <b>ALSA（auto）:</b> lets the audio path choose <b>RW</b> or <b>MMAP</b> automatically.\n\n"
-        "• <b>ALSA（mmap）:</b> forces <b>MMAP</b> mode.\n\n"
-        "• <b>Why use MMAP:</b> It can reduce host-side jitter and data-copy overhead.\n\n"
-        "• <b>Tradeoff:</b> Some devices are more stable with auto selection."
+        "<b>Audio Driver Modes</b>\n\n"
+        "• <b>ALSA（auto）:</b> Recommended for most setups. hiresTI chooses the most compatible ALSA path for your device automatically.\n\n"
+        "• <b>ALSA（mmap）:</b> A zero-copy ALSA path with a more direct handoff to the device. Best for users who want a leaner playback path or prefer MMAP on their hardware.\n\n"
+        "• <b>USB Rawlink:</b> Bypasses the kernel USB audio driver and lets hiresTI talk directly to the USB device for playback. Best for users who want the most direct player-to-DAC path on a compatible external USB DAC."
     )
     drv_pop_box = Gtk.Box(margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
     drv_pop_box.append(drv_pop_content)
@@ -521,7 +523,7 @@ def build_settings_page(app):
     drv_title_box.append(drv_help_btn)
     drv_info.append(drv_title_box)
     drv_desc = Gtk.Label(
-        label="ALSA（auto） auto-selects RW/MMAP. ALSA（mmap） forces MMAP.",
+        label="ALSA（auto） for most setups. ALSA（mmap） for zero-copy tuning. USB Rawlink for direct USB playback.",
         xalign=0,
         css_classes=["dim-label"],
     )
@@ -544,7 +546,7 @@ def build_settings_page(app):
     depth_info.append(Gtk.Label(label="Output Bit Depth", xalign=0, css_classes=["settings-label"]))
     depth_info.append(
         Gtk.Label(
-            label="ALSA（auto） / ALSA（mmap）. PipeWire final hardware depth is controlled by the system graph",
+            label="ALSA（auto） / ALSA（mmap） only. Not applicable for USB Rawlink (bit depth is fixed by the device).",
             xalign=0,
             css_classes=["dim-label"],
         )
@@ -562,6 +564,31 @@ def build_settings_page(app):
     app.mmap_realtime_priority_dd.set_sensitive(saved_driver_init == "ALSA（mmap）")
     group_out.append(row_rt)
 
+    # ── USB Rawlink: Clock Alignment ────────────────────────────────────────
+    from actions.audio_settings_actions import USB_CLOCK_OPTIONS, USB_CLOCK_DEFAULT
+    row_usb_clk = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
+    usb_clk_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
+    usb_clk_info.append(Gtk.Label(label="USB Clock Alignment", xalign=0, css_classes=["settings-label"]))
+    usb_clk_info.append(
+        Gtk.Label(
+            label="Push: clock driven by write position. Pull: clock driven by playback position. USB Rawlink only.",
+            xalign=0,
+            css_classes=["dim-label"],
+        )
+    )
+    row_usb_clk.append(usb_clk_info)
+    row_usb_clk.append(Gtk.Box(hexpand=True))
+    app.usb_clock_mode_dd = Gtk.DropDown(model=Gtk.StringList.new(USB_CLOCK_OPTIONS))
+    app.usb_clock_mode_dd.set_valign(Gtk.Align.CENTER)
+    saved_usb_clk = app.settings.get("usb_clock_mode", USB_CLOCK_DEFAULT)
+    if saved_usb_clk not in USB_CLOCK_OPTIONS:
+        saved_usb_clk = USB_CLOCK_DEFAULT
+    app.usb_clock_mode_dd.set_selected(USB_CLOCK_OPTIONS.index(saved_usb_clk))
+    app.usb_clock_mode_dd.set_sensitive(saved_driver_init == "USB Rawlink")
+    app.usb_clock_mode_dd.connect("notify::selected-item", app.on_usb_clock_mode_changed)
+    row_usb_clk.append(app.usb_clock_mode_dd)
+    group_out.append(row_usb_clk)
+
     row_dev = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
     row_dev.append(Gtk.Label(label="Output Device", hexpand=True, xalign=0))
     app.device_dd = Gtk.DropDown(model=Gtk.StringList.new(["Default"]))
@@ -578,6 +605,10 @@ def build_settings_page(app):
     app.output_status_label.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
     app.output_status_label.set_max_width_chars(72)
     status_box.append(app.output_status_label)
+    app.usb_fix_perm_btn = Gtk.Button(label="Fix USB Permissions", css_classes=["flat"], valign=Gtk.Align.START)
+    app.usb_fix_perm_btn.connect("clicked", app.on_usb_fix_permissions_clicked)
+    app.usb_fix_perm_btn.set_visible(False)
+    status_box.append(app.usb_fix_perm_btn)
     row_state.append(status_box)
     app.output_recover_btn = Gtk.Button(label="Recover", css_classes=["flat"], valign=Gtk.Align.START)
     app.output_recover_btn.connect("clicked", app.on_recover_output_clicked)

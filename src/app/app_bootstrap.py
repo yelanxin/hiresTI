@@ -165,6 +165,7 @@ def _restore_runtime_state(self):
         self.paned.set_position(sidebar_px)
 
     self._apply_viz_bars_by_count(self.settings.get("viz_bar_count", 32), update_dropdown=True)
+    self._apply_viz_frequency_scale_by_index(self.settings.get("viz_frequency_scale", 0), update_dropdown=True)
     self._apply_viz_profile_by_index(self.settings.get("viz_profile", 1), update_dropdown=True)
     self._apply_viz_effect_by_index(self.settings.get("viz_effect", 3), update_dropdown=True)
     self._apply_spectrum_theme_by_index(self.settings.get("spectrum_theme", 0), update_dropdown=True)
@@ -309,6 +310,15 @@ def do_activate(self):
         buf_ms, lat_ms = self.LATENCY_MAP[saved_profile]
         self.player.set_alsa_latency(buf_ms, lat_ms)
     _startup_mark("alsa-latency")
+
+    # 3b. 应用 USB 时钟模式
+    from actions.audio_settings_actions import USB_CLOCK_DEFAULT, _USB_CLOCK_MODE_MAP
+    saved_usb_clock = self.settings.get("usb_clock_mode", USB_CLOCK_DEFAULT)
+    if saved_usb_clock not in _USB_CLOCK_MODE_MAP:
+        saved_usb_clock = USB_CLOCK_DEFAULT
+    if hasattr(self.player, "set_usb_clock_mode"):
+        self.player.set_usb_clock_mode(_USB_CLOCK_MODE_MAP[saved_usb_clock])
+    _startup_mark("usb-clock-mode")
 
     # 4. 恢复驱动选择
     drivers = self.player.get_drivers()

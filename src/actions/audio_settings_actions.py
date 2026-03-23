@@ -1,6 +1,10 @@
 from threading import Thread
 import logging
+import os
 import re
+import shlex
+import subprocess
+import tempfile
 import time
 
 import gi
@@ -19,6 +23,11 @@ _OUTPUT_BIT_DEPTH_GUESS_FORMATS = {
 
 DRIVER_ALSA_AUTO = "ALSA（auto）"
 DRIVER_ALSA_MMAP = "ALSA（mmap）"
+DRIVER_USB_RAWLINK = "USB Rawlink"
+
+USB_CLOCK_OPTIONS = ["Push", "Pull"]
+USB_CLOCK_DEFAULT = "Push"
+_USB_CLOCK_MODE_MAP = {"Push": 0, "Pull": 1}
 _PLAYBACK_STATUS_NORMAL = "normal"
 _PLAYBACK_STATUS_BIT_PERFECT = "bit-perfect"
 _PLAYBACK_STATUS_EXCLUSIVE = "exclusive"
@@ -249,7 +258,7 @@ def _driver_choices_for_mode(app, exclusive_enabled=None):
         else:
             exclusive_enabled = bool(getattr(app, "settings", {}).get("exclusive_lock", False))
     if exclusive_enabled:
-        drivers = [drv for drv in drivers if _driver_is_alsa_family(drv)]
+        drivers = [drv for drv in drivers if _driver_is_alsa_family(drv) or drv == DRIVER_USB_RAWLINK]
     return drivers
 
 
@@ -409,7 +418,8 @@ def _refresh_devices_for_current_driver_ui_only(app, reason="hotplug-watch", pre
             app.ignore_device_change = True
             app.current_device_list = devices
             app.device_dd.set_model(Gtk.StringList.new(new_names))
-            app.device_dd.set_sensitive(len(devices) > 1)
+            _min_dev = 1 if driver_name == DRIVER_USB_RAWLINK else 2
+            app.device_dd.set_sensitive(len(devices) >= _min_dev)
 
             sel_idx = 0
             if prefer_device_id:
@@ -661,7 +671,7 @@ def _monitor_selected_device_presence(app):
         device_name = dev_item.get_string()
         if not driver_name or not device_name:
             return
-        if _driver_key(driver_name) not in ("alsa_auto", "alsa_mmap", "pipewire"):
+        if _driver_key(driver_name) not in ("alsa_auto", "alsa_mmap", "pipewire", "usbrawlink"):
             return
         if device_name in ("Default Output", "Default System Output", "Unavailable", "Default"):
             return
@@ -681,6 +691,16 @@ def _monitor_selected_device_presence(app):
                         return False
                     if requested_id and requested_id in ids:
                         return False
+                    # USB Rawlink: also match by vid:pid prefix — id may have/lack serial
+                    # or the cache may have already restored the real name, so a strict
+                    # string compare could miss a physically-present device.
+                    if _driver_key(driver_name) == "usbrawlink" and requested_id:
+                        req_prefix = ":".join(requested_id.split(":")[:3])  # "usb:vid:pid"
+                        if any(
+                            str(d.get("device_id") or "").startswith(req_prefix)
+                            for d in devices
+                        ):
+                            return False
                     if hasattr(app, "show_output_notice"):
                         app.show_output_notice(
                             f"Audio device disconnected: {device_name}",
@@ -727,7 +747,7 @@ def _passive_sync_device_list(app):
         if not drv_item:
             return
         driver_name = drv_item.get_string()
-        if _driver_key(driver_name) not in ("alsa_auto", "alsa_mmap", "pipewire"):
+        if _driver_key(driver_name) not in ("alsa_auto", "alsa_mmap", "pipewire", "usbrawlink"):
             return
 
         selected_item = app.device_dd.get_selected_item() if hasattr(app, "device_dd") else None
@@ -750,7 +770,8 @@ def _passive_sync_device_list(app):
                     app.ignore_device_change = True
                     app.current_device_list = devices
                     app.device_dd.set_model(Gtk.StringList.new(new_names))
-                    app.device_dd.set_sensitive(len(devices) > 1)
+                    _min_dev = 1 if driver_name == DRIVER_USB_RAWLINK else 2
+                    app.device_dd.set_sensitive(len(devices) >= _min_dev)
 
                     sel_idx = 0
                     if prefer_name:
@@ -811,6 +832,39 @@ def update_output_status_ui(app):
     app._last_output_state = state
     app._last_output_error = err
 
+    # If snd-usb-audio just finished re-attaching (after USB rawlink release),
+    # the device list had a placeholder entry with no hw: label.  Refresh now
+    # so it shows the proper hw:X,Y device.
+    if getattr(app.player, "_needs_device_list_refresh", False):
+        app.player._needs_device_list_refresh = False
+        try:
+            _refresh_devices_for_current_driver_ui_only(app, reason="alsa-device-ready")
+        except Exception:
+            pass
+
+    is_usb_perm_error = (
+        state == "error"
+        and bool(err)
+        and ("Access denied" in err or "Permission denied" in err)
+        and getattr(app.player, "requested_driver", "") == "USB Rawlink"
+    )
+    if hasattr(app, "usb_fix_perm_btn") and app.usb_fix_perm_btn is not None:
+        app.usb_fix_perm_btn.set_visible(is_usb_perm_error)
+
+    # USB Rawlink replug timing race: if the udev rule already covers this device,
+    # the ACL just hasn't been applied yet.  Schedule one silent auto-retry after
+    # 2.5 s instead of requiring the user to click "Fix USB Permissions".
+    if is_usb_perm_error and not getattr(app, "_usb_perm_auto_retry_pending", False):
+        device_id = getattr(app.player, "requested_device_id", None)
+        if device_id and _usb_rule_covers_device(device_id):
+            app._usb_perm_auto_retry_pending = True
+            logger.info("USB permission timing race detected — auto-retry in 2.5 s")
+            def _auto_retry():
+                app._usb_perm_auto_retry_pending = False
+                on_recover_output_clicked(app)
+                return False
+            GLib.timeout_add(2500, _auto_retry)
+
     can_recover = state in ("fallback", "error") and bool(getattr(app.player, "requested_driver", None))
     if hasattr(app, "output_recover_btn") and app.output_recover_btn is not None:
         app.output_recover_btn.set_sensitive(can_recover)
@@ -827,6 +881,272 @@ def update_output_status_ui(app):
     _passive_sync_device_list(app)
     if hasattr(app, "_sync_playback_status_icon"):
         app._sync_playback_status_icon()
+
+
+_USB_UDEV_RULE_PATH = "/etc/udev/rules.d/99-hiresti-usb-audio.rules"
+_USB_AUDIO_INTERFACES_GLOB = "*:01????:*"
+_USB_AUDIO_INTERFACES_REGEX = r"^ID_USB_INTERFACES=.*:01[[:xdigit:]]{4}:"
+
+
+def _build_udev_rule_content(device_id=None):
+    """Return the udev rule file content.
+
+    Always includes a generic rule matching any USB Audio Class device via
+    ID_USB_INTERFACES (populated by 50-udev-default.rules → usb_id builtin).
+
+    If ``device_id`` is a known ``usb:VVVV:PPPP`` identifier, also adds a
+    VID/PID-specific rule using ``ATTRS{idVendor}``/``ATTRS{idProduct}``.
+    These sysfs attributes are always present on ``add`` events without any
+    import, making the device-specific rule reliable even when the generic
+    rule's ID_USB_INTERFACES match is delayed or unavailable.
+
+    TAG+="uaccess" grants access to the currently-active logged-in session
+    user via systemd-logind; it persists across replugs as long as the rule
+    file is installed.
+    """
+    lines = [
+        "# HiresTI USB Rawlink - grant logged-in user access to USB audio devices",
+        # Generic rule: any USB device advertising an Audio-class interface.
+        f'SUBSYSTEM=="usb", ENV{{DEVTYPE}}=="usb_device",'
+        f' ENV{{ID_USB_INTERFACES}}=="{_USB_AUDIO_INTERFACES_GLOB}", TAG+="uaccess"',
+    ]
+    target = _parse_usb_rawlink_device_id(device_id)
+    if target is not None:
+        # Device-specific rule: matched by VID/PID, no property import needed.
+        # This ensures the device is re-granted access on every replug even if
+        # the generic class rule hasn't matched yet at the time of the add event.
+        lines.append(
+            f'SUBSYSTEM=="usb", ENV{{DEVTYPE}}=="usb_device",'
+            f' ATTRS{{idVendor}}=="{target["vendor_id"]}",'
+            f' ATTRS{{idProduct}}=="{target["product_id"]}", TAG+="uaccess"'
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _parse_usb_rawlink_device_id(device_id):
+    text = str(device_id or "").strip()
+    if not text.lower().startswith("usb:"):
+        return None
+    parts = text.split(":")
+    if len(parts) < 3:
+        return None
+    vendor_id = parts[1].strip().lower()
+    product_id = parts[2].strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{4}", vendor_id):
+        return None
+    if not re.fullmatch(r"[0-9a-f]{4}", product_id):
+        return None
+    serial = ":".join(parts[3:]).strip() if len(parts) > 3 else ""
+    return {
+        "vendor_id": vendor_id,
+        "product_id": product_id,
+        "serial": serial or None,
+    }
+
+
+def _build_usb_audio_acl_script(device_id=None):
+    target = _parse_usb_rawlink_device_id(device_id)
+    lines = [
+        'for _d in /dev/bus/usb/*/*; do',
+        '  _props=$(udevadm info -q property -n "$_d" 2>/dev/null || true)',
+        '  printf \'%s\\n\' "$_props" | grep -q "^DEVTYPE=usb_device$" || continue',
+    ]
+    if target is None:
+        lines.append(
+            f'  printf \'%s\\n\' "$_props" | grep -Eiq {shlex.quote(_USB_AUDIO_INTERFACES_REGEX)} || continue'
+        )
+    else:
+        vendor_pat = shlex.quote(f"^ID_VENDOR_ID={target['vendor_id']}$")
+        product_pat = shlex.quote(f"^ID_MODEL_ID={target['product_id']}$")
+        lines.extend(
+            [
+                f'  printf \'%s\\n\' "$_props" | grep -Eiq {vendor_pat} || continue',
+                f'  printf \'%s\\n\' "$_props" | grep -Eiq {product_pat} || continue',
+            ]
+        )
+        if target["serial"]:
+            serial_line = shlex.quote(f"ID_SERIAL_SHORT={target['serial']}")
+            lines.append(
+                f'  printf \'%s\\n\' "$_props" | grep -Fqx -- {serial_line} || continue'
+            )
+    lines.extend(
+        [
+            '  setfacl -m "u:$_U:rw" "$_d" 2>/dev/null || true',
+            'done',
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _build_usb_permission_install_cmd(tmp_path, device_id=None):
+    quoted_tmp = shlex.quote(str(tmp_path))
+    quoted_rule = shlex.quote(_USB_UDEV_RULE_PATH)
+    acl_script = _build_usb_audio_acl_script(device_id)
+    return (
+        f"cp {quoted_tmp} {quoted_rule} "
+        f"&& udevadm control --reload-rules "
+        f"&& udevadm trigger --subsystem-match=usb "
+        f"&& udevadm settle --timeout=3 "
+        f'&& _U=$(id -nu "$PKEXEC_UID" 2>/dev/null || id -nu) '
+        f"&& {acl_script} "
+        f"&& rm -f {quoted_tmp}"
+    )
+
+
+_USB_FALLBACK_NAME_RE = re.compile(
+    r'^USB Audio Device \([0-9a-f]{4}:[0-9a-f]{4}\)$', re.IGNORECASE
+)
+
+
+def _usb_device_needs_permission(dev):
+    """True if this USB Rawlink device was enumerated without read permission."""
+    return bool(_USB_FALLBACK_NAME_RE.match(str(dev.get("name") or "")))
+
+
+def _show_usb_permission_dialog(app, dev_name, device_id):
+    """Ask user whether to grant USB access; if yes, run pkexec install."""
+    dialog = Gtk.Dialog(title="USB Access Required", transient_for=app.win, modal=True)
+    root = Gtk.Box(
+        orientation=Gtk.Orientation.VERTICAL,
+        spacing=12,
+        margin_top=16,
+        margin_bottom=16,
+        margin_start=20,
+        margin_end=20,
+    )
+    msg = Gtk.Label(
+        label=(
+            f"USB audio device detected, but access permission is missing.\n\n"
+            f"Grant system-level USB access for \"{dev_name}\"?\n\n"
+            "This installs a udev rule and requires your password."
+        ),
+        wrap=True,
+        xalign=0.0,
+        max_width_chars=52,
+    )
+    root.append(msg)
+    action_row = Gtk.Box(spacing=8, halign=Gtk.Align.END)
+    no_btn = Gtk.Button(label="Not Now")
+    yes_btn = Gtk.Button(label="Grant Access", css_classes=["suggested-action"])
+    action_row.append(no_btn)
+    action_row.append(yes_btn)
+    root.append(action_row)
+    dialog.set_child(root)
+
+    def _on_response(d, resp):
+        d.destroy()
+        if resp == Gtk.ResponseType.YES:
+            on_usb_fix_permissions_clicked(app, device_id=device_id)
+
+    no_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.NO))
+    yes_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.YES))
+    dialog.connect("response", _on_response)
+    dialog.present()
+
+
+def _usb_rule_covers_device(device_id):
+    """True if the installed udev rule file has a VID:PID-specific rule for this device.
+
+    When the rule file already covers the exact VID:PID, any fallback name seen at
+    enumeration time is a transient timing race (udev ACL not yet applied).  The
+    device cache handles the identity restore; we don't need to prompt the user.
+    """
+    target = _parse_usb_rawlink_device_id(device_id)
+    if not target:
+        return False
+    try:
+        content = open(_USB_UDEV_RULE_PATH).read()
+        return (
+            f'idVendor}}=="{target["vendor_id"]}"' in content
+            and f'idProduct}}=="{target["product_id"]}"' in content
+        )
+    except OSError:
+        return False
+
+
+def _check_and_prompt_usb_permission(app, devices):
+    """Show permission dialog if USB Rawlink devices lack access and no rule covers them.
+
+    Only prompts when the udev rule file does NOT already have a VID:PID entry for the
+    affected device.  If the rule is present, the fallback name is a transient timing
+    race (udev ACL not yet applied on replug) — the device cache handles identity
+    restore and no user action is needed.
+    """
+    if getattr(app, "_usb_perm_dialog_shown", False):
+        return
+    needs_perm = [d for d in devices if _usb_device_needs_permission(d)]
+    if not needs_perm:
+        return
+    # If every fallback device is already covered by the installed rule, it's a timing
+    # race — udev will grant access within ~1 s.  Don't interrupt the user.
+    if all(_usb_rule_covers_device(d.get("device_id")) for d in needs_perm):
+        return
+    app._usb_perm_dialog_shown = True
+    dev = needs_perm[0]
+    _show_usb_permission_dialog(app, dev.get("name", "USB audio device"), dev.get("device_id"))
+
+
+def on_usb_fix_permissions_clicked(app, _btn=None, device_id=None):
+    if hasattr(app, "usb_fix_perm_btn") and app.usb_fix_perm_btn is not None:
+        app.usb_fix_perm_btn.set_sensitive(False)
+
+    try:
+        requested_device_id = device_id or getattr(getattr(app, "player", None), "requested_device_id", None)
+        rule_content = _build_udev_rule_content(requested_device_id)
+
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".rules", delete=False, prefix="hiresti_usb_"
+        )
+        tmp.write(rule_content)
+        tmp.close()
+        tmp_path = tmp.name
+
+        # Install the udev rule AND directly set ACLs on the current USB
+        # Rawlink target (or, if unavailable, USB Audio Class devices only).
+        # TAG+="uaccess" is processed asynchronously by systemd-logind, so there
+        # is a window after udevadm settle returns where the ACL may not yet be
+        # applied.  The setfacl step provides an immediate, synchronous grant
+        # that takes effect before pkexec returns, eliminating the race.
+        # $PKEXEC_UID is set by pkexec to the invoking user's UID.
+        cmd = _build_usb_permission_install_cmd(tmp_path, requested_device_id)
+
+        def _on_done(proc):
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            rc = proc.returncode
+
+            def _ui():
+                if hasattr(app, "usb_fix_perm_btn") and app.usb_fix_perm_btn is not None:
+                    app.usb_fix_perm_btn.set_sensitive(True)
+                if rc == 0:
+                    logger.info("USB udev rule installed successfully")
+                    if hasattr(app, "record_diag_event"):
+                        app.record_diag_event("USB permission rule installed via pkexec")
+                    # Extra 1s delay: systemd-logind sets ACLs asynchronously after
+                    # udevadm settle returns, so give it a moment before retrying.
+                    # Also refresh the device list so the real device name/serial is
+                    # read and the USB device cache is populated — this prevents the
+                    # "needs re-auth" dialog from appearing on subsequent replugs.
+                    def _recover_and_refresh():
+                        on_recover_output_clicked(app)
+                        _refresh_devices_for_current_driver_ui_only(app, reason="usb-perm-granted")
+                        return False
+                    GLib.timeout_add(1000, _recover_and_refresh)
+                else:
+                    logger.warning("pkexec USB rule install failed (rc=%d)", rc)
+
+            GLib.idle_add(_ui)
+
+        def _run():
+            proc = subprocess.run(["pkexec", "/bin/sh", "-c", cmd])
+            _on_done(proc)
+
+        Thread(target=_run, daemon=True).start()
+
+    except Exception as e:
+        logger.error("USB fix permissions error: %s", e)
+        if hasattr(app, "usb_fix_perm_btn") and app.usb_fix_perm_btn is not None:
+            app.usb_fix_perm_btn.set_sensitive(True)
 
 
 def on_recover_output_clicked(app, _btn=None):
@@ -893,6 +1213,19 @@ def on_mmap_realtime_priority_changed(app, dd, p):
         app.on_driver_changed(app.driver_dd, None)
 
 
+def on_usb_clock_mode_changed(app, dd, p):
+    selected = dd.get_selected_item()
+    if not selected:
+        return
+    label = selected.get_string()
+    app.settings["usb_clock_mode"] = label
+    app.save_settings()
+    mode_int = _USB_CLOCK_MODE_MAP.get(label, 0)
+    if hasattr(app, "player") and hasattr(app.player, "set_usb_clock_mode"):
+        app.player.set_usb_clock_mode(mode_int)
+    logger.info("USB clock mode changed: %s (%d)", label, mode_int)
+
+
 def on_driver_changed(app, dd, p):
     driver_change_t0 = time.monotonic()
 
@@ -905,6 +1238,7 @@ def on_driver_changed(app, dd, p):
 
     if getattr(app, "ignore_driver_change", False):
         return
+    app._usb_perm_dialog_shown = False  # reset so prompt can fire for this driver selection
     _stop_output_hotplug_watch(app)
     _touch_output_probe_burst(app, seconds=30)
     selected = dd.get_selected_item()
@@ -913,17 +1247,17 @@ def on_driver_changed(app, dd, p):
     driver_name = selected.get_string()
     _driver_mark(f"begin driver={driver_name}")
 
-    if app.ex_switch.get_active() and not _driver_is_alsa_family(driver_name):
+    if app.ex_switch.get_active() and not _driver_is_alsa_family(driver_name) and driver_name != DRIVER_USB_RAWLINK:
         app._force_driver_selection(DRIVER_ALSA_AUTO)
         if hasattr(app, "show_output_notice"):
             app.show_output_notice(
-                f"Exclusive mode requires {DRIVER_ALSA_AUTO} or {DRIVER_ALSA_MMAP}.",
+                f"Exclusive mode requires {DRIVER_ALSA_AUTO}, {DRIVER_ALSA_MMAP}, or {DRIVER_USB_RAWLINK}.",
                 "warn",
                 3200,
             )
         return
 
-    if not app.ex_switch.get_active() or _driver_is_alsa_family(driver_name):
+    if not app.ex_switch.get_active() or _driver_is_alsa_family(driver_name) or driver_name == DRIVER_USB_RAWLINK:
         app.settings["driver"] = driver_name
         app.save_settings()
     _driver_mark("settings-saved")
@@ -974,11 +1308,15 @@ def on_driver_changed(app, dd, p):
                         sel_idx = i
                         break
 
-            app.device_dd.set_sensitive(len(devices) > 1)
+            # USB Rawlink has no "Default" placeholder — enable with ≥1 device.
+            min_count = 1 if driver_name == DRIVER_USB_RAWLINK else 2
+            app.device_dd.set_sensitive(len(devices) >= min_count)
             if hasattr(app, "mmap_realtime_priority_dd"):
                 app.mmap_realtime_priority_dd.set_sensitive(driver_name == DRIVER_ALSA_MMAP)
             if hasattr(app, "latency_dd"):
                 app.latency_dd.set_sensitive(_driver_is_alsa_family(driver_name))
+            if hasattr(app, "usb_clock_mode_dd"):
+                app.usb_clock_mode_dd.set_sensitive(driver_name == DRIVER_USB_RAWLINK)
 
             if sel_idx < len(devices):
                 app.device_dd.set_selected(sel_idx)
@@ -1003,6 +1341,9 @@ def on_driver_changed(app, dd, p):
 
             app.update_tech_label(app.player.stream_info)
             _driver_mark(f"devices-applied target={target_id or 'default'}")
+
+            if driver_name == DRIVER_USB_RAWLINK:
+                GLib.idle_add(lambda: _check_and_prompt_usb_permission(app, devices) or False)
 
             def apply_output_async():
                 output_t0 = time.monotonic()
@@ -1224,6 +1565,34 @@ def on_output_state_transition(self, prev_state, state, detail=None):
         return
     if state == "active" and prev_state in ("switching", "fallback", "error"):
         self.show_output_notice("Audio output reconnected", "ok", 2200)
+        # USB Rawlink: the USB sink was rebuilt by set_output but the GStreamer
+        # pipeline was stopped during the disconnect.  Resume automatically if a
+        # track was loaded and the player is not already playing.
+        if getattr(self.player, "requested_driver", "") == DRIVER_USB_RAWLINK:
+            uri = str(getattr(self.player, "_last_loaded_uri", "") or "")
+            if uri and not self.player.is_playing():
+                pos_s = float(getattr(self.player, "_cached_pos_s", 0.0) or 0.0)
+                logger.info(
+                    "USB Rawlink reconnected; auto-resuming playback pos=%.1fs uri=%.60s",
+                    pos_s, uri,
+                )
+                def _usb_resume():
+                    try:
+                        # Re-issue load() so Rust's engine.uri is (re-)populated.
+                        # rac_set_uri clears engine.uri on a dead-pusher error, and
+                        # set_output_tuned rebuilds the sink without restoring it, so a
+                        # bare play() call would hit "rac_play: empty uri" (-2).
+                        self.player.load(uri)
+                        self.player.play()
+                        if pos_s > 0.5:
+                            GLib.timeout_add(500, lambda: (self.player.seek(pos_s), None)[1] or False)
+                        if self.play_btn is not None:
+                            self.play_btn.set_icon_name("media-playback-pause-symbolic")
+                        update_output_status_ui(self)
+                    except Exception:
+                        logger.debug("USB Rawlink auto-resume failed", exc_info=True)
+                    return False
+                GLib.timeout_add(200, _usb_resume)
         return
     if state == "fallback":
         try:

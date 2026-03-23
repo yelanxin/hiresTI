@@ -15,10 +15,19 @@ gi.require_version("GstPbutils", "1.0")
 from gi.repository import Gst, GstPbutils
 
 logger = logging.getLogger(__name__)
+
+_MAX_SPECTRUM_BANDS = 512
 _LV2_HOST_MANAGED_PORT_SYMBOLS = {"enabled", "enable", "bypass"}
 
 DRIVER_ALSA_AUTO = "ALSA（auto）"
 DRIVER_ALSA_MMAP = "ALSA（mmap）"
+DRIVER_USB_RAWLINK = "USB Rawlink"
+
+# Matches the fallback label emitted by Rust when device.open() fails (no permission).
+# Format: "USB Audio Device (1fc9:6004)"
+_USB_FALLBACK_NAME_RE = re.compile(
+    r'^USB Audio Device \([0-9a-f]{4}:[0-9a-f]{4}\)$', re.IGNORECASE
+)
 
 
 def _driver_key(driver_name):
@@ -33,6 +42,8 @@ def _driver_key(driver_name):
         return "pipewire"
     if compact in ("auto", "auto(default)"):
         return "auto"
+    if compact in ("usbrawlink", "usb_rawlink"):
+        return "usb_rawlink"
     return compact
 
 
@@ -145,6 +156,9 @@ class _RustAudioCore:
             if hasattr(lib, "rac_set_preferred_output_format"):
                 lib.rac_set_preferred_output_format.restype = ctypes.c_int
                 lib.rac_set_preferred_output_format.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+            if hasattr(lib, "rac_set_usb_clock_mode"):
+                lib.rac_set_usb_clock_mode.restype = ctypes.c_int
+                lib.rac_set_usb_clock_mode.argtypes = [ctypes.c_void_p, ctypes.c_int]
             if hasattr(lib, "rac_set_dsp_enabled"):
                 lib.rac_set_dsp_enabled.restype = ctypes.c_int
                 lib.rac_set_dsp_enabled.argtypes = [ctypes.c_void_p, ctypes.c_int]
@@ -499,6 +513,13 @@ class _RustAudioCore:
             ctypes.c_int(int(priority or 0)),
             default_rc=-3,
         )
+
+    def set_usb_clock_mode(self, mode):
+        if (not self.available) or self._closed:
+            return -1
+        if not hasattr(self.lib, "rac_set_usb_clock_mode"):
+            return -3
+        return self._call_int("rac_set_usb_clock_mode", ctypes.c_int(int(mode or 0)), default_rc=-2)
 
     def set_preferred_output_format(self, format_name=None):
         if (not self.available) or self._closed:
@@ -1121,7 +1142,7 @@ class _RustAudioCore:
             if self._closed or not self.handle:
                 return None
             try:
-                max_bands = 128
+                max_bands = _MAX_SPECTRUM_BANDS
                 buf = (ctypes.c_float * max_bands)()
                 out_len = ctypes.c_int(0)
                 out_pos = ctypes.c_double(0.0)
@@ -1146,7 +1167,7 @@ class _RustAudioCore:
             except Exception:
                 return None
 
-    def get_spectrum_frames_since(self, since_seq, max_frames=12, max_bands=128):
+    def get_spectrum_frames_since(self, since_seq, max_frames=12, max_bands=_MAX_SPECTRUM_BANDS):
         if (not self.available) or self._closed:
             return []
         with self._call_lock:
@@ -1154,7 +1175,7 @@ class _RustAudioCore:
                 return []
             try:
                 mf = max(1, min(int(max_frames), 256))
-                mb = max(1, min(int(max_bands), 128))
+                mb = max(1, min(int(max_bands), _MAX_SPECTRUM_BANDS))
                 cache_key = (mf, mb)
                 cache = self._spectrum_batch_cache.get(cache_key)
                 if cache is None:
@@ -1213,10 +1234,10 @@ class _RustAudioCore:
                 for i in range(nframes):
                     ln = max(0, min(int(out_lens[i]), mb))
                     base = i * mb
-                    mono = [float(mono_vals[base + j]) for j in range(ln)]
+                    mono = mono_vals[base:base + ln]
                     if self._rac_get_stereo_spectrum_frames_since is not None:
-                        left = [float(left_vals[base + j]) for j in range(ln)]
-                        right = [float(right_vals[base + j]) for j in range(ln)]
+                        left = left_vals[base:base + ln]
+                        right = right_vals[base:base + ln]
                         payload = {
                             "mono": mono,
                             "left": left,
@@ -1615,6 +1636,7 @@ class RustAudioPlayerAdapter:
         self.alsa_mmap_realtime_priority = 60
         self.output_state = "idle"
         self.output_error = None
+        self._needs_device_list_refresh = False
         self.dsp_enabled = True
         self.dsp_order = ["peq", "convolver", "tape", "tube", "widener"]
         self.peq_enabled = False
@@ -1668,6 +1690,8 @@ class RustAudioPlayerAdapter:
         self._rust_disconnect_recovering = False
         self._rust_pump_source = 0
         self._last_enum_signature_by_driver = {}
+        # vid:pid → {"name": str, "device_id": str} — restored on permission-denied re-enum.
+        self._usb_device_cache: dict = {}
         self._last_rust_spectrum_seq = 0
         self._rust_spectrum_frames_seen = 0
         self._rust_last_play_ts = 0.0
@@ -2250,8 +2274,11 @@ class RustAudioPlayerAdapter:
                     _driver_key(getattr(self, "current_driver", "")) == "alsa_auto":
                 self._release_alsa_reservation()
                 self.output_state = "error"
-            self.output_error = text or "ALSA exclusive mode error"
-            return
+                self.output_error = text or "ALSA exclusive mode error"
+                return
+            # USB Rawlink / other device disconnect: switch to fallback state and
+            # schedule the reconnect-recovery flow so the UI can rebind when the
+            # device reappears.
             self.output_state = "fallback"
             self.output_error = "USB audio device disconnected; switching output"
             if not self._rust_disconnect_recovering:
@@ -2322,11 +2349,36 @@ class RustAudioPlayerAdapter:
             )
         return True
 
+    def set_usb_clock_mode(self, mode):
+        """Set USB rawlink clock alignment mode: 0 = push, 1 = pull."""
+        try:
+            mode_int = int(mode or 0)
+        except Exception:
+            mode_int = 0
+        rc = -2
+        try:
+            rc = int(self._rust.set_usb_clock_mode(mode_int))
+        except Exception:
+            logger.debug("Rust USB clock mode setter failed", exc_info=True)
+        if rc == 0:
+            logger.info("USB clock mode set: %s", "pull" if mode_int == 1 else "push")
+        elif rc == -3:
+            logger.debug("Rust USB clock mode setter unavailable")
+        elif rc < 0:
+            logger.warning("Rust USB clock mode apply failed rc=%s mode=%s", rc, mode_int)
+        return rc == 0 or rc == -3
+
     def toggle_bit_perfect(self, enabled, exclusive_lock=False):
         old_exclusive = bool(getattr(self, "exclusive_lock_mode", False))
         self.bit_perfect_mode = bool(enabled)
         self.exclusive_lock_mode = bool(exclusive_lock)
         self.active_rate_switch = bool(enabled) and (not bool(exclusive_lock))
+        if enabled:
+            # Reset GStreamer pipeline volume to 1.0 (unity gain / bypass).
+            # Call _rust directly to skip the bit_perfect_mode guard in
+            # RustAdapter.set_volume — this covers all entry paths including
+            # on_exclusive_toggled which does not go through _lock_volume_controls.
+            self._rust.set_volume(1.0)
         logger.info(
             "RustAdapter.toggle_bit_perfect enabled=%s exclusive_lock=%s dsp_enabled=%s lv2_slots=%s",
             bool(enabled),
@@ -2871,7 +2923,7 @@ class RustAudioPlayerAdapter:
             return []
 
     def get_drivers(self):
-        return ["Auto (Default)", "PipeWire", DRIVER_ALSA_AUTO, DRIVER_ALSA_MMAP]
+        return ["Auto (Default)", "PipeWire", DRIVER_ALSA_AUTO, DRIVER_ALSA_MMAP, DRIVER_USB_RAWLINK]
 
     def _on_rust_event(self, evt, msg):
         if evt == _RustAudioCore.EVENT_EOS:
@@ -2909,6 +2961,12 @@ class RustAudioPlayerAdapter:
             if msg and "output-switched" in msg:
                 self.output_state = "active"
                 self.output_error = None
+            if msg and "alsa-mmap device ready" in msg:
+                self.output_error = None
+                # Signal the app to refresh the device list immediately —
+                # snd-usb-audio has finished re-attaching and the device now
+                # shows up with proper hw: labels in /proc/asound.
+                self._needs_device_list_refresh = True
             if msg:
                 lmsg = msg.lower()
                 if "container-adapter" in lmsg:
@@ -3238,7 +3296,11 @@ class RustAudioPlayerAdapter:
 
             frames = []
             if bool(self._rust_spectrum_enabled):
-                frames = self._rust.get_spectrum_frames_since(self._last_rust_spectrum_seq, max_frames=48, max_bands=128)
+                frames = self._rust.get_spectrum_frames_since(
+                    self._last_rust_spectrum_seq,
+                    max_frames=48,
+                    max_bands=_MAX_SPECTRUM_BANDS,
+                )
             if self._viz_trace_enabled and bool(self._rust_spectrum_enabled):
                 self._viz_trace_tick_count += 1
                 # Log densely only right after enabling, then sparse.
@@ -3809,10 +3871,53 @@ class RustAudioPlayerAdapter:
     def set_pitch(self, semitones):
         return self._rust.set_pitch(semitones) == 0
 
+    def _merge_usb_device_cache(self, devices):
+        """Update cache with permission-granted entries; restore cached info for fallback entries.
+
+        When a USB device is replugged before udev has re-applied the ACL, rusb's
+        device.open() fails and the Rust enumerator falls back to name="VID:PID" (no
+        serial).  This produces a different device_id than the authorised entry saved
+        in settings, causing a spurious "re-authorise" prompt.
+
+        We solve it in two passes:
+        1. Cache every entry whose name is NOT the fallback pattern (permission OK).
+        2. For entries whose name IS the fallback, substitute the cached name/device_id
+           so the rest of the app sees a stable identity across replugs.
+        """
+        # Pass 1: update cache for entries we can read.
+        for dev in devices:
+            dev_id = str(dev.get("device_id") or "")
+            name = str(dev.get("name") or "")
+            if not dev_id.startswith("usb:") or _USB_FALLBACK_NAME_RE.match(name):
+                continue
+            parts = dev_id.split(":")
+            if len(parts) >= 3:
+                self._usb_device_cache[f"{parts[1]}:{parts[2]}"] = {
+                    "name": name,
+                    "device_id": dev_id,
+                }
+        # Pass 2: restore cached identity for permission-denied entries.
+        result = []
+        for dev in devices:
+            dev_id = str(dev.get("device_id") or "")
+            name = str(dev.get("name") or "")
+            if _USB_FALLBACK_NAME_RE.match(name) and dev_id.startswith("usb:"):
+                parts = dev_id.split(":")
+                if len(parts) >= 3:
+                    cached = self._usb_device_cache.get(f"{parts[1]}:{parts[2]}")
+                    if cached:
+                        dev = dict(dev)
+                        dev["name"] = cached["name"]
+                        dev["device_id"] = cached["device_id"]
+            result.append(dev)
+        return result
+
     def get_devices_for_driver(self, driver):
         driver_name = str(driver or "")
         devices = self._rust.list_devices(driver)
         if devices is not None:
+            if driver_name == DRIVER_USB_RAWLINK:
+                devices = self._merge_usb_device_cache(devices)
             try:
                 key = driver_name
                 sig = tuple((str(d.get("name") or ""), str(d.get("device_id") or "")) for d in devices)

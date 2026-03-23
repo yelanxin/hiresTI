@@ -2381,15 +2381,23 @@ class TidalBackend:
             return [], []
 
         eager = []
-        if definitions:
-            first_label, first_path = definitions[0]
-            first_sec = self.get_genre_section(first_label, first_path)
-            if first_sec:
-                eager.append(first_sec)
-        return definitions, eager
+        if not definitions:
+            return definitions, eager
+
+        filtered_definitions = []
+        for title, path in definitions:
+            sec = self.get_genre_section(title, path)
+            if not sec:
+                logger.info("Moods page: suppressing empty/unsupported tab %r (%s)", title, path)
+                continue
+            filtered_definitions.append((title, path))
+            eager.append(sec)
+        return filtered_definitions, eager
 
     def get_genre_section(self, label, path):
         """Fetch a single genre page on demand (used for lazy tab loading)."""
+        _SKIP_ITEM = object()
+
         def _norm_path(raw_path):
             p = str(raw_path or "").strip()
             if not p:
@@ -2434,7 +2442,7 @@ class TidalBackend:
                     if not name:
                         # Item has no displayable title — editorial/unsupported content;
                         # skip it so tabs made up entirely of such items are hidden.
-                        return None
+                        return _SKIP_ITEM
                     return {
                         "obj": item,
                         "name": name,
@@ -2446,7 +2454,7 @@ class TidalBackend:
                     _title = getattr(item, "title", None)
                     name = str(_title if _title is not None and not callable(_title) else "").strip()
                     if not name:
-                        return None
+                        return _SKIP_ITEM
                     return {
                         "obj": item,
                         "name": name,
@@ -2504,6 +2512,8 @@ class TidalBackend:
                 raw_items, more_path = _collect_category_items(category)
                 for item in raw_items:
                     processed = _process_item(item)
+                    if processed is _SKIP_ITEM:
+                        continue
                     if not processed:
                         processed = self._process_generic_item(item)
                     if processed:

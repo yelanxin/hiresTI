@@ -1,8 +1,8 @@
 use std::sync::{Arc, Mutex};
 
+use gst::prelude::*;
 use gst::PadProbeReturn;
 use gst::PadProbeType;
-use gst::prelude::*;
 use gstreamer as gst;
 
 /// Release time constant in seconds.
@@ -218,10 +218,7 @@ impl LimiterNode {
                 if raw.len() % 8 == 0 {
                     // SAFETY: format is F64LE, pointer is 8-byte aligned by GStreamer.
                     let samples = unsafe {
-                        std::slice::from_raw_parts_mut(
-                            raw.as_mut_ptr() as *mut f64,
-                            raw.len() / 8,
-                        )
+                        std::slice::from_raw_parts_mut(raw.as_mut_ptr() as *mut f64, raw.len() / 8)
                     };
                     st.process(samples, channels);
                 }
@@ -300,7 +297,10 @@ mod tests {
         // With finite ratio the output ceiling is threshold + (peak - threshold) / ratio.
         let ceiling = threshold + (peak - threshold) / ratio;
         for s in &samples {
-            assert!(s.abs() <= ceiling + 1e-9, "sample {s} exceeded ceiling {ceiling}");
+            assert!(
+                s.abs() <= ceiling + 1e-9,
+                "sample {s} exceeded ceiling {ceiling}"
+            );
         }
     }
 
@@ -321,6 +321,10 @@ mod tests {
         st.process(&mut silence, 2);
 
         // After one τ the remaining deficit should be ≤ 37 % of the initial drop.
-        assert!(st.gain > 0.6, "gain should have recovered substantially: {}", st.gain);
+        assert!(
+            st.gain > 0.6,
+            "gain should have recovered substantially: {}",
+            st.gain
+        );
     }
 }

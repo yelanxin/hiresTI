@@ -14,7 +14,7 @@ gi.require_version("Gdk", "4.0")
 from gi.repository import Gtk, Adw, Pango, GLib, Gdk
 
 from background_viz import BackgroundVisualizer
-from visualizer import SpectrumVisualizer
+from visualizer import HybridVisualizer as _HybridVisualizer
 from dr_meter import LevelMonitor
 from ui import config as ui_config
 
@@ -835,16 +835,20 @@ def build_body(app, container):
     app.viz_surface_overlay.set_valign(Gtk.Align.FILL)
     app.viz_surface_overlay.set_child(app.viz_stack)
 
-    app.viz = SpectrumVisualizer()
-    logger.info("Visualizer backend selected: cairo")
+    app.viz = _HybridVisualizer()
     app.viz.set_num_bars(32)
     app.viz.set_valign(Gtk.Align.FILL)
     app.viz_stack.add_titled(app.viz, "spectrum", "Spectrum")
     _body_mark("viz-spectrum-tab")
 
+    app.viz_freq_scale_dd = Gtk.DropDown(model=Gtk.StringList.new(app.viz.get_frequency_scale_names()))
+    app.viz_freq_scale_dd.add_css_class("viz-theme-dd")
+    app.viz_freq_scale_dd.add_css_class("viz-right-first")
+    app.viz_freq_scale_dd.set_valign(Gtk.Align.CENTER)
+    app.viz_freq_scale_dd.connect("notify::selected", app.on_viz_frequency_scale_changed)
+
     app.viz_bars_dd = Gtk.DropDown(model=Gtk.StringList.new([str(v) for v in app.VIZ_BAR_OPTIONS]))
     app.viz_bars_dd.add_css_class("viz-theme-dd")
-    app.viz_bars_dd.add_css_class("viz-right-first")
     app.viz_bars_dd.set_valign(Gtk.Align.CENTER)
     app.viz_bars_dd.connect("notify::selected", app.on_viz_bars_changed)
 
@@ -888,6 +892,7 @@ def build_body(app, container):
     right_ctrl_box.add_css_class("viz-right-controls")
     right_ctrl_box.set_halign(Gtk.Align.END)
     theme_row.append(right_ctrl_box)
+    right_ctrl_box.append(app.viz_freq_scale_dd)
     right_ctrl_box.append(app.viz_bars_dd)
     right_ctrl_box.append(app.viz_profile_dd)
     right_ctrl_box.append(app.viz_effect_dd)
