@@ -10,6 +10,7 @@
 - **Network buffering diagnostics**: GStreamer `Buffering` bus messages are now logged (`usb-audio: network buffering XX%`), and `pull timeout` logs include `appsink` state for easier root-cause analysis of pipeline stalls.
 - **Enhanced per-second diagnostics** (gated behind `HIRESTI_USB_AUDIO_DIAG` env var): USB rawlink status line now includes drift correction (ppb), calibrated USB clock rate (Hz), clock mode (Push/Pull), callback max latency (µs), and queue minimum water-level timestamp.
 - **AlsaHwClock mode getter**: `AlsaHwClockFeed::mode()` exposed for diagnostics.
+- **Signal Path page**: USB Rawlink now shows output rate, bit depth, device name, latency (ISO Ring), output path, and is included in the Bit-Perfect verdict. The Bit-Perfect help popover displays driver-specific notes.
 
 ### Changed
 - **Increased GStreamer playbin internal buffer** to 10 seconds / 4 MiB for streaming sources (Tidal), reducing decoder starvation and xruns caused by transient network latency.
@@ -21,6 +22,7 @@
 - **USB Audio**: ISO OUT packet layout uses tight packing (cumulative actual lengths) instead of stride=max_packet, fixing continuous crackling on devices where packet size varies per-frame.
 - **USB Audio**: `subframe_size` from the USB descriptor is now used for wire byte count (S24_3LE → 3 bytes, not 4), preventing sample corruption on 24-bit packed devices.
 - **USB Audio**: Device disconnect is now detected reliably (LIBUSB_TRANSFER_NO_DEVICE + submit failure) and propagated to the engine as an error event.
+- **Build**: Upgraded `pipewire` crate from 0.8 to 0.9, fixing a build failure on Arch Linux (and other distros with PipeWire ≥ 1.2) where `libspa 0.8.0` bindgen output referenced removed `spa_pod_builder.data`/`.size` fields.
 
 ### Known Issues
 - **FiiO KA13 pops during USB Rawlink playback**: This DAC has a firmware bug where the feedback endpoint intermittently sends zero-length packets, each correlating with an audible pop. The issue persists after the 2023-09-28 firmware update. Other tested DACs (Monitor 09, FiiO E10) are unaffected. ALSA `snd-usb-audio` does not trigger this device bug.

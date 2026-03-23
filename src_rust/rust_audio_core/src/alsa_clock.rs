@@ -198,7 +198,7 @@ pub struct AlsaHwClockFeed {
     /// Total PCM frames committed since the anchor was set.
     total_frames: AtomicU64,
     /// Negotiated sample rate (frames per second).
-    rate: AtomicU32,
+    pub(crate) rate: AtomicU32,
     /// True once `anchor()` has been called and the feed is ready.
     valid: AtomicBool,
 
@@ -207,7 +207,7 @@ pub struct AlsaHwClockFeed {
     mode: AtomicU8,
     /// Write-ahead depth of the ISO transfer ring in nanoseconds.
     /// Approximately 128 ms for the standard 16-transfer × 8 ms ring.
-    buffer_depth_ns: AtomicU64,
+    pub(crate) buffer_depth_ns: AtomicU64,
     /// ISO completion timestamp (ns) of the calibration anchor.
     pull_anchor_ns: AtomicU64,
     /// `total_frames` value at the calibration anchor.

@@ -831,6 +831,11 @@ struct UsbSinkHandle {
     /// Set by `rac_set_uri` to signal the pusher thread to close the device
     /// so it re-opens at the new track's sample rate.
     reset_pending: Arc<AtomicBool>,
+    /// Wire bit depth selected at build time (e.g. 16, 24, 32).
+    /// Used by `rac_get_runtime_snapshot` for the signal-path display.
+    bit_depth: u8,
+    /// Human-readable device name (from USB string descriptor).
+    device_name: String,
 }
 
 impl std::fmt::Debug for UsbSinkHandle {
@@ -4267,6 +4272,8 @@ impl Engine {
                 appsink,
                 base_caps: caps,
                 reset_pending,
+                bit_depth: alt.bit_depth,
+                device_name: dev.name.clone(),
             },
             hw_clock,
         ))
@@ -7822,6 +7829,29 @@ pub extern "C" fn rac_get_runtime_snapshot(ptr: *const Engine) -> *mut c_char {
         None => s.push_str("null"),
     }
     s.push(',');
+
+    // USB rawlink runtime info (for signal-path display).
+    s.push_str("\"usb_rawlink\":");
+    if let Some(ref us) = engine.usb_sink {
+        let usb_rate = us.feed.rate.load(Ordering::Relaxed);
+        let usb_depth = us.bit_depth as u32;
+        // ISO ring latency = N_TRANSFERS × N_PACKETS_TARGET_MS.
+        // This is the physical write-ahead regardless of clock mode
+        // (buffer_depth_ns is 0 in Pull mode for clock math, not latency).
+        let usb_latency_ms = (usb_audio::transfer::N_TRANSFERS
+            * usb_audio::transfer::N_PACKETS_TARGET_MS) as f64;
+        s.push_str(&format!(
+            "{{\"rate\":{},\"depth\":{},\"latency_ms\":{:.1},\"device_name\":\"{}\"}}",
+            usb_rate,
+            usb_depth,
+            usb_latency_ms,
+            json_escape(&us.device_name),
+        ));
+    } else {
+        s.push_str("null");
+    }
+    s.push(',');
+
     s.push_str("\"source\":{");
     let source_rate = if engine.source_rate > 0 {
         engine.source_rate
