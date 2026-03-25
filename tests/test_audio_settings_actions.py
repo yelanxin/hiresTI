@@ -599,6 +599,113 @@ def test_on_driver_changed_refreshes_dsp_overview(monkeypatch):
     assert len(dsp_updates) >= 3
 
 
+def test_on_driver_changed_releases_usb_rawlink_before_enumerating_alsa(monkeypatch):
+    monkeypatch.setattr(audio_settings_actions, "_stop_output_hotplug_watch", lambda _app: None)
+    monkeypatch.setattr(audio_settings_actions, "_touch_output_probe_burst", lambda _app, seconds=0: None)
+    monkeypatch.setattr(audio_settings_actions, "_sync_output_bit_depth_dropdown", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(audio_settings_actions, "update_output_status_ui", lambda _app: None)
+    monkeypatch.setattr(
+        audio_settings_actions,
+        "_schedule_output_refresh_after_usb_release",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(audio_settings_actions.Gtk, "StringList", SimpleNamespace(new=lambda items: list(items)))
+    monkeypatch.setattr(audio_settings_actions.GLib, "idle_add", lambda fn: fn())
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            if self._target is not None:
+                self._target()
+
+    monkeypatch.setattr(audio_settings_actions, "Thread", _ImmediateThread)
+
+    class _SwitchPlayer(_Player):
+        def __init__(self):
+            super().__init__()
+            self.output_state = "active"
+            self.current_device_id = "usb:1a2b:3c4d"
+            self.current_driver = "USB Rawlink"
+            self.requested_driver = "USB Rawlink"
+            self.phase = []
+            self.release_calls = []
+
+        def is_playing(self):
+            return False
+
+        def stop(self):
+            self.phase.append("stop")
+
+        def release_output_route(self):
+            self.phase.append("release")
+            self.release_calls.append(True)
+            return True
+
+        def get_devices_for_driver(self, driver):
+            self.phase.append("enum")
+            return [{"name": "DAC", "device_id": "hw:1,0"}]
+
+        def set_output(self, driver, device_id):
+            self.phase.append("set_output")
+            return super().set_output(driver, device_id)
+
+    player = _SwitchPlayer()
+    driver_dd = _DriverDropdown()
+    driver_dd.model = [audio_settings_actions.DRIVER_ALSA_AUTO]
+    device_dd = _ModelDropdown()
+    app = SimpleNamespace(
+        ignore_driver_change=False,
+        ex_switch=_Switch(active=False),
+        settings={},
+        save_settings=lambda: None,
+        player=player,
+        driver_dd=driver_dd,
+        device_dd=device_dd,
+        mmap_realtime_priority_dd=_Switch(),
+        current_device_name="Default",
+        current_device_list=[],
+        update_tech_label=lambda _stream: None,
+        _apply_viz_sync_offset_for_device=lambda *_args, **_kwargs: None,
+        show_output_notice=lambda *_args, **_kwargs: None,
+    )
+
+    audio_settings_actions.on_driver_changed(app, driver_dd, None)
+
+    assert player.release_calls == [True]
+    assert player.phase.index("release") < player.phase.index("enum")
+    assert player.set_output_calls == [(audio_settings_actions.DRIVER_ALSA_AUTO, "hw:1,0")]
+
+
+def test_schedule_output_refresh_after_usb_release_prefers_requested_device(monkeypatch):
+    refreshes = []
+    monkeypatch.setattr(audio_settings_actions.GLib, "idle_add", lambda fn: fn())
+    monkeypatch.setattr(audio_settings_actions.GLib, "timeout_add", lambda _delay, fn: fn())
+    monkeypatch.setattr(
+        audio_settings_actions,
+        "_refresh_devices_for_current_driver_ui_only",
+        lambda _app, reason="x", prefer_device_id=None: refreshes.append((reason, prefer_device_id)),
+    )
+
+    app = SimpleNamespace(
+        driver_dd=SimpleNamespace(get_selected_item=lambda: _DriverItem(audio_settings_actions.DRIVER_ALSA_AUTO)),
+        player=SimpleNamespace(requested_device_id="hw:2,0"),
+    )
+
+    audio_settings_actions._schedule_output_refresh_after_usb_release(
+        app,
+        audio_settings_actions.DRIVER_USB_RAWLINK,
+        audio_settings_actions.DRIVER_ALSA_AUTO,
+    )
+
+    assert refreshes == [
+        ("usb-rawlink-release", "hw:2,0"),
+        ("usb-rawlink-release", "hw:2,0"),
+        ("usb-rawlink-release", "hw:2,0"),
+    ]
+
+
 def test_passive_sync_device_list_updates_dropdown_without_nameerror(monkeypatch):
     monkeypatch.setattr(audio_settings_actions, "_get_output_probe_intervals", lambda _app: (0.0, 0.0))
     monkeypatch.setattr(audio_settings_actions, "_driver_key", lambda _name: "pipewire")

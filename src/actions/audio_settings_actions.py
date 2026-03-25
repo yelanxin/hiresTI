@@ -248,6 +248,52 @@ def _driver_is_alsa_family(driver_name):
     return _driver_key(driver_name) in ("alsa_auto", "alsa_mmap")
 
 
+def _is_usb_rawlink_to_alsa_switch(previous_driver_name, target_driver_name):
+    return _driver_key(previous_driver_name) == "usbrawlink" and _driver_is_alsa_family(target_driver_name)
+
+
+def _release_output_before_driver_enumeration(app, previous_driver_name, target_driver_name):
+    if not _is_usb_rawlink_to_alsa_switch(previous_driver_name, target_driver_name):
+        return
+    player = getattr(app, "player", None)
+    if player is None or not hasattr(player, "release_output_route"):
+        return
+    try:
+        logger.info(
+            "Pre-releasing USB Rawlink session before ALSA enumeration: from=%s to=%s",
+            previous_driver_name,
+            target_driver_name,
+        )
+        player.release_output_route()
+    except Exception:
+        logger.debug("Pre-release before ALSA enumeration failed", exc_info=True)
+
+
+def _schedule_output_refresh_after_usb_release(app, previous_driver_name, target_driver_name):
+    if not _is_usb_rawlink_to_alsa_switch(previous_driver_name, target_driver_name):
+        return
+
+    target_key = _driver_key(target_driver_name)
+
+    def _refresh():
+        if _driver_key(_selected_driver_name(app)) != target_key:
+            return False
+        prefer_device_id = str(getattr(getattr(app, "player", None), "requested_device_id", "") or "") or None
+        try:
+            _refresh_devices_for_current_driver_ui_only(
+                app,
+                reason="usb-rawlink-release",
+                prefer_device_id=prefer_device_id,
+            )
+        except Exception:
+            logger.debug("Post-release ALSA device refresh failed", exc_info=True)
+        return False
+
+    GLib.idle_add(_refresh)
+    GLib.timeout_add(900, _refresh)
+    GLib.timeout_add(1800, _refresh)
+
+
 def _driver_choices_for_mode(app, exclusive_enabled=None):
     player = getattr(app, "player", None)
     drivers = list(player.get_drivers() or []) if player is not None else []
@@ -944,6 +990,9 @@ def _parse_usb_rawlink_device_id(device_id):
     }
 
 
+_USB_UDEV_RULE_CONTENT = _build_udev_rule_content()
+
+
 def _build_usb_audio_acl_script(device_id=None):
     target = _parse_usb_rawlink_device_id(device_id)
     lines = [
@@ -1245,6 +1294,11 @@ def on_driver_changed(app, dd, p):
     if not selected:
         return
     driver_name = selected.get_string()
+    previous_driver_name = str(
+        getattr(app.player, "current_driver", None)
+        or getattr(app.player, "requested_driver", None)
+        or ""
+    )
     _driver_mark(f"begin driver={driver_name}")
 
     if app.ex_switch.get_active() and not _driver_is_alsa_family(driver_name) and driver_name != DRIVER_USB_RAWLINK:
@@ -1276,6 +1330,7 @@ def on_driver_changed(app, dd, p):
     elif had_active_output:
         app.player.stop()
     _driver_mark("stop-complete")
+    _release_output_before_driver_enumeration(app, previous_driver_name, driver_name)
 
     app.current_device_name = "Default"
     app.update_tech_label(app.player.stream_info)
@@ -1367,6 +1422,8 @@ def on_driver_changed(app, dd, p):
                         device_id=target_id,
                         device_name=app.current_device_name,
                     )
+                if ok:
+                    _schedule_output_refresh_after_usb_release(app, previous_driver_name, driver_name)
                 if hasattr(app, "_update_dsp_ui_state"):
                     GLib.idle_add(lambda: (app._update_dsp_ui_state(), False)[1])
                 GLib.idle_add(lambda: update_output_status_ui(app) or False)
@@ -1556,6 +1613,7 @@ def on_output_bit_depth_changed(app, dd, p):
 
 
 def on_output_state_transition(self, prev_state, state, detail=None):
+    player = getattr(self, "player", None)
     if state == "switching":
         try:
             _touch_output_probe_burst(self, seconds=30)
@@ -1568,10 +1626,10 @@ def on_output_state_transition(self, prev_state, state, detail=None):
         # USB Rawlink: the USB sink was rebuilt by set_output but the GStreamer
         # pipeline was stopped during the disconnect.  Resume automatically if a
         # track was loaded and the player is not already playing.
-        if getattr(self.player, "requested_driver", "") == DRIVER_USB_RAWLINK:
-            uri = str(getattr(self.player, "_last_loaded_uri", "") or "")
-            if uri and not self.player.is_playing():
-                pos_s = float(getattr(self.player, "_cached_pos_s", 0.0) or 0.0)
+        if getattr(player, "requested_driver", "") == DRIVER_USB_RAWLINK:
+            uri = str(getattr(player, "_last_loaded_uri", "") or "")
+            if uri and not player.is_playing():
+                pos_s = float(getattr(player, "_cached_pos_s", 0.0) or 0.0)
                 logger.info(
                     "USB Rawlink reconnected; auto-resuming playback pos=%.1fs uri=%.60s",
                     pos_s, uri,
@@ -1582,10 +1640,10 @@ def on_output_state_transition(self, prev_state, state, detail=None):
                         # rac_set_uri clears engine.uri on a dead-pusher error, and
                         # set_output_tuned rebuilds the sink without restoring it, so a
                         # bare play() call would hit "rac_play: empty uri" (-2).
-                        self.player.load(uri)
-                        self.player.play()
+                        player.load(uri)
+                        player.play()
                         if pos_s > 0.5:
-                            GLib.timeout_add(500, lambda: (self.player.seek(pos_s), None)[1] or False)
+                            GLib.timeout_add(500, lambda: (player.seek(pos_s), None)[1] or False)
                         if self.play_btn is not None:
                             self.play_btn.set_icon_name("media-playback-pause-symbolic")
                         update_output_status_ui(self)

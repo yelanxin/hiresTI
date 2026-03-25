@@ -1524,8 +1524,12 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
     color: #cf222e;
 }
 .player-title { font-size: 14px; font-weight: 800; margin-bottom: 10px; }
-.player-artist { color: @accent_color; font-weight: 600; font-size: 12px; margin-bottom: 5px; }
+.player-artist { color: @accent_color; font-weight: 600; font-size: 12px; }
 .player-album { color: alpha(currentColor, 0.5); font-size: 12px; }
+.player-artist-btn, .player-album-btn { padding: 0; min-height: 0; min-width: 0; margin: 0; border: none; background: none; box-shadow: none; }
+.player-artist-btn:hover, .player-album-btn:hover { background: none; box-shadow: none; }
+.player-artist-btn:hover .player-artist { color: #fff; text-decoration: underline; }
+.player-album-btn:hover .player-album { color: alpha(currentColor, 0.8); text-decoration: underline; }
 .bp-text-glow { color: #489A54; font-size: 10px; letter-spacing: 1px; margin-right: 3px; text-shadow: 0 0 2px alpha(#FFD700, 0.6), 0 0 5px alpha(#FFD700, 0.3); }
 .signal-card { background-color: alpha(currentColor, 0.05); border-radius: 12px; padding: 16px; margin: 0 8px; border: 1px solid alpha(currentColor, 0.08); }
 .signal-icon { color: @accent_color; -gtk-icon-size: 24px; }

@@ -201,6 +201,47 @@ def on_header_artist_clicked(self, gest, n, x, y):
         submit_daemon(resolve_artist)
 
 
+def on_player_artist_clicked(self):
+    """Navigate to the artist of the currently playing track."""
+    track = getattr(self, "playing_track", None)
+    if track is None:
+        return
+    artist_obj = getattr(track, "artist", None)
+    if artist_obj is None:
+        return
+    artist_id = getattr(artist_obj, "id", None)
+    artist_name = str(getattr(artist_obj, "name", "") or "").strip()
+    if not artist_id and not artist_name:
+        return
+
+    def _resolve():
+        resolved = self.backend.resolve_artist(artist_id=artist_id, artist_name=artist_name)
+        if resolved:
+            GLib.idle_add(self.on_artist_clicked, resolved)
+
+    submit_daemon(_resolve)
+
+
+def on_player_album_clicked(self):
+    """Navigate to the album of the currently playing track."""
+    track = getattr(self, "playing_track", None)
+    if track is None:
+        return
+    album_obj = getattr(track, "album", None)
+    album_id = getattr(album_obj, "id", None) if album_obj is not None else None
+    if not album_id:
+        return
+
+    def _resolve():
+        try:
+            alb = self.backend.session.album(album_id)
+        except Exception:
+            alb = album_obj
+        GLib.idle_add(self.show_album_details, alb)
+
+    submit_daemon(_resolve)
+
+
 def create_album_flow(self):
     section_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, css_classes=["home-section", "home-generic-section"])
     self.main_flow = Gtk.FlowBox(

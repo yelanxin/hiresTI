@@ -73,7 +73,7 @@ INSTALL_DIR="$BUILD_ROOT/usr/share/$APP_NAME"
 BIN_DIR="$BUILD_ROOT/usr/bin"
 APP_DIR="$BUILD_ROOT/usr/share/applications"
 SYSTEM_ICON_DIR="$BUILD_ROOT/usr/share/icons"
-UDEV_DIR="$BUILD_ROOT/lib/udev/rules.d"
+UDEV_DIR="$BUILD_ROOT/usr/lib/udev/rules.d"
 
 mkdir -p "$INSTALL_DIR"
 mkdir -p "$BIN_DIR"
@@ -330,7 +330,7 @@ udevadm trigger --subsystem-match=usb 2>/dev/null || true
 /usr/bin/$APP_NAME
 /usr/share/applications/$APP_ID.desktop
 /usr/share/icons/*
-/lib/udev/rules.d/99-hiresti-usb-audio.rules
+/usr/lib/udev/rules.d/99-hiresti-usb-audio.rules
 
 %changelog
 * $(date "+%a %b %d %Y") $MAINTAINER - $VERSION-1
@@ -398,7 +398,7 @@ INSTALL_EOF
 
     mkdir -p dist
     tar --sort=name --mtime="@$build_ts" --owner=0 --group=0 --numeric-owner \
-        -C "$pkg_root" -I 'zstd -19 -T0' -cf "$pkg_file" .PKGINFO .INSTALL usr lib
+        -C "$pkg_root" -I 'zstd -19 -T0' -cf "$pkg_file" .PKGINFO .INSTALL usr
     echo "✅ Arch package created."
 }
 

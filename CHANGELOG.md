@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.8.1 - 2026-03-24
+
+### Added
+- **Player bar metadata navigation**: the bottom playback bar now supports direct navigation from the currently playing track metadata.
+- **Clickable artist / album links in the player bar**: clicking the current track's `Artist` or `Album` in the playback bar now opens the corresponding artist or album page.
+
+### Changed
+- **Previous-track behavior** now follows a restart-first flow: when the current track position is within the first `5` seconds, pressing `Previous` rewinds to the start of the current track instead of jumping immediately to the previous track.
+- **Previous-track double-tap window** added: after rewinding to the start, pressing `Previous` again within `2` seconds now jumps to the previous track.
+
+### Fixed
+- **USB Rawlink → ALSA switching**: the USB Rawlink output path is now explicitly released before ALSA device enumeration, so the kernel can re-attach the USB audio device cleanly and expose it to the system again.
+- **Output device auto-refresh after USB Rawlink release**: after switching away from USB Rawlink, the output device list now refreshes automatically so the recovered ALSA device reappears without requiring a manual reopen of the settings page.
+
 ## 1.8.0 - 2026-03-23
 
 ### Added

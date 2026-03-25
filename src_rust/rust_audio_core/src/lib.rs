@@ -6675,6 +6675,23 @@ pub extern "C" fn rac_stop(ptr: *mut Engine) -> c_int {
 }
 
 #[no_mangle]
+pub extern "C" fn rac_release_output(ptr: *mut Engine) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    let had_usb_rawlink = engine.usb_sink.is_some();
+    engine.reset_spectrum_timeline();
+    let _ = engine.playbin.set_state(gst::State::Null);
+    engine.stop_mmap_sink();
+    engine.stop_usb_sink();
+    if had_usb_rawlink {
+        std::thread::sleep(std::time::Duration::from_millis(350));
+    }
+    engine.emit_event(EVT_STATE, "output-released");
+    0
+}
+
+#[no_mangle]
 pub extern "C" fn rac_seek(ptr: *mut Engine, pos_s: c_double) -> c_int {
     let Some(engine) = as_mut_engine(ptr) else {
         return -1;

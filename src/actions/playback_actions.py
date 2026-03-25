@@ -1,6 +1,26 @@
+import math
 import random
+import time
 
 from actions import audio_settings_actions
+
+_PREV_RESTART_THRESHOLD_S = 5.0
+_PREV_DOUBLE_TAP_WINDOW_S = 2.0
+
+
+def _choose_shuffle_index(app, current, total):
+    if not hasattr(app, "shuffle_indices") or not app.shuffle_indices:
+        app._generate_shuffle_list()
+
+    raw_candidates = list(getattr(app, "shuffle_indices", []) or [])
+    candidates = [idx for idx in raw_candidates if isinstance(idx, int) and 0 <= idx < total and idx != current]
+    if candidates:
+        return random.choice(candidates)
+
+    fallback = [idx for idx in range(total) if idx != current]
+    if fallback:
+        return random.choice(fallback)
+    return current
 
 
 def on_play_pause(app, btn):
@@ -69,12 +89,7 @@ def on_next_track(app, btn=None):
         if total <= 1:
             next_idx = 0
         else:
-            if not hasattr(app, "shuffle_indices") or not app.shuffle_indices:
-                app._generate_shuffle_list()
-            if app.shuffle_indices:
-                next_idx = random.choice(app.shuffle_indices)
-            else:
-                next_idx = (current + 1) % total
+            next_idx = _choose_shuffle_index(app, current, total)
     else:
         next_idx = (current + 1) % total
 
@@ -94,6 +109,34 @@ def on_prev_track(app, btn=None):
     current = getattr(app, "current_track_index", 0)
     if current is None:
         current = 0
+
+    now = time.monotonic()
+    rewind_armed_until = float(getattr(app, "_prev_track_rewind_armed_until", 0.0) or 0.0)
+    rewind_armed_index = getattr(app, "_prev_track_rewind_armed_index", None)
+    rewind_to_start_armed = rewind_armed_index == current and now <= rewind_armed_until
+
+    player = getattr(app, "player", None)
+    if player is not None and hasattr(player, "get_position") and hasattr(player, "seek"):
+        try:
+            pos_s, _dur_s = player.get_position()
+            pos_s = float(pos_s or 0.0)
+        except Exception:
+            pos_s = None
+        if pos_s is not None and math.isfinite(pos_s) and pos_s <= _PREV_RESTART_THRESHOLD_S:
+            if not rewind_to_start_armed:
+                player.seek(0.0)
+                app._prev_track_rewind_armed_until = now + _PREV_DOUBLE_TAP_WINDOW_S
+                app._prev_track_rewind_armed_index = current
+                if hasattr(app, "_mpris_emit_seeked"):
+                    app._mpris_emit_seeked(0.0)
+                if hasattr(app, "_mpris_sync_position"):
+                    app._mpris_sync_position(force=True)
+                if hasattr(app, "_remote_publish_playback_event"):
+                    app._remote_publish_playback_event("seek")
+                return
+
+    app._prev_track_rewind_armed_until = 0.0
+    app._prev_track_rewind_armed_index = None
 
     prev_idx = (current - 1) % total
     if 0 <= prev_idx < total:
@@ -118,15 +161,9 @@ def get_next_index(app, direction=1):
 
     if app.play_mode in [app.MODE_SHUFFLE, app.MODE_SMART]:
         if direction == 1:
-            if not app.shuffle_indices:
-                app._generate_shuffle_list()
-
-            if not app.shuffle_indices:
-                return current
-
             # Use the same selection logic as on_next_track so that prefetch
             # actually predicts the track that will be played next.
-            return random.choice(app.shuffle_indices)
+            return _choose_shuffle_index(app, current, total)
         return (current - 1) % total
 
     return (current + direction) % total

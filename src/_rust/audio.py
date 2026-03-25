@@ -109,6 +109,9 @@ class _RustAudioCore:
 
             lib.rac_stop.restype = ctypes.c_int
             lib.rac_stop.argtypes = [ctypes.c_void_p]
+            if hasattr(lib, "rac_release_output"):
+                lib.rac_release_output.restype = ctypes.c_int
+                lib.rac_release_output.argtypes = [ctypes.c_void_p]
 
             lib.rac_seek.restype = ctypes.c_int
             lib.rac_seek.argtypes = [ctypes.c_void_p, ctypes.c_double]
@@ -462,6 +465,9 @@ class _RustAudioCore:
 
     def stop(self):
         return self._call_int("rac_stop", default_rc=-3)
+
+    def release_output(self):
+        return self._call_int("rac_release_output", default_rc=-3)
 
     def seek(self, seconds):
         return self._call_int("rac_seek", ctypes.c_double(float(seconds or 0.0)), default_rc=-3)
@@ -3582,6 +3588,31 @@ class RustAudioPlayerAdapter:
             self._release_pipewire_clock_override(reason="stop")
             self._refresh_rust_cache(force=True)
             self._retune_idle_timers()
+
+    def release_output_route(self):
+        self._reset_rust_visual_sync_state()
+        rc = -2
+        try:
+            rc = int(self._rust.release_output())
+        except Exception:
+            logger.debug("RustAdapter.release_output_route: rust release failed", exc_info=True)
+        if rc == -2:
+            logger.debug("RustAdapter.release_output_route: rust release unavailable, falling back to stop()")
+            self.stop()
+            if _driver_key(getattr(self, "current_driver", None) or getattr(self, "requested_driver", None)) == "usb_rawlink":
+                time.sleep(0.35)
+            return True
+        logger.info("RustAdapter.release_output_route: rust release rc=%s", rc)
+        if rc != 0:
+            self._mark_transport_error("release_output_route", rc)
+            return False
+        self.output_error = None
+        self._cached_is_playing = False
+        self._release_pipewire_clock_override(reason="release-output")
+        self._refresh_rust_cache(force=True)
+        self._retune_idle_timers()
+        return True
+
     def seek(self, position_seconds):
         try:
             target_s = float(position_seconds or 0.0)
