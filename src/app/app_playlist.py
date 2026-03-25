@@ -19,6 +19,16 @@ def on_playlist_sort_clicked(self, field):
         self.render_playlist_detail(self.current_playlist_id)
 
 
+def on_playlists_home_sort_changed(self, sort_key):
+    """Handle sort selection change on the playlists home page."""
+    if self.playlists_home_sort == sort_key:
+        self.playlists_home_sort_asc = not self.playlists_home_sort_asc
+    else:
+        self.playlists_home_sort = sort_key
+        self.playlists_home_sort_asc = True
+    self.render_playlists_home()
+
+
 def on_playlist_folder_card_clicked(self, folder_obj):
     if folder_obj is None:
         return

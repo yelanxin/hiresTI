@@ -6084,6 +6084,58 @@ def render_playlists_home(app):
     head.append(Gtk.Label(label=title_txt, xalign=0, hexpand=True, css_classes=["home-section-title"]))
     count_lbl = Gtk.Label(label="", css_classes=["home-section-count"])
     head.append(count_lbl)
+
+    # Sort button
+    sort_options = [
+        ("default", "Default"),
+        ("name", "Name"),
+        ("tracks", "Tracks"),
+        ("duration", "Duration"),
+        ("updated", "Last Updated"),
+        ("created", "Created"),
+    ]
+    current_sort = getattr(app, "playlists_home_sort", "default")
+    current_asc = getattr(app, "playlists_home_sort_asc", True)
+    sort_arrow = " ▲" if current_asc else " ▼"
+    sort_label = "Default"
+    for key, label in sort_options:
+        if key == current_sort:
+            sort_label = label
+            break
+    sort_btn = Gtk.MenuButton(
+        css_classes=["flat", "playlist-add-top-btn"],
+        tooltip_text="Sort playlists",
+    )
+    sort_btn_content = Gtk.Box(spacing=4)
+    sort_btn_content.append(Gtk.Image.new_from_icon_name("view-sort-descending-symbolic"))
+    sort_btn_label = Gtk.Label(label=sort_label + (sort_arrow if current_sort != "default" else ""))
+    sort_btn_content.append(sort_btn_label)
+    sort_btn.set_child(sort_btn_content)
+    sort_pop = Gtk.Popover()
+    sort_box = Gtk.Box(
+        orientation=Gtk.Orientation.VERTICAL,
+        spacing=2,
+        margin_top=8,
+        margin_bottom=8,
+        margin_start=8,
+        margin_end=8,
+    )
+    for key, label in sort_options:
+        display = label
+        if key == current_sort and key != "default":
+            display = label + sort_arrow
+        btn = Gtk.Button(label=display, css_classes=["flat"])
+        if key == current_sort:
+            btn.add_css_class("suggested-action")
+        btn.connect(
+            "clicked",
+            lambda _b, k=key, p=sort_pop: (p.popdown(), app.on_playlists_home_sort_changed(k)),
+        )
+        sort_box.append(btn)
+    sort_pop.set_child(sort_box)
+    sort_btn.set_popover(sort_pop)
+    head.append(sort_btn)
+
     up_btn = Gtk.Button(icon_name="go-up-symbolic", css_classes=["flat", "playlist-add-top-btn"])
     up_btn.set_tooltip_text("Up Folder")
     up_btn.set_sensitive(bool(stack))
@@ -6143,6 +6195,24 @@ def render_playlists_home(app):
         payload = dict(app.backend.get_playlists_and_folders(parent_folder=parent_folder, limit=1000) or {})
         folders = list(payload.get("folders", []) or [])
         playlists = list(payload.get("playlists", []) or [])
+
+        # Sort playlists based on user selection.
+        sort_key = getattr(app, "playlists_home_sort", "default")
+        sort_asc = getattr(app, "playlists_home_sort_asc", True)
+        if sort_key != "default":
+            _sort_key_funcs = {
+                "name": lambda p: (getattr(p, "name", "") or "").lower(),
+                "tracks": lambda p: int(getattr(p, "num_tracks", 0) or getattr(p, "number_of_tracks", 0) or 0),
+                "duration": lambda p: int(getattr(p, "duration", 0) or 0),
+                "updated": lambda p: getattr(p, "last_updated", None) or getattr(p, "created", None) or 0,
+                "created": lambda p: getattr(p, "created", None) or 0,
+            }
+            fn = _sort_key_funcs.get(sort_key)
+            if fn:
+                try:
+                    playlists.sort(key=fn, reverse=not sort_asc)
+                except Exception:
+                    pass
 
         # Phase 1: render all cards immediately with placeholder collages.
         # Phase 2: async per-folder preview artwork fetching without blocking the UI.

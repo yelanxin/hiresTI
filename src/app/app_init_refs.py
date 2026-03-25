@@ -243,6 +243,8 @@ def _init_runtime_refs(self):
     self.current_remote_playlist = None
     self.current_playlist_folder = None
     self.current_playlist_folder_stack = []
+    self.playlists_home_sort = "default"
+    self.playlists_home_sort_asc = True
     self.current_selected_artist = None
     self.artists_query = ""
     self.artists_sort = "name_asc"

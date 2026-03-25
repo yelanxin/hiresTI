@@ -5,6 +5,7 @@
 ### Added
 - **Player bar metadata navigation**: the bottom playback bar now supports direct navigation from the currently playing track metadata.
 - **Clickable artist / album links in the player bar**: clicking the current track's `Artist` or `Album` in the playback bar now opens the corresponding artist or album page.
+- **Playlist sorting**: playlists home page now has a sort button supporting sort by Name, Tracks, Duration, Last Updated, and Created date, with toggleable ascending/descending order.
 
 ### Changed
 - **Previous-track behavior** now follows a restart-first flow: when the current track position is within the first `5` seconds, pressing `Previous` rewinds to the start of the current track instead of jumping immediately to the previous track.

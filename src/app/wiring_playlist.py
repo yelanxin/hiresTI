@@ -6,6 +6,7 @@ from app.wiring_utils import bind_map
 def bind_playlist(TidalApp, seen=None):
     from app.app_playlist import (
         on_playlist_sort_clicked,
+        on_playlists_home_sort_changed,
         on_playlist_folder_card_clicked,
         on_playlist_folder_up_clicked,
         on_create_playlist_folder_clicked,
@@ -40,6 +41,7 @@ def bind_playlist(TidalApp, seen=None):
 
     bind_map(TidalApp, [
         ("on_playlist_sort_clicked", on_playlist_sort_clicked),
+        ("on_playlists_home_sort_changed", on_playlists_home_sort_changed),
         ("on_playlist_folder_card_clicked", on_playlist_folder_card_clicked),
         ("on_playlist_folder_up_clicked", on_playlist_folder_up_clicked),
         ("on_create_playlist_folder_clicked", on_create_playlist_folder_clicked),
