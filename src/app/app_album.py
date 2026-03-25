@@ -29,6 +29,18 @@ def on_grid_item_activated(self, flow, child):
 
 
 def _play_single_track(self, track):
+    section = ""
+    gtl = getattr(self, "grid_title_label", None)
+    if gtl is not None:
+        section = str(gtl.get_text() or "").strip()
+    album = getattr(track, "album", None)
+    album_name = getattr(album, "name", None) or getattr(album, "title", None) or ""
+    if section and section.lower() not in ("", "albums"):
+        self.playback_source = {"type": section, "name": album_name or section, "obj": album}
+    elif album_name:
+        self.playback_source = {"type": "album", "name": album_name, "obj": album}
+    else:
+        self.playback_source = {"type": "track"}
     self.current_track_list = [track]
     self._set_play_queue([track])
     self.play_track(0)

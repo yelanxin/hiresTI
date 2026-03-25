@@ -1636,6 +1636,14 @@ def show_album_details(app, alb):
     app.back_btn.set_sensitive(True)
 
     title = getattr(alb, "title", getattr(alb, "name", "Unknown"))
+    section = ""
+    gtl = getattr(app, "grid_title_label", None)
+    if gtl is not None:
+        section = str(gtl.get_text() or "").strip()
+    if section and section.lower() not in ("", "albums"):
+        app._track_view_source = {"type": section, "name": title, "obj": alb, "open_method": "show_album_details"}
+    else:
+        app._track_view_source = {"type": "album", "name": title, "obj": alb, "open_method": "show_album_details"}
     app.header_title.set_text(title)
     app.header_title.set_tooltip_text(title)
 
@@ -2845,9 +2853,12 @@ def render_artist_detail(app, artist, render_token=None):
             btn._dashboard_track_artist = _norm_trackish_text(str(getattr(getattr(track, "artist", None), "name", "") or ""))
             btn._dashboard_playing_icon = playing_icon
             btn.set_child(row_box)
+            _artist_obj = getattr(app, "current_selected_artist", None)
+            _artist_name = str(getattr(_artist_obj, "name", "") or "Artist")
             btn.connect(
                 "clicked",
-                lambda _b, arr=list(all_tracks), idx=rank_idx: (
+                lambda _b, arr=list(all_tracks), idx=rank_idx, aname=_artist_name, aobj=_artist_obj: (
+                    setattr(app, "playback_source", {"type": "artist", "name": aname, "obj": aobj}),
                     setattr(app, "current_track_list", list(arr)),
                     app._set_play_queue(list(arr)),
                     app.play_track(idx),
@@ -3405,7 +3416,7 @@ def render_history_dashboard(app):
         btn._dashboard_track_artist = row_artist_norm
         btn._dashboard_playing_icon = playing_icon
         btn.set_child(row_box)
-        btn.connect("clicked", lambda _b, idx=i: app.on_history_track_clicked(top_tracks, idx))
+        btn.connect("clicked", lambda _b, idx=i: app.on_history_track_clicked(top_tracks, idx, {"type": "history", "name": "Top 20"}))
 
         col = 0 if i < 10 else 1
         row = i if i < 10 else i - 10
@@ -3562,6 +3573,11 @@ def render_top_dashboard(app, prefer_cache=True):
                         return
 
                     def apply():
+                        section = ""
+                        gtl = getattr(app, "grid_title_label", None)
+                        if gtl is not None:
+                            section = str(gtl.get_text() or "").strip()
+                        app.playback_source = {"type": section or "tracks", "name": section or "Tracks"}
                         app.current_track_list = list(tracks)
                         app._set_play_queue(list(tracks))
                         app.play_track(play_idx)
@@ -3926,6 +3942,11 @@ def render_new_dashboard(app, prefer_cache=True):
                         return
 
                     def apply():
+                        section = ""
+                        gtl = getattr(app, "grid_title_label", None)
+                        if gtl is not None:
+                            section = str(gtl.get_text() or "").strip()
+                        app.playback_source = {"type": section or "tracks", "name": section or "Tracks"}
                         app.current_track_list = list(tracks)
                         app._set_play_queue(list(tracks))
                         app.play_track(play_idx)

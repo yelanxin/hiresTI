@@ -319,6 +319,9 @@ def _apply_now_playing_dynamic_color(self, rgb=None):
 .now-playing-artist {{
     color: rgb({rb8}, {gb8}, {bb8});
 }}
+.now-playing-source {{
+    color: rgb({rb8}, {gb8}, {bb8});
+}}
 .now-playing-progress progress {{
     background-color: rgb({rb8}, {gb8}, {bb8});
 }}
@@ -1241,7 +1244,14 @@ def _build_now_playing_left_panel(self, layout):
         halign=Gtk.Align.FILL,
         css_classes=["now-playing-artist"],
     )
-    track_meta_box.append(self.now_playing_artist_label)
+    artist_btn = Gtk.Button(
+        css_classes=["flat", "now-playing-meta-link"],
+        halign=Gtk.Align.START,
+    )
+    artist_btn.set_child(self.now_playing_artist_label)
+    artist_btn.connect("clicked", self._on_now_playing_artist_clicked)
+    self.now_playing_artist_btn = artist_btn
+    track_meta_box.append(artist_btn)
 
     self.now_playing_album_label = Gtk.Label(
         label="",
@@ -1251,7 +1261,27 @@ def _build_now_playing_left_panel(self, layout):
         halign=Gtk.Align.FILL,
         css_classes=["now-playing-album"],
     )
-    track_meta_box.append(self.now_playing_album_label)
+    album_btn = Gtk.Button(
+        css_classes=["flat", "now-playing-meta-link"],
+        halign=Gtk.Align.START,
+    )
+    album_btn.set_child(self.now_playing_album_label)
+    album_btn.connect("clicked", self._on_now_playing_album_clicked)
+    self.now_playing_album_btn = album_btn
+    track_meta_box.append(album_btn)
+
+    self.now_playing_source_label = Gtk.Label(label="", xalign=1, ellipsize=3, max_width_chars=32, css_classes=["now-playing-source"])
+    source_btn = Gtk.Button(
+        css_classes=["flat", "now-playing-source-btn"],
+        halign=Gtk.Align.END,
+        valign=Gtk.Align.START,
+        hexpand=True,
+    )
+    source_btn.set_child(self.now_playing_source_label)
+    source_btn.set_margin_bottom(42)
+    source_btn.connect("clicked", self._on_playback_source_clicked)
+    self.now_playing_source_btn = source_btn
+    meta_tool_band.add_overlay(source_btn)
 
     controls_stack = Gtk.Box(
         orientation=Gtk.Orientation.VERTICAL,
@@ -1779,6 +1809,25 @@ def on_now_playing_open_album_clicked(self, _btn=None):
     self.show_album_details(album)
 
 
+def _on_now_playing_artist_clicked(self, _btn=None):
+    track = getattr(self, "playing_track", None)
+    artist = getattr(track, "artist", None) if track is not None else None
+    if artist is None:
+        return
+    hide_now_playing_overlay(self)
+    self.on_artist_clicked(artist)
+
+
+def _on_now_playing_album_clicked(self, _btn=None):
+    track = getattr(self, "playing_track", None)
+    album = getattr(track, "album", None) if track is not None else None
+    if album is None:
+        return
+    _select_sidebar_nav_row(self, "collection")
+    hide_now_playing_overlay(self)
+    self.show_album_details(album)
+
+
 def on_now_playing_track_selected(self, _box, row):
     if row is None:
         return
@@ -1786,9 +1835,104 @@ def on_now_playing_track_selected(self, _box, row):
     idx = getattr(row, "now_playing_track_index", row.get_index())
     if idx < 0 or idx >= len(tracks):
         return
+    track = getattr(self, "playing_track", None)
+    album = getattr(track, "album", None) if track else None
+    album_name = getattr(album, "name", None) or getattr(album, "title", None) or ""
+    self.playback_source = {"type": "album", "name": album_name, "obj": album} if album_name else {"type": "album", "name": "Album", "obj": album}
     self.current_track_list = tracks
     self._set_play_queue(tracks)
     self.play_track(idx)
+
+
+_SOURCE_TYPE_TO_NAV_ID = {
+    "album": "collection",
+    "playlist": "playlists",
+    "search": None,
+    "history": "history",
+    "tracks": "liked_songs",
+    "Daily Mix": "daily_mix",
+    "Home": "home",
+    "New": "new",
+    "Top": "top",
+    "Hi-Res": "hires",
+    "Genres": "genres",
+    "Decades": "decades",
+    "Moods": "moods",
+    "artist": None,
+    "queue": "queue",
+    "track": None,
+    "liked": "liked_songs",
+}
+
+
+def _on_playback_source_clicked(self, _btn=None):
+    src = getattr(self, "playback_source", None)
+    if not src:
+        return
+    src_type = src.get("type", "")
+    nav_id = _SOURCE_TYPE_TO_NAV_ID.get(src_type)
+
+    hide_now_playing_overlay(self)
+
+    if src_type == "album":
+        album_obj = src.get("obj")
+        if album_obj is not None:
+            _select_sidebar_nav_row(self, "collection")
+            self.show_album_details(album_obj)
+            return
+        # fallback: try current playing track's album
+        track = getattr(self, "playing_track", None)
+        album_obj = getattr(track, "album", None) if track else None
+        if album_obj is not None:
+            _select_sidebar_nav_row(self, "collection")
+            self.show_album_details(album_obj)
+            return
+
+    if src_type == "playlist":
+        rpl = src.get("obj")
+        if rpl is not None:
+            _select_sidebar_nav_row(self, nav_id or "playlists")
+            self.on_remote_playlist_card_clicked(rpl)
+            return
+        pl_id = src.get("playlist_id")
+        if pl_id:
+            _select_sidebar_nav_row(self, nav_id or "playlists")
+            self.render_playlist_detail(pl_id)
+            return
+
+    if src_type == "artist":
+        artist_obj = src.get("obj")
+        if artist_obj is not None:
+            self.on_artist_clicked(artist_obj)
+            return
+
+    # For section-level sources, try to open the concrete object if available,
+    # otherwise fall back to the section first page.
+    obj = src.get("obj")
+    if obj is not None and nav_id:
+        open_method = src.get("open_method", "")
+        _select_sidebar_nav_row(self, nav_id)
+        if open_method == "show_album_details":
+            self.show_album_details(obj)
+            return
+        if open_method == "on_remote_playlist_card_clicked":
+            self.on_remote_playlist_card_clicked(obj)
+            return
+        # Guess from type name
+        obj_type = type(obj).__name__
+        if "Playlist" in obj_type:
+            self.on_remote_playlist_card_clicked(obj)
+            return
+        # Default: try show_album_details for anything with tracks
+        if hasattr(obj, "id"):
+            self.show_album_details(obj)
+            return
+
+    if nav_id:
+        if _select_sidebar_nav_row(self, nav_id):
+            row = self.nav_list.get_selected_row()
+            if row is not None:
+                self.on_nav_selected(self.nav_list, row)
 
 
 def _refresh_now_playing_from_track(self):
@@ -1801,6 +1945,8 @@ def _refresh_now_playing_from_track(self):
             self.now_playing_artist_label.set_text("")
         if self.now_playing_album_label is not None:
             self.now_playing_album_label.set_text("")
+        if self.now_playing_source_btn is not None:
+            self.now_playing_source_btn.set_visible(False)
         if self.now_playing_open_album_btn is not None:
             self.now_playing_open_album_btn.set_sensitive(False)
         self._render_now_playing_queue([])
@@ -1826,6 +1972,25 @@ def _refresh_now_playing_from_track(self):
     if self.now_playing_album_label is not None:
         self.now_playing_album_label.set_text(album_meta)
         self.now_playing_album_label.set_tooltip_text(album_meta)
+    if self.now_playing_source_label is not None:
+        src = getattr(self, "playback_source", None)
+        if src:
+            src_type = src.get("type", "")
+            src_name = src.get("name", "")
+            if src_type and src_name and src_name != src_type:
+                source_text = f"Playing from {src_type} \u00B7 {src_name}"
+            elif src_name:
+                source_text = f"Playing from {src_name}"
+            else:
+                source_text = f"Playing from {src_type}"
+            self.now_playing_source_label.set_text(source_text)
+            self.now_playing_source_label.set_tooltip_text(source_text)
+            if self.now_playing_source_btn is not None:
+                self.now_playing_source_btn.set_visible(True)
+        else:
+            self.now_playing_source_label.set_text("")
+            if self.now_playing_source_btn is not None:
+                self.now_playing_source_btn.set_visible(False)
     if self.now_playing_open_album_btn is not None:
         self.now_playing_open_album_btn.set_sensitive(getattr(track, "album", None) is not None)
 

@@ -78,6 +78,7 @@ def on_queue_track_selected(self, box, row):
     tracks = self._get_active_queue()
     if idx < 0 or idx >= len(tracks):
         return
+    self.playback_source = {"type": "queue", "name": "Queue"}
     self.play_track(idx)
 
 

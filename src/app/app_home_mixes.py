@@ -86,9 +86,10 @@ def on_history_album_clicked(self, album):
     self.show_album_details(album)
 
 
-def on_history_track_clicked(self, tracks, index):
+def on_history_track_clicked(self, tracks, index, source=None):
     if not tracks or index < 0 or index >= len(tracks):
         return
+    self.playback_source = source or {"type": "tracks", "name": "Tracks"}
     self.current_track_list = tracks
     self._set_play_queue(tracks)
     self._debug_dump_button_metrics("history-click:before-play")
@@ -263,6 +264,7 @@ def on_daily_mix_track_selected(self, box, row):
     daily_tracks = getattr(box, "daily_tracks", None)
     if not daily_tracks or track_index < 0 or track_index >= len(daily_tracks):
         return
+    self.playback_source = {"type": "daily_mix", "name": "Daily Mix"}
     self.current_track_list = daily_tracks
     self._set_play_queue(daily_tracks)
     self.play_track(track_index)
@@ -275,6 +277,7 @@ def on_daily_mix_item_activated(self, flow, child):
     daily_tracks = getattr(flow, "daily_tracks", None)
     if not daily_tracks or track_index < 0 or track_index >= len(daily_tracks):
         return
+    self.playback_source = {"type": "daily_mix", "name": "Daily Mix"}
     self.current_track_list = daily_tracks
     self._set_play_queue(daily_tracks)
     self.play_track(track_index)

@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.8.2 - 2026-03-25
+
+### Added
+- **"Playing from" source indicator**: the Now Playing overlay now shows a "Playing from" label (e.g. "Playing from album · Hunting High and Low", "Playing from playlist · DJ Classics") indicating where the current queue originated. The label uses a dynamic accent color derived from the album artwork.
+- **"Playing from" navigation**: clicking the "Playing from" label navigates back to the source — album detail, playlist detail, artist page, or sidebar section (Home, New, Top, Hi-Res, Genres, Decades, Moods, History, etc.).
+- **Clickable artist / album in Now Playing**: the artist name and album name on the Now Playing overlay are now clickable links — artist navigates to the artist page, album navigates to the album detail view.
+- **Playback source tracking**: all playback entry points (album, playlist, search, search history, liked tracks, daily mix, queue, artist top tracks, Home/New/Top/Hi-Res/Genres/Decades/Moods dashboards) now record playback origin context.
+
 ## 1.8.1 - 2026-03-24
 
 ### Added

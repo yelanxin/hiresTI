@@ -232,6 +232,14 @@ def on_remote_playlist_card_clicked(self, playlist_obj):
     self.back_btn.set_sensitive(True)
 
     title = getattr(playlist_obj, "name", "TIDAL Playlist")
+    section = ""
+    gtl = getattr(self, "grid_title_label", None)
+    if gtl is not None:
+        section = str(gtl.get_text() or "").strip()
+    if section and section.lower() not in ("", "albums", "playlists"):
+        self._track_view_source = {"type": section, "name": title, "obj": playlist_obj, "open_method": "on_remote_playlist_card_clicked"}
+    else:
+        self._track_view_source = {"type": "playlist", "name": title, "obj": playlist_obj, "open_method": "on_remote_playlist_card_clicked"}
     creator = getattr(playlist_obj, "creator", None)
     creator_name = str(getattr(creator, "name", None) or "TIDAL")
     user_id = str(getattr(getattr(self.backend, "user", None), "id", "") or "").strip()
@@ -743,6 +751,16 @@ def on_playlist_track_selected(self, box, row):
     tracks = getattr(box, "playlist_tracks", [])
     if not tracks or idx < 0 or idx >= len(tracks):
         return
+    pl_name = ""
+    pl_id = getattr(self, "current_playlist_id", None)
+    if pl_id and hasattr(self, "playlist_mgr"):
+        p = self.playlist_mgr.get_playlist(pl_id)
+        pl_name = (p.get("name", "") if p else "") if p else ""
+    if not pl_name:
+        rpl = getattr(self, "current_remote_playlist", None)
+        pl_name = str(getattr(rpl, "name", "") or getattr(rpl, "title", "") or "") if rpl else ""
+    rpl_obj = getattr(self, "current_remote_playlist", None)
+    self.playback_source = {"type": "playlist", "name": pl_name or "Playlist", "playlist_id": pl_id, "obj": rpl_obj}
     self.current_track_list = tracks
     self._set_play_queue(tracks)
     self.play_track(idx)

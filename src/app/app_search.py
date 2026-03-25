@@ -23,6 +23,7 @@ def on_search_track_selected(self, box, row):
         return
     idx = getattr(row, "search_track_index", row.get_index())
     if idx < len(self.search_track_data):
+        self.playback_source = {"type": "search", "name": "Search"}
         self.current_track_list = self.search_track_data
         self._set_play_queue(self.search_track_data)
         self.play_track(idx)
@@ -35,6 +36,7 @@ def on_search_history_track_selected(self, box, row):
     tracks = list(getattr(self, "search_history_track_data", []) or [])
     if idx < 0 or idx >= len(tracks):
         return
+    self.playback_source = {"type": "history", "name": "Search History"}
     self.current_track_list = tracks
     self._set_play_queue(tracks)
     self.play_track(idx)
@@ -44,6 +46,11 @@ def on_track_selected(self, box, row):
     if not row:
         return
     idx = row.get_index()
+    view_src = getattr(self, "_track_view_source", None)
+    if view_src:
+        self.playback_source = dict(view_src)
+    else:
+        self.playback_source = {"type": "tracks", "name": "Tracks"}
     self._set_play_queue(getattr(self, "current_track_list", []))
     self.play_track(idx)
 

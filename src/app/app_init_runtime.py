@@ -285,6 +285,7 @@ def _init_runtime_state(self):
     self.album_sort_buttons = {}
     self.playlist_sort_field = None
     self.playlist_sort_asc = True
+    self.playback_source = None
 
     self.window_created = False
     self.is_programmatic_update = False

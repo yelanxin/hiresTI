@@ -1286,6 +1286,37 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
     color: alpha(white, 0.78);
     text-shadow: 0 2px 12px alpha(black, 0.30);
 }
+.now-playing-meta-link {
+    padding: 0;
+    min-height: 0;
+}
+.now-playing-meta-link:hover label.now-playing-artist {
+    text-decoration: underline;
+}
+.now-playing-meta-link:hover label.now-playing-album {
+    text-decoration: underline;
+    color: white;
+}
+.now-playing-source {
+    font-size: 13px;
+    font-weight: 600;
+    opacity: 1;
+    color: #f1c76a;
+    text-shadow: 0 2px 12px alpha(black, 0.30);
+}
+.now-playing-source-btn {
+    padding: 4px 8px;
+    min-height: 0;
+    border-radius: 6px;
+    opacity: 1;
+    background-color: alpha(black, 0.22);
+}
+.now-playing-source-btn:hover {
+    background-color: alpha(black, 0.36);
+}
+.now-playing-source-btn:hover label {
+    color: white;
+}
 .now-playing-tool-row {
     margin-top: 0;
     margin-bottom: 0;

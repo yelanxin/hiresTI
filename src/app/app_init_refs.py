@@ -128,6 +128,10 @@ def _init_widget_refs(self):
     self.now_playing_title_label = None
     self.now_playing_artist_label = None
     self.now_playing_album_label = None
+    self.now_playing_artist_btn = None
+    self.now_playing_album_btn = None
+    self.now_playing_source_label = None
+    self.now_playing_source_btn = None
     self.now_playing_meta_panel = None
     self.now_playing_tool_row = None
     self.now_playing_track_fav_btn = None
