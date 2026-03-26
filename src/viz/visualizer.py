@@ -27,10 +27,11 @@ _FREQ_SCALE_LINEAR = "Linear"
 _FREQ_SCALE_LOG = "Log"
 _FREQ_SCALE_NAMES = [_FREQ_SCALE_LINEAR, _FREQ_SCALE_LOG]
 _SPECTRUM_HALF_RATE_HZ = 22050.0
-_DEFAULT_SPECTRUM_BANDS = 512
-_LINEAR_ANALYSIS_BANDS = 512
+_DEFAULT_SPECTRUM_BANDS = 2048
+_LINEAR_ANALYSIS_BANDS = 2048
 _LINEAR_DISPLAY_ZOOM = 1.0
-_LOG_DISPLAY_MIN_FREQ_HZ = 100.0
+_LOG_DISPLAY_ANCHOR_FREQS_HZ = (200.0, 500.0, 1000.0, 4000.0, 8000.0, 12000.0)
+_LOG_DISPLAY_ANCHOR_FRACTIONS = (0.15, 0.32, 0.50, 0.70, 0.87, 0.95)
 _LOG_DISPLAY_MAX_FREQ_HZ = 16000.0
 _LEGACY_LOG_BIN_EXPONENT = 2.15
 
@@ -123,11 +124,11 @@ def _build_linear_spectrum_bins(
     if out_count == analysis_n:
         return list(base or [])
     # Blend peak and mean aggregation: peak preserves sparse mid/high-freq tones
-    # while mean smooths out transient jumpiness.  60% peak + 40% mean gives
-    # similar reactivity to log mode without fully diluting narrow-bin signals.
+    # while mean smooths out transient jumpiness.  50% peak + 50% mean keeps
+    # more body in dense bands without fully diluting narrow-bin signals.
     out_peak = _resample_linear_values(base or [], out_count, use_peak=True)
     out_mean = _resample_linear_values(base or [], out_count, use_peak=False)
-    out = [p * 0.6 + m * 0.4 for p, m in zip(out_peak, out_mean)]
+    out = [p * 0.5 + m * 0.5 for p, m in zip(out_peak, out_mean)]
     # Apply per-bar voicing: rolls off bass (prevents peak saturation) and
     # boosts mid/high (compensates for narrow-bin bandwidth vs 96-band FFT).
     for i in range(out_count):
@@ -199,39 +200,99 @@ def _linear_display_voicing(freq_hz, half_rate_hz=_SPECTRUM_HALF_RATE_HZ):
 
 
 def _log_display_frequency_range(total_bands, half_rate_hz=_SPECTRUM_HALF_RATE_HZ):
-    base_min, base_max = _spectrum_frequency_range(total_bands, half_rate_hz=half_rate_hz)
-    min_f = max(base_min, _LOG_DISPLAY_MIN_FREQ_HZ)
-    max_f = min(base_max, _LOG_DISPLAY_MAX_FREQ_HZ)
-    if max_f <= min_f:
-        return (base_min, base_max)
-    return (min_f, max_f)
+    _base_min, base_max = _spectrum_frequency_range(total_bands, half_rate_hz=half_rate_hz)
+    return (0.0, min(base_max, _LOG_DISPLAY_MAX_FREQ_HZ))
+
+
+def _log_display_anchor_points(total_bands, half_rate_hz=_SPECTRUM_HALF_RATE_HZ):
+    _min_f, max_f = _log_display_frequency_range(total_bands, half_rate_hz=half_rate_hz)
+    if max_f <= 0.0:
+        return [(0.0, 0.0)]
+    points = [(0.0, 0.0)]
+    for freq_hz, frac in zip(_LOG_DISPLAY_ANCHOR_FREQS_HZ, _LOG_DISPLAY_ANCHOR_FRACTIONS):
+        if 0.0 < float(freq_hz) < max_f and 0.0 < float(frac) < 1.0:
+            points.append((float(freq_hz), float(frac)))
+    if abs(points[-1][0] - max_f) <= 1e-6:
+        points[-1] = (max_f, 1.0)
+    else:
+        points.append((max_f, 1.0))
+    return points
+
+
+def _log_display_frequency_at_fraction_from_points(frac, points):
+    p = max(0.0, min(1.0, float(frac)))
+    if not points:
+        return 0.0
+    if p <= points[0][1]:
+        return points[0][0]
+    for idx in range(1, len(points)):
+        f0, p0 = points[idx - 1]
+        f1, p1 = points[idx]
+        if p <= (p1 + 1e-9):
+            if p1 <= (p0 + 1e-9):
+                return f1
+            t = (p - p0) / (p1 - p0)
+            if f0 <= 0.0 or f1 <= 0.0:
+                return f0 + ((f1 - f0) * t)
+            return f0 * ((f1 / f0) ** t)
+    return points[-1][0]
+
+
+def _log_display_frequency_to_fraction_from_points(freq_hz, points):
+    if not points:
+        return 0.0
+    f = max(points[0][0], min(points[-1][0], float(freq_hz)))
+    for idx in range(1, len(points)):
+        f0, p0 = points[idx - 1]
+        f1, p1 = points[idx]
+        if f <= (f1 + 1e-9):
+            if f1 <= (f0 + 1e-9):
+                return p1
+            if f0 <= 0.0 or f1 <= 0.0 or f <= 0.0:
+                t = (f - f0) / (f1 - f0)
+            else:
+                log_span = math.log10(f1 / f0)
+                t = (math.log10(f / f0) / log_span) if log_span > 1e-9 else 1.0
+            return p0 + ((p1 - p0) * t)
+    return points[-1][1]
+
+
+def _log_display_frequency_at_fraction(frac, total_bands, half_rate_hz=_SPECTRUM_HALF_RATE_HZ):
+    points = _log_display_anchor_points(
+        total_bands,
+        half_rate_hz=half_rate_hz,
+    )
+    return _log_display_frequency_at_fraction_from_points(frac, points)
+
+
+def _log_display_frequency_to_fraction(freq_hz, total_bands, half_rate_hz=_SPECTRUM_HALF_RATE_HZ):
+    points = _log_display_anchor_points(
+        total_bands,
+        half_rate_hz=half_rate_hz,
+    )
+    return _log_display_frequency_to_fraction_from_points(freq_hz, points)
 
 
 def _log_display_eq_gain(freq_hz):
-    # Perceptual voicing: approximates the inverse of the equal-loudness
-    # contour (ISO 226) at a comfortable listening level (~70 phon).
-    # Reduces bass and very high frequencies, peaks around 3-4 kHz where
-    # the human ear is most sensitive.
     f = max(20.0, float(freq_hz))
-    if f < 200.0:
-        # 50 Hz → 0.45, 200 Hz → 0.72 (log-interpolated)
-        t = math.log10(f / 20.0) / math.log10(200.0 / 20.0)
-        return 0.30 + 0.42 * t
-    if f < 1000.0:
-        # 200 Hz → 0.72, 1 kHz → 0.92
-        t = math.log10(f / 200.0) / math.log10(1000.0 / 200.0)
-        return 0.72 + 0.20 * t
-    if f < 3500.0:
-        # 1 kHz → 0.92, 3.5 kHz → 1.05 (ear sensitivity peak)
-        t = math.log10(f / 1000.0) / math.log10(3500.0 / 1000.0)
-        return 0.92 + 0.13 * t
-    if f < 8000.0:
-        # 3.5 kHz → 1.05, 8 kHz → 0.90
-        t = math.log10(f / 3500.0) / math.log10(8000.0 / 3500.0)
-        return 1.05 - 0.15 * t
-    # 8 kHz → 0.90, 16 kHz → 0.68
-    t = math.log10(f / 8000.0) / math.log10(16000.0 / 8000.0)
-    return max(0.50, 0.90 - 0.22 * t)
+    anchors = (
+        (20.0, 0.50),
+        (100.0, 0.70),
+        (200.0, 1.00),
+        (1000.0, 1.00),
+        (4000.0, 1.20),
+        (8000.0, 1.50),
+    )
+    if f <= anchors[0][0]:
+        return anchors[0][1]
+    for idx in range(1, len(anchors)):
+        f0, g0 = anchors[idx - 1]
+        f1, g1 = anchors[idx]
+        if f <= f1:
+            span = math.log10(f1 / f0)
+            t = (math.log10(f / f0) / span) if span > 1e-9 else 1.0
+            return g0 + ((g1 - g0) * t)
+    return anchors[-1][1]
 
 
 def _draw_freq_axis_cairo(cr, width, height, frequency_scale_name,
@@ -241,15 +302,17 @@ def _draw_freq_axis_cairo(cr, width, height, frequency_scale_name,
     Standalone version of SpectrumVisualizer._draw_freq_axis so it can be
     reused by the GL overlay in HybridVisualizer.
     """
-    TICKS = 9
     HALF_RATE = _SPECTRUM_HALF_RATE_HZ
     TOTAL_BANDS = float(max(2, int(input_band_count or _DEFAULT_SPECTRUM_BANDS)))
     if frequency_scale_name == _FREQ_SCALE_LOG:
-        min_f, max_f = _log_display_frequency_range(int(TOTAL_BANDS), half_rate_hz=HALF_RATE)
-        log_min = math.log10(min_f)
-        log_span = math.log10(max_f) - log_min
+        _min_f, max_f = _log_display_frequency_range(int(TOTAL_BANDS), half_rate_hz=HALF_RATE)
+        log_points = _log_display_anchor_points(int(TOTAL_BANDS), half_rate_hz=HALF_RATE)
+        tick_freqs = [freq for freq, _frac in log_points]
+        if tick_freqs and tick_freqs[-1] < max_f:
+            tick_freqs.append(max_f)
     else:
         min_f, max_f = _linear_display_frequency_range(int(TOTAL_BANDS), half_rate_hz=HALF_RATE)
+        tick_freqs = [min_f + ((k / 8.0) * (max_f - min_f)) for k in range(9)]
 
     TICK_H = 4.0
     LABEL_FONT = 9.0
@@ -260,13 +323,12 @@ def _draw_freq_axis_cairo(cr, width, height, frequency_scale_name,
     cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
     cr.set_font_size(LABEL_FONT)
 
-    for k in range(TICKS):
-        p = k / float(TICKS - 1)
-        x = p * width
+    for freq in tick_freqs:
         if frequency_scale_name == _FREQ_SCALE_LOG:
-            freq = 10.0 ** (log_min + (p * log_span))
+            p = _log_display_frequency_to_fraction_from_points(freq, log_points)
         else:
-            freq = min_f + (p * (max_f - min_f))
+            p = (freq - min_f) / (max_f - min_f) if max_f > min_f else 0.0
+        x = p * width
 
         if freq >= 1000.0:
             kv = freq / 1000.0
@@ -289,7 +351,7 @@ def _draw_freq_axis_cairo(cr, width, height, frequency_scale_name,
         cr.show_text(label)
 
 
-def _build_log_spectrum_bins(values, out_count, half_rate_hz=_SPECTRUM_HALF_RATE_HZ):
+def _build_log_spectrum_bins(values, out_count, half_rate_hz=_SPECTRUM_HALF_RATE_HZ, rust_core=None):
     vals = list(values or [])
     if out_count <= 0:
         return []
@@ -297,6 +359,14 @@ def _build_log_spectrum_bins(values, out_count, half_rate_hz=_SPECTRUM_HALF_RATE
         return [0.0] * out_count
     if len(vals) <= 1:
         return [float(vals[0])] * out_count
+
+    if rust_core is not None and getattr(rust_core, "available", False):
+        try:
+            out = rust_core.build_log_bins(vals, out_count)
+        except Exception:
+            out = None
+        if out is not None:
+            return out
 
     # Band 0 is the DC component. Keep log mode aligned with the normal
     # spectrum path by skipping it when real spectrum bands are provided.
@@ -308,38 +378,42 @@ def _build_log_spectrum_bins(values, out_count, half_rate_hz=_SPECTRUM_HALF_RATE
 
     total_bands = len(vals)
     band_hz = float(half_rate_hz) / max(1.0, float(total_bands))
-    min_f, max_f = _log_display_frequency_range(total_bands, half_rate_hz=half_rate_hz)
-    if max_f <= min_f:
+    _min_f, max_f = _log_display_frequency_range(total_bands, half_rate_hz=half_rate_hz)
+    if max_f <= 0.0:
         return _resample_linear_values(usable, out_count)
-
-    log_min = math.log10(min_f)
-    log_span = math.log10(max_f) - log_min
-    if log_span <= 1e-9:
-        return _resample_linear_values(usable, out_count)
+    log_points = _log_display_anchor_points(total_bands, half_rate_hz=half_rate_hz)
 
     out = [0.0] * out_count
     for i in range(out_count):
         t0 = i / float(out_count)
         t1 = (i + 1) / float(out_count)
-        log_f0 = log_min + (t0 * log_span)
-        log_f1 = log_min + (t1 * log_span)
-        f0 = 10.0 ** log_f0
-        f1 = 10.0 ** log_f1
+        f0 = _log_display_frequency_at_fraction_from_points(t0, log_points)
+        f1 = _log_display_frequency_at_fraction_from_points(t1, log_points)
         pos0 = max(0.0, (f0 / band_hz) - 1.0)
         pos1 = max(pos0 + 1e-6, (f1 / band_hz) - 1.0)
-        sample_count = max(4, min(48, int(math.ceil((pos1 - pos0) * 4.0))))
-        sum_sq = 0.0
-        peak = 0.0
-        for s in range(sample_count):
-            t = (s + 0.5) / float(sample_count)
-            pos = pos0 + ((pos1 - pos0) * t)
-            v = _interpolate_series_value(usable, pos)
-            sum_sq += v * v
-            if v > peak:
-                peak = v
-        rms = math.sqrt(sum_sq / float(sample_count))
         center_f = math.sqrt(f0 * f1)  # geometric mean → log-scale centre freq
-        voiced = ((rms * 0.90) + (peak * 0.10)) * _log_display_eq_gain(center_f)
+        span = pos1 - pos0
+        if span < 1.0:
+            # A display bucket narrower than one FFT band should not be smoothed
+            # with multiple probes from the same coarse source bin; doing so
+            # makes the low end look like a flat plateau. Probe once at the
+            # center and add a light contrast curve so adjacent sub-band bars
+            # remain visually distinct.
+            probe = max(0.0, min(1.0, _interpolate_series_value(usable, pos0 + (span * 0.5))))
+            voiced = (probe ** 1.35) * _log_display_eq_gain(center_f)
+        else:
+            sample_count = max(2, min(32, int(math.ceil(span * 2.0))))
+            sum_sq = 0.0
+            peak = 0.0
+            for s in range(sample_count):
+                t = (s + 0.5) / float(sample_count)
+                pos = pos0 + (span * t)
+                v = _interpolate_series_value(usable, pos)
+                sum_sq += v * v
+                if v > peak:
+                    peak = v
+            rms = math.sqrt(sum_sq / float(sample_count))
+            voiced = ((rms * 0.50) + (peak * 0.50)) * _log_display_eq_gain(center_f)
         out[i] = max(0.0, min(1.0, voiced))
     return out
 
@@ -852,7 +926,11 @@ class SpectrumVisualizer(Gtk.DrawingArea):
         if not vals:
             return [0.0] * self.num_bars
         if self.frequency_scale_name == _FREQ_SCALE_LOG:
-            return _build_log_spectrum_bins(_normalize_spectrum_magnitudes(vals), self.num_bars)
+            return _build_log_spectrum_bins(
+                _normalize_spectrum_magnitudes(vals),
+                self.num_bars,
+                rust_core=self._rust_core,
+            )
         if use_rust and self._rust_core.available and log_rust and not self._logged_rust_path:
             logger.info("Spectrum preprocessing path: Rust")
             self._logged_rust_path = True
@@ -3774,7 +3852,11 @@ class DotsGLVisualizer(Gtk.GLArea):
         if len(vals) > 1:
             self._input_band_count = len(vals)
         if self.frequency_scale_name == _FREQ_SCALE_LOG:
-            new_heights = _build_log_spectrum_bins(_normalize_spectrum_magnitudes(vals), self.num_bars)
+            new_heights = _build_log_spectrum_bins(
+                _normalize_spectrum_magnitudes(vals),
+                self.num_bars,
+                rust_core=self._rust_core,
+            )
             self.target_heights[:self.num_bars] = new_heights[:self.num_bars]
             return
         new_heights = _build_linear_spectrum_bins(
@@ -4571,6 +4653,7 @@ class BarsGLVisualizer(Gtk.GLArea):
         self.themes               = proto.themes
         self.profiles             = proto.profiles
         self._color_from_gradient = proto._color_from_gradient
+        self._rust_core           = proto._rust_core
 
         self.num_bars            = 32
         self.theme_name          = "Aurora (Default)"
@@ -4847,7 +4930,11 @@ class BarsGLVisualizer(Gtk.GLArea):
 
         def _build(vals):
             if self.frequency_scale_name == _FREQ_SCALE_LOG:
-                return _build_log_spectrum_bins(_normalize_spectrum_magnitudes(vals), self.num_bars)
+                return _build_log_spectrum_bins(
+                    _normalize_spectrum_magnitudes(vals),
+                    self.num_bars,
+                    rust_core=self._rust_core,
+                )
             return _build_linear_spectrum_bins(
                 vals, self.num_bars,
                 rust_core=None,

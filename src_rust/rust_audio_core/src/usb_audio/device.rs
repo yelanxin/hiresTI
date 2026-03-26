@@ -8,14 +8,20 @@
 
 use std::time::Duration;
 
-use rusb::{Context, Device, DeviceHandle, Direction, Speed, SyncType, TransferType, UsageType, UsbContext};
+use rusb::{
+    Context, Device, DeviceHandle, Direction, Speed, SyncType, TransferType, UsageType, UsbContext,
+};
 
 use super::control::{
     get_cur_sample_rate_uac2, query_sample_rates_uac2, set_sample_rate_uac1, set_sample_rate_uac2,
 };
+use super::control::{
+    get_volume_cur, get_volume_range_uac1, get_volume_range_uac2, set_volume_cur,
+};
 use super::descriptor::{
-    detect_uac_version, parse_clock_id_from_ac, parse_stream_alt, EpInfo, UacStreamAlt, UacVersion,
-    USB_CLASS_AUDIO, USB_SUBCLASS_AUDIO_CONTROL, USB_SUBCLASS_AUDIO_STREAMING,
+    detect_uac_version, parse_clock_id_from_ac, parse_feature_unit_from_ac, parse_stream_alt,
+    EpInfo, FeatureUnitInfo, UacStreamAlt, UacVersion, USB_CLASS_AUDIO, USB_SUBCLASS_AUDIO_CONTROL,
+    USB_SUBCLASS_AUDIO_STREAMING,
 };
 
 // ---------------------------------------------------------------------------
@@ -47,6 +53,38 @@ pub struct UsbAudioDevice {
     /// Determines how to interpret `bInterval` on isochronous endpoints:
     /// HS → interval = 2^(bInterval-1) × 125 µs; FS → interval = bInterval ms.
     pub is_high_speed: bool,
+    /// Feature Unit with volume control (if present in the Audio Control descriptors).
+    pub feature_unit: Option<FeatureUnitInfo>,
+}
+
+/// Stable stream-profile fields used to keep appsink caps and lazy-open
+/// alt-selection aligned across rate changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UacAltProfile {
+    pub format: super::descriptor::UacFormat,
+    pub bit_depth: u8,
+    pub subframe_size: u8,
+    pub channels: u8,
+}
+
+impl From<&UacStreamAlt> for UacAltProfile {
+    fn from(alt: &UacStreamAlt) -> Self {
+        Self {
+            format: alt.format,
+            bit_depth: alt.bit_depth,
+            subframe_size: alt.subframe_size,
+            channels: alt.channels,
+        }
+    }
+}
+
+impl UacAltProfile {
+    fn matches(&self, alt: &UacStreamAlt) -> bool {
+        self.format == alt.format
+            && self.bit_depth == alt.bit_depth
+            && self.subframe_size == alt.subframe_size
+            && self.channels == alt.channels
+    }
 }
 
 impl UsbAudioDevice {
@@ -60,6 +98,83 @@ impl UsbAudioDevice {
             }
             _ => format!("usb:{:04x}:{:04x}", self.vendor_id, self.product_id),
         }
+    }
+
+    fn alt_selection_score(
+        alt: &UacStreamAlt,
+        bit_depth: u8,
+    ) -> (u8, u8, u8, u8, u8, u8, u8, u16) {
+        let format_rank = match alt.format {
+            super::descriptor::UacFormat::Pcm => 3,
+            super::descriptor::UacFormat::Float32 => 2,
+            super::descriptor::UacFormat::Pcm8 => 1,
+            super::descriptor::UacFormat::Unknown => 0,
+        };
+        let stereo_rank = (alt.channels == 2) as u8;
+        let mono_rank = (alt.channels == 1) as u8;
+        let fewer_channels_rank = u8::MAX - alt.channels;
+        let compact_subframe_rank = u8::MAX - alt.subframe_size;
+        (
+            (alt.bit_depth == bit_depth) as u8,
+            alt.bit_depth,
+            stereo_rank,
+            mono_rank,
+            format_rank,
+            fewer_channels_rank,
+            compact_subframe_rank,
+            alt.max_packet,
+        )
+    }
+
+    fn best_alt_internal(
+        &self,
+        rate: Option<u32>,
+        bit_depth: u8,
+        profile: Option<UacAltProfile>,
+    ) -> Option<&UacStreamAlt> {
+        let candidates: Vec<&UacStreamAlt> = self
+            .alts
+            .iter()
+            .filter(|alt| {
+                if self.uac_version == UacVersion::V1 {
+                    rate.map_or(true, |r| alt.sample_rates.contains(&r))
+                } else {
+                    true
+                }
+            })
+            .filter(|alt| profile.map_or(true, |p| p.matches(alt)))
+            .collect();
+
+        if candidates.is_empty() {
+            return None;
+        }
+
+        if profile.is_some() {
+            return candidates.into_iter().max_by_key(|alt| alt.max_packet);
+        }
+
+        candidates
+            .into_iter()
+            .max_by_key(|alt| Self::alt_selection_score(alt, bit_depth))
+    }
+
+    pub fn best_alt_profile(&self, bit_depth: u8) -> Option<UacAltProfile> {
+        self.best_alt_internal(None, bit_depth, None)
+            .map(UacAltProfile::from)
+    }
+
+    pub fn best_alt_for_profile(
+        &self,
+        rate: u32,
+        bit_depth: u8,
+        profile: Option<UacAltProfile>,
+    ) -> Option<&UacStreamAlt> {
+        if let Some(profile) = profile {
+            if let Some(alt) = self.best_alt_internal(Some(rate), bit_depth, Some(profile)) {
+                return Some(alt);
+            }
+        }
+        self.best_alt_internal(Some(rate), bit_depth, None)
     }
 }
 
@@ -124,6 +239,7 @@ fn try_parse_device<T: UsbContext>(device: &Device<T>) -> Option<UsbAudioDevice>
     } else {
         None
     };
+    let feature_unit = parse_feature_unit_from_ac(&ac_extra_bytes, uac_version);
 
     // ---- Step 2: find Audio Streaming interfaces and parse alt-settings ----
 
@@ -216,6 +332,7 @@ fn try_parse_device<T: UsbContext>(device: &Device<T>) -> Option<UsbAudioDevice>
         clock_id,
         alts: best_alts,
         is_high_speed,
+        feature_unit,
     })
 }
 
@@ -309,7 +426,7 @@ impl Drop for OpenUsbDevice {
         // (calling it again after release would double-attach and trigger repeated
         // snd-usb-audio probe/remove udev events).
         let _ = self.handle.release_interface(si);
-        if self.dev.uac_version == UacVersion::V2 && ci != si {
+        if ci != si {
             let _ = self.handle.release_interface(ci);
         }
 
@@ -402,11 +519,9 @@ impl OpenUsbDevice {
         // Auto-detach any kernel driver (e.g. snd-usb-audio) when claiming.
         let _ = self.handle.set_auto_detach_kernel_driver(true);
 
-        // For UAC 2.0 the clock SET_CUR is addressed to the Audio Control
-        // interface; claim it first so the kernel driver is detached from it.
-        // rusb tracks claimed interfaces internally; its DeviceHandle::drop()
-        // will release them all (with auto_detach → snd-usb-audio re-attaches).
-        if self.dev.uac_version == UacVersion::V2 && ci != si {
+        // Claim the Audio Control interface first so class-specific control
+        // transfers (sample-rate / hardware volume) have the kernel detached.
+        if ci != si {
             let _ = self.handle.claim_interface(ci);
         }
 
@@ -521,10 +636,9 @@ impl OpenUsbDevice {
                         );
                         std::thread::sleep(std::time::Duration::from_millis(150));
                         if set_sample_rate_uac2(&self.handle, ci, clock_id, chosen_rate).is_ok() {
-                            let verified =
-                                get_cur_sample_rate_uac2(&self.handle, ci, clock_id)
-                                    .filter(|&r| r >= 8_000 && r <= 768_000)
-                                    .unwrap_or(chosen_rate);
+                            let verified = get_cur_sample_rate_uac2(&self.handle, ci, clock_id)
+                                .filter(|&r| r >= 8_000 && r <= 768_000)
+                                .unwrap_or(chosen_rate);
                             eprintln!(
                                 "usb-audio: UAC2 long-delay retry OK → verified={}",
                                 verified
@@ -611,6 +725,53 @@ impl OpenUsbDevice {
         }
     }
 
+    /// Query hardware volume range from the Feature Unit.
+    ///
+    /// Returns `(min_raw, max_raw, res_raw)` in 1/256 dB units, or `None` if the
+    /// device has no Feature Unit with volume control.
+    ///
+    /// For per-channel devices (no master volume), queries the first writable
+    /// playback-path channel.
+    pub fn get_hw_volume_range(&self) -> Option<(i16, i16, i16)> {
+        let fu = self.dev.feature_unit.as_ref().filter(|f| f.has_volume)?;
+        let &ch = fu.channels.first()?;
+        match self.dev.uac_version {
+            UacVersion::V1 => {
+                get_volume_range_uac1(&self.handle, self.dev.ctrl_iface, fu.unit_id, ch)
+            }
+            UacVersion::V2 => {
+                get_volume_range_uac2(&self.handle, self.dev.ctrl_iface, fu.unit_id, ch)
+            }
+        }
+    }
+
+    /// Read the current hardware volume (1/256 dB).
+    pub fn get_hw_volume(&self) -> Option<i16> {
+        let fu = self.dev.feature_unit.as_ref().filter(|f| f.has_volume)?;
+        let &ch = fu.channels.first()?;
+        get_volume_cur(&self.handle, self.dev.ctrl_iface, fu.unit_id, ch)
+    }
+
+    /// Set the hardware volume (1/256 dB).
+    ///
+    /// For master-channel devices: sets channel 0.
+    /// For per-channel devices: sets all channels with volume support to the same value.
+    pub fn set_hw_volume(&self, value_raw: i16) -> Result<(), String> {
+        let fu = self
+            .dev
+            .feature_unit
+            .as_ref()
+            .filter(|f| f.has_volume)
+            .ok_or_else(|| "device has no volume Feature Unit".to_string())?;
+        if fu.channels.is_empty() {
+            return Err("device has no writable volume channels".to_string());
+        }
+        for &ch in &fu.channels {
+            set_volume_cur(&self.handle, self.dev.ctrl_iface, fu.unit_id, ch, value_raw)?;
+        }
+        Ok(())
+    }
+
     /// Select the best alt-setting for the requested `rate` and `bit_depth`.
     ///
     /// Prefers exact bit-depth match; falls back to the highest available
@@ -626,45 +787,124 @@ impl OpenUsbDevice {
     /// 192), causing `fill_transfer` to advance the clock at ¼ speed and making
     /// playback run 4× too slowly.
     pub fn best_alt(&self, rate: u32, bit_depth: u8) -> Option<&UacStreamAlt> {
-        // For UAC 1.0: only consider alts that advertise the rate
-        // For UAC 2.0: all alts are candidates (rate set via clock source)
-        let candidates: Vec<&UacStreamAlt> = self
-            .dev
-            .alts
-            .iter()
-            .filter(|a| {
-                if self.dev.uac_version == UacVersion::V1 {
-                    a.sample_rates.contains(&rate)
-                } else {
-                    true
-                }
-            })
-            .collect();
+        self.dev.best_alt_for_profile(rate, bit_depth, None)
+    }
 
-        if self.dev.uac_version == UacVersion::V2 {
-            // For UAC 2.0 prefer the alt with the largest max_packet among
-            // those that match the requested bit depth.  This ensures the ISO
-            // OUT endpoint has enough bandwidth for high sample rates (e.g.
-            // 192 kHz stereo 24-bit needs ≥1152 B/packet).
-            if let Some(a) = candidates
-                .iter()
-                .filter(|a| a.bit_depth == bit_depth)
-                .max_by_key(|a| a.max_packet)
-            {
-                return Some(*a);
+    pub fn best_alt_for_profile(
+        &self,
+        rate: u32,
+        bit_depth: u8,
+        profile: Option<UacAltProfile>,
+    ) -> Option<&UacStreamAlt> {
+        self.dev.best_alt_for_profile(rate, bit_depth, profile)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::usb_audio::UacFormat;
+
+    fn alt(
+        alt_setting: u8,
+        format: UacFormat,
+        bit_depth: u8,
+        subframe_size: u8,
+        channels: u8,
+        max_packet: u16,
+        sample_rates: &[u32],
+    ) -> UacStreamAlt {
+        UacStreamAlt {
+            alt_setting,
+            format,
+            bit_depth,
+            subframe_size,
+            channels,
+            sample_rates: sample_rates.to_vec(),
+            out_ep: 0x01,
+            feedback_ep: None,
+            max_packet,
+            out_ep_interval: 1,
+        }
+    }
+
+    fn mock_device(uac_version: UacVersion, alts: Vec<UacStreamAlt>) -> UsbAudioDevice {
+        UsbAudioDevice {
+            vendor_id: 0x1234,
+            product_id: 0x5678,
+            name: "Mock".into(),
+            serial: None,
+            bus: 1,
+            address: 1,
+            ctrl_iface: 0,
+            stream_iface: 1,
+            uac_version,
+            clock_id: Some(1),
+            alts,
+            is_high_speed: true,
+            feature_unit: None,
+        }
+    }
+
+    #[test]
+    fn best_alt_profile_prefers_stereo_profile_over_multichannel_bandwidth() {
+        let dev = mock_device(
+            UacVersion::V2,
+            vec![
+                alt(1, UacFormat::Pcm, 24, 3, 6, 1152, &[]),
+                alt(2, UacFormat::Pcm, 24, 3, 2, 576, &[]),
+            ],
+        );
+
+        let profile = dev.best_alt_profile(24).expect("profile");
+
+        assert_eq!(
+            profile,
+            UacAltProfile {
+                format: UacFormat::Pcm,
+                bit_depth: 24,
+                subframe_size: 3,
+                channels: 2,
             }
-            // Bit-depth fallback: highest bit depth, then largest max_packet.
-            return candidates
-                .into_iter()
-                .max_by_key(|a| (a.bit_depth, a.max_packet));
-        }
+        );
+    }
 
-        // UAC 1.0: exact bit-depth match first (any max_packet — already
-        // rate-filtered so it is sized correctly for the requested rate).
-        if let Some(a) = candidates.iter().find(|a| a.bit_depth == bit_depth) {
-            return Some(a);
-        }
-        // Highest bit-depth fallback
-        candidates.into_iter().max_by_key(|a| a.bit_depth)
+    #[test]
+    fn best_alt_for_profile_reuses_selected_profile_and_picks_largest_packet() {
+        let dev = mock_device(
+            UacVersion::V2,
+            vec![
+                alt(1, UacFormat::Pcm, 24, 3, 2, 576, &[]),
+                alt(2, UacFormat::Pcm, 24, 3, 2, 1152, &[]),
+                alt(3, UacFormat::Pcm, 24, 3, 6, 2048, &[]),
+            ],
+        );
+        let profile = dev.best_alt_profile(24).expect("profile");
+
+        let chosen = dev
+            .best_alt_for_profile(192_000, 24, Some(profile))
+            .expect("alt");
+
+        assert_eq!(chosen.channels, 2);
+        assert_eq!(chosen.max_packet, 1152);
+    }
+
+    #[test]
+    fn best_alt_for_profile_falls_back_when_profile_missing_for_requested_rate() {
+        let dev = mock_device(
+            UacVersion::V1,
+            vec![
+                alt(1, UacFormat::Pcm, 24, 3, 2, 288, &[44_100]),
+                alt(2, UacFormat::Pcm, 32, 4, 2, 384, &[96_000]),
+            ],
+        );
+        let profile = dev.best_alt_profile(24).expect("profile");
+
+        let chosen = dev
+            .best_alt_for_profile(96_000, 24, Some(profile))
+            .expect("fallback alt");
+
+        assert_eq!(chosen.bit_depth, 32);
+        assert_eq!(chosen.sample_rates, vec![96_000]);
     }
 }

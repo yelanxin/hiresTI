@@ -233,6 +233,9 @@ def bind_builders(TidalApp, seen=None):
     from app.app_builders import (
         _build_volume_popover,
         _sync_volume_ui_state,
+        _update_volume_db_label,
+        _on_hw_volume_ready,
+        _on_hw_volume_changed,
         on_key_pressed,
         toggle_mini_mode,
         _build_user_popover,
@@ -315,6 +318,9 @@ def bind_builders(TidalApp, seen=None):
     bind_map(TidalApp, [
         ("_build_volume_popover", _build_volume_popover),
         ("_sync_volume_ui_state", _sync_volume_ui_state),
+        ("_update_volume_db_label", _update_volume_db_label),
+        ("_on_hw_volume_ready", _on_hw_volume_ready),
+        ("_on_hw_volume_changed", _on_hw_volume_changed),
         ("on_key_pressed", on_key_pressed),
         ("toggle_mini_mode", toggle_mini_mode),
         ("_build_user_popover", _build_user_popover),

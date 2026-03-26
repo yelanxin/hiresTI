@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.8.3 - 2026-03-25
+
+### Added
+- **USB Rawlink hardware volume support**: devices that expose a writable USB Audio Class Feature Unit can now report hardware volume capability, range, current value, and accept direct hardware volume changes without going through the software mixer.
+
+### Changed
+- **USB Rawlink hardware-volume control path moved off the PCM pusher thread**: hardware volume range/current probing and pending volume writes now run in a dedicated worker so class-specific USB control transfers no longer block lazy-open startup or steady-state queue filling.
+- **USB Rawlink timeout diagnostics now print the actual stall duration**: `pull timeout` log lines include the measured `try-pull-sample` wait time rather than only reporting `≥100ms`.
+- **USB Rawlink startup prefill is now capped to the FrameQueue capacity** so very high-rate formats no longer request more startup audio than the queue can hold.
+- **USB Rawlink drift / settle heuristics are now time-aware**: no-feedback drift decay follows the active packet rate, and feedback PLL settling uses a fixed wall-clock window instead of a fixed packet count.
+- **Visualizer spectrum source resolution increased to 2048 bands**: the Rust/GStreamer spectrum path, Python FFI buffer limits, and visualizer preprocessing defaults now consume denser upstream spectrum data, improving low/mid detail before any display-side remapping.
+- **Log spectrum tuning was overhauled**: the log axis now uses explicit frequency anchor points (tuned for vocal presence and upper-mid / treble readability), wide log buckets now blend `50% RMS + 50% peak`, and the log voicing curve is rebalanced to preserve more bass / treble energy.
+- **Visualizer bar-count menu is capped back to 128 bars**: `256` / `512` display-bar options were removed from the UI and old saved values now fall back to the default, while the upstream analyzer still runs at high resolution.
+
+### Fixed
+- **USB Rawlink alt-setting selection stability**: appsink caps selection and lazy-open now share a stable alt profile (`format` / `bit_depth` / `subframe_size` / `channels`), preventing mismatches on DACs that expose multiple channel/format families.
+- **USB Rawlink Float32 xrun recovery**: fade-in after underrun now preserves `F32LE` sample data instead of treating it as `S32LE`.
+- **USB Rawlink transfer-ring startup failures now fail fast**: if libusb cannot arm the ISO OUT ring cleanly, startup returns an explicit error instead of entering a partially started state.
+- **Visualizer fullscreen / restore icons no longer pick up KDE theme variants unexpectedly**: the waveform panel fullscreen button, mini-mode restore button, and top sidebar navigation icons now use bundled app-specific symbolic icon names instead of generic theme icon names.
+
 ## 1.8.2 - 2026-03-25
 
 ### Added

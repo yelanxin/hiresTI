@@ -40,6 +40,10 @@ unsafe impl Send for FrameQueue {}
 unsafe impl Sync for FrameQueue {}
 
 impl FrameQueue {
+    pub const fn capacity_bytes() -> usize {
+        QUEUE_CAP
+    }
+
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             buf: Box::new([0u8; QUEUE_CAP]),

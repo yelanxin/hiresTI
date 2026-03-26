@@ -71,6 +71,14 @@ def _init_audio_and_data_services(self):
         on_spectrum_callback=self.on_spectrum_data,
         on_viz_sync_offset_update=self.on_viz_sync_offset_update,
     )
+    # When the USB sink becomes ready with hardware volume support,
+    # re-check whether volume controls should be unlocked (bit-perfect + hw vol).
+    ready_cb = getattr(self, "_on_hw_volume_ready", None)
+    if callable(ready_cb):
+        self.player._on_hw_volume_ready_callback = ready_cb
+    changed_cb = getattr(self, "_on_hw_volume_changed", None)
+    if callable(changed_cb):
+        self.player._on_hw_volume_changed_callback = changed_cb
     self._viz_sync_device_key = None
     self._viz_sync_offsets = dict(self.settings.get("viz_sync_device_offsets", {}))
     self._viz_sync_last_saved_ms = int(self.settings.get("viz_sync_offset_ms", 0) or 0)

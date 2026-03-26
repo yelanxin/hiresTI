@@ -16,7 +16,7 @@ from gi.repository import Gst, GstPbutils
 
 logger = logging.getLogger(__name__)
 
-_MAX_SPECTRUM_BANDS = 512
+_MAX_SPECTRUM_BANDS = 2048
 _LV2_HOST_MANAGED_PORT_SYMBOLS = {"enabled", "enable", "bypass"}
 
 DRIVER_ALSA_AUTO = "ALSA（auto）"
@@ -118,6 +118,27 @@ class _RustAudioCore:
 
             lib.rac_set_volume.restype = ctypes.c_int
             lib.rac_set_volume.argtypes = [ctypes.c_void_p, ctypes.c_double]
+
+            if hasattr(lib, "rac_usb_hw_volume_supported"):
+                lib.rac_usb_hw_volume_supported.restype = ctypes.c_int
+                lib.rac_usb_hw_volume_supported.argtypes = [ctypes.c_void_p]
+            if hasattr(lib, "rac_usb_hw_volume_get_range"):
+                lib.rac_usb_hw_volume_get_range.restype = ctypes.c_int
+                lib.rac_usb_hw_volume_get_range.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.POINTER(ctypes.c_int),
+                    ctypes.POINTER(ctypes.c_int),
+                    ctypes.POINTER(ctypes.c_int),
+                ]
+            if hasattr(lib, "rac_usb_hw_volume_set"):
+                lib.rac_usb_hw_volume_set.restype = ctypes.c_int
+                lib.rac_usb_hw_volume_set.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            if hasattr(lib, "rac_usb_hw_volume_get"):
+                lib.rac_usb_hw_volume_get.restype = ctypes.c_int
+                lib.rac_usb_hw_volume_get.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.POINTER(ctypes.c_int),
+                ]
 
             lib.rac_get_position.restype = ctypes.c_int
             lib.rac_get_position.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_double)]
@@ -474,6 +495,42 @@ class _RustAudioCore:
 
     def set_volume(self, vol):
         return self._call_int("rac_set_volume", ctypes.c_double(float(vol or 0.0)), default_rc=-3)
+
+    def usb_hw_volume_supported(self):
+        """Return 1 if the current USB sink supports hardware volume, 0 otherwise."""
+        return self._call_int("rac_usb_hw_volume_supported", default_rc=0)
+
+    def usb_hw_volume_get_range(self):
+        """Return (min_raw, max_raw, res_raw) in 1/256 dB, or None."""
+        if not self.available or self.handle is None:
+            return None
+        fn = getattr(self.lib, "rac_usb_hw_volume_get_range", None)
+        if fn is None:
+            return None
+        mn = ctypes.c_int(0)
+        mx = ctypes.c_int(0)
+        rs = ctypes.c_int(0)
+        rc = fn(self.handle, ctypes.byref(mn), ctypes.byref(mx), ctypes.byref(rs))
+        if rc != 0:
+            return None
+        return (mn.value, mx.value, rs.value)
+
+    def usb_hw_volume_set(self, value_raw):
+        """Set hardware volume (1/256 dB raw units)."""
+        return self._call_int("rac_usb_hw_volume_set", ctypes.c_int(int(value_raw)), default_rc=-3)
+
+    def usb_hw_volume_get(self):
+        """Read the current hardware volume (1/256 dB raw), or None."""
+        if not self.available or self.handle is None:
+            return None
+        fn = getattr(self.lib, "rac_usb_hw_volume_get", None)
+        if fn is None:
+            return None
+        val = ctypes.c_int(0)
+        rc = fn(self.handle, ctypes.byref(val))
+        if rc != 0:
+            return None
+        return val.value
 
     def set_output(self, driver, device_id=None, buffer_us=100000, latency_us=10000, exclusive=False):
         if not self.available:
@@ -1693,6 +1750,7 @@ class RustAudioPlayerAdapter:
         self._last_rust_error_msg = ""
         self._last_rust_error_ts = 0.0
         self._rust_error_repeat = 0
+        self._last_usb_hw_volume_raw = None
         self._rust_disconnect_recovering = False
         self._rust_pump_source = 0
         self._last_enum_signature_by_driver = {}
@@ -2964,6 +3022,29 @@ class RustAudioPlayerAdapter:
             except Exception:
                 pass
         elif evt == _RustAudioCore.EVENT_STATE:
+            if msg and str(msg).startswith("usb-hw-volume="):
+                try:
+                    raw = int(str(msg).split("=", 1)[1].strip())
+                except Exception:
+                    raw = None
+                if raw is not None:
+                    self._last_usb_hw_volume_raw = raw
+                    cb = getattr(self, "_on_hw_volume_changed_callback", None)
+                    if callable(cb):
+                        try:
+                            GLib.idle_add(cb, raw)
+                        except Exception:
+                            pass
+                return
+            if msg and "usb-audio configured" in msg:
+                # USB sink just became available — check if hw volume is now
+                # supported and notify the app so it can unlock the slider.
+                cb = getattr(self, "_on_hw_volume_ready_callback", None)
+                if callable(cb) and self.usb_hw_volume_supported():
+                    try:
+                        GLib.idle_add(cb)
+                    except Exception:
+                        pass
             if msg and "output-switched" in msg:
                 self.output_state = "active"
                 self.output_error = None
@@ -3678,11 +3759,73 @@ class RustAudioPlayerAdapter:
             logger.info("RustAdapter.set_volume ignored while bit-perfect mode is active")
             self.output_error = None
             return
+        # If USB hw volume is available, route to hardware and keep software at unity.
+        if self.usb_hw_volume_supported():
+            self.usb_hw_volume_set_percent(vol * 100.0)
+            # Keep GStreamer volume at unity so PCM data is untouched.
+            self._rust.set_volume(1.0)
+            self.output_error = None
+            return
         rc = self._rust.set_volume(vol)
         if rc != 0:
             self._mark_transport_error("set_volume", rc)
         else:
             self.output_error = None
+
+    def usb_hw_volume_supported(self):
+        """Return True if the current USB sink supports hardware volume."""
+        return self._rust.usb_hw_volume_supported() == 1
+
+    def usb_hw_volume_get_range(self):
+        """Return (min_raw, max_raw, res_raw) in 1/256 dB, or None."""
+        return self._rust.usb_hw_volume_get_range()
+
+    @staticmethod
+    def _usb_hw_volume_slider_max(min_raw, max_raw):
+        """Map the UI's 100% point to the DAC's actual hardware maximum."""
+        return max_raw
+
+    def usb_hw_volume_set_percent(self, percent):
+        """Convert 0-100 slider percentage to raw 1/256 dB and send to hardware."""
+        rng = self._rust.usb_hw_volume_get_range()
+        if not rng:
+            return
+        min_raw, max_raw, res_raw = rng
+        if min_raw > max_raw:
+            return
+        effective_max = self._usb_hw_volume_slider_max(min_raw, max_raw)
+        raw = int(min_raw + (effective_max - min_raw) * max(0.0, min(100.0, percent)) / 100.0)
+        # Quantize to resolution steps
+        if res_raw > 0:
+            raw = min_raw + round((raw - min_raw) / res_raw) * res_raw
+        raw = max(min_raw, min(effective_max, raw))
+        self._rust.usb_hw_volume_set(raw)
+
+    def usb_hw_volume_raw_to_percent(self, raw_value):
+        """Convert a hardware volume raw value (1/256 dB) to the UI's 0-100 scale."""
+        rng = self._rust.usb_hw_volume_get_range()
+        if not rng:
+            return None
+        min_raw, max_raw, _res = rng
+        if min_raw > max_raw:
+            return None
+        effective_max = self._usb_hw_volume_slider_max(min_raw, max_raw)
+        if effective_max <= min_raw:
+            return 100.0
+        raw = max(min_raw, min(effective_max, int(raw_value)))
+        return (raw - min_raw) * 100.0 / (effective_max - min_raw)
+
+    def usb_hw_volume_percent_to_db(self, percent):
+        """Convert slider percentage (0-100) to dB value for display."""
+        rng = self._rust.usb_hw_volume_get_range()
+        if not rng:
+            return None
+        min_raw, max_raw, _res = rng
+        if min_raw > max_raw:
+            return None
+        effective_max = self._usb_hw_volume_slider_max(min_raw, max_raw)
+        raw = min_raw + (effective_max - min_raw) * max(0.0, min(100.0, percent)) / 100.0
+        return raw / 256.0
 
     def set_output(self, driver, device_id=None):
         req_driver = driver

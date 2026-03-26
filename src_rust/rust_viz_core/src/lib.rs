@@ -67,7 +67,8 @@ impl BarsRenderer {
         if self.width != w || self.height != h {
             self.width = w;
             self.height = h;
-            self.rgba.resize(self.width.saturating_mul(self.height).saturating_mul(4), 0);
+            self.rgba
+                .resize(self.width.saturating_mul(self.height).saturating_mul(4), 0);
         }
         if self.num_bars != n {
             self.num_bars = n;
@@ -91,7 +92,11 @@ impl VizProcessor {
         let hz = if max_hz <= 0.0 { 20.0 } else { max_hz };
         let interval = 1000.0_f64 / f64::from(hz);
         let s = smooth.clamp(0.0, 1.0);
-        let range = if db_range.abs() < f32::EPSILON { 60.0 } else { db_range };
+        let range = if db_range.abs() < f32::EPSILON {
+            60.0
+        } else {
+            db_range
+        };
         Self {
             num_bars: bars,
             db_min,
@@ -207,7 +212,11 @@ fn map_input_to_heights(input: &[f32], out: &mut [f32], db_min: f32, db_range: f
     if in_n == n {
         for i in 0..n {
             let val = input[i];
-            let mut h = if val <= db_min { 0.0 } else { (val - db_min) / db_range };
+            let mut h = if val <= db_min {
+                0.0
+            } else {
+                (val - db_min) / db_range
+            };
             if h < 0.0 {
                 h = 0.0;
             } else if h > 1.0 {
@@ -233,7 +242,11 @@ fn map_input_to_heights(input: &[f32], out: &mut [f32], db_min: f32, db_range: f
         let mut sum = 0.0_f32;
         let mut cnt = 0_usize;
         for &val in &input[x0..x1] {
-            let mut h = if val <= db_min { 0.0 } else { (val - db_min) / db_range };
+            let mut h = if val <= db_min {
+                0.0
+            } else {
+                (val - db_min) / db_range
+            };
             if h < 0.0 {
                 h = 0.0;
             } else if h > 1.0 {
@@ -247,33 +260,235 @@ fn map_input_to_heights(input: &[f32], out: &mut [f32], db_min: f32, db_range: f
 }
 
 fn build_log_bins_impl(input: &[f32], out: &mut [f32]) {
-    // Skip band 0 (DC component) for the same reason as map_input_to_heights.
-    let input = if input.len() > 1 { &input[1..] } else { input };
-    let in_count = input.len();
+    const HALF_RATE_HZ: f32 = 22_050.0;
+    const ANCHOR_FREQS_HZ: [f32; 6] = [200.0, 500.0, 1_000.0, 4_000.0, 8_000.0, 12_000.0];
+    const ANCHOR_FRACTIONS: [f32; 6] = [0.15, 0.32, 0.50, 0.70, 0.87, 0.95];
+    const MAX_FREQ_HZ: f32 = 16_000.0;
+
+    fn spectrum_frequency_range(total_bands: usize, half_rate_hz: f32) -> (f32, f32) {
+        if total_bands <= 1 {
+            return (20.0, half_rate_hz.min(20_000.0));
+        }
+        let band_hz = half_rate_hz / (total_bands as f32);
+        let min_f = 20.0_f32.max(band_hz);
+        let mut max_f = 20_000.0_f32.min(band_hz * ((total_bands.saturating_sub(1)) as f32));
+        if max_f <= min_f {
+            max_f = min_f.max(half_rate_hz);
+        }
+        (min_f, max_f)
+    }
+
+    fn log_display_frequency_range(total_bands: usize, half_rate_hz: f32) -> (f32, f32) {
+        let (_base_min, base_max) = spectrum_frequency_range(total_bands, half_rate_hz);
+        (0.0, base_max.min(MAX_FREQ_HZ))
+    }
+
+    fn log_display_anchor_points(total_bands: usize, half_rate_hz: f32) -> Vec<(f32, f32)> {
+        let (_min_f, max_f) = log_display_frequency_range(total_bands, half_rate_hz);
+        if max_f <= 0.0 {
+            return vec![(0.0, 0.0)];
+        }
+        let mut points = vec![(0.0_f32, 0.0_f32)];
+        for idx in 0..ANCHOR_FREQS_HZ.len() {
+            let freq = ANCHOR_FREQS_HZ[idx];
+            let frac = ANCHOR_FRACTIONS[idx];
+            if freq > 0.0 && freq < max_f && frac > 0.0 && frac < 1.0 {
+                points.push((freq, frac));
+            }
+        }
+        if (points.last().map(|v| v.0).unwrap_or(0.0) - max_f).abs() <= 1e-6 {
+            if let Some(last) = points.last_mut() {
+                *last = (max_f, 1.0);
+            }
+        } else {
+            points.push((max_f, 1.0));
+        }
+        points
+    }
+
+    fn log_display_frequency_at_fraction(
+        frac: f32,
+        points: &[(f32, f32)],
+    ) -> f32 {
+        let p = frac.clamp(0.0, 1.0);
+        if points.is_empty() {
+            return 0.0;
+        }
+        if p <= points[0].1 {
+            return points[0].0;
+        }
+        for idx in 1..points.len() {
+            let (f0, p0) = points[idx - 1];
+            let (f1, p1) = points[idx];
+            if p <= (p1 + 1e-9) {
+                if p1 <= (p0 + 1e-9) {
+                    return f1;
+                }
+                let t = (p - p0) / (p1 - p0);
+                if f0 <= 0.0 || f1 <= 0.0 {
+                    return f0 + ((f1 - f0) * t);
+                }
+                return f0 * (f1 / f0).powf(t);
+            }
+        }
+        points.last().map(|v| v.0).unwrap_or(0.0)
+    }
+
+    fn log_display_eq_gain(freq_hz: f32) -> f32 {
+        let f = 20.0_f32.max(freq_hz);
+        let anchors: [(f32, f32); 6] = [
+            (20.0, 0.50),
+            (100.0, 0.70),
+            (200.0, 1.00),
+            (1_000.0, 1.00),
+            (4_000.0, 1.20),
+            (8_000.0, 1.50),
+        ];
+        if f <= anchors[0].0 {
+            return anchors[0].1;
+        }
+        for idx in 1..anchors.len() {
+            let (f0, g0) = anchors[idx - 1];
+            let (f1, g1) = anchors[idx];
+            if f <= f1 {
+                let span = (f1 / f0).log10();
+                let t = if span > 1e-9 {
+                    (f / f0).log10() / span
+                } else {
+                    1.0
+                };
+                return g0 + ((g1 - g0) * t);
+            }
+        }
+        anchors[anchors.len() - 1].1
+    }
+
+    fn interpolate_series_value(values: &[f32], pos: f32) -> f32 {
+        if values.is_empty() {
+            return 0.0;
+        }
+        if values.len() == 1 {
+            return values[0];
+        }
+        let p = pos.clamp(0.0, (values.len().saturating_sub(1)) as f32);
+        let i0 = p.floor() as usize;
+        let i1 = (i0 + 1).min(values.len().saturating_sub(1));
+        let frac = p - (i0 as f32);
+        (values[i0] * (1.0 - frac)) + (values[i1] * frac)
+    }
+
+    fn resample_linear_average(values: &[f32], out: &mut [f32]) {
+        let in_count = values.len();
+        let out_count = out.len();
+        if in_count == 0 || out_count == 0 {
+            return;
+        }
+        for i in 0..out_count {
+            let t0 = (i as f32) / (out_count as f32);
+            let t1 = ((i + 1) as f32) / (out_count as f32);
+            let mut x0 = (t0 * (in_count as f32)) as usize;
+            let mut x1 = (t1 * (in_count as f32)) as usize;
+            if x0 >= in_count {
+                x0 = in_count - 1;
+            }
+            if x1 <= x0 {
+                x1 = (x0 + 1).min(in_count);
+            } else if x1 > in_count {
+                x1 = in_count;
+            }
+            let mut sum = 0.0_f32;
+            let mut cnt = 0_usize;
+            for &val in &values[x0..x1] {
+                sum += val;
+                cnt += 1;
+            }
+            out[i] = if cnt > 0 { sum / (cnt as f32) } else { 0.0 };
+        }
+    }
+
+    let total_bands = input.len();
+    // Skip band 0 (DC component) for the same reason as the Python path.
+    let usable = if input.len() > 1 { &input[1..] } else { input };
+    let in_count = usable.len();
     let out_count = out.len();
     if in_count == 0 || out_count == 0 {
         return;
     }
+    if in_count == 1 {
+        out.fill(usable[0]);
+        return;
+    }
+
+    let band_hz = HALF_RATE_HZ / (total_bands.max(1) as f32);
+    let (_min_f, max_f) = log_display_frequency_range(total_bands, HALF_RATE_HZ);
+    if max_f <= 0.0 {
+        resample_linear_average(usable, out);
+        return;
+    }
+    let anchor_points = log_display_anchor_points(total_bands, HALF_RATE_HZ);
+
     for i in 0..out_count {
         let t0 = (i as f32) / (out_count as f32);
         let t1 = ((i + 1) as f32) / (out_count as f32);
-        let mut x0 = (t0.powf(2.15) * ((in_count - 1) as f32)) as usize;
-        let mut x1 = (t1.powf(2.15) * ((in_count - 1) as f32)) as usize;
-        if x1 <= x0 {
-            x1 = (x0 + 1).min(in_count - 1);
-        }
-        if x0 >= in_count {
-            x0 = in_count - 1;
-        }
-        let mut sum = 0.0_f32;
-        let mut cnt = 0_usize;
-        for &v in &input[x0..=x1] {
-            sum += v;
-            cnt += 1;
-        }
-        let avg = if cnt > 0 { sum / (cnt as f32) } else { 0.0 };
-        let tilt = 0.92 + (0.16 * ((i as f32) / ((out_count.saturating_sub(1).max(1)) as f32)));
-        out[i] = (avg.max(0.0).min(1.0).powf(0.84) * tilt).max(0.0).min(1.0);
+        let f0 = log_display_frequency_at_fraction(t0, &anchor_points);
+        let f1 = log_display_frequency_at_fraction(t1, &anchor_points);
+        let pos0 = ((f0 / band_hz) - 1.0).max(0.0);
+        let pos1 = (((f1 / band_hz) - 1.0).max(pos0 + 1e-6)).max(0.0);
+        let span = pos1 - pos0;
+        let center_f = (f0 * f1).sqrt();
+        let voiced = if span < 1.0 {
+            // When a display bucket is narrower than one FFT band, probing the
+            // same coarse bin multiple times makes the low end look overly flat.
+            // Probe once at the bucket center, then apply a light contrast curve
+            // so adjacent sub-band bars stay visually distinct.
+            let probe = interpolate_series_value(usable, pos0 + (span * 0.5))
+                .clamp(0.0, 1.0)
+                .powf(1.35);
+            probe * log_display_eq_gain(center_f)
+        } else {
+            let sample_count = ((span * 2.0).ceil() as usize).clamp(2, 32);
+            let mut sum_sq = 0.0_f32;
+            let mut peak = 0.0_f32;
+            for s in 0..sample_count {
+                let t = ((s as f32) + 0.5) / (sample_count as f32);
+                let pos = pos0 + (span * t);
+                let v = interpolate_series_value(usable, pos);
+                sum_sq += v * v;
+                if v > peak {
+                    peak = v;
+                }
+            }
+            let rms = (sum_sq / (sample_count as f32)).sqrt();
+            ((rms * 0.50) + (peak * 0.50)) * log_display_eq_gain(center_f)
+        };
+        out[i] = voiced.clamp(0.0, 1.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_log_bins_impl;
+
+    #[test]
+    fn build_log_bins_preserves_low_end_shape_for_dense_outputs() {
+        let input: Vec<f32> = (0..512).map(|i| (i as f32) / 511.0).collect();
+        let mut out = vec![0.0_f32; 512];
+        build_log_bins_impl(&input, &mut out);
+        let split = ((0.15_f32 * 512.0).round() as usize).clamp(2, out.len() - 3);
+        assert!(out[0] <= out[split - 1]);
+        assert!(out[split - 1] < out[split]);
+        assert!(out[split] < out[split + 1]);
+    }
+
+    #[test]
+    fn build_log_bins_keeps_dense_low_end_bars_contrasty() {
+        let mut input = vec![0.0_f32; 512];
+        input[3] = 1.0;
+        let mut out = vec![0.0_f32; 256];
+        build_log_bins_impl(&input, &mut out);
+        let peak = out.iter().copied().fold(0.0_f32, f32::max);
+        assert!(peak > 0.0);
+        assert!(out[0] < (peak * 0.30));
     }
 }
 
@@ -420,7 +635,12 @@ pub extern "C" fn viz_state_tick_copy(
     out_len: usize,
     bass_out_ptr: *mut f32,
 ) -> usize {
-    if ptr.is_null() || cur_out_ptr.is_null() || trail_out_ptr.is_null() || peak_out_ptr.is_null() || out_len == 0 {
+    if ptr.is_null()
+        || cur_out_ptr.is_null()
+        || trail_out_ptr.is_null()
+        || peak_out_ptr.is_null()
+        || out_len == 0
+    {
         return 0;
     }
     let st = unsafe { &mut *ptr };
@@ -460,7 +680,11 @@ pub extern "C" fn process_spectrum(
     let n = num_bars.min(output_len);
     let input = unsafe { slice::from_raw_parts(input_ptr, input_len) };
     let out = unsafe { slice::from_raw_parts_mut(output_ptr, n) };
-    let safe_range = if db_range.abs() < f32::EPSILON { 60.0 } else { db_range };
+    let safe_range = if db_range.abs() < f32::EPSILON {
+        60.0
+    } else {
+        db_range
+    };
     map_input_to_heights(input, out, db_min, safe_range);
     n
 }
@@ -573,7 +797,8 @@ pub extern "C" fn build_neon_spokes(
         if lvl < 0.02 {
             continue;
         }
-        let angle = ((2.0 * std::f32::consts::PI) * ((i as f32) / (bins_len as f32))) + (phase * 0.30);
+        let angle =
+            ((2.0 * std::f32::consts::PI) * ((i as f32) / (bins_len as f32))) + (phase * 0.30);
         let ln = (size * 0.06) + (lvl * max_len);
         let x2 = cx + angle.cos() * ln;
         let y2 = cy + angle.sin() * ln;
@@ -625,15 +850,15 @@ pub extern "C" fn build_neon_ring_points(
         let f1 = 2.6 + (2.8 * t);
         let f2 = 6.4 + (4.4 * (1.0 - t));
         let ph = (phase * (1.2 + (0.25 * t))) + ((ri as f32) * 0.19);
-        let start_a =
-            (((ri as f32) * 2.399_963_1) + (phase * 0.17) + (t * 1.1)).rem_euclid(2.0 * std::f32::consts::PI);
+        let start_a = (((ri as f32) * 2.399_963_1) + (phase * 0.17) + (t * 1.1))
+            .rem_euclid(2.0 * std::f32::consts::PI);
         for si in 0..seg_n {
             if (w / 6) >= cap {
                 return w;
             }
             let a = start_a + ((2.0 * std::f32::consts::PI) * ((si as f32) / (seg_n as f32)));
-            let wobble_raw = (a * f1 + ph).sin() * warp_amp
-                + (a * f2 - (ph * 1.35)).sin() * (warp_amp * 0.72);
+            let wobble_raw =
+                (a * f1 + ph).sin() * warp_amp + (a * f2 - (ph * 1.35)).sin() * (warp_amp * 0.72);
             let wobble = wobble_raw.clamp(-radius * 0.34, radius * 0.34);
             let rr = (radius + wobble).max(2.0);
             let px = cx + (a.cos() * rr);
@@ -793,7 +1018,9 @@ pub extern "C" fn build_pro_fall_rgba(
         let age = if cols <= 1 {
             1.0
         } else {
-            ((c as f32) / ((cols - 1) as f32)).clamp(0.0, 1.0).powf(1.25)
+            ((c as f32) / ((cols - 1) as f32))
+                .clamp(0.0, 1.0)
+                .powf(1.25)
         };
         for r in 0..rows {
             let raw = frames[c * rows + r];
@@ -1288,10 +1515,15 @@ pub extern "C" fn filter_sort_indices_no_query(
     }
 
     match sort_mode {
-        1 => idxs.sort_unstable_by(|&a, &b| title_rank[a].cmp(&title_rank[b]).then_with(|| a.cmp(&b))),
-        2 => idxs.sort_unstable_by(|&a, &b| artist_rank[a].cmp(&artist_rank[b]).then_with(|| a.cmp(&b))),
-        3 => idxs.sort_unstable_by(|&a, &b| album_rank[a].cmp(&album_rank[b]).then_with(|| a.cmp(&b))),
-        4 => idxs.sort_unstable_by(|&a, &b| durations[a].cmp(&durations[b]).then_with(|| a.cmp(&b))),
+        1 => idxs
+            .sort_unstable_by(|&a, &b| title_rank[a].cmp(&title_rank[b]).then_with(|| a.cmp(&b))),
+        2 => idxs
+            .sort_unstable_by(|&a, &b| artist_rank[a].cmp(&artist_rank[b]).then_with(|| a.cmp(&b))),
+        3 => idxs
+            .sort_unstable_by(|&a, &b| album_rank[a].cmp(&album_rank[b]).then_with(|| a.cmp(&b))),
+        4 => {
+            idxs.sort_unstable_by(|&a, &b| durations[a].cmp(&durations[b]).then_with(|| a.cmp(&b)))
+        }
         _ => {}
     }
 
@@ -1379,10 +1611,15 @@ pub extern "C" fn filter_sort_indices_with_query(
     }
 
     match sort_mode {
-        1 => idxs.sort_unstable_by(|&a, &b| title_rank[a].cmp(&title_rank[b]).then_with(|| a.cmp(&b))),
-        2 => idxs.sort_unstable_by(|&a, &b| artist_rank[a].cmp(&artist_rank[b]).then_with(|| a.cmp(&b))),
-        3 => idxs.sort_unstable_by(|&a, &b| album_rank[a].cmp(&album_rank[b]).then_with(|| a.cmp(&b))),
-        4 => idxs.sort_unstable_by(|&a, &b| durations[a].cmp(&durations[b]).then_with(|| a.cmp(&b))),
+        1 => idxs
+            .sort_unstable_by(|&a, &b| title_rank[a].cmp(&title_rank[b]).then_with(|| a.cmp(&b))),
+        2 => idxs
+            .sort_unstable_by(|&a, &b| artist_rank[a].cmp(&artist_rank[b]).then_with(|| a.cmp(&b))),
+        3 => idxs
+            .sort_unstable_by(|&a, &b| album_rank[a].cmp(&album_rank[b]).then_with(|| a.cmp(&b))),
+        4 => {
+            idxs.sort_unstable_by(|&a, &b| durations[a].cmp(&durations[b]).then_with(|| a.cmp(&b)))
+        }
         _ => {}
     }
 

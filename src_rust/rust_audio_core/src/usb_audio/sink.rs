@@ -30,7 +30,7 @@
 
 use std::os::raw::{c_int, c_uchar, c_uint, c_void};
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use libusb1_sys::{
     libusb_alloc_transfer, libusb_cancel_transfer, libusb_device_handle, libusb_fill_iso_transfer,
@@ -42,7 +42,7 @@ use rusb::UsbContext as _;
 use crate::alsa_clock::{AlsaHwClock, AlsaHwClockFeed};
 
 use super::descriptor::UacVersion;
-use super::device::{enumerate_usb_audio_devices, OpenUsbDevice, UsbAudioDevice};
+use super::device::{enumerate_usb_audio_devices, OpenUsbDevice, UacAltProfile, UsbAudioDevice};
 use super::feedback::{parse_feedback_uac1, parse_feedback_uac2};
 use super::queue::FrameQueue;
 use super::transfer::{IsoTransferRing, RingState};
@@ -77,8 +77,10 @@ pub struct UsbAudioSink {
     /// Dropped **after** `ring` so the transfer is freed only after the event
     /// thread has fully exited.
     _feedback: Option<FeedbackReader>,
+    /// `true` once the ISO ring and feedback endpoint have been armed.
+    started: bool,
     /// Open USB device handle + claimed interface. Dropped last.
-    _open_dev: OpenUsbDevice,
+    _open_dev: Arc<Mutex<OpenUsbDevice>>,
 }
 
 impl UsbAudioSink {
@@ -98,7 +100,140 @@ impl UsbAudioSink {
     /// kernel driver (snd-usb-audio) from re-attaching and locking the device
     /// to 48 kHz.  Use this before dropping the sink on track switches.
     pub fn set_skip_release_on_drop(&mut self, skip: bool) {
-        self._open_dev.skip_release_on_drop = skip;
+        if let Ok(mut open_dev) = self._open_dev.lock() {
+            open_dev.skip_release_on_drop = skip;
+        }
+    }
+
+    /// Shared access to the opened USB device for non-RT control-plane work.
+    pub fn control_device(&self) -> Arc<Mutex<OpenUsbDevice>> {
+        Arc::clone(&self._open_dev)
+    }
+
+    /// Start the ISO ring and feedback endpoint if they are not already running.
+    pub fn ensure_started(&mut self) -> Result<(), String> {
+        if self.started {
+            return Ok(());
+        }
+        self.ring.start()?;
+
+        let (dev_handle_raw, feedback_ep, uac_version, is_high_speed) = {
+            let open_dev = self._open_dev.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                open_dev.handle.as_raw(),
+                open_dev.active_alt.as_ref().and_then(|alt| alt.feedback_ep),
+                open_dev.dev.uac_version,
+                open_dev.dev.is_high_speed,
+            )
+        };
+        let feedback = feedback_ep
+            .map(|ep| {
+                FeedbackReader::new(
+                    dev_handle_raw,
+                    ep,
+                    Arc::clone(&self.state),
+                    uac_version,
+                    is_high_speed,
+                )
+                .and_then(|mut fr| {
+                    fr.start()?;
+                    Ok(fr)
+                })
+            })
+            .transpose()?;
+
+        if let Some(ref fb) = feedback {
+            self.ring.feedback_xfer = Some(fb.transfer);
+        }
+        self._feedback = feedback;
+        self.started = true;
+        Ok(())
+    }
+
+    /// Query the hardware volume range from the device's Feature Unit.
+    ///
+    /// Returns `(min_raw, max_raw, res_raw)` in 1/256 dB, or `None`.
+    pub fn get_hw_volume_range(&self) -> Option<(i16, i16, i16)> {
+        self._open_dev.lock().ok()?.get_hw_volume_range()
+    }
+
+    /// Read the current hardware volume (1/256 dB).
+    pub fn get_hw_volume(&self) -> Option<i16> {
+        self._open_dev.lock().ok()?.get_hw_volume()
+    }
+
+    /// Set the hardware volume (1/256 dB).
+    pub fn set_hw_volume(&self, value_raw: i16) -> Result<(), String> {
+        self._open_dev
+            .lock()
+            .map_err(|_| "hardware volume device lock poisoned".to_string())?
+            .set_hw_volume(value_raw)
+    }
+
+    /// `true` if the device has a Feature Unit with volume control.
+    pub fn has_hw_volume(&self) -> bool {
+        self._open_dev
+            .lock()
+            .ok()
+            .map(|open_dev| {
+                open_dev
+                    .dev
+                    .feature_unit
+                    .as_ref()
+                    .map_or(false, |fu| fu.has_volume)
+            })
+            .unwrap_or(false)
+    }
+}
+
+impl UsbAudioSink {
+    fn build_ring_state(
+        queue: &Arc<FrameQueue>,
+        feed: &Arc<AlsaHwClockFeed>,
+        actual_rate: u32,
+        alt: &super::descriptor::UacStreamAlt,
+        is_high_speed: bool,
+    ) -> Arc<RingState> {
+        let bytes_per_sample = if alt.subframe_size > 0 {
+            alt.subframe_size as usize
+        } else {
+            (alt.bit_depth as usize + 7) / 8
+        };
+        queue.set_frame_bytes(alt.channels as usize * bytes_per_sample);
+        let packets_per_sec = iso_packets_per_sec(is_high_speed, alt.out_ep_interval);
+        RingState::new(
+            Arc::clone(queue),
+            actual_rate,
+            bytes_per_sample,
+            alt.channels as usize,
+            alt.max_packet as usize,
+            packets_per_sec,
+            alt.feedback_ep.is_some(),
+            alt.format == super::descriptor::UacFormat::Float32,
+            Arc::clone(feed),
+        )
+    }
+
+    fn open_and_configure(
+        device_id: &str,
+        rate: u32,
+        bit_depth: u8,
+        preferred_profile: Option<UacAltProfile>,
+    ) -> Result<(UsbAudioDevice, OpenUsbDevice, super::descriptor::UacStreamAlt), String> {
+        let dev = find_device_by_id(device_id)
+            .ok_or_else(|| format!("USB audio device '{}' not found", device_id))?;
+        let mut open_dev = OpenUsbDevice::open(&dev)?;
+        let alt = open_dev
+            .best_alt_for_profile(rate, bit_depth, preferred_profile)
+            .ok_or_else(|| {
+                format!(
+                    "no alt-setting for rate={} bit_depth={} on '{}'",
+                    rate, bit_depth, device_id
+                )
+            })?
+            .clone();
+        open_dev.configure(&alt, rate)?;
+        Ok((dev, open_dev, alt))
     }
 }
 
@@ -115,69 +250,20 @@ impl UsbAudioSink {
     /// `pipeline.use_clock(Some(&clock))` so GStreamer paces the pipeline with
     /// the USB frame counter.
     pub fn open(device_id: &str, rate: u32, bit_depth: u8) -> Result<(Self, AlsaHwClock), String> {
-        // 1. Enumerate to find the requested device.
-        let dev = find_device_by_id(device_id)
-            .ok_or_else(|| format!("USB audio device '{}' not found", device_id))?;
-
-        // 2. Allocate the SPSC frame queue.
+        let (dev, open_dev, alt) = Self::open_and_configure(device_id, rate, bit_depth, None)?;
         let queue = FrameQueue::new();
-
-        // 3. Create frame-counting clock feed + GStreamer clock.
         let feed = Arc::new(AlsaHwClockFeed::default());
         let clock = AlsaHwClock::new(Arc::clone(&feed));
-
-        // 4. Open the device handle and configure the best alt-setting.
-        let mut open_dev = OpenUsbDevice::open(&dev)?;
-
-        let alt = open_dev
-            .best_alt(rate, bit_depth)
-            .ok_or_else(|| {
-                format!(
-                    "no alt-setting for rate={} bit_depth={} on '{}'",
-                    rate, bit_depth, device_id
-                )
-            })?
-            .clone();
-
-        open_dev.configure(&alt, rate)?;
-
-        // Read back the actual negotiated rate.  For UAC 2.0 devices with a
-        // fixed clock, configure() may have updated active_rate to the value
-        // returned by GET_CUR rather than the requested `rate`.
         let actual_rate = open_dev.active_rate;
         eprintln!(
             "usb-audio: sink::open device={} requested_rate={} actual_rate={} bit_depth={} channels={}",
             device_id, rate, actual_rate, bit_depth, alt.channels
         );
 
-        // 5. Obtain raw libusb handles (valid for the lifetime of open_dev).
         let dev_handle_raw = open_dev.handle.as_raw();
         let ctx_raw = open_dev.handle.context().as_raw();
+        let state = Self::build_ring_state(&queue, &feed, actual_rate, &alt, dev.is_high_speed);
 
-        // 6. Build shared ring state.
-        //    Use bSubFrameSize/bSubSlotSize for the exact wire byte count:
-        //    S24_3LE → subframe_size=3; S24LE (32-bit container) → 4; S32LE/F32LE → 4.
-        let bytes_per_sample = if alt.subframe_size > 0 {
-            alt.subframe_size as usize
-        } else {
-            (alt.bit_depth as usize + 7) / 8
-        };
-        queue.set_frame_bytes(alt.channels as usize * bytes_per_sample);
-        let packets_per_sec = iso_packets_per_sec(dev.is_high_speed, alt.out_ep_interval);
-        let state = RingState::new(
-            Arc::clone(&queue),
-            actual_rate,
-            bytes_per_sample,
-            alt.channels as usize,
-            alt.max_packet as usize,
-            packets_per_sec,
-            alt.feedback_ep.is_some(),
-            Arc::clone(&feed),
-        );
-
-        // 7. Create and start the ISO OUT transfer ring.
-        //    Anchor the clock with the actual device rate so the frame counter
-        //    advances at the correct pace.
         let anchor_ns = clock_monotonic_ns();
         feed.anchor(anchor_ns, actual_rate);
 
@@ -189,11 +275,17 @@ impl UsbAudioSink {
         let feedback = alt
             .feedback_ep
             .map(|ep| {
-                FeedbackReader::new(dev_handle_raw, ep, Arc::clone(&state), dev.uac_version)
-                    .and_then(|mut fr| {
-                        fr.start()?;
-                        Ok(fr)
-                    })
+                FeedbackReader::new(
+                    dev_handle_raw,
+                    ep,
+                    Arc::clone(&state),
+                    dev.uac_version,
+                    dev.is_high_speed,
+                )
+                .and_then(|mut fr| {
+                    fr.start()?;
+                    Ok(fr)
+                })
             })
             .transpose()?;
 
@@ -210,7 +302,8 @@ impl UsbAudioSink {
                 actual_rate,
                 ring,
                 _feedback: feedback,
-                _open_dev: open_dev,
+                started: true,
+                _open_dev: Arc::new(Mutex::new(open_dev)),
             },
             clock,
         ))
@@ -235,12 +328,8 @@ impl UsbAudioSink {
         bit_depth: u8,
         feed: Arc<AlsaHwClockFeed>,
         prefill: Option<&[u8]>,
+        preferred_profile: Option<UacAltProfile>,
     ) -> Result<Self, String> {
-        // 1. Find device.
-        let dev = find_device_by_id(device_id)
-            .ok_or_else(|| format!("USB audio device '{}' not found", device_id))?;
-
-        // 2. Frame queue.
         let queue = FrameQueue::new();
 
         if let Some(data) = prefill.filter(|data| !data.is_empty()) {
@@ -254,74 +343,22 @@ impl UsbAudioSink {
             }
         }
 
-        // 3. Open device handle and configure.
-        let mut open_dev = OpenUsbDevice::open(&dev)?;
-
-        let alt = open_dev
-            .best_alt(rate, bit_depth)
-            .ok_or_else(|| {
-                format!(
-                    "no alt-setting for rate={} bit_depth={} on '{}'",
-                    rate, bit_depth, device_id
-                )
-            })?
-            .clone();
-
-        open_dev.configure(&alt, rate)?;
-
+        let (dev, open_dev, alt) =
+            Self::open_and_configure(device_id, rate, bit_depth, preferred_profile)?;
         let actual_rate = open_dev.active_rate;
         eprintln!(
             "usb-audio: sink::open_with_feed device={} requested_rate={} actual_rate={} bit_depth={} channels={} feedback_ep={:?}",
             device_id, rate, actual_rate, bit_depth, alt.channels, alt.feedback_ep
         );
 
-        // 4. Raw handles.
         let dev_handle_raw = open_dev.handle.as_raw();
         let ctx_raw = open_dev.handle.context().as_raw();
+        let state = Self::build_ring_state(&queue, &feed, actual_rate, &alt, dev.is_high_speed);
 
-        // 5. Ring state.
-        let bytes_per_sample = if alt.subframe_size > 0 {
-            alt.subframe_size as usize
-        } else {
-            (alt.bit_depth as usize + 7) / 8
-        };
-        queue.set_frame_bytes(alt.channels as usize * bytes_per_sample);
-        let packets_per_sec = iso_packets_per_sec(dev.is_high_speed, alt.out_ep_interval);
-        let state = RingState::new(
-            Arc::clone(&queue),
-            actual_rate,
-            bytes_per_sample,
-            alt.channels as usize,
-            alt.max_packet as usize,
-            packets_per_sec,
-            alt.feedback_ep.is_some(),
-            Arc::clone(&feed),
-        );
-
-        // 6. Anchor the caller's clock feed and start the ring.
         let anchor_ns = clock_monotonic_ns();
         feed.anchor(anchor_ns, actual_rate);
 
-        let mut ring =
-            IsoTransferRing::new(dev_handle_raw, ctx_raw, alt.out_ep, Arc::clone(&state))?;
-        ring.start()?;
-
-        // 7. Feedback reader (UAC 2.0 only).
-        let feedback = alt
-            .feedback_ep
-            .map(|ep| {
-                FeedbackReader::new(dev_handle_raw, ep, Arc::clone(&state), dev.uac_version)
-                    .and_then(|mut fr| {
-                        fr.start()?;
-                        Ok(fr)
-                    })
-            })
-            .transpose()?;
-
-        // Register feedback transfer with the ring so stop() can cancel it.
-        if let Some(ref fb) = feedback {
-            ring.feedback_xfer = Some(fb.transfer);
-        }
+        let ring = IsoTransferRing::new(dev_handle_raw, ctx_raw, alt.out_ep, Arc::clone(&state))?;
 
         Ok(UsbAudioSink {
             queue,
@@ -329,8 +366,9 @@ impl UsbAudioSink {
             state,
             actual_rate,
             ring,
-            _feedback: feedback,
-            _open_dev: open_dev,
+            _feedback: None,
+            started: false,
+            _open_dev: Arc::new(Mutex::new(open_dev)),
         })
     }
 
@@ -366,55 +404,39 @@ impl UsbAudioSink {
             if written < data.len() {
                 eprintln!(
                     "usb-audio: reconfigure prefill truncated {} -> {} bytes",
-                    data.len(), written
+                    data.len(),
+                    written
                 );
             }
         }
 
         // 3. Reconfigure device (alt-setting + rate) — reuses claimed interface.
-        let alt = self._open_dev
-            .best_alt(rate, bit_depth)
-            .ok_or_else(|| {
-                format!(
-                    "no alt-setting for rate={} bit_depth={} on reconfigure",
-                    rate, bit_depth
-                )
-            })?
-            .clone();
-
-        self._open_dev.configure(&alt, rate)?;
-
-        let actual_rate = self._open_dev.active_rate;
+        let (alt, actual_rate, dev_handle_raw, ctx_raw, uac_version, is_high_speed) = {
+            let mut open_dev = self._open_dev.lock().unwrap_or_else(|e| e.into_inner());
+            let alt = open_dev
+                .best_alt(rate, bit_depth)
+                .ok_or_else(|| {
+                    format!(
+                        "no alt-setting for rate={} bit_depth={} on reconfigure",
+                        rate, bit_depth
+                    )
+                })?
+                .clone();
+            open_dev.configure(&alt, rate)?;
+            (
+                alt,
+                open_dev.active_rate,
+                open_dev.handle.as_raw(),
+                open_dev.handle.context().as_raw(),
+                open_dev.dev.uac_version,
+                open_dev.dev.is_high_speed,
+            )
+        };
         eprintln!(
             "usb-audio: reconfigure requested_rate={} actual_rate={} bit_depth={} channels={}",
             rate, actual_rate, bit_depth, alt.channels
         );
-
-        // 4. Raw handles (still valid — same open_dev).
-        let dev_handle_raw = self._open_dev.handle.as_raw();
-        let ctx_raw = self._open_dev.handle.context().as_raw();
-
-        // 5. New ring state.
-        let bytes_per_sample = if alt.subframe_size > 0 {
-            alt.subframe_size as usize
-        } else {
-            (alt.bit_depth as usize + 7) / 8
-        };
-        queue.set_frame_bytes(alt.channels as usize * bytes_per_sample);
-        let packets_per_sec = iso_packets_per_sec(
-            self._open_dev.dev.is_high_speed,
-            alt.out_ep_interval,
-        );
-        let state = RingState::new(
-            Arc::clone(&queue),
-            actual_rate,
-            bytes_per_sample,
-            alt.channels as usize,
-            alt.max_packet as usize,
-            packets_per_sec,
-            alt.feedback_ep.is_some(),
-            Arc::clone(&self.feed),
-        );
+        let state = Self::build_ring_state(&queue, &self.feed, actual_rate, &alt, is_high_speed);
 
         // 6. Anchor clock and start new ring.
         let anchor_ns = clock_monotonic_ns();
@@ -428,11 +450,17 @@ impl UsbAudioSink {
         let feedback = alt
             .feedback_ep
             .map(|ep| {
-                FeedbackReader::new(dev_handle_raw, ep, Arc::clone(&state), self._open_dev.dev.uac_version)
-                    .and_then(|mut fr| {
-                        fr.start()?;
-                        Ok(fr)
-                    })
+                FeedbackReader::new(
+                    dev_handle_raw,
+                    ep,
+                    Arc::clone(&state),
+                    uac_version,
+                    is_high_speed,
+                )
+                .and_then(|mut fr| {
+                    fr.start()?;
+                    Ok(fr)
+                })
             })
             .transpose()?;
 
@@ -446,6 +474,7 @@ impl UsbAudioSink {
         self.actual_rate = actual_rate;
         self.ring = ring;
         self._feedback = feedback;
+        self.started = true;
 
         Ok(())
     }
@@ -519,10 +548,14 @@ fn clock_monotonic_ns() -> u64 {
 struct FeedbackCtx {
     state: Arc<RingState>,
     uac_version: UacVersion,
+    is_high_speed: bool,
     ep: u8,
-    /// EMA accumulator for feedback smoothing (α = 1/16).
+    /// EMA accumulator for feedback smoothing.
     /// `None` until the first feedback packet arrives.
     ema: Option<i64>,
+    /// EMA divisor chosen so the smoothing window stays reasonable across
+    /// full-speed and high-speed feedback rates.
+    ema_divisor: i64,
     callbacks: u64,
     parse_failures: u64,
     rejected_outliers: u64,
@@ -532,7 +565,15 @@ struct FeedbackCtx {
     /// clock rate — preventing device-side FIFO overflow from a stale
     /// (slightly too-high) feedback value.
     consecutive_rejects: u64,
+    /// Discard feedback until this monotonic timestamp to give the DAC PLL a
+    /// fixed wall-clock settle window after a rate / alt-setting switch.
+    settle_until_ns: u64,
+    /// Number of feedback packets discarded during the settle window.
+    settle_discards: u32,
 }
+
+/// PLL settle window after opening / reconfiguring the device.
+const PLL_SETTLE_NS: u64 = 20_000_000;
 
 /// Mark feedback tracking as stopped.
 ///
@@ -582,25 +623,9 @@ fn feedback_rate_hz(ms: i64, packets_per_sec: u32) -> f64 {
 
 /// libusb ISO IN completion callback for the feedback endpoint.
 ///
-/// Parses the feedback value, applies a 1/16 EMA to smooth quantisation
+/// Parses the feedback value, applies an EMA to smooth quantisation
 /// noise from the device's fixed-point feedback format, and updates
 /// `RingState::feedback_ms`.  Then resubmits unless `state.stop` is set.
-///
-/// # EMA smoothing
-///
-/// Raw feedback packets carry a Q16.16 (UAC 2.0) or Q10.14 (UAC 1.0)
-/// fixed-point value.  Each quantisation step causes an immediate step in
-/// the per-packet sample count which the listener can perceive as high-
-/// frequency jitter ("hardness").  An exponential moving average with
-/// α = 1/16 attenuates steps while still tracking slow crystal drift:
-///
-/// ```text
-/// ema_new = ema_old + (raw - ema_old) / 16
-/// ```
-///
-/// Time constant ≈ 16 × feedback_interval.  For a typical 8 ms feedback
-/// period this is ~128 ms — fast enough to follow ppm-level drift,
-/// slow enough to suppress packet-to-packet jitter.
 extern "system" fn feedback_in_callback(transfer: *mut libusb_transfer) {
     // SAFETY: user_data == &mut FeedbackCtx; valid while FeedbackReader alive.
     // The callback is only ever invoked from the single libusb event thread,
@@ -619,9 +644,7 @@ extern "system" fn feedback_in_callback(transfer: *mut libusb_transfer) {
         // Non-recoverable status (CANCELLED, NO_DEVICE, etc.) — stop tracking.
         eprintln!(
             "usb-audio: feedback callback ep=0x{:02x} status={} callbacks={}",
-            ctx.ep,
-            status,
-            ctx.callbacks,
+            ctx.ep, status, ctx.callbacks,
         );
         stop_feedback_tracking(
             &ctx.state,
@@ -639,10 +662,7 @@ extern "system" fn feedback_in_callback(transfer: *mut libusb_transfer) {
     let pkt_configured_len = pkt_desc.length as usize;
     let _pkt_status = pkt_desc.status;
     let raw_storage = unsafe {
-        std::slice::from_raw_parts(
-            (*transfer).buffer as *const u8,
-            pkt_configured_len.min(16),
-        )
+        std::slice::from_raw_parts((*transfer).buffer as *const u8, pkt_configured_len.min(16))
     };
     // For ISO IN transfers libusb reports the real payload length per packet in
     // iso_packet_desc[i].actual_length.  The top-level transfer.actual_length
@@ -652,31 +672,26 @@ extern "system" fn feedback_in_callback(transfer: *mut libusb_transfer) {
     } else {
         transfer_len.min(pkt_configured_len)
     };
-    let buf = unsafe {
-        std::slice::from_raw_parts(
-            (*transfer).buffer as *const u8,
-            payload_len,
-        )
-    };
+    let buf = unsafe { std::slice::from_raw_parts((*transfer).buffer as *const u8, payload_len) };
     let ms = match ctx.uac_version {
         UacVersion::V2 => parse_feedback_uac2(buf, ctx.state.packets_per_sec),
-        UacVersion::V1 => parse_feedback_uac1(buf),
+        UacVersion::V1 => parse_feedback_uac1(buf, ctx.is_high_speed),
     };
     if let Some(raw) = ms {
         let raw_rate_hz = feedback_rate_hz(raw, ctx.state.packets_per_sec);
         let nominal_rate_hz = ctx.state.rate as f64;
-        let raw_ppm = if nominal_rate_hz > 0.0 {
-            (raw_rate_hz - nominal_rate_hz) / nominal_rate_hz * 1_000_000.0
-        } else {
-            0.0
-        };
-        // USB audio feedback should stay very close to nominal/sample-clock
-        // reality. Reject obviously bogus packets (observed as transient 48 kHz
-        // or ~44.32 kHz jumps on a 44.1 kHz stream) and keep the previous
-        // stable value instead of letting one bad packet perturb pacing.
-        const FEEDBACK_SANITY_MAX_PPM: f64 = 1000.0;
-        let rejected = nominal_rate_hz > 0.0 && raw_ppm.abs() > FEEDBACK_SANITY_MAX_PPM;
+        let nominal_ms = ctx.state.rate as i64 * 1_000_000 / ctx.state.packets_per_sec as i64;
+
+        // Hard reject completely implausible values first.
+        let lo_hard = nominal_ms * 9 / 10;
+        let hi_hard = nominal_ms * 11 / 10;
+        let rejected = raw < lo_hard || raw > hi_hard;
         if rejected {
+            let raw_ppm = if nominal_rate_hz > 0.0 {
+                (raw_rate_hz - nominal_rate_hz) / nominal_rate_hz * 1_000_000.0
+            } else {
+                0.0
+            };
             ctx.rejected_outliers = ctx.rejected_outliers.saturating_add(1);
             ctx.consecutive_rejects = ctx.consecutive_rejects.saturating_add(1);
             if ctx.rejected_outliers <= 2 || (ctx.rejected_outliers % 4096 == 0) {
@@ -698,25 +713,35 @@ extern "system" fn feedback_in_callback(transfer: *mut libusb_transfer) {
             // and makes the queue grow rapidly (~6 ms/s vs ~0.06 ms/s).
         } else {
             ctx.consecutive_rejects = 0;
-            // Apply EMA: seed with first value to avoid a slow ramp-up from zero.
-            let smoothed = match ctx.ema {
-                None => raw,
-                Some(prev) => prev + (raw - prev) / 16,
-            };
-            ctx.ema = Some(smoothed);
-            if ctx.callbacks <= 1 {
-                let rate_hz = feedback_rate_hz(smoothed, ctx.state.packets_per_sec);
-                eprintln!(
-                    "usb-audio: feedback ep=0x{:02x} cb#{} raw=[{}] smoothed_ms={} rate={:.3}Hz",
-                    ctx.ep,
-                    ctx.callbacks,
-                    format_feedback_bytes(raw_storage),
-                    smoothed,
-                    rate_hz,
-                );
-            }
-            if let Ok(mut lock) = ctx.state.feedback_ms.lock() {
-                *lock = Some(smoothed);
+            if clock_monotonic_ns() < ctx.settle_until_ns {
+                ctx.settle_discards = ctx.settle_discards.saturating_add(1);
+                if ctx.settle_discards <= 4 {
+                    eprintln!(
+                        "usb-audio: PLL settling, discarding feedback {:.2}Hz (discard #{})",
+                        raw_rate_hz, ctx.settle_discards
+                    );
+                }
+            } else {
+                let first_valid = ctx.ema.is_none();
+                let smoothed = match ctx.ema {
+                    None => raw,
+                    Some(prev) => prev + (raw - prev) / ctx.ema_divisor,
+                };
+                ctx.ema = Some(smoothed);
+                if first_valid || ctx.callbacks <= 1 {
+                    let rate_hz = feedback_rate_hz(smoothed, ctx.state.packets_per_sec);
+                    eprintln!(
+                        "usb-audio: feedback ep=0x{:02x} cb#{} raw=[{}] smoothed_ms={} rate={:.3}Hz",
+                        ctx.ep,
+                        ctx.callbacks,
+                        format_feedback_bytes(raw_storage),
+                        smoothed,
+                        rate_hz,
+                    );
+                }
+                if let Ok(mut lock) = ctx.state.feedback_ms.lock() {
+                    *lock = Some(smoothed);
+                }
             }
         }
     } else {
@@ -769,23 +794,31 @@ impl FeedbackReader {
         ep: u8,
         state: Arc<RingState>,
         uac_version: UacVersion,
+        is_high_speed: bool,
     ) -> Result<Self, String> {
-        // UAC 2.0 feedback: 4 bytes (Q16.16); UAC 1.0: 3 bytes (Q10.14).
+        // UAC 2.0 feedback: 4 bytes (Q16.16); UAC 1.0 HS also uses 4 bytes.
         let buf_len: usize = match uac_version {
             UacVersion::V2 => 4,
+            UacVersion::V1 if is_high_speed => 4,
             UacVersion::V1 => 3,
         };
         let mut buf = vec![0u8; buf_len];
+        let ema_divisor = if is_high_speed { 128 } else { 16 };
+        let settle_until_ns = clock_monotonic_ns().saturating_add(PLL_SETTLE_NS);
 
         let ctx_box = Box::new(FeedbackCtx {
             state,
             uac_version,
+            is_high_speed,
             ep,
             ema: None,
+            ema_divisor,
             callbacks: 0,
             parse_failures: 0,
             rejected_outliers: 0,
             consecutive_rejects: 0,
+            settle_until_ns,
+            settle_discards: 0,
         });
         let ctx_ptr = ctx_box.as_ref() as *const FeedbackCtx as *mut c_void;
 
@@ -826,8 +859,7 @@ impl FeedbackReader {
             .store(true, Ordering::Release);
         eprintln!(
             "usb-audio: feedback start ep=0x{:02x} uac={:?}",
-            self._ctx.ep,
-            self._ctx.uac_version,
+            self._ctx.ep, self._ctx.uac_version,
         );
         let rc = unsafe { libusb_submit_transfer(self.transfer) };
         if rc != 0 {
@@ -864,7 +896,7 @@ mod tests {
     fn feedback_resubmit_failure_no_device_marks_disconnect_and_clears_inflight() {
         let queue = FrameQueue::new();
         let feed = Arc::new(AlsaHwClockFeed::default());
-        let state = RingState::new(queue, 48_000, 4, 2, 192, 8_000, false, feed);
+        let state = RingState::new(queue, 48_000, 4, 2, 192, 8_000, false, false, feed);
         state.feedback_in_flight.store(true, Ordering::Release);
 
         handle_feedback_resubmit_failure(&state, libusb1_sys::constants::LIBUSB_ERROR_NO_DEVICE);
@@ -878,7 +910,7 @@ mod tests {
     fn feedback_resubmit_failure_generic_only_clears_inflight() {
         let queue = FrameQueue::new();
         let feed = Arc::new(AlsaHwClockFeed::default());
-        let state = RingState::new(queue, 48_000, 4, 2, 192, 8_000, false, feed);
+        let state = RingState::new(queue, 48_000, 4, 2, 192, 8_000, false, false, feed);
         state.feedback_in_flight.store(true, Ordering::Release);
 
         handle_feedback_resubmit_failure(&state, libusb1_sys::constants::LIBUSB_ERROR_BUSY);

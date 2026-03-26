@@ -36,6 +36,9 @@ class _FakeRust:
         lv2_finish_restore_slots_rc=0,
         lv2_set_slot_enabled_rc=0,
         lv2_set_port_value_rc=0,
+        usb_hw_volume_supported=False,
+        usb_hw_volume_range=None,
+        usb_hw_volume_set_rc=0,
     ):
         self.band_rc = band_rc
         self.reset_rc = reset_rc
@@ -62,6 +65,9 @@ class _FakeRust:
         self.lv2_finish_restore_slots_rc = lv2_finish_restore_slots_rc
         self.lv2_set_slot_enabled_rc = lv2_set_slot_enabled_rc
         self.lv2_set_port_value_rc = lv2_set_port_value_rc
+        self.usb_hw_volume_supported_value = bool(usb_hw_volume_supported)
+        self.usb_hw_volume_range_value = usb_hw_volume_range
+        self.usb_hw_volume_set_rc = usb_hw_volume_set_rc
         self.calls = []
 
     def set_peq_band_gain(self, band_index, gain_db):
@@ -167,6 +173,16 @@ class _FakeRust:
     def lv2_finish_restore_slots(self):
         self.calls.append(("lv2_finish_restore_slots",))
         return self.lv2_finish_restore_slots_rc
+
+    def usb_hw_volume_supported(self):
+        return 1 if self.usb_hw_volume_supported_value else 0
+
+    def usb_hw_volume_get_range(self):
+        return self.usb_hw_volume_range_value
+
+    def usb_hw_volume_set(self, value_raw):
+        self.calls.append(("usb_hw_volume_set", int(value_raw)))
+        return self.usb_hw_volume_set_rc
 
 
 def test_set_eq_band_forwards_to_rust_peq():
@@ -535,3 +551,54 @@ def test_set_volume_is_ignored_while_bit_perfect_mode_is_active():
     assert adapter._rust.calls == []
     assert mark_calls == []
     assert adapter.output_error is None
+
+
+def test_set_volume_is_ignored_while_bit_perfect_mode_is_active_even_with_hw_volume():
+    adapter = object.__new__(rust_audio.RustAudioPlayerAdapter)
+    adapter._rust = _FakeRust(
+        usb_hw_volume_supported=True,
+        usb_hw_volume_range=(-2560, 256, 128),
+    )
+    adapter.output_error = "boom"
+    adapter.bit_perfect_mode = True
+    mark_calls = []
+    adapter._mark_transport_error = lambda *args, **kwargs: mark_calls.append((args, kwargs))
+
+    adapter.set_volume(0.35)
+
+    assert adapter._rust.calls == []
+    assert mark_calls == []
+    assert adapter.output_error is None
+def test_on_rust_event_dispatches_hw_volume_feedback(monkeypatch):
+    adapter = object.__new__(rust_audio.RustAudioPlayerAdapter)
+    seen = []
+    adapter._on_hw_volume_changed_callback = lambda raw: seen.append(int(raw))
+    monkeypatch.setattr(rust_audio.GLib, "idle_add", lambda cb, *args: cb(*args) or 1)
+
+    adapter._on_rust_event(rust_audio._RustAudioCore.EVENT_STATE, "usb-hw-volume=-512")
+
+    assert seen == [-512]
+
+
+def test_usb_hw_volume_positive_only_range_uses_reported_device_max():
+    adapter = object.__new__(rust_audio.RustAudioPlayerAdapter)
+    adapter._rust = _FakeRust(
+        usb_hw_volume_supported=True,
+        usb_hw_volume_range=(0, 256, 1),
+    )
+
+    adapter.usb_hw_volume_set_percent(75.0)
+
+    assert adapter._rust.calls == [("usb_hw_volume_set", 192)]
+
+
+def test_usb_hw_volume_crossing_zero_uses_reported_device_max():
+    adapter = object.__new__(rust_audio.RustAudioPlayerAdapter)
+    adapter._rust = _FakeRust(
+        usb_hw_volume_supported=True,
+        usb_hw_volume_range=(-2560, 256, 128),
+    )
+
+    adapter.usb_hw_volume_set_percent(100.0)
+
+    assert adapter._rust.calls == [("usb_hw_volume_set", 256)]

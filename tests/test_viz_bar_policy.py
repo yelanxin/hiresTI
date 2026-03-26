@@ -40,7 +40,7 @@ class _DummyDropDown:
 
 def _make_app(scale_idx=0, bar_count=48):
     app = SimpleNamespace(
-        VIZ_BAR_OPTIONS=[4, 8, 16, 32, 48, 64],
+        VIZ_BAR_OPTIONS=[4, 8, 16, 32, 48, 64, 128],
         settings={"viz_frequency_scale": scale_idx, "viz_bar_count": bar_count},
         viz=_DummyViz(),
         viz_bars_dd=_DummyDropDown(),

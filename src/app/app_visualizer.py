@@ -163,7 +163,7 @@ def _set_viz_fullscreen(self, fullscreen, restore_drawer=True):
     if getattr(self, "viz_handle_box", None) is not None:
         self.viz_handle_box.set_visible(True)
     if getattr(self, "viz_fullscreen_btn", None) is not None:
-        self.viz_fullscreen_btn.set_icon_name("view-fullscreen-symbolic")
+        self.viz_fullscreen_btn.set_icon_name("hiresti-view-fullscreen-symbolic")
         page = str(getattr(self, "_viz_current_page", "spectrum") or "spectrum")
         if page == "dsp":
             self.viz_fullscreen_btn.set_tooltip_text("Expand DSP")

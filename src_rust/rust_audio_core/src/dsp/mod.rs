@@ -681,7 +681,7 @@ impl DspGraphRuntime {
         for p in spectrum.list_properties() {
             let pn = p.name();
             if pn == "bands" {
-                spectrum.set_property_from_str("bands", "512");
+                spectrum.set_property_from_str("bands", "2048");
             } else if pn == "multi-channel" {
                 let _ = spectrum.set_property("multi-channel", true);
             } else if pn == "interval" {
