@@ -28,3 +28,7 @@ Cargo.lock
 
 # Logs
 *.log
+
+# Profiling captures
+perf.data
+perf.data.old
