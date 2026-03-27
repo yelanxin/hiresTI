@@ -31,7 +31,10 @@ mod dsp;
 pub mod usb_audio;
 
 use alsa_clock::{AlsaHwClock, AlsaHwClockFeed};
-use dsp::{DspGraphConfig, DspGraphRuntime, LufsValues, PEQ_BAND_COUNT};
+use dsp::{
+    DspGraphConfig, DspGraphRuntime, LufsValues, PEQ_BAND_COUNT,
+    SPECTRUM_ACTIVE_BANDS_DEFAULT,
+};
 
 static GST_INIT: Once = Once::new();
 static PW_INIT: Once = Once::new();
@@ -2427,6 +2430,8 @@ pub struct Engine {
     source_depth: i32,
     preferred_output_format: String,
     spectrum_enabled: bool,
+    spectrum_stereo_enabled: bool,
+    spectrum_active_bands: u32,
     mmap_sink: Option<MmapSink>,
     usb_sink: Option<UsbSinkHandle>,
     /// USB rawlink clock alignment: 0 = push (default), 1 = pull (Level 3).
@@ -3135,6 +3140,16 @@ impl Engine {
         let _ = self.sync_audio_filter_graph();
     }
 
+    fn set_spectrum_stereo_enabled(&mut self, enabled: bool) {
+        self.spectrum_stereo_enabled = enabled;
+        let _ = self.sync_audio_filter_graph();
+    }
+
+    fn set_spectrum_active_bands(&mut self, bands: u32) {
+        self.spectrum_active_bands = bands.clamp(2, SPECTRUM_BANDS_MAX as u32);
+        let _ = self.sync_audio_filter_graph();
+    }
+
     /// Returns whether a DSP bin is currently attached as playbin's audio-filter.
     /// Queries playbin directly, so it is always in sync with GStreamer's internal
     /// state (e.g. after set_state(Null) resets the property automatically).
@@ -3166,18 +3181,16 @@ impl Engine {
             return Ok(());
         };
 
-        graph.set_spectrum_messages_enabled(self.spectrum_enabled);
+        graph.set_spectrum_runtime_enabled(
+            self.spectrum_enabled,
+            self.spectrum_stereo_enabled,
+            self.spectrum_active_bands,
+        );
         graph.apply_config(&self.dsp_config)?;
 
-        if self.spectrum_enabled || self.dsp_config.has_active_processing() {
-            if !filter_attached {
-                let elem = graph.bin_element();
-                self.playbin.set_property("audio-filter", &elem);
-            }
-            // Already attached; apply_config already hot-updated plugin properties.
-        } else if filter_attached {
-            self.playbin
-                .set_property("audio-filter", Option::<gst::Element>::None);
+        if !filter_attached {
+            let elem = graph.bin_element();
+            self.playbin.set_property("audio-filter", &elem);
         }
         Ok(())
     }
@@ -4098,9 +4111,10 @@ impl Engine {
         }
 
         let dsp_config = DspGraphConfig::default();
+        let spectrum_enabled = false;
         let mut audio_filter_graph = DspGraphRuntime::build(&dsp_config).ok();
         if let Some(ref mut graph) = audio_filter_graph {
-            graph.set_spectrum_messages_enabled(true);
+            graph.set_spectrum_runtime_enabled(spectrum_enabled, false, SPECTRUM_ACTIVE_BANDS_DEFAULT);
             let _ = graph.apply_config(&dsp_config);
             let elem = graph.bin_element();
             playbin.set_property("audio-filter", &elem);
@@ -4143,7 +4157,9 @@ impl Engine {
             source_rate: 0,
             source_depth: 0,
             preferred_output_format: String::new(),
-            spectrum_enabled: true,
+            spectrum_enabled,
+            spectrum_stereo_enabled: false,
+            spectrum_active_bands: SPECTRUM_ACTIVE_BANDS_DEFAULT,
             mmap_sink: None,
             usb_sink: None,
             usb_clock_mode: 0,
@@ -4761,12 +4777,18 @@ impl Engine {
         }
 
         let driver_norm = normalized_driver_label(driver);
-        self.spectrum_enabled = true;
         if let Err(err) = self.sync_audio_filter_graph() {
             self.set_error(format!("audio-filter setup failed: {err}"));
             self.emit_event(EVT_ERROR, &format!("audio-filter setup failed: {err}"));
         }
-        self.emit_event(EVT_STATE, "spectrum-path=enabled");
+        self.emit_event(
+            EVT_STATE,
+            if self.spectrum_enabled {
+                "spectrum-path=enabled"
+            } else {
+                "spectrum-path=disabled"
+            },
+        );
         let original_device = device
             .map(|d| d.trim().to_string())
             .filter(|d| !d.is_empty());
@@ -5400,6 +5422,24 @@ pub extern "C" fn rac_set_spectrum_enabled(ptr: *mut Engine, enabled: c_int) -> 
         engine.spectrum_len = 0;
         engine.spectrum_ring_count = 0;
     }
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn rac_set_spectrum_stereo_enabled(ptr: *mut Engine, enabled: c_int) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    engine.set_spectrum_stereo_enabled(enabled != 0);
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn rac_set_spectrum_active_bands(ptr: *mut Engine, bands: c_uint) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    engine.set_spectrum_active_bands(bands as u32);
     0
 }
 

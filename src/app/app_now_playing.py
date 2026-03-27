@@ -33,7 +33,7 @@ _NOW_PLAYING_TRACK_INFO_WIDTH = 170
 _NOW_PLAYING_TRACK_ALBUM_WIDTH = 120
 _NOW_PLAYING_TRACK_DURATION_WIDTH = 64
 _NOW_PLAYING_REVEAL_DURATION_MS = 260
-_NOW_PLAYING_LAYOUT_SETTLE_DELAYS_MS = (_NOW_PLAYING_REVEAL_DURATION_MS + 40, _NOW_PLAYING_REVEAL_DURATION_MS + 160)
+_NOW_PLAYING_LAYOUT_SETTLE_DELAYS_MS = (90, _NOW_PLAYING_REVEAL_DURATION_MS + 40)
 _TNUM_ATTR_LIST = Pango.AttrList.from_string("font-features 'tnum=1'")
 # Seconds to look ahead when highlighting the current lyric line, so the
 # highlight arrives slightly before the word is sung rather than after.
@@ -1972,7 +1972,8 @@ def _refresh_now_playing_from_track(self):
     if self.now_playing_album_label is not None:
         self.now_playing_album_label.set_text(album_meta)
         self.now_playing_album_label.set_tooltip_text(album_meta)
-    if self.now_playing_source_label is not None:
+    source_label = getattr(self, "now_playing_source_label", None)
+    if source_label is not None:
         src = getattr(self, "playback_source", None)
         if src:
             src_type = src.get("type", "")
@@ -1983,12 +1984,12 @@ def _refresh_now_playing_from_track(self):
                 source_text = f"Playing from {src_name}"
             else:
                 source_text = f"Playing from {src_type}"
-            self.now_playing_source_label.set_text(source_text)
-            self.now_playing_source_label.set_tooltip_text(source_text)
+            source_label.set_text(source_text)
+            source_label.set_tooltip_text(source_text)
             if self.now_playing_source_btn is not None:
                 self.now_playing_source_btn.set_visible(True)
         else:
-            self.now_playing_source_label.set_text("")
+            source_label.set_text("")
             if self.now_playing_source_btn is not None:
                 self.now_playing_source_btn.set_visible(False)
     if self.now_playing_open_album_btn is not None:

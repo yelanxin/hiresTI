@@ -22,6 +22,12 @@ pub use tape::{TapeConfig, TapeNode};
 pub use tube::{TubeConfig, TubeNode};
 pub use widener::{WidenerConfig, WidenerNode};
 
+pub(crate) const SPECTRUM_ACTIVE_BANDS_DEFAULT: u32 = 512;
+pub(crate) const SPECTRUM_ACTIVE_BANDS_MAX: u32 = 2048;
+const SPECTRUM_IDLE_BANDS: u32 = 16;
+const SPECTRUM_ACTIVE_INTERVAL_NS: u64 = 16_000_000;
+const SPECTRUM_IDLE_INTERVAL_NS: u64 = 10_000_000_000;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DspReorderableModule {
     Peq,
@@ -585,6 +591,11 @@ impl DspGraphRuntime {
         self.bin.clone().upcast()
     }
 
+    #[cfg(test)]
+    pub fn has_spectrum(&self) -> bool {
+        self.spectrum.is_some()
+    }
+
     pub fn apply_config(&mut self, config: &DspGraphConfig) -> Result<(), String> {
         if let Some(ref mut peq) = self.peq {
             peq.apply_config(&config.effective_peq_config())?;
@@ -632,26 +643,37 @@ impl DspGraphRuntime {
         Ok(())
     }
 
-    pub fn set_spectrum_messages_enabled(&self, enabled: bool) {
+    pub fn set_spectrum_runtime_enabled(&self, enabled: bool, stereo_enabled: bool, active_bands: u32) {
         let Some(ref spectrum) = self.spectrum else {
             return;
         };
-        let mut updated = false;
         for p in spectrum.list_properties() {
             let pn = p.name();
             if pn == "message" {
                 let _ = spectrum.set_property("message", enabled);
-                updated = true;
-                break;
-            }
-            if pn == "post-messages" {
+            } else if pn == "post-messages" {
                 let _ = spectrum.set_property("post-messages", enabled);
-                updated = true;
-                break;
+            } else if pn == "message-magnitude" {
+                let _ = spectrum.set_property("message-magnitude", enabled);
+            } else if pn == "message-phase" {
+                let _ = spectrum.set_property("message-phase", false);
+            } else if pn == "multi-channel" {
+                let _ = spectrum.set_property("multi-channel", enabled && stereo_enabled);
+            } else if pn == "bands" {
+                let bands = if enabled {
+                    active_bands.clamp(2, SPECTRUM_ACTIVE_BANDS_MAX)
+                } else {
+                    SPECTRUM_IDLE_BANDS
+                };
+                let _ = spectrum.set_property("bands", bands);
+            } else if pn == "interval" {
+                let interval_ns = if enabled {
+                    SPECTRUM_ACTIVE_INTERVAL_NS
+                } else {
+                    SPECTRUM_IDLE_INTERVAL_NS
+                };
+                let _ = spectrum.set_property("interval", interval_ns);
             }
-        }
-        if !updated && enabled {
-            eprintln!("[dsp] spectrum element lacks message/post-messages property");
         }
     }
 
@@ -681,11 +703,11 @@ impl DspGraphRuntime {
         for p in spectrum.list_properties() {
             let pn = p.name();
             if pn == "bands" {
-                spectrum.set_property_from_str("bands", "2048");
+                let _ = spectrum.set_property("bands", SPECTRUM_ACTIVE_BANDS_DEFAULT);
             } else if pn == "multi-channel" {
                 let _ = spectrum.set_property("multi-channel", true);
             } else if pn == "interval" {
-                spectrum.set_property_from_str("interval", "16000000");
+                let _ = spectrum.set_property("interval", SPECTRUM_ACTIVE_INTERVAL_NS);
             } else if pn == "threshold" {
                 // Match our Python db_min so silent bands are reported as -80
                 // instead of the default -60, which would otherwise appear as
@@ -699,7 +721,8 @@ impl DspGraphRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::{DspGraphConfig, DspOrderEntry, DspReorderableModule};
+    use super::{DspGraphConfig, DspGraphRuntime, DspOrderEntry, DspReorderableModule};
+    use gstreamer as gst;
 
     #[test]
     fn sanitized_order_deduplicates_and_appends_missing_modules() {
@@ -751,5 +774,13 @@ mod tests {
 
         config.lv2_slot_mut("lv2_0").unwrap().set_enabled(false);
         assert!(!config.has_active_processing());
+    }
+
+    #[test]
+    fn build_graph_includes_spectrum_node() {
+        let _ = gst::init();
+        let config = DspGraphConfig::default();
+        let graph = DspGraphRuntime::build(&config).unwrap();
+        assert!(graph.has_spectrum());
     }
 }

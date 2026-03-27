@@ -182,7 +182,8 @@ def _run_post_activate_tasks(app):
     app._restore_session_async()
     app._schedule_update_ui_loop(40)
     app._schedule_output_status_loop(1000)
-    GLib.timeout_add(80, app._start_spectrum_stream_prewarm)
+    if hasattr(app, "_prewarm_visualizer_cold_start"):
+        app._viz_cold_prewarm_source = GLib.timeout_add(140, app._prewarm_visualizer_cold_start)
     GLib.timeout_add(220, lambda: (app._init_tray_icon(), False)[1])
     GLib.timeout_add(0, app._ensure_overlay_handles_visible)
     return False
