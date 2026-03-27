@@ -89,3 +89,40 @@ def test_enqueue_rust_spectrum_pushes_frame_into_rust_sampler():
 
     assert list(adapter._viz_spectrum_queue) == [(1.25, [0.1, 0.2])]
     assert pushed == [(1.25, [0.1, 0.2])]
+
+
+def test_set_spectrum_stereo_enabled_clears_old_queue_state():
+    calls = []
+    adapter = object.__new__(rust_audio.RustAudioPlayerAdapter)
+    adapter._rust_spectrum_stereo_enabled = False
+    adapter._rust = SimpleNamespace(available=True, set_spectrum_stereo_enabled=lambda enabled: calls.append(("rust", bool(enabled))))
+    adapter._viz_spectrum_queue = [("old", [1.0])]
+    adapter._viz_last_render_frame = [0.2]
+    adapter._last_rust_spectrum_seq = 7
+    adapter._viz_rust_sampler = SimpleNamespace(clear=lambda: calls.append(("clear",)))
+
+    ok = rust_audio.RustAudioPlayerAdapter.set_spectrum_stereo_enabled(adapter, True)
+
+    assert ok is True
+    assert adapter._rust_spectrum_stereo_enabled is True
+    assert adapter._viz_spectrum_queue == []
+    assert adapter._viz_last_render_frame is None
+    assert adapter._last_rust_spectrum_seq == 0
+    assert calls == [("rust", True), ("clear",)]
+
+
+def test_sample_spectrum_at_pos_handles_mixed_mono_and_stereo_frames():
+    adapter = object.__new__(rust_audio.RustAudioPlayerAdapter)
+    adapter._viz_rust_sampler = None
+    adapter._viz_spectrum_queue = [
+        (1.0, [0.0, 1.0]),
+        (2.0, {"mono": [1.0, 0.0], "left": [0.2, 0.8], "right": [0.8, 0.2]}),
+    ]
+
+    out = rust_audio.RustAudioPlayerAdapter._sample_spectrum_at_pos(adapter, 1.5)
+
+    assert out == {
+        "mono": [0.5, 0.5],
+        "left": [0.1, 0.9],
+        "right": [0.4, 0.6],
+    }

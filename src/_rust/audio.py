@@ -2334,10 +2334,24 @@ class RustAudioPlayerAdapter:
 
     def set_spectrum_stereo_enabled(self, enabled):
         stereo_enabled = bool(enabled)
+        prev_enabled = bool(getattr(self, "_rust_spectrum_stereo_enabled", False))
         self._rust_spectrum_stereo_enabled = stereo_enabled
         if self._rust.available:
             try:
                 self._rust.set_spectrum_stereo_enabled(stereo_enabled)
+            except Exception:
+                pass
+        if prev_enabled != stereo_enabled:
+            self._last_rust_spectrum_seq = 0
+            self._viz_last_render_frame = None
+            try:
+                self._viz_spectrum_queue.clear()
+            except Exception:
+                pass
+            try:
+                sampler = getattr(self, "_viz_rust_sampler", None)
+                if sampler is not None:
+                    sampler.clear()
             except Exception:
                 pass
         return True
@@ -3328,6 +3342,16 @@ class RustAudioPlayerAdapter:
                     }
                 return list(frame or [])
 
+            def _copy_frame_dict(frame):
+                if isinstance(frame, dict):
+                    return {
+                        "mono": list(frame.get("mono") or []),
+                        "left": list(frame.get("left") or frame.get("mono") or []),
+                        "right": list(frame.get("right") or frame.get("mono") or []),
+                    }
+                mono = list(frame or [])
+                return {"mono": mono, "left": list(mono), "right": list(mono)}
+
             def _blend_lists(a, b, t):
                 n = min(len(a), len(b))
                 if n <= 0:
@@ -3358,8 +3382,8 @@ class RustAudioPlayerAdapter:
                 return _copy_frame(f0)
             t = max(0.0, min(1.0, (target_pos_s - p0) / (p1 - p0)))
             if isinstance(f0, dict) or isinstance(f1, dict):
-                d0 = _copy_frame(f0)
-                d1 = _copy_frame(f1)
+                d0 = _copy_frame_dict(f0)
+                d1 = _copy_frame_dict(f1)
                 mono = _blend_lists(d0.get("mono", []), d1.get("mono", []), t)
                 if not mono:
                     return None

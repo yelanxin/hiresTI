@@ -290,6 +290,16 @@ def test_bars_gl_update_data_prefers_rust_mapper_when_available():
     assert obj._balance_target == 0.0
 
 
+def test_bars_gl_stereo_effect_keeps_rust_render_arrays():
+    obj = SimpleNamespace(
+        _rust_state_engine=object(),
+        _rust_stereo_state_engine=object(),
+        requires_stereo_spectrum=lambda: True,
+    )
+
+    assert mod.BarsGLVisualizer._should_use_python_render_state(obj) is False
+
+
 def test_dots_gl_update_data_prefers_rust_mapper_when_available():
     class _RustCore:
         available = True

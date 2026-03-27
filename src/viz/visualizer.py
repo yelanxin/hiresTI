@@ -5434,7 +5434,7 @@ class BarsGLVisualizer(Gtk.GLArea):
             self._cached_w     = pw
             self._cached_h     = ph
             self._dirty_static = False
-        if self._rust_state_engine is None or self.requires_stereo_spectrum():
+        if self._should_use_python_render_state():
             self._h_arr[:512]  = self.current_heights[:512]
             self._ph_arr[:512] = self.peak_holds[:512]
             self._tr_arr[:512] = self.trail_heights[:512]
@@ -5451,6 +5451,11 @@ class BarsGLVisualizer(Gtk.GLArea):
         GL.glDrawArrays(GL.GL_TRIANGLE_STRIP, 0, 4)
         GL.glBindVertexArray(0)
         return True
+
+    def _should_use_python_render_state(self):
+        if self.requires_stereo_spectrum():
+            return self._rust_stereo_state_engine is None
+        return self._rust_state_engine is None
 
     # ------------------------------------------------------------------
     # Animation tick
