@@ -42,6 +42,10 @@ The ALSA software parameters set `avail_min` to half a period rather than one fu
 
 HiresTI supports S16LE, S24LE (24-in-32 container), and S32LE output, written directly to a `hw:` device with no ALSA dmix, softvol, or software resampling in the path. The format is selected in settings and negotiated with the hardware; the PCM stream from TIDAL reaches your DAC mathematically identical to the source.
 
+### 1.10 USB Rawlink Direct USB Playback
+
+For supported USB DACs, HiresTI can bypass the kernel `snd-usb-audio` driver entirely and stream audio through its Rust USB Rawlink path. In this mode, isochronous USB packets are scheduled directly from userspace to the DAC, removing the ALSA/PipeWire/PulseAudio mixer stack from the USB path. The practical benefit is a shorter and more deterministic playback chain: fewer software layers, no kernel-side USB audio resampler/mixer involvement, cleaner sample-rate switching, and a direct bit-perfect route from the decoded PCM stream to the DAC.
+
 ---
 
 ## 2. System-Level Optimizations (User Side)
