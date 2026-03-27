@@ -83,6 +83,24 @@ class TidalApp(Adw.Application):
     def schedule_save_settings(self, delay_ms=250):
         return app_state_persistence.schedule_save_settings(self, delay_ms)
 
+    def _get_startup_window_size(self):
+        return app_state_persistence._get_startup_window_size(self)
+
+    def _remember_current_window_size(self, width=None, height=None, force=False, persist=True):
+        return app_state_persistence._remember_current_window_size(
+            self,
+            width=width,
+            height=height,
+            force=force,
+            persist=persist,
+        )
+
+    def on_remember_window_size_toggled(self, switch, state):
+        return app_state_persistence.on_remember_window_size_toggled(self, switch, state)
+
+    def on_window_size_changed(self, *args):
+        return app_state_persistence.on_window_size_changed(self, *args)
+
     def _remember_last_nav(self, nav_id):
         return app_state_persistence._remember_last_nav(self, nav_id)
 

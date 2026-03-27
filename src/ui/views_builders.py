@@ -345,6 +345,31 @@ def build_settings_page(app):
     settings_scroll.set_child(settings_vbox)
     settings_vbox.append(Gtk.Label(label="Settings", xalign=0, css_classes=["album-title-large"], margin_bottom=10))
 
+    settings_vbox.append(Gtk.Label(label="General", xalign=0, css_classes=["section-title"]))
+    group_cfg = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["settings-group"])
+
+    row_window_size = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
+    window_size_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
+    window_size_info.append(Gtk.Label(label="Remember Window Size", xalign=0, css_classes=["settings-label"]))
+    window_size_desc = Gtk.Label(
+        label="Restore the last main window width and height on next launch",
+        xalign=0,
+        css_classes=["dim-label"],
+    )
+    window_size_desc.set_wrap(True)
+    window_size_desc.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+    window_size_desc.set_max_width_chars(56)
+    window_size_info.append(window_size_desc)
+    row_window_size.append(window_size_info)
+    row_window_size.append(Gtk.Box(hexpand=True))
+    app.remember_window_size_switch = Gtk.Switch(valign=Gtk.Align.CENTER)
+    app.remember_window_size_switch.set_active(bool(app.settings.get("remember_window_size", False)))
+    app.remember_window_size_switch.connect("state-set", app.on_remember_window_size_toggled)
+    row_window_size.append(app.remember_window_size_switch)
+    group_cfg.append(row_window_size)
+    settings_vbox.append(group_cfg)
+
+    settings_vbox.append(Gtk.Label(label="Streaming", xalign=0, css_classes=["section-title"], margin_top=10))
     group_q = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["settings-group"])
     row_q = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
     row_q.append(Gtk.Label(label="Audio Quality", hexpand=True, xalign=0))

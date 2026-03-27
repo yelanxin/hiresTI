@@ -8,9 +8,15 @@ from core.constants import AlsaMmapRealtimePriority, VisualizerSettings
 
 logger = logging.getLogger(__name__)
 
-CURRENT_SETTINGS_VERSION = 7
+CURRENT_SETTINGS_VERSION = 8
 DSP_REORDERABLE_MODULES = ["peq", "convolver", "tape", "tube", "widener"]
 PEQ_BAND_COUNT = 10
+WINDOW_SIZE_DEFAULT_WIDTH = 1250
+WINDOW_SIZE_DEFAULT_HEIGHT = 800
+WINDOW_SIZE_MIN_WIDTH = 480
+WINDOW_SIZE_MIN_HEIGHT = 320
+WINDOW_SIZE_MAX_WIDTH = 8192
+WINDOW_SIZE_MAX_HEIGHT = 8192
 
 
 @dataclass
@@ -41,6 +47,9 @@ class SettingsSchema:
     viz_sync_offset_ms: int = 0
     viz_sync_device_offsets: dict = field(default_factory=dict)
     paned_position: int = 0
+    remember_window_size: bool = False
+    window_width: int = 0
+    window_height: int = 0
     search_history: list = field(default_factory=list)
     audio_cache_tracks: int = 20
     dsp_enabled: bool = True
@@ -110,6 +119,9 @@ DEFAULT_SETTINGS = {
     "viz_sync_offset_ms": 0,
     "viz_sync_device_offsets": {},
     "paned_position": 0,
+    "remember_window_size": False,
+    "window_width": 0,
+    "window_height": 0,
     "search_history": [],
     "audio_cache_tracks": 20,
     "dsp_enabled": True,
@@ -180,6 +192,9 @@ _VALIDATION_RULES = {
     "lyrics_user_offset_ms": (int, -2000, 2000, 0),
     "viz_sync_offset_ms": (int, -500, 500, 0),
     "paned_position": (int, 0, None, 0),
+    "remember_window_size": (bool, None, None, False),
+    "window_width": (int, 0, WINDOW_SIZE_MAX_WIDTH, 0),
+    "window_height": (int, 0, WINDOW_SIZE_MAX_HEIGHT, 0),
     "search_history": (list, None, None, []),
     "audio_cache_tracks": (int, 0, 200, 20),
     "dsp_enabled": (bool, None, None, True),
@@ -415,6 +430,23 @@ def normalize_settings(raw: Optional[dict[str, Any]]) -> dict[str, Any]:
     normalized["viz_sync_offset_ms"] = _as_int(raw.get("viz_sync_offset_ms"), DEFAULT_SETTINGS["viz_sync_offset_ms"], minimum=-500, maximum=500)
     normalized["viz_sync_device_offsets"] = _as_int_dict(raw.get("viz_sync_device_offsets"), DEFAULT_SETTINGS["viz_sync_device_offsets"], minimum=-500, maximum=500, max_items=64)
     normalized["paned_position"] = _as_int(raw.get("paned_position"), DEFAULT_SETTINGS["paned_position"], minimum=0)
+    normalized["remember_window_size"] = _as_bool(raw.get("remember_window_size"), DEFAULT_SETTINGS["remember_window_size"])
+    normalized["window_width"] = _as_int(
+        raw.get("window_width"),
+        DEFAULT_SETTINGS["window_width"],
+        minimum=0,
+        maximum=WINDOW_SIZE_MAX_WIDTH,
+    )
+    normalized["window_height"] = _as_int(
+        raw.get("window_height"),
+        DEFAULT_SETTINGS["window_height"],
+        minimum=0,
+        maximum=WINDOW_SIZE_MAX_HEIGHT,
+    )
+    if 0 < normalized["window_width"] < WINDOW_SIZE_MIN_WIDTH:
+        normalized["window_width"] = DEFAULT_SETTINGS["window_width"]
+    if 0 < normalized["window_height"] < WINDOW_SIZE_MIN_HEIGHT:
+        normalized["window_height"] = DEFAULT_SETTINGS["window_height"]
     normalized["search_history"] = _as_str_list(raw.get("search_history"), DEFAULT_SETTINGS["search_history"])
     normalized["audio_cache_tracks"] = _as_int(raw.get("audio_cache_tracks"), DEFAULT_SETTINGS["audio_cache_tracks"], minimum=0, maximum=200)
     normalized["dsp_enabled"] = _as_bool(raw.get("dsp_enabled"), DEFAULT_SETTINGS["dsp_enabled"])

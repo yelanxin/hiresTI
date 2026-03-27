@@ -134,6 +134,8 @@ def do_shutdown(self):
     if seek_commit:
         GLib.source_remove(seek_commit)
         self._seek_commit_source = 0
+    if hasattr(self, "_remember_current_window_size"):
+        self._remember_current_window_size(persist=False)
     self.save_settings()
     if self.player is not None:
         self.player.cleanup()
@@ -242,11 +244,19 @@ def do_activate(self):
                 _display_scale, _text_scale, _font_scale, _helpers.COVER_SIZE)
     _startup_mark("display-scale")
 
+    startup_width = int(ui_config.WINDOW_WIDTH)
+    startup_height = int(ui_config.WINDOW_HEIGHT)
+    if hasattr(self, "_get_startup_window_size"):
+        try:
+            startup_width, startup_height = self._get_startup_window_size()
+        except Exception:
+            logger.debug("Failed to read startup window size preference", exc_info=True)
+
     self.win = Adw.ApplicationWindow(
         application=self,
         title="hiresTI Desktop",
-        default_width=ui_config.WINDOW_WIDTH,
-        default_height=ui_config.WINDOW_HEIGHT,
+        default_width=startup_width,
+        default_height=startup_height,
     )
     self.window_created = True
     self.win.connect("close-request", self.on_window_close_request)
@@ -361,6 +371,9 @@ def do_activate(self):
     GLib.timeout_add(120, self._clear_initial_search_focus)
     self.win.connect("notify::default-width", self.update_layout_proportions)
     self.win.connect("notify::default-height", self.update_layout_proportions)
+    if hasattr(self, "on_window_size_changed"):
+        self.win.connect("notify::default-width", self.on_window_size_changed)
+        self.win.connect("notify::default-height", self.on_window_size_changed)
     # Fullscreen/restore can finish allocation a bit later; listen and re-align.
     for prop in ("fullscreened", "maximized"):
         try:

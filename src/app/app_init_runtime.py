@@ -333,6 +333,11 @@ def _init_runtime_state(self):
     self.is_mini_mode = False
     self.saved_width = ui_config.WINDOW_WIDTH
     self.saved_height = ui_config.WINDOW_HEIGHT
+    if hasattr(self, "_get_startup_window_size"):
+        try:
+            self.saved_width, self.saved_height = self._get_startup_window_size()
+        except Exception:
+            logger.debug("Failed to initialize saved window size", exc_info=True)
 
 
 def init_runtime(self):

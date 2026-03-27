@@ -168,6 +168,7 @@ def _init_widget_refs(self):
     self.remote_playlist_visibility_btn = None
     self.remote_playlist_more_btn = None
     self.remote_playlist_more_pop = None
+    self.remember_window_size_switch = None
     self.remote_api_switch = None
     self.remote_api_access_dd = None
     self.remote_api_network_row = None

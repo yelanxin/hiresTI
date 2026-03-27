@@ -125,6 +125,8 @@ def on_window_close_request(self, _win):
         if not self._tray_ready:
             # No tray support (e.g. GNOME without indicator extension): close normally.
             return False
+        if hasattr(self, "_remember_current_window_size"):
+            self._remember_current_window_size()
         if self.win is not None:
             self.win.hide()
         logger.info("Window hidden to background. Playback continues.")
