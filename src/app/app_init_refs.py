@@ -200,6 +200,8 @@ def _init_viz_refs(self):
     self._viz_profile_apply_source = None
     self._viz_theme_apply_source = None
     self._viz_freq_scale_apply_source = None
+    self._viz_cold_prewarm_source = 0
+    self._viz_cold_prewarm_attempts = 0
     self._viz_handle_anim_source = 0
     self._viz_handle_settle_source = 0
     self._viz_handle_resize_source = 0
@@ -221,6 +223,9 @@ def _init_viz_refs(self):
     self._viz_trace_open_ts = 0.0
     self._viz_trace_last_cb_ts = 0.0
     self._viz_trace_first_real_logged = False
+    self._dr_meter_last_update_ts = 0.0
+    self._dr_lufs_last_poll_ts = 0.0
+    self._dr_lufs_cached = None
     self._viz_current_page = "spectrum"
     self._dsp_selected_module = "peq"
     self._dsp_order_editing = False

@@ -35,3 +35,57 @@ def test_viz_render_tick_forces_runtime_cache_refresh():
     assert ok is True
     assert calls == [True]
     assert seen == [([0.1, 0.2, 0.3], 1.19)]
+
+
+def test_sample_spectrum_at_pos_prefers_rust_sampler():
+    seen = []
+    adapter = object.__new__(rust_audio.RustAudioPlayerAdapter)
+    adapter._viz_rust_sampler = SimpleNamespace(
+        sample=lambda pos, stereo=False, out_len=0: seen.append((pos, stereo, out_len)) or [0.4, 0.2]
+    )
+    adapter._rust_spectrum_stereo_enabled = False
+    adapter._rust_spectrum_active_bands = 512
+    adapter._viz_spectrum_queue = []
+
+    out = rust_audio.RustAudioPlayerAdapter._sample_spectrum_at_pos(adapter, 1.5)
+
+    assert out == [0.4, 0.2]
+    assert seen == [(1.5, False, 512)]
+
+
+def test_reset_rust_visual_sync_state_clears_rust_sampler():
+    calls = []
+    adapter = object.__new__(rust_audio.RustAudioPlayerAdapter)
+    adapter._viz_latency_cached_ms = 1.0
+    adapter._viz_latency_smooth_ms = 2.0
+    adapter._viz_msg_age_smooth_ms = 3.0
+    adapter._viz_latency_last_probe_ts = 4.0
+    adapter._last_rust_spectrum_seq = 9
+    adapter._viz_spectrum_queue = []
+    adapter._viz_rust_sampler = SimpleNamespace(clear=lambda: calls.append("clear"))
+    adapter._viz_last_render_frame = [1.0]
+    adapter._rust_last_spectrum_seen_ts = 8.0
+    adapter._viz_epoch = 4
+
+    rust_audio.RustAudioPlayerAdapter._reset_rust_visual_sync_state(adapter)
+
+    assert calls == ["clear"]
+    assert adapter._last_rust_spectrum_seq == 0
+    assert adapter._viz_last_render_frame is None
+    assert adapter._viz_epoch == 5
+
+
+def test_enqueue_rust_spectrum_pushes_frame_into_rust_sampler():
+    pushed = []
+    adapter = object.__new__(rust_audio.RustAudioPlayerAdapter)
+    adapter._viz_spectrum_queue = []
+    adapter._viz_rust_sampler = SimpleNamespace(push_frame=lambda pos, frame: pushed.append((pos, frame)))
+    adapter._last_rust_spectrum_seq = 0
+    adapter._viz_last_render_frame = None
+    adapter._cached_pos_s = 1.0
+    adapter._viz_trace_enabled = False
+
+    rust_audio.RustAudioPlayerAdapter._enqueue_rust_spectrum(adapter, 1.25, [0.1, 0.2])
+
+    assert list(adapter._viz_spectrum_queue) == [(1.25, [0.1, 0.2])]
+    assert pushed == [(1.25, [0.1, 0.2])]

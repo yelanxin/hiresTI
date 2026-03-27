@@ -30,8 +30,8 @@ pub mod queue;
 pub mod sink;
 pub mod transfer;
 
-pub use descriptor::{UacFormat, UacStreamAlt, UacVersion};
-pub use device::{enumerate_usb_audio_devices, OpenUsbDevice, UsbAudioDevice};
+pub use descriptor::{FeatureUnitInfo, UacFormat, UacStreamAlt, UacVersion};
+pub use device::{enumerate_usb_audio_devices, OpenUsbDevice, UacAltProfile, UsbAudioDevice};
 pub use dop::DopEncoder;
 pub use queue::FrameQueue;
 pub use sink::UsbAudioSink;

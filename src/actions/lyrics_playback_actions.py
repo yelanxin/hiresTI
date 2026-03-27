@@ -3,6 +3,7 @@ import logging
 import time
 
 from gi.repository import Gtk, GLib
+from app.app_ui_loop import _is_now_playing_overlay_open, _ui_loop_has_high_frequency_consumer
 from core.errors import classify_exception, user_message
 from actions import audio_settings_actions
 
@@ -330,6 +331,8 @@ def play_track(app, index):
             app.bg_viz.set_colors_from_cover(cover_url, app.cache_dir)
         else:
             app.bg_viz.randomize_colors()
+    if hasattr(app, "_refresh_visualizer_cover_theme"):
+        app._refresh_visualizer_cover_theme()
 
     if cover_id:
         Thread(target=lambda: app._load_cover_art(cover_id), daemon=True).start()
@@ -568,21 +571,27 @@ def update_ui_loop(app):
     except Exception:
         playing_now = False
 
+    fast_ui_mode = _ui_loop_has_high_frequency_consumer(app)
+    overlay_open = _is_now_playing_overlay_open(app)
     p = 0.0
     d = 0.0
     cached_pd = getattr(app, "_ui_cached_pd", None)
-    if (not playing_now) and cached_pd is not None:
-        last_poll = float(getattr(app, "_ui_last_pos_poll_ts", 0.0) or 0.0)
-        if (now - last_poll) < 0.25:
-            p, d = cached_pd
-        else:
-            p, d = app.player.get_position()
-            app._ui_cached_pd = (p, d)
-            app._ui_last_pos_poll_ts = now
+    last_poll = float(getattr(app, "_ui_last_pos_poll_ts", 0.0) or 0.0)
+    if playing_now:
+        poll_interval = 0.10 if fast_ui_mode else 0.45
     else:
+        poll_interval = 0.25 if fast_ui_mode else 0.80
+
+    if cached_pd is None or (now - last_poll) >= poll_interval:
         p, d = app.player.get_position()
         app._ui_cached_pd = (p, d)
         app._ui_last_pos_poll_ts = now
+    else:
+        p, d = cached_pd
+        if playing_now:
+            p = max(0.0, float(p or 0.0) + max(0.0, now - last_poll))
+            if float(d or 0.0) > 0.0:
+                p = min(float(d), p)
 
     hold_pos = getattr(app, "_playback_rebind_hold_position_s", None)
     hold_dur = float(getattr(app, "_playback_rebind_hold_duration_s", 0.0) or 0.0)
@@ -619,7 +628,8 @@ def update_ui_loop(app):
                 cur_scale_v = float(app.scale.get_value() or 0.0)
             except Exception:
                 cur_scale_v = 0.0
-            if abs(cur_scale_v - float(p)) >= 0.025:
+            scale_epsilon = 0.025 if fast_ui_mode else 0.18
+            if abs(cur_scale_v - float(p)) >= scale_epsilon:
                 app.is_programmatic_update = True
                 app.scale.set_value(p)
                 app.is_programmatic_update = False
@@ -702,9 +712,13 @@ def update_ui_loop(app):
             adj.set_value(new_y)
 
     if hasattr(app, "_mpris_sync_position"):
-        app._mpris_sync_position()
+        mpris_interval = 0.25 if playing_now else 0.8
+        last_mpris_sync = float(getattr(app, "_ui_last_mpris_sync_ts", 0.0) or 0.0)
+        if (now - last_mpris_sync) >= mpris_interval:
+            app._mpris_sync_position()
+            app._ui_last_mpris_sync_ts = now
 
-    if hasattr(app, "_sync_now_playing_overlay_state"):
+    if overlay_open and hasattr(app, "_sync_now_playing_overlay_state"):
         try:
             app._sync_now_playing_overlay_state(p, d, playing_now)
         except Exception as e:

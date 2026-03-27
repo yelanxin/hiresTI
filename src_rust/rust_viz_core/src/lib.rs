@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::os::raw::c_int;
 use std::slice;
 
@@ -27,6 +27,13 @@ pub struct VizStateEngine {
     bass_smooth: f32,
 }
 
+pub struct StereoVizStateEngine {
+    left: VizStateEngine,
+    right: VizStateEngine,
+    balance: f32,
+    balance_smooth: f32,
+}
+
 pub struct BarsRenderer {
     width: usize,
     height: usize,
@@ -34,6 +41,18 @@ pub struct BarsRenderer {
     colors: Vec<f32>, // RGBA per bar, len=num_bars*4
     rgba: Vec<u8>,    // premultiplied BGRA (Cairo ARGB32 little-endian)
     seq: u64,
+}
+
+struct SpectrumFrame {
+    pos_s: f64,
+    mono: Vec<f32>,
+    left: Vec<f32>,
+    right: Vec<f32>,
+}
+
+pub struct SpectrumFrameSampler {
+    max_frames: usize,
+    frames: VecDeque<SpectrumFrame>,
 }
 
 impl BarsRenderer {
@@ -67,7 +86,8 @@ impl BarsRenderer {
         if self.width != w || self.height != h {
             self.width = w;
             self.height = h;
-            self.rgba.resize(self.width.saturating_mul(self.height).saturating_mul(4), 0);
+            self.rgba
+                .resize(self.width.saturating_mul(self.height).saturating_mul(4), 0);
         }
         if self.num_bars != n {
             self.num_bars = n;
@@ -85,13 +105,138 @@ impl BarsRenderer {
     }
 }
 
+impl SpectrumFrameSampler {
+    fn new(max_frames: usize) -> Self {
+        Self {
+            max_frames: max_frames.max(2),
+            frames: VecDeque::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.frames.clear();
+    }
+
+    fn push_mono(&mut self, pos_s: f64, mono: &[f32]) {
+        let mono_vals = mono.to_vec();
+        self.frames.push_back(SpectrumFrame {
+            pos_s,
+            mono: mono_vals.clone(),
+            left: mono_vals.clone(),
+            right: mono_vals,
+        });
+        while self.frames.len() > self.max_frames {
+            self.frames.pop_front();
+        }
+    }
+
+    fn push_stereo(&mut self, pos_s: f64, mono: &[f32], left: &[f32], right: &[f32]) {
+        let mono_vals = mono.to_vec();
+        let n = mono_vals.len();
+        let mut left_vals = vec![0.0_f32; n];
+        let mut right_vals = vec![0.0_f32; n];
+        for i in 0..n {
+            left_vals[i] = if i < left.len() { left[i] } else { mono_vals[i] };
+            right_vals[i] = if i < right.len() { right[i] } else { mono_vals[i] };
+        }
+        self.frames.push_back(SpectrumFrame {
+            pos_s,
+            mono: mono_vals,
+            left: left_vals,
+            right: right_vals,
+        });
+        while self.frames.len() > self.max_frames {
+            self.frames.pop_front();
+        }
+    }
+
+    fn sample_mono(&self, target_pos_s: f64, out: &mut [f32]) -> usize {
+        let (mono, _left, _right) = self.sample_impl(target_pos_s);
+        let n = mono.len().min(out.len());
+        if n == 0 {
+            return 0;
+        }
+        out[..n].copy_from_slice(&mono[..n]);
+        n
+    }
+
+    fn sample_stereo(&self, target_pos_s: f64, mono_out: &mut [f32], left_out: &mut [f32], right_out: &mut [f32]) -> usize {
+        let (mono, left, right) = self.sample_impl(target_pos_s);
+        let n = mono
+            .len()
+            .min(left.len())
+            .min(right.len())
+            .min(mono_out.len())
+            .min(left_out.len())
+            .min(right_out.len());
+        if n == 0 {
+            return 0;
+        }
+        mono_out[..n].copy_from_slice(&mono[..n]);
+        left_out[..n].copy_from_slice(&left[..n]);
+        right_out[..n].copy_from_slice(&right[..n]);
+        n
+    }
+
+    fn sample_impl(&self, target_pos_s: f64) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        if self.frames.is_empty() {
+            return (Vec::new(), Vec::new(), Vec::new());
+        }
+        let mut prev_idx: Option<usize> = None;
+        let mut next_idx: Option<usize> = None;
+        for (idx, item) in self.frames.iter().enumerate() {
+            if item.pos_s <= target_pos_s {
+                prev_idx = Some(idx);
+            } else {
+                next_idx = Some(idx);
+                break;
+            }
+        }
+
+        if prev_idx.is_none() {
+            if let Some(first) = self.frames.front() {
+                return (first.mono.clone(), first.left.clone(), first.right.clone());
+            }
+            return (Vec::new(), Vec::new(), Vec::new());
+        }
+
+        let prev = &self.frames[prev_idx.unwrap()];
+        if next_idx.is_none() {
+            return (prev.mono.clone(), prev.left.clone(), prev.right.clone());
+        }
+        let next = &self.frames[next_idx.unwrap()];
+        if next.pos_s <= prev.pos_s {
+            return (prev.mono.clone(), prev.left.clone(), prev.right.clone());
+        }
+        let t = ((target_pos_s - prev.pos_s) / (next.pos_s - prev.pos_s)).clamp(0.0, 1.0) as f32;
+        (
+            blend_series(&prev.mono, &next.mono, t),
+            blend_series(&prev.left, &next.left, t),
+            blend_series(&prev.right, &next.right, t),
+        )
+    }
+}
+
+fn blend_series(a: &[f32], b: &[f32], t: f32) -> Vec<f32> {
+    let n = a.len().min(b.len());
+    let mut out = vec![0.0_f32; n];
+    for i in 0..n {
+        out[i] = (a[i] * (1.0 - t)) + (b[i] * t);
+    }
+    out
+}
+
 impl VizProcessor {
     fn new(num_bars: usize, max_hz: f32, smooth: f32, db_min: f32, db_range: f32) -> Self {
         let bars = num_bars.max(1);
         let hz = if max_hz <= 0.0 { 20.0 } else { max_hz };
         let interval = 1000.0_f64 / f64::from(hz);
         let s = smooth.clamp(0.0, 1.0);
-        let range = if db_range.abs() < f32::EPSILON { 60.0 } else { db_range };
+        let range = if db_range.abs() < f32::EPSILON {
+            60.0
+        } else {
+            db_range
+        };
         Self {
             num_bars: bars,
             db_min,
@@ -194,6 +339,251 @@ impl VizStateEngine {
     }
 }
 
+impl StereoVizStateEngine {
+    fn new(
+        num_bars: usize,
+        smooth: f32,
+        trail_decay: f32,
+        peak_hold_frames: u16,
+        peak_fall: f32,
+        bass_smooth: f32,
+        balance_smooth: f32,
+    ) -> Self {
+        Self {
+            left: VizStateEngine::new(
+                num_bars,
+                smooth,
+                trail_decay,
+                peak_hold_frames,
+                peak_fall,
+                bass_smooth,
+            ),
+            right: VizStateEngine::new(
+                num_bars,
+                smooth,
+                trail_decay,
+                peak_hold_frames,
+                peak_fall,
+                bass_smooth,
+            ),
+            balance: 0.0,
+            balance_smooth: balance_smooth.clamp(0.0, 1.0),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.left.reset();
+        self.right.reset();
+        self.balance = 0.0;
+    }
+
+    fn set_params(
+        &mut self,
+        smooth: f32,
+        trail_decay: f32,
+        peak_hold_frames: u16,
+        peak_fall: f32,
+        bass_smooth: f32,
+        balance_smooth: f32,
+    ) {
+        self.left
+            .set_params(smooth, trail_decay, peak_hold_frames, peak_fall, bass_smooth);
+        self.right
+            .set_params(smooth, trail_decay, peak_hold_frames, peak_fall, bass_smooth);
+        self.balance_smooth = balance_smooth.clamp(0.0, 1.0);
+    }
+
+    fn set_targets_from_slices(&mut self, left: &[f32], right: &[f32]) -> usize {
+        let ln = self.left.set_target_from_slice(left);
+        let rn = self.right.set_target_from_slice(right);
+        ln.min(rn)
+    }
+
+    fn tick(&mut self) {
+        self.left.tick();
+        self.right.tick();
+        let left_avg = if self.left.current.is_empty() {
+            0.0
+        } else {
+            self.left.current.iter().copied().sum::<f32>() / (self.left.current.len() as f32)
+        };
+        let right_avg = if self.right.current.is_empty() {
+            0.0
+        } else {
+            self.right.current.iter().copied().sum::<f32>() / (self.right.current.len() as f32)
+        };
+        let total = left_avg + right_avg;
+        let target = if total > 1e-6 {
+            ((right_avg - left_avg) / total).clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+        self.balance += (target - self.balance) * self.balance_smooth;
+    }
+}
+
+fn normalize_spectrum_magnitudes_impl(values: &[f32], out: &mut [f32], db_min: f32, db_range: f32) {
+    let safe_range = if db_range.abs() < f32::EPSILON {
+        80.0
+    } else {
+        db_range
+    };
+    let n = values.len().min(out.len());
+    for i in 0..n {
+        let val = values[i];
+        let h = if val <= db_min {
+            0.0
+        } else {
+            (val - db_min) / safe_range
+        };
+        out[i] = h.clamp(0.0, 1.0).powf(1.5);
+    }
+    if n < out.len() {
+        out[n..].fill(0.0);
+    }
+}
+
+fn resample_linear_values_impl(values: &[f32], out: &mut [f32], use_peak: bool) {
+    let in_count = values.len();
+    let out_count = out.len();
+    if in_count == 0 || out_count == 0 {
+        if out_count > 0 {
+            out.fill(0.0);
+        }
+        return;
+    }
+    for i in 0..out_count {
+        let t0 = (i as f32) / (out_count as f32);
+        let t1 = ((i + 1) as f32) / (out_count as f32);
+        let mut x0 = (t0 * (in_count as f32)) as usize;
+        let mut x1 = (t1 * (in_count as f32)) as usize;
+        if x0 >= in_count {
+            x0 = in_count - 1;
+        }
+        if x1 <= x0 {
+            x1 = (x0 + 1).min(in_count);
+        } else if x1 > in_count {
+            x1 = in_count;
+        }
+        if use_peak {
+            let mut peak = 0.0_f32;
+            for &v in &values[x0..x1] {
+                if v > peak {
+                    peak = v;
+                }
+            }
+            out[i] = peak;
+        } else {
+            let mut sum = 0.0_f32;
+            let mut cnt = 0usize;
+            for &v in &values[x0..x1] {
+                sum += v;
+                cnt += 1;
+            }
+            out[i] = if cnt > 0 { sum / (cnt as f32) } else { 0.0 };
+        }
+    }
+}
+
+fn linear_display_voicing(freq_hz: f32, half_rate_hz: f32) -> f32 {
+    let f = 20.0_f32.max(freq_hz);
+    if f < 1_000.0 {
+        let t = (f / 20.0).log10() / (1_000.0_f32 / 20.0_f32).log10();
+        return 0.55 + (0.45 * t);
+    }
+    let log_max = (1_001.0_f32.max(half_rate_hz) / 1_000.0).log10();
+    let t = if log_max > 1e-9 {
+        (f / 1_000.0).log10() / log_max
+    } else {
+        0.0
+    };
+    1.0 + (0.2 * t.min(1.0))
+}
+
+fn map_linear_spectrum_impl(
+    input: &[f32],
+    out: &mut [f32],
+    analysis_bands: usize,
+    db_min: f32,
+    db_range: f32,
+    half_rate_hz: f32,
+) {
+    if out.is_empty() {
+        return;
+    }
+    if input.is_empty() {
+        out.fill(0.0);
+        return;
+    }
+
+    let analysis_n = analysis_bands.max(1);
+    let mut normalized = vec![0.0_f32; input.len()];
+    normalize_spectrum_magnitudes_impl(input, &mut normalized, db_min, db_range);
+
+    let base = if analysis_n == normalized.len() {
+        normalized
+    } else {
+        let mut resampled = vec![0.0_f32; analysis_n];
+        resample_linear_values_impl(&normalized, &mut resampled, false);
+        resampled
+    };
+
+    if out.len() == analysis_n {
+        out.copy_from_slice(&base[..analysis_n]);
+        return;
+    }
+
+    let mut out_peak = vec![0.0_f32; out.len()];
+    let mut out_mean = vec![0.0_f32; out.len()];
+    resample_linear_values_impl(&base, &mut out_peak, true);
+    resample_linear_values_impl(&base, &mut out_mean, false);
+    for i in 0..out.len() {
+        let center_f = ((i as f32) + 0.5) / (out.len() as f32) * half_rate_hz;
+        let mixed = (out_peak[i] * 0.5) + (out_mean[i] * 0.5);
+        out[i] = (mixed * linear_display_voicing(center_f, half_rate_hz)).min(1.0);
+    }
+}
+
+fn map_log_spectrum_impl(input: &[f32], out: &mut [f32], db_min: f32, db_range: f32) {
+    if out.is_empty() {
+        return;
+    }
+    if input.is_empty() {
+        out.fill(0.0);
+        return;
+    }
+    let mut normalized = vec![0.0_f32; input.len()];
+    normalize_spectrum_magnitudes_impl(input, &mut normalized, db_min, db_range);
+    build_log_bins_impl(&normalized, out);
+}
+
+fn bins_max_db(values: &[f32]) -> f32 {
+    if values.is_empty() {
+        return -70.0;
+    }
+    values
+        .iter()
+        .copied()
+        .fold(-70.0_f32, f32::max)
+        .max(-70.0)
+}
+
+fn mean_power_db(values: &[f32]) -> f32 {
+    if values.is_empty() {
+        return -70.0;
+    }
+    let mut lin_sum = 0.0_f32;
+    for &v in values {
+        lin_sum += 10.0_f32.powf(v.max(-70.0) / 10.0);
+    }
+    let mean = lin_sum / (values.len() as f32);
+    if mean > 0.0 {
+        10.0 * mean.log10()
+    } else {
+        -70.0
+    }
+}
+
 fn map_input_to_heights(input: &[f32], out: &mut [f32], db_min: f32, db_range: f32) {
     // Band 0 from the GStreamer spectrum element covers 0 Hz (DC component)
     // which is always abnormally high and causes the leftmost bar to pin at
@@ -207,7 +597,11 @@ fn map_input_to_heights(input: &[f32], out: &mut [f32], db_min: f32, db_range: f
     if in_n == n {
         for i in 0..n {
             let val = input[i];
-            let mut h = if val <= db_min { 0.0 } else { (val - db_min) / db_range };
+            let mut h = if val <= db_min {
+                0.0
+            } else {
+                (val - db_min) / db_range
+            };
             if h < 0.0 {
                 h = 0.0;
             } else if h > 1.0 {
@@ -233,7 +627,11 @@ fn map_input_to_heights(input: &[f32], out: &mut [f32], db_min: f32, db_range: f
         let mut sum = 0.0_f32;
         let mut cnt = 0_usize;
         for &val in &input[x0..x1] {
-            let mut h = if val <= db_min { 0.0 } else { (val - db_min) / db_range };
+            let mut h = if val <= db_min {
+                0.0
+            } else {
+                (val - db_min) / db_range
+            };
             if h < 0.0 {
                 h = 0.0;
             } else if h > 1.0 {
@@ -247,33 +645,260 @@ fn map_input_to_heights(input: &[f32], out: &mut [f32], db_min: f32, db_range: f
 }
 
 fn build_log_bins_impl(input: &[f32], out: &mut [f32]) {
-    // Skip band 0 (DC component) for the same reason as map_input_to_heights.
-    let input = if input.len() > 1 { &input[1..] } else { input };
-    let in_count = input.len();
+    const HALF_RATE_HZ: f32 = 22_050.0;
+    const ANCHOR_FREQS_HZ: [f32; 6] = [200.0, 500.0, 1_000.0, 4_000.0, 8_000.0, 12_000.0];
+    const ANCHOR_FRACTIONS: [f32; 6] = [0.15, 0.32, 0.50, 0.70, 0.87, 0.95];
+    const MAX_FREQ_HZ: f32 = 16_000.0;
+
+    fn spectrum_frequency_range(total_bands: usize, half_rate_hz: f32) -> (f32, f32) {
+        if total_bands <= 1 {
+            return (20.0, half_rate_hz.min(20_000.0));
+        }
+        let band_hz = half_rate_hz / (total_bands as f32);
+        let min_f = 20.0_f32.max(band_hz);
+        let mut max_f = 20_000.0_f32.min(band_hz * ((total_bands.saturating_sub(1)) as f32));
+        if max_f <= min_f {
+            max_f = min_f.max(half_rate_hz);
+        }
+        (min_f, max_f)
+    }
+
+    fn log_display_frequency_range(total_bands: usize, half_rate_hz: f32) -> (f32, f32) {
+        let (_base_min, base_max) = spectrum_frequency_range(total_bands, half_rate_hz);
+        (0.0, base_max.min(MAX_FREQ_HZ))
+    }
+
+    fn log_display_anchor_points(total_bands: usize, half_rate_hz: f32) -> Vec<(f32, f32)> {
+        let (_min_f, max_f) = log_display_frequency_range(total_bands, half_rate_hz);
+        if max_f <= 0.0 {
+            return vec![(0.0, 0.0)];
+        }
+        let mut points = vec![(0.0_f32, 0.0_f32)];
+        for idx in 0..ANCHOR_FREQS_HZ.len() {
+            let freq = ANCHOR_FREQS_HZ[idx];
+            let frac = ANCHOR_FRACTIONS[idx];
+            if freq > 0.0 && freq < max_f && frac > 0.0 && frac < 1.0 {
+                points.push((freq, frac));
+            }
+        }
+        if (points.last().map(|v| v.0).unwrap_or(0.0) - max_f).abs() <= 1e-6 {
+            if let Some(last) = points.last_mut() {
+                *last = (max_f, 1.0);
+            }
+        } else {
+            points.push((max_f, 1.0));
+        }
+        points
+    }
+
+    fn log_display_frequency_at_fraction(
+        frac: f32,
+        points: &[(f32, f32)],
+    ) -> f32 {
+        let p = frac.clamp(0.0, 1.0);
+        if points.is_empty() {
+            return 0.0;
+        }
+        if p <= points[0].1 {
+            return points[0].0;
+        }
+        for idx in 1..points.len() {
+            let (f0, p0) = points[idx - 1];
+            let (f1, p1) = points[idx];
+            if p <= (p1 + 1e-9) {
+                if p1 <= (p0 + 1e-9) {
+                    return f1;
+                }
+                let t = (p - p0) / (p1 - p0);
+                if f0 <= 0.0 || f1 <= 0.0 {
+                    return f0 + ((f1 - f0) * t);
+                }
+                return f0 * (f1 / f0).powf(t);
+            }
+        }
+        points.last().map(|v| v.0).unwrap_or(0.0)
+    }
+
+    fn log_display_eq_gain(freq_hz: f32) -> f32 {
+        let f = 20.0_f32.max(freq_hz);
+        let anchors: [(f32, f32); 6] = [
+            (20.0, 0.50),
+            (100.0, 0.70),
+            (200.0, 1.00),
+            (1_000.0, 1.00),
+            (4_000.0, 1.20),
+            (8_000.0, 1.50),
+        ];
+        if f <= anchors[0].0 {
+            return anchors[0].1;
+        }
+        for idx in 1..anchors.len() {
+            let (f0, g0) = anchors[idx - 1];
+            let (f1, g1) = anchors[idx];
+            if f <= f1 {
+                let span = (f1 / f0).log10();
+                let t = if span > 1e-9 {
+                    (f / f0).log10() / span
+                } else {
+                    1.0
+                };
+                return g0 + ((g1 - g0) * t);
+            }
+        }
+        anchors[anchors.len() - 1].1
+    }
+
+    fn interpolate_series_value(values: &[f32], pos: f32) -> f32 {
+        if values.is_empty() {
+            return 0.0;
+        }
+        if values.len() == 1 {
+            return values[0];
+        }
+        let p = pos.clamp(0.0, (values.len().saturating_sub(1)) as f32);
+        let i0 = p.floor() as usize;
+        let i1 = (i0 + 1).min(values.len().saturating_sub(1));
+        let frac = p - (i0 as f32);
+        (values[i0] * (1.0 - frac)) + (values[i1] * frac)
+    }
+
+    fn resample_linear_average(values: &[f32], out: &mut [f32]) {
+        let in_count = values.len();
+        let out_count = out.len();
+        if in_count == 0 || out_count == 0 {
+            return;
+        }
+        for i in 0..out_count {
+            let t0 = (i as f32) / (out_count as f32);
+            let t1 = ((i + 1) as f32) / (out_count as f32);
+            let mut x0 = (t0 * (in_count as f32)) as usize;
+            let mut x1 = (t1 * (in_count as f32)) as usize;
+            if x0 >= in_count {
+                x0 = in_count - 1;
+            }
+            if x1 <= x0 {
+                x1 = (x0 + 1).min(in_count);
+            } else if x1 > in_count {
+                x1 = in_count;
+            }
+            let mut sum = 0.0_f32;
+            let mut cnt = 0_usize;
+            for &val in &values[x0..x1] {
+                sum += val;
+                cnt += 1;
+            }
+            out[i] = if cnt > 0 { sum / (cnt as f32) } else { 0.0 };
+        }
+    }
+
+    let total_bands = input.len();
+    // Skip band 0 (DC component) for the same reason as the Python path.
+    let usable = if input.len() > 1 { &input[1..] } else { input };
+    let in_count = usable.len();
     let out_count = out.len();
     if in_count == 0 || out_count == 0 {
         return;
     }
+    if in_count == 1 {
+        out.fill(usable[0]);
+        return;
+    }
+
+    let band_hz = HALF_RATE_HZ / (total_bands.max(1) as f32);
+    let (_min_f, max_f) = log_display_frequency_range(total_bands, HALF_RATE_HZ);
+    if max_f <= 0.0 {
+        resample_linear_average(usable, out);
+        return;
+    }
+    let anchor_points = log_display_anchor_points(total_bands, HALF_RATE_HZ);
+
     for i in 0..out_count {
         let t0 = (i as f32) / (out_count as f32);
         let t1 = ((i + 1) as f32) / (out_count as f32);
-        let mut x0 = (t0.powf(2.15) * ((in_count - 1) as f32)) as usize;
-        let mut x1 = (t1.powf(2.15) * ((in_count - 1) as f32)) as usize;
-        if x1 <= x0 {
-            x1 = (x0 + 1).min(in_count - 1);
-        }
-        if x0 >= in_count {
-            x0 = in_count - 1;
-        }
-        let mut sum = 0.0_f32;
-        let mut cnt = 0_usize;
-        for &v in &input[x0..=x1] {
-            sum += v;
-            cnt += 1;
-        }
-        let avg = if cnt > 0 { sum / (cnt as f32) } else { 0.0 };
-        let tilt = 0.92 + (0.16 * ((i as f32) / ((out_count.saturating_sub(1).max(1)) as f32)));
-        out[i] = (avg.max(0.0).min(1.0).powf(0.84) * tilt).max(0.0).min(1.0);
+        let f0 = log_display_frequency_at_fraction(t0, &anchor_points);
+        let f1 = log_display_frequency_at_fraction(t1, &anchor_points);
+        let pos0 = ((f0 / band_hz) - 1.0).max(0.0);
+        let pos1 = (((f1 / band_hz) - 1.0).max(pos0 + 1e-6)).max(0.0);
+        let span = pos1 - pos0;
+        let center_f = (f0 * f1).sqrt();
+        let voiced = if span < 1.0 {
+            // When a display bucket is narrower than one FFT band, probing the
+            // same coarse bin multiple times makes the low end look overly flat.
+            // Probe once at the bucket center, then apply a light contrast curve
+            // so adjacent sub-band bars stay visually distinct.
+            let probe = interpolate_series_value(usable, pos0 + (span * 0.5))
+                .clamp(0.0, 1.0)
+                .powf(1.35);
+            probe * log_display_eq_gain(center_f)
+        } else {
+            let sample_count = ((span * 2.0).ceil() as usize).clamp(2, 32);
+            let mut sum_sq = 0.0_f32;
+            let mut peak = 0.0_f32;
+            for s in 0..sample_count {
+                let t = ((s as f32) + 0.5) / (sample_count as f32);
+                let pos = pos0 + (span * t);
+                let v = interpolate_series_value(usable, pos);
+                sum_sq += v * v;
+                if v > peak {
+                    peak = v;
+                }
+            }
+            let rms = (sum_sq / (sample_count as f32)).sqrt();
+            ((rms * 0.50) + (peak * 0.50)) * log_display_eq_gain(center_f)
+        };
+        out[i] = voiced.clamp(0.0, 1.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bins_max_db, build_log_bins_impl, map_linear_spectrum_impl, map_log_spectrum_impl, mean_power_db};
+
+    #[test]
+    fn build_log_bins_preserves_low_end_shape_for_dense_outputs() {
+        let input: Vec<f32> = (0..512).map(|i| (i as f32) / 511.0).collect();
+        let mut out = vec![0.0_f32; 512];
+        build_log_bins_impl(&input, &mut out);
+        let split = ((0.15_f32 * 512.0).round() as usize).clamp(2, out.len() - 3);
+        assert!(out[0] <= out[split - 1]);
+        assert!(out[split - 1] < out[split]);
+        assert!(out[split] < out[split + 1]);
+    }
+
+    #[test]
+    fn build_log_bins_keeps_dense_low_end_bars_contrasty() {
+        let mut input = vec![0.0_f32; 512];
+        input[3] = 1.0;
+        let mut out = vec![0.0_f32; 256];
+        build_log_bins_impl(&input, &mut out);
+        let peak = out.iter().copied().fold(0.0_f32, f32::max);
+        assert!(peak > 0.0);
+        assert!(out[0] < (peak * 0.30));
+    }
+
+    #[test]
+    fn map_linear_spectrum_preserves_sparse_peak_energy() {
+        let input = vec![-80.0_f32, -80.0, 0.0, -80.0];
+        let mut out = vec![0.0_f32; 1];
+        map_linear_spectrum_impl(&input, &mut out, 4, -80.0, 80.0, 22_050.0);
+        assert!(out[0] > 0.45);
+    }
+
+    #[test]
+    fn map_log_spectrum_handles_empty_input() {
+        let input = Vec::<f32>::new();
+        let mut out = vec![1.0_f32; 8];
+        map_log_spectrum_impl(&input, &mut out, -80.0, 80.0);
+        assert_eq!(out, vec![0.0_f32; 8]);
+    }
+
+    #[test]
+    fn level_metrics_match_expected_peak_and_mean() {
+        let input = vec![-80.0_f32, -20.0, -10.0];
+        assert_eq!(bins_max_db(&input), -10.0);
+        let mean = mean_power_db(&input);
+        assert!(mean > -16.0);
+        assert!(mean < -11.0);
     }
 }
 
@@ -420,7 +1045,12 @@ pub extern "C" fn viz_state_tick_copy(
     out_len: usize,
     bass_out_ptr: *mut f32,
 ) -> usize {
-    if ptr.is_null() || cur_out_ptr.is_null() || trail_out_ptr.is_null() || peak_out_ptr.is_null() || out_len == 0 {
+    if ptr.is_null()
+        || cur_out_ptr.is_null()
+        || trail_out_ptr.is_null()
+        || peak_out_ptr.is_null()
+        || out_len == 0
+    {
         return 0;
     }
     let st = unsafe { &mut *ptr };
@@ -445,6 +1075,138 @@ pub extern "C" fn viz_state_tick_copy(
 }
 
 #[no_mangle]
+pub extern "C" fn viz_state_stereo_new(
+    num_bars: usize,
+    smooth: f32,
+    trail_decay: f32,
+    peak_hold_frames: usize,
+    peak_fall: f32,
+    bass_smooth: f32,
+    balance_smooth: f32,
+) -> *mut StereoVizStateEngine {
+    let hold = peak_hold_frames.min(u16::MAX as usize) as u16;
+    let st = StereoVizStateEngine::new(
+        num_bars,
+        smooth,
+        trail_decay,
+        hold,
+        peak_fall,
+        bass_smooth,
+        balance_smooth,
+    );
+    Box::into_raw(Box::new(st))
+}
+
+#[no_mangle]
+pub extern "C" fn viz_state_stereo_free(ptr: *mut StereoVizStateEngine) {
+    if ptr.is_null() {
+        return;
+    }
+    unsafe {
+        drop(Box::from_raw(ptr));
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn viz_state_stereo_reset(ptr: *mut StereoVizStateEngine) {
+    if ptr.is_null() {
+        return;
+    }
+    let st = unsafe { &mut *ptr };
+    st.reset();
+}
+
+#[no_mangle]
+pub extern "C" fn viz_state_stereo_set_params(
+    ptr: *mut StereoVizStateEngine,
+    smooth: f32,
+    trail_decay: f32,
+    peak_hold_frames: usize,
+    peak_fall: f32,
+    bass_smooth: f32,
+    balance_smooth: f32,
+) -> c_int {
+    if ptr.is_null() {
+        return -1;
+    }
+    let st = unsafe { &mut *ptr };
+    let hold = peak_hold_frames.min(u16::MAX as usize) as u16;
+    st.set_params(
+        smooth,
+        trail_decay,
+        hold,
+        peak_fall,
+        bass_smooth,
+        balance_smooth,
+    );
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn viz_state_stereo_set_targets(
+    ptr: *mut StereoVizStateEngine,
+    left_ptr: *const f32,
+    right_ptr: *const f32,
+    input_len: usize,
+) -> usize {
+    if ptr.is_null() || left_ptr.is_null() || right_ptr.is_null() || input_len == 0 {
+        return 0;
+    }
+    let st = unsafe { &mut *ptr };
+    let left = unsafe { slice::from_raw_parts(left_ptr, input_len) };
+    let right = unsafe { slice::from_raw_parts(right_ptr, input_len) };
+    st.set_targets_from_slices(left, right)
+}
+
+#[no_mangle]
+pub extern "C" fn viz_state_stereo_tick_copy(
+    ptr: *mut StereoVizStateEngine,
+    left_cur_out_ptr: *mut f32,
+    right_cur_out_ptr: *mut f32,
+    left_peak_out_ptr: *mut f32,
+    right_peak_out_ptr: *mut f32,
+    out_len: usize,
+    bass_out_ptr: *mut f32,
+    balance_out_ptr: *mut f32,
+) -> usize {
+    if ptr.is_null()
+        || left_cur_out_ptr.is_null()
+        || right_cur_out_ptr.is_null()
+        || left_peak_out_ptr.is_null()
+        || right_peak_out_ptr.is_null()
+        || out_len == 0
+    {
+        return 0;
+    }
+    let st = unsafe { &mut *ptr };
+    let n = st.left.num_bars.min(out_len);
+    if n == 0 {
+        return 0;
+    }
+    st.tick();
+
+    let left_cur_out = unsafe { slice::from_raw_parts_mut(left_cur_out_ptr, n) };
+    let right_cur_out = unsafe { slice::from_raw_parts_mut(right_cur_out_ptr, n) };
+    let left_peak_out = unsafe { slice::from_raw_parts_mut(left_peak_out_ptr, n) };
+    let right_peak_out = unsafe { slice::from_raw_parts_mut(right_peak_out_ptr, n) };
+    left_cur_out.copy_from_slice(&st.left.current[..n]);
+    right_cur_out.copy_from_slice(&st.right.current[..n]);
+    left_peak_out.copy_from_slice(&st.left.peak[..n]);
+    right_peak_out.copy_from_slice(&st.right.peak[..n]);
+    if !bass_out_ptr.is_null() {
+        unsafe {
+            *bass_out_ptr = (st.left.bass_level + st.right.bass_level) * 0.5;
+        }
+    }
+    if !balance_out_ptr.is_null() {
+        unsafe {
+            *balance_out_ptr = st.balance;
+        }
+    }
+    n
+}
+
+#[no_mangle]
 pub extern "C" fn process_spectrum(
     input_ptr: *const f32,
     input_len: usize,
@@ -460,7 +1222,11 @@ pub extern "C" fn process_spectrum(
     let n = num_bars.min(output_len);
     let input = unsafe { slice::from_raw_parts(input_ptr, input_len) };
     let out = unsafe { slice::from_raw_parts_mut(output_ptr, n) };
-    let safe_range = if db_range.abs() < f32::EPSILON { 60.0 } else { db_range };
+    let safe_range = if db_range.abs() < f32::EPSILON {
+        60.0
+    } else {
+        db_range
+    };
     map_input_to_heights(input, out, db_min, safe_range);
     n
 }
@@ -479,6 +1245,188 @@ pub extern "C" fn build_log_bins(
     let out = unsafe { slice::from_raw_parts_mut(output_ptr, output_len) };
     build_log_bins_impl(input, out);
     output_len
+}
+
+#[no_mangle]
+pub extern "C" fn map_spectrum_linear(
+    input_ptr: *const f32,
+    input_len: usize,
+    num_bars: usize,
+    analysis_bands: usize,
+    db_min: f32,
+    db_range: f32,
+    output_ptr: *mut f32,
+    output_len: usize,
+) -> usize {
+    if input_ptr.is_null() || output_ptr.is_null() || num_bars == 0 || output_len == 0 {
+        return 0;
+    }
+    let n = num_bars.min(output_len);
+    let input = unsafe { slice::from_raw_parts(input_ptr, input_len) };
+    let out = unsafe { slice::from_raw_parts_mut(output_ptr, n) };
+    map_linear_spectrum_impl(input, out, analysis_bands, db_min, db_range, 22_050.0);
+    n
+}
+
+#[no_mangle]
+pub extern "C" fn map_spectrum_log(
+    input_ptr: *const f32,
+    input_len: usize,
+    num_bars: usize,
+    db_min: f32,
+    db_range: f32,
+    output_ptr: *mut f32,
+    output_len: usize,
+) -> usize {
+    if input_ptr.is_null() || output_ptr.is_null() || num_bars == 0 || output_len == 0 {
+        return 0;
+    }
+    let n = num_bars.min(output_len);
+    let input = unsafe { slice::from_raw_parts(input_ptr, input_len) };
+    let out = unsafe { slice::from_raw_parts_mut(output_ptr, n) };
+    map_log_spectrum_impl(input, out, db_min, db_range);
+    n
+}
+
+#[no_mangle]
+pub extern "C" fn compute_level_metrics(
+    left_ptr: *const f32,
+    left_len: usize,
+    right_ptr: *const f32,
+    right_len: usize,
+    left_peak_out: *mut f32,
+    left_mean_out: *mut f32,
+    right_peak_out: *mut f32,
+    right_mean_out: *mut f32,
+) -> c_int {
+    if left_ptr.is_null() || right_ptr.is_null() {
+        return -1;
+    }
+    let left = unsafe { slice::from_raw_parts(left_ptr, left_len) };
+    let right = unsafe { slice::from_raw_parts(right_ptr, right_len) };
+    if !left_peak_out.is_null() {
+        unsafe { *left_peak_out = bins_max_db(left); }
+    }
+    if !left_mean_out.is_null() {
+        unsafe { *left_mean_out = mean_power_db(left); }
+    }
+    if !right_peak_out.is_null() {
+        unsafe { *right_peak_out = bins_max_db(right); }
+    }
+    if !right_mean_out.is_null() {
+        unsafe { *right_mean_out = mean_power_db(right); }
+    }
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn viz_spectrum_sampler_new(max_frames: usize) -> *mut SpectrumFrameSampler {
+    Box::into_raw(Box::new(SpectrumFrameSampler::new(max_frames)))
+}
+
+#[no_mangle]
+pub extern "C" fn viz_spectrum_sampler_free(ptr: *mut SpectrumFrameSampler) {
+    if ptr.is_null() {
+        return;
+    }
+    unsafe {
+        drop(Box::from_raw(ptr));
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn viz_spectrum_sampler_clear(ptr: *mut SpectrumFrameSampler) -> c_int {
+    if ptr.is_null() {
+        return -1;
+    }
+    let sampler = unsafe { &mut *ptr };
+    sampler.clear();
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn viz_spectrum_sampler_push_mono(
+    ptr: *mut SpectrumFrameSampler,
+    pos_s: f64,
+    mono_ptr: *const f32,
+    mono_len: usize,
+) -> c_int {
+    if ptr.is_null() || mono_ptr.is_null() {
+        return -1;
+    }
+    let sampler = unsafe { &mut *ptr };
+    let mono = unsafe { slice::from_raw_parts(mono_ptr, mono_len) };
+    sampler.push_mono(pos_s, mono);
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn viz_spectrum_sampler_push_stereo(
+    ptr: *mut SpectrumFrameSampler,
+    pos_s: f64,
+    mono_ptr: *const f32,
+    mono_len: usize,
+    left_ptr: *const f32,
+    left_len: usize,
+    right_ptr: *const f32,
+    right_len: usize,
+) -> c_int {
+    if ptr.is_null() || mono_ptr.is_null() {
+        return -1;
+    }
+    let sampler = unsafe { &mut *ptr };
+    let mono = unsafe { slice::from_raw_parts(mono_ptr, mono_len) };
+    let left = if left_ptr.is_null() {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(left_ptr, left_len) }
+    };
+    let right = if right_ptr.is_null() {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(right_ptr, right_len) }
+    };
+    sampler.push_stereo(pos_s, mono, left, right);
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn viz_spectrum_sampler_sample_mono(
+    ptr: *mut SpectrumFrameSampler,
+    target_pos_s: f64,
+    out_ptr: *mut f32,
+    out_len: usize,
+) -> usize {
+    if ptr.is_null() || out_ptr.is_null() || out_len == 0 {
+        return 0;
+    }
+    let sampler = unsafe { &mut *ptr };
+    let out = unsafe { slice::from_raw_parts_mut(out_ptr, out_len) };
+    sampler.sample_mono(target_pos_s, out)
+}
+
+#[no_mangle]
+pub extern "C" fn viz_spectrum_sampler_sample_stereo(
+    ptr: *mut SpectrumFrameSampler,
+    target_pos_s: f64,
+    mono_out_ptr: *mut f32,
+    left_out_ptr: *mut f32,
+    right_out_ptr: *mut f32,
+    out_len: usize,
+) -> usize {
+    if ptr.is_null()
+        || mono_out_ptr.is_null()
+        || left_out_ptr.is_null()
+        || right_out_ptr.is_null()
+        || out_len == 0
+    {
+        return 0;
+    }
+    let sampler = unsafe { &mut *ptr };
+    let mono_out = unsafe { slice::from_raw_parts_mut(mono_out_ptr, out_len) };
+    let left_out = unsafe { slice::from_raw_parts_mut(left_out_ptr, out_len) };
+    let right_out = unsafe { slice::from_raw_parts_mut(right_out_ptr, out_len) };
+    sampler.sample_stereo(target_pos_s, mono_out, left_out, right_out)
 }
 
 #[no_mangle]
@@ -573,7 +1521,8 @@ pub extern "C" fn build_neon_spokes(
         if lvl < 0.02 {
             continue;
         }
-        let angle = ((2.0 * std::f32::consts::PI) * ((i as f32) / (bins_len as f32))) + (phase * 0.30);
+        let angle =
+            ((2.0 * std::f32::consts::PI) * ((i as f32) / (bins_len as f32))) + (phase * 0.30);
         let ln = (size * 0.06) + (lvl * max_len);
         let x2 = cx + angle.cos() * ln;
         let y2 = cy + angle.sin() * ln;
@@ -625,15 +1574,15 @@ pub extern "C" fn build_neon_ring_points(
         let f1 = 2.6 + (2.8 * t);
         let f2 = 6.4 + (4.4 * (1.0 - t));
         let ph = (phase * (1.2 + (0.25 * t))) + ((ri as f32) * 0.19);
-        let start_a =
-            (((ri as f32) * 2.399_963_1) + (phase * 0.17) + (t * 1.1)).rem_euclid(2.0 * std::f32::consts::PI);
+        let start_a = (((ri as f32) * 2.399_963_1) + (phase * 0.17) + (t * 1.1))
+            .rem_euclid(2.0 * std::f32::consts::PI);
         for si in 0..seg_n {
             if (w / 6) >= cap {
                 return w;
             }
             let a = start_a + ((2.0 * std::f32::consts::PI) * ((si as f32) / (seg_n as f32)));
-            let wobble_raw = (a * f1 + ph).sin() * warp_amp
-                + (a * f2 - (ph * 1.35)).sin() * (warp_amp * 0.72);
+            let wobble_raw =
+                (a * f1 + ph).sin() * warp_amp + (a * f2 - (ph * 1.35)).sin() * (warp_amp * 0.72);
             let wobble = wobble_raw.clamp(-radius * 0.34, radius * 0.34);
             let rr = (radius + wobble).max(2.0);
             let px = cx + (a.cos() * rr);
@@ -793,7 +1742,9 @@ pub extern "C" fn build_pro_fall_rgba(
         let age = if cols <= 1 {
             1.0
         } else {
-            ((c as f32) / ((cols - 1) as f32)).clamp(0.0, 1.0).powf(1.25)
+            ((c as f32) / ((cols - 1) as f32))
+                .clamp(0.0, 1.0)
+                .powf(1.25)
         };
         for r in 0..rows {
             let raw = frames[c * rows + r];
@@ -1288,10 +2239,15 @@ pub extern "C" fn filter_sort_indices_no_query(
     }
 
     match sort_mode {
-        1 => idxs.sort_unstable_by(|&a, &b| title_rank[a].cmp(&title_rank[b]).then_with(|| a.cmp(&b))),
-        2 => idxs.sort_unstable_by(|&a, &b| artist_rank[a].cmp(&artist_rank[b]).then_with(|| a.cmp(&b))),
-        3 => idxs.sort_unstable_by(|&a, &b| album_rank[a].cmp(&album_rank[b]).then_with(|| a.cmp(&b))),
-        4 => idxs.sort_unstable_by(|&a, &b| durations[a].cmp(&durations[b]).then_with(|| a.cmp(&b))),
+        1 => idxs
+            .sort_unstable_by(|&a, &b| title_rank[a].cmp(&title_rank[b]).then_with(|| a.cmp(&b))),
+        2 => idxs
+            .sort_unstable_by(|&a, &b| artist_rank[a].cmp(&artist_rank[b]).then_with(|| a.cmp(&b))),
+        3 => idxs
+            .sort_unstable_by(|&a, &b| album_rank[a].cmp(&album_rank[b]).then_with(|| a.cmp(&b))),
+        4 => {
+            idxs.sort_unstable_by(|&a, &b| durations[a].cmp(&durations[b]).then_with(|| a.cmp(&b)))
+        }
         _ => {}
     }
 
@@ -1379,10 +2335,15 @@ pub extern "C" fn filter_sort_indices_with_query(
     }
 
     match sort_mode {
-        1 => idxs.sort_unstable_by(|&a, &b| title_rank[a].cmp(&title_rank[b]).then_with(|| a.cmp(&b))),
-        2 => idxs.sort_unstable_by(|&a, &b| artist_rank[a].cmp(&artist_rank[b]).then_with(|| a.cmp(&b))),
-        3 => idxs.sort_unstable_by(|&a, &b| album_rank[a].cmp(&album_rank[b]).then_with(|| a.cmp(&b))),
-        4 => idxs.sort_unstable_by(|&a, &b| durations[a].cmp(&durations[b]).then_with(|| a.cmp(&b))),
+        1 => idxs
+            .sort_unstable_by(|&a, &b| title_rank[a].cmp(&title_rank[b]).then_with(|| a.cmp(&b))),
+        2 => idxs
+            .sort_unstable_by(|&a, &b| artist_rank[a].cmp(&artist_rank[b]).then_with(|| a.cmp(&b))),
+        3 => idxs
+            .sort_unstable_by(|&a, &b| album_rank[a].cmp(&album_rank[b]).then_with(|| a.cmp(&b))),
+        4 => {
+            idxs.sort_unstable_by(|&a, &b| durations[a].cmp(&durations[b]).then_with(|| a.cmp(&b)))
+        }
         _ => {}
     }
 

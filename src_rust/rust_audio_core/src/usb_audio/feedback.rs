@@ -66,9 +66,8 @@ pub struct RateAdapter {
     packets_since_decay: u32,
 }
 
-/// Decay interval: apply one decay step every this many packets.
-/// At 8000 pkt/s (HS microframe) this is once per second.
-const DRIFT_DECAY_INTERVAL_PKTS: u32 = 8_000;
+/// Decay interval target in seconds.
+const DRIFT_DECAY_INTERVAL_SECS: u32 = 1;
 
 /// Amount to decay per step, in ppb.  At 1 step/second this removes
 /// 200 ppb/s ≈ 0.2 ppm/s, draining a +2000 ppb bump in ~10 seconds.
@@ -133,7 +132,8 @@ impl RateAdapter {
 
         // Tick decay counter.
         self.packets_since_decay += 1;
-        if self.packets_since_decay >= DRIFT_DECAY_INTERVAL_PKTS {
+        let decay_interval = self.packets_per_sec.max(1) * DRIFT_DECAY_INTERVAL_SECS.max(1);
+        if self.packets_since_decay >= decay_interval {
             self.packets_since_decay = 0;
             self.decay_drift();
         }
@@ -157,7 +157,8 @@ impl RateAdapter {
     /// host-side FrameQueue has plenty of data — indicating the device ran
     /// out of audio in its internal FIFO.
     pub fn bump_drift(&mut self, ppb: i64) {
-        self.drift_correction_ppb = (self.drift_correction_ppb + ppb).clamp(-DRIFT_MAX_PPB, DRIFT_MAX_PPB);
+        self.drift_correction_ppb =
+            (self.drift_correction_ppb + ppb).clamp(-DRIFT_MAX_PPB, DRIFT_MAX_PPB);
     }
 
     /// Decay the correction toward zero by one step.
@@ -179,11 +180,19 @@ impl RateAdapter {
 // Feedback value parsers
 // ---------------------------------------------------------------------------
 
-/// Parse a UAC 1.0 Full-Speed feedback value (3-byte Q10.14, samples/frame).
+/// Parse a UAC 1.0 feedback value.
 ///
 /// Returns the rate in millisamples per packet (× 1 000 000):
 /// `result / 1_000_000` = samples per 1 ms ISO packet.
-pub fn parse_feedback_uac1(buf: &[u8]) -> Option<i64> {
+pub fn parse_feedback_uac1(buf: &[u8], is_high_speed: bool) -> Option<i64> {
+    if is_high_speed {
+        if buf.len() < 4 {
+            return None;
+        }
+        let raw = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        let millisamples = (raw as i64) * 1_000_000 / (1 << 16);
+        return Some(millisamples);
+    }
     if buf.len() < 3 {
         return None;
     }
@@ -264,6 +273,12 @@ mod tests {
     fn parse_feedback_uac2_48000_microframe_packet() {
         let raw = (6u32 << 16).to_le_bytes();
         assert_eq!(parse_feedback_uac2(&raw, 8_000), Some(6_000_000));
+    }
+
+    #[test]
+    fn parse_feedback_uac1_high_speed_uses_q16_16() {
+        let raw = (6u32 << 16).to_le_bytes();
+        assert_eq!(parse_feedback_uac1(&raw, true), Some(6_000_000));
     }
 
     #[test]

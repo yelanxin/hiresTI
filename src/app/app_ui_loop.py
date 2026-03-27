@@ -11,6 +11,27 @@ from ui import config as ui_config
 logger = logging.getLogger(__name__)
 
 
+def _is_now_playing_overlay_open(self):
+    checker = getattr(self, "is_now_playing_overlay_open", None)
+    if not callable(checker):
+        return False
+    try:
+        return bool(checker())
+    except Exception:
+        return False
+
+
+def _ui_loop_has_high_frequency_consumer(self):
+    if bool(getattr(self, "_seek_user_interacting", False)):
+        return True
+    try:
+        if hasattr(self, "_is_viz_surface_visible") and self._is_viz_surface_visible():
+            return True
+    except Exception:
+        pass
+    return _is_now_playing_overlay_open(self)
+
+
 def on_seek(self, s):
     self._update_progress_thumb_position()
     if self.is_programmatic_update:
@@ -37,6 +58,7 @@ def on_seek(self, s):
                     self._mpris_emit_seeked(float(target))
                 if hasattr(self, "_mpris_sync_position"):
                     self._mpris_sync_position(force=True)
+                    self._ui_last_mpris_sync_ts = GLib.get_monotonic_time() / 1_000_000.0
                 if hasattr(self, "_remote_publish_playback_event"):
                     self._remote_publish_playback_event("seek")
         finally:
@@ -104,24 +126,31 @@ def _restore_paned_position_after_layout(self):
 
 
 def _get_ui_loop_interval_ms(self):
+    viz_visible = False
+    try:
+        viz_visible = bool(hasattr(self, "_is_viz_surface_visible") and self._is_viz_surface_visible())
+    except Exception:
+        viz_visible = False
+    overlay_open = _is_now_playing_overlay_open(self)
+    seek_interacting = bool(getattr(self, "_seek_user_interacting", False))
     is_playing = False
     try:
         is_playing = bool(self.player.is_playing())
     except Exception:
         is_playing = False
 
-    if not self.playing_track_id:
-        return 280
-    if not is_playing:
-        if hasattr(self, "_is_viz_surface_visible") and self._is_viz_surface_visible():
-            return 120
-        return 220
-    if hasattr(self, "_is_viz_surface_visible") and self._is_viz_surface_visible():
+    if viz_visible:
         if self._viz_current_page == "lyrics":
             return 25
         return 40
-    # No visualizer/lyrics drawer visible: keep UI updates responsive but reduce idle wakeups.
-    return 160
+    if seek_interacting or overlay_open:
+        return 90 if is_playing else 120
+    if not self.playing_track_id:
+        return 320
+    if not is_playing:
+        return 320
+    # Hidden steady-state playback should avoid waking the GTK/Python loop too often.
+    return 280
 
 
 def _schedule_update_ui_loop(self, delay_ms=None):

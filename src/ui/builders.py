@@ -22,15 +22,19 @@ logger = logging.getLogger(__name__)
 _SEARCH_HEADER_DRAG_THRESHOLD_PX = 6.0
 
 
+def _hide_dr_meter_debug() -> bool:
+    return str(os.getenv("HIRESTI_VIZ_HIDE_DR_METER", "0")).strip().lower() in ("1", "true", "yes", "on")
+
+
 def _sidebar_nav_sections():
     return [
         (
             "DISCOVER",
             [
                 ("home", "hiresti-home-symbolic", "Home"),
-                ("new", "starred-symbolic", "New"),
-                ("top", "view-grid-symbolic", "Top"),
-                ("hires", "audio-x-generic-symbolic", "Hi-Res"),
+                ("new", "hiresti-new-symbolic", "New"),
+                ("top", "hiresti-top-symbolic", "Top"),
+                ("hires", "hiresti-hires-symbolic", "Hi-Res"),
                 ("genres", "hiresti-genres-symbolic", "Genres"),
                 ("decades", "hiresti-decades-symbolic", "Decades"),
                 ("moods", "hiresti-moods-symbolic", "Moods"),
@@ -897,7 +901,7 @@ def build_body(app, container):
     right_ctrl_box.append(app.viz_profile_dd)
     right_ctrl_box.append(app.viz_effect_dd)
     right_ctrl_box.append(app.viz_theme_dd)
-    app.viz_fullscreen_btn = Gtk.Button(icon_name="view-fullscreen-symbolic", css_classes=["flat", "viz-overlay-btn"])
+    app.viz_fullscreen_btn = Gtk.Button(icon_name="hiresti-view-fullscreen-symbolic", css_classes=["flat", "viz-overlay-btn"])
     app.viz_fullscreen_btn.set_tooltip_text("Expand Waveform")
     app.viz_fullscreen_btn.connect("clicked", app.toggle_viz_fullscreen)
     app.viz_fullscreen_btn.set_size_request(35, 35)
@@ -986,7 +990,10 @@ def build_body(app, container):
     app.dr_meter.set_vexpand(False)
     app.dr_meter.set_valign(Gtk.Align.END)
     app.dr_meter.set_size_request(84, _dr_h)
-    app.viz_main_row.append(app.dr_meter)
+    if not _hide_dr_meter_debug():
+        app.viz_main_row.append(app.dr_meter)
+    else:
+        app.dr_meter.set_visible(False)
 
     app.viz_content_overlay = Gtk.Overlay()
     app.viz_content_overlay.set_hexpand(True)
@@ -1064,7 +1071,7 @@ def build_player_bar(app, container):
     app.mini_controls.set_margin_end(6)
     app.mini_controls.set_visible(False)
 
-    m_restore = Gtk.Button(icon_name="view-fullscreen-symbolic", css_classes=["flat", "circular"])
+    m_restore = Gtk.Button(icon_name="hiresti-view-fullscreen-symbolic", css_classes=["flat", "circular"])
     m_restore.set_tooltip_text("Restore to Default View")
     m_restore.connect("clicked", app.toggle_mini_mode)
 

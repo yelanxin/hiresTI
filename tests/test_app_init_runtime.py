@@ -176,11 +176,13 @@ def test_init_audio_and_data_services_sets_up_player_and_cache(tmp_path, monkeyp
     monkeypatch.setattr(mod, "LyricsManager", lambda: "lyrics_mgr")
     monkeypatch.setattr(mod, "HistoryManager", _Mgr)
     monkeypatch.setattr(mod, "PlaylistManager", _Mgr)
+    monkeypatch.setattr(mod, "DspPresetManager", lambda config_dir: SimpleNamespace(config_dir=config_dir))
 
     root = tmp_path / "cache"
     root.mkdir()
     app = SimpleNamespace()
     app._cache_root = str(root)
+    app._config_root = str(root)
     app._account_scope = "guest"
     app.settings = {
         "viz_sync_device_offsets": {"dev_a": 10},
@@ -204,12 +206,16 @@ def test_init_audio_and_data_services_sets_up_player_and_cache(tmp_path, monkeyp
     app.update_tech_label = lambda *a, **k: None
     app.on_spectrum_data = lambda *a, **k: None
     app.on_viz_sync_offset_update = lambda *a, **k: None
+    app._on_hw_volume_ready = lambda: None
+    app._on_hw_volume_changed = lambda raw: None
     called = []
     app._schedule_cache_maintenance = lambda: called.append("scheduled")
 
     mod._init_audio_and_data_services(app)
 
     assert app.player is player
+    assert app.player._on_hw_volume_ready_callback is app._on_hw_volume_ready
+    assert app.player._on_hw_volume_changed_callback is app._on_hw_volume_changed
     assert app._viz_sync_device_key is None
     assert app._viz_sync_offsets == {"dev_a": 10}
     assert app._viz_sync_last_saved_ms == 40

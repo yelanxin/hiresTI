@@ -31,11 +31,14 @@ mod dsp;
 pub mod usb_audio;
 
 use alsa_clock::{AlsaHwClock, AlsaHwClockFeed};
-use dsp::{DspGraphConfig, DspGraphRuntime, LufsValues, PEQ_BAND_COUNT};
+use dsp::{
+    DspGraphConfig, DspGraphRuntime, LufsValues, PEQ_BAND_COUNT,
+    SPECTRUM_ACTIVE_BANDS_DEFAULT,
+};
 
 static GST_INIT: Once = Once::new();
 static PW_INIT: Once = Once::new();
-const SPECTRUM_BANDS_MAX: usize = 512;
+const SPECTRUM_BANDS_MAX: usize = 2048;
 const SPECTRUM_RING_CAP: usize = 512;
 const PIPEWIRE_CARD_PROFILE_TARGET_PREFIX: &str = "pwcardprofile:";
 
@@ -846,6 +849,21 @@ struct UsbSinkHandle {
     bit_depth: u8,
     /// Human-readable device name (from USB string descriptor).
     device_name: String,
+    /// Hardware volume target in 1/256 dB raw units.
+    /// `i32::MIN` means "no change pending".
+    /// Written by the main thread (FFI), read by the pusher thread.
+    hw_volume_target: Arc<AtomicI32>,
+    /// Whether the device supports hardware volume control (Feature Unit).
+    hw_volume_supported: bool,
+    /// Hardware volume range: (min_raw, max_raw, res_raw) in 1/256 dB.
+    /// Set by the pusher thread after the device is opened; read by FFI.
+    /// Packed as `(min << 16) | (max & 0xFFFF)` and `res` separately.
+    hw_volume_min: Arc<AtomicI32>,
+    hw_volume_max: Arc<AtomicI32>,
+    hw_volume_res: Arc<AtomicI32>,
+    /// Last observed hardware volume from GET_CUR in 1/256 dB raw units.
+    /// `i32::MIN` means "unknown / not yet observed".
+    hw_volume_current: Arc<AtomicI32>,
 }
 
 impl std::fmt::Debug for UsbSinkHandle {
@@ -885,6 +903,9 @@ impl Drop for UsbSinkHandle {
 struct LazyUsbOpen {
     device_id: String,
     bit_depth: u8,
+    /// Stream profile selected at build time so lazy-open reuses the same
+    /// channels / format family instead of drifting to a different alt.
+    alt_profile: usb_audio::UacAltProfile,
     /// Clock feed shared with the GStreamer AlsaHwClock.  Anchored the first
     /// time the device is opened.
     feed: Arc<AlsaHwClockFeed>,
@@ -907,6 +928,137 @@ struct LazyUsbOpen {
     spectrum_reset_after_open: Arc<AtomicBool>,
     /// Shared with `UsbSinkHandle::anchor_stream_pos_ns`.
     anchor_stream_pos_ns: Arc<AtomicU64>,
+    /// Shared with `UsbSinkHandle::hw_volume_target`.
+    hw_volume_target: Arc<AtomicI32>,
+    /// Shared with `UsbSinkHandle::hw_volume_{min,max,res}`.
+    hw_volume_min: Arc<AtomicI32>,
+    hw_volume_max: Arc<AtomicI32>,
+    hw_volume_res: Arc<AtomicI32>,
+    /// Shared with `UsbSinkHandle::hw_volume_current`.
+    hw_volume_current: Arc<AtomicI32>,
+}
+
+fn reset_usb_hw_volume_state(lazy: &LazyUsbOpen) {
+    lazy.hw_volume_min.store(0, Ordering::Relaxed);
+    lazy.hw_volume_max.store(0, Ordering::Relaxed);
+    lazy.hw_volume_res.store(1, Ordering::Relaxed);
+    lazy.hw_volume_current.store(i32::MIN, Ordering::Relaxed);
+}
+
+struct UsbHwVolumeWorker {
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl UsbHwVolumeWorker {
+    fn spawn(
+        control_dev: Arc<Mutex<usb_audio::OpenUsbDevice>>,
+        lazy: &LazyUsbOpen,
+        events: ThreadEventQueue,
+    ) -> Self {
+        const USB_HW_VOLUME_POLL_MS: u64 = 500;
+        const USB_HW_VOLUME_IDLE_MS: u64 = 25;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = Arc::clone(&stop);
+        let target = Arc::clone(&lazy.hw_volume_target);
+        let min_raw = Arc::clone(&lazy.hw_volume_min);
+        let max_raw = Arc::clone(&lazy.hw_volume_max);
+        let res_raw = Arc::clone(&lazy.hw_volume_res);
+        let current_raw = Arc::clone(&lazy.hw_volume_current);
+
+        let thread = thread::spawn(move || {
+            let mut last_current = i32::MIN;
+            let mut range_probed = false;
+            let mut last_poll = std::time::Instant::now()
+                - std::time::Duration::from_millis(USB_HW_VOLUME_POLL_MS);
+
+            while !stop_clone.load(Ordering::Relaxed) {
+                let target_raw = target.swap(i32::MIN, Ordering::Relaxed);
+                let poll_now =
+                    last_poll.elapsed() >= std::time::Duration::from_millis(USB_HW_VOLUME_POLL_MS);
+
+                if target_raw == i32::MIN && !poll_now {
+                    thread::sleep(std::time::Duration::from_millis(USB_HW_VOLUME_IDLE_MS));
+                    continue;
+                }
+
+                let open_dev = control_dev.lock().unwrap_or_else(|e| e.into_inner());
+
+                if !range_probed {
+                    match open_dev.get_hw_volume_range() {
+                        Some((min, max, res)) => {
+                            min_raw.store(min as i32, Ordering::Relaxed);
+                            max_raw.store(max as i32, Ordering::Relaxed);
+                            res_raw.store(res as i32, Ordering::Relaxed);
+                            eprintln!(
+                                "usb-audio: hw volume range min={} max={} res={} (1/256 dB) = {:.1}..{:.1} dB",
+                                min,
+                                max,
+                                res,
+                                min as f64 / 256.0,
+                                max as f64 / 256.0,
+                            );
+                        }
+                        None => {
+                            eprintln!(
+                                "usb-audio: hw volume range query deferred worker returned None"
+                            );
+                        }
+                    }
+                    range_probed = true;
+                }
+
+                if target_raw != i32::MIN {
+                    match open_dev.set_hw_volume(target_raw as i16) {
+                        Ok(()) => {
+                            eprintln!("usb-audio: hw volume set to {} (raw 1/256dB)", target_raw)
+                        }
+                        Err(e) => eprintln!("usb-audio: hw volume set failed: {}", e),
+                    }
+                }
+
+                if target_raw != i32::MIN || poll_now {
+                    if poll_now {
+                        last_poll = std::time::Instant::now();
+                    }
+                    if let Some(current) = open_dev.get_hw_volume() {
+                        let current = current as i32;
+                        current_raw.store(current, Ordering::Relaxed);
+                        if last_current != i32::MIN && current != last_current {
+                            eprintln!(
+                                "usb-audio: hw volume actual current={} ({:+.2} dB) previous={} ({:+.2} dB)",
+                                current,
+                                current as f64 / 256.0,
+                                last_current,
+                                last_current as f64 / 256.0,
+                            );
+                            push_thread_event(&events, EVT_STATE, format!("usb-hw-volume={current}"));
+                        }
+                        last_current = current;
+                    }
+                }
+            }
+        });
+
+        Self {
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn stop_and_join(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for UsbHwVolumeWorker {
+    fn drop(&mut self) {
+        self.stop_and_join();
+    }
 }
 
 /// Background thread: drains the GStreamer appsink and pushes PCM bytes into
@@ -931,11 +1083,7 @@ fn set_usb_thread_realtime(label: &str, priority: i32) {
         let param = libc::sched_param {
             sched_priority: priority,
         };
-        let rc = libc::pthread_setschedparam(
-            libc::pthread_self(),
-            libc::SCHED_FIFO,
-            &param,
-        );
+        let rc = libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &param);
         if rc == 0 {
             eprintln!("usb-audio: {} SCHED_FIFO priority={}", label, priority);
         } else {
@@ -960,6 +1108,7 @@ fn usb_audio_pusher_thread(
 
     // Opened lazily on first sample.
     let mut sink: Option<usb_audio::UsbAudioSink> = None;
+    let mut hw_volume_worker: Option<UsbHwVolumeWorker> = None;
     let mut dop_enc: Option<usb_audio::DopEncoder> = None;
     let mut last_xruns: u64 = 0;
     let mut startup_prefill: Vec<u8> = Vec::new();
@@ -978,11 +1127,11 @@ fn usb_audio_pusher_thread(
     // Enabled by HIRESTI_USB_PCM_DUMP=/path/to/output.raw
     // Format: S32LE interleaved stereo, same rate as playback.
     // Import in Audacity: File → Import → Raw Data → Signed 32-bit LE, Stereo, rate.
-    let mut pcm_dump: Option<std::io::BufWriter<std::fs::File>> = std::env::var("HIRESTI_USB_PCM_DUMP")
-        .ok()
-        .filter(|p| !p.is_empty())
-        .and_then(|path| {
-            match std::fs::File::create(&path) {
+    let mut pcm_dump: Option<std::io::BufWriter<std::fs::File>> =
+        std::env::var("HIRESTI_USB_PCM_DUMP")
+            .ok()
+            .filter(|p| !p.is_empty())
+            .and_then(|path| match std::fs::File::create(&path) {
                 Ok(f) => {
                     eprintln!("usb-audio: PCM dump enabled → {}", path);
                     Some(std::io::BufWriter::with_capacity(256 * 1024, f))
@@ -991,14 +1140,13 @@ fn usb_audio_pusher_thread(
                     eprintln!("usb-audio: PCM dump failed to open {}: {}", path, e);
                     None
                 }
-            }
-        });
+            });
 
     // Queue depth trend tracking: sample min/max each period + session-wide min.
     let mut queue_min: usize = usize::MAX;
     let mut queue_max: usize = 0;
     let mut queue_min_session: usize = usize::MAX; // lowest depth seen this session
-    // Timestamp (seconds since session start) when queue_min was last updated.
+                                                   // Timestamp (seconds since session start) when queue_min was last updated.
     let mut queue_min_at_sec: f64 = 0.0;
     let session_start = std::time::Instant::now();
     // Count buffers received so we can log the first few for PTS diagnostics.
@@ -1085,10 +1233,14 @@ fn usb_audio_pusher_thread(
                         "usb-audio: closing idle USB sink (non-PLAYING for ~{}s)",
                         idle_with_sink_ms / 1000
                     );
+                    if let Some(mut worker) = hw_volume_worker.take() {
+                        worker.stop_and_join();
+                    }
                     if let Some(ref mut s) = sink {
                         s.set_skip_release_on_drop(true);
                     }
                     sink = None;
+                    reset_usb_hw_volume_state(&lazy);
                     dop_enc = None;
                     buf_count = 0;
                     idle_with_sink_ms = 0;
@@ -1120,10 +1272,7 @@ fn usb_audio_pusher_thread(
                         * s.state.bytes_per_sample as u64)
                         .max(1)
             });
-            eprintln!(
-                "usb-audio: slow pull {}ms (queue={}ms)",
-                pull_ms, q_ms,
-            );
+            eprintln!("usb-audio: slow pull {}ms (queue={}ms)", pull_ms, q_ms,);
         }
 
         // Report any new xruns accumulated during the pull wait.
@@ -1154,12 +1303,15 @@ fn usb_audio_pusher_thread(
                 });
                 let state = appsink.current_state();
                 eprintln!(
-                    "usb-audio: pull timeout #{} (pipeline stalled ≥100ms, queue={}ms, appsink={:?})",
-                    pull_timeout_count, q_ms, state,
+                    "usb-audio: pull timeout #{} (pipeline stalled {}ms, timeout=100ms, queue={}ms, appsink={:?})",
+                    pull_timeout_count, pull_ms, q_ms, state,
                 );
             }
-            thread::sleep(std::time::Duration::from_millis(idle_sleep_ms));
-            idle_sleep_ms = (idle_sleep_ms * 2).min(MAX_IDLE_MS);
+            // `try-pull-sample` has already blocked for 100 ms.  Sleeping again
+            // here only extends producer starvation while the USB ring keeps
+            // draining the queued audio, increasing the chance of an avoidable
+            // xrun/click after an upstream decode stall.
+            idle_sleep_ms = MIN_IDLE_MS;
             continue;
         };
 
@@ -1194,6 +1346,9 @@ fn usb_audio_pusher_thread(
                  (caps_rate={:?})",
                 sample_caps_rate
             );
+            if let Some(mut worker) = hw_volume_worker.take() {
+                worker.stop_and_join();
+            }
             // Invalidate the clock feed BEFORE dropping the sink so the
             // AlsaHwClock falls back to CLOCK_MONOTONIC immediately.
             lazy.feed.invalidate();
@@ -1204,6 +1359,7 @@ fn usb_audio_pusher_thread(
                 s.set_skip_release_on_drop(true);
             }
             sink = None;
+            reset_usb_hw_volume_state(&lazy);
             dop_enc = None;
             buf_count = 0;
             startup_prefill.clear();
@@ -1219,11 +1375,15 @@ fn usb_audio_pusher_thread(
                     "usb-audio: sample rate change {} Hz → {} Hz; re-opening device",
                     s.actual_rate, new_rate
                 );
+                if let Some(mut worker) = hw_volume_worker.take() {
+                    worker.stop_and_join();
+                }
                 lazy.feed.invalidate();
                 if let Some(ref mut s) = sink {
                     s.set_skip_release_on_drop(true);
                 }
                 sink = None;
+                reset_usb_hw_volume_state(&lazy);
                 dop_enc = None;
                 buf_count = 0;
                 startup_prefill.clear();
@@ -1246,8 +1406,7 @@ fn usb_audio_pusher_thread(
                     buf.pts(),
                     buf.size(),
                     sink.as_ref().map_or(0, |s| {
-                        s.queue.available_read() as u64
-                            * 1000
+                        s.queue.available_read() as u64 * 1000
                             / (s.state.rate as u64
                                 * s.state.channels as u64
                                 * s.state.bytes_per_sample as u64)
@@ -1293,7 +1452,10 @@ fn usb_audio_pusher_thread(
                         for c in 0..ch {
                             let off = f * frame_bytes + c * bps;
                             let cur = i32::from_le_bytes([
-                                data[off], data[off + 1], data[off + 2], data[off + 3],
+                                data[off],
+                                data[off + 1],
+                                data[off + 2],
+                                data[off + 3],
                             ]);
                             if click_hist_count >= 2 {
                                 // Check if prev1 (click_hist[c][1]) is a spike:
@@ -1364,6 +1526,7 @@ fn usb_audio_pusher_thread(
                         lazy.bit_depth,
                         Arc::clone(&lazy.feed),
                         Some(startup_prefill.as_slice()),
+                        Some(lazy.alt_profile),
                     ) {
                         Ok(s) => {
                             let actual = s.actual_rate;
@@ -1398,6 +1561,28 @@ fn usb_audio_pusher_thread(
                                 buf_ns / 1_000_000
                             );
                             sink = Some(s);
+                            if let Some(ref mut sn) = sink {
+                                if let Err(e) = sn.ensure_started() {
+                                    startup_prefill.clear();
+                                    push_thread_event(
+                                        &events,
+                                        EVT_ERROR,
+                                        format!("usb-audio: deferred ring start failed: {e}"),
+                                    );
+                                    return;
+                                }
+                            }
+                            if let Some(ref sn) = sink {
+                                if sn.has_hw_volume() {
+                                    hw_volume_worker = Some(UsbHwVolumeWorker::spawn(
+                                        sn.control_device(),
+                                        &lazy,
+                                        Arc::clone(&events),
+                                    ));
+                                } else {
+                                    reset_usb_hw_volume_state(&lazy);
+                                }
+                            }
                             // anchor_stream_pos_ns was already recorded when the
                             // first prefill sample arrived — that is the true DAC
                             // start position.  Do NOT overwrite it here (pipeline
@@ -1431,7 +1616,7 @@ fn usb_audio_pusher_thread(
                 }
 
                 let s = sink
-                    .as_ref()
+                    .as_mut()
                     .expect("startup prefill opens sink before push");
                 let mut written = 0;
                 let mut queue_full_retries: u32 = 0;
@@ -1465,6 +1650,14 @@ fn usb_audio_pusher_thread(
                         std::thread::sleep(Duration::from_micros(250));
                     }
                 }
+                if let Err(e) = s.ensure_started() {
+                    push_thread_event(
+                        &events,
+                        EVT_ERROR,
+                        format!("usb-audio: deferred ring start failed: {e}"),
+                    );
+                    return;
+                }
                 push_bytes_window += data.len() as u64;
             }
         }
@@ -1477,8 +1670,12 @@ fn usb_audio_pusher_thread(
                     queue_min = qd;
                     queue_min_at_sec = session_start.elapsed().as_secs_f64();
                 }
-                if qd > queue_max { queue_max = qd; }
-                if qd < queue_min_session { queue_min_session = qd; }
+                if qd > queue_max {
+                    queue_max = qd;
+                }
+                if qd < queue_min_session {
+                    queue_min_session = qd;
+                }
             }
         }
 
@@ -1489,8 +1686,7 @@ fn usb_audio_pusher_thread(
                 let drain_total = s.state.bytes_drained_total.load(Ordering::Relaxed);
                 let drain_delta = drain_total.wrapping_sub(last_drain_snapshot);
                 let secs = elapsed.as_secs_f64();
-                let frame_bytes =
-                    s.state.channels as u64 * s.state.bytes_per_sample as u64;
+                let frame_bytes = s.state.channels as u64 * s.state.bytes_per_sample as u64;
                 let expected = s.state.rate as u64 * frame_bytes;
                 let xrun_total = s.state.xruns.load(Ordering::Relaxed);
                 let xrun_delta = xrun_total.wrapping_sub(last_xrun_snapshot);
@@ -1502,7 +1698,11 @@ fn usb_audio_pusher_thread(
                 let feedback_mode = if feedback_val.is_some() {
                     "live"
                 } else if s.state.has_feedback_ep {
-                    if feedback_tracking { "armed" } else { "lost" }
+                    if feedback_tracking {
+                        "armed"
+                    } else {
+                        "lost"
+                    }
                 } else {
                     "none"
                 };
@@ -1516,20 +1716,34 @@ fn usb_audio_pusher_thread(
                 // Convert queue bytes to ms for readability.
                 let bytes_per_ms = (expected / 1000).max(1);
                 let q_now_ms = queue_now as u64 / bytes_per_ms;
-                let q_min_ms = if queue_min == usize::MAX { 0 } else { queue_min as u64 / bytes_per_ms };
+                let q_min_ms = if queue_min == usize::MAX {
+                    0
+                } else {
+                    queue_min as u64 / bytes_per_ms
+                };
                 let q_max_ms = queue_max as u64 / bytes_per_ms;
-                let q_min_session_ms = if queue_min_session == usize::MAX { 0 } else { queue_min_session as u64 / bytes_per_ms };
+                let q_min_session_ms = if queue_min_session == usize::MAX {
+                    0
+                } else {
+                    queue_min_session as u64 / bytes_per_ms
+                };
                 // feedback in Hz for readability (millisamples/pkt → Hz)
-                let feedback_hz = feedback_val.map(|ms| {
-                    ms as f64 / 1_000_000.0 * s.state.packets_per_sec as f64
-                });
+                let feedback_hz =
+                    feedback_val.map(|ms| ms as f64 / 1_000_000.0 * s.state.packets_per_sec as f64);
                 // Drift correction and packet scheduler target from RateAdapter.
                 let nominal_rate_hz = s.state.rate as f64;
                 let nominal_ms = nominal_rate_hz * 1_000_000.0 / s.state.packets_per_sec as f64;
-                let (drift_ppb, sched_ms) = s.state.rate_adapter
+                let (drift_ppb, sched_ms) = s
+                    .state
+                    .rate_adapter
                     .lock()
                     .ok()
-                    .map(|a| (a.drift_correction_ppb(), a.target_millisamples(feedback_val) as f64))
+                    .map(|a| {
+                        (
+                            a.drift_correction_ppb(),
+                            a.target_millisamples(feedback_val) as f64,
+                        )
+                    })
                     .unwrap_or((0, nominal_ms));
                 let sched_rate_hz = sched_ms * s.state.packets_per_sec as f64 / 1_000_000.0;
                 let sched_ppm = if nominal_rate_hz > 0.0 {
@@ -1551,8 +1765,15 @@ fn usb_audio_pusher_thread(
                 // Snapshot and reset ISO completion jitter stats.
                 let jitter_events = s.state.iso_jitter_events.load(Ordering::Relaxed);
                 let iso_max_us = s.state.iso_interval_max_us.swap(0, Ordering::Relaxed);
-                let iso_min_us = s.state.iso_interval_min_us.swap(u64::MAX, Ordering::Relaxed);
-                let iso_min_display = if iso_min_us == u64::MAX { 0 } else { iso_min_us };
+                let iso_min_us = s
+                    .state
+                    .iso_interval_min_us
+                    .swap(u64::MAX, Ordering::Relaxed);
+                let iso_min_display = if iso_min_us == u64::MAX {
+                    0
+                } else {
+                    iso_min_us
+                };
                 let cb_max_us = s.state.callback_max_us.swap(0, Ordering::Relaxed);
                 eprintln!(
                     "usb-audio: push={:.0} drain={:.0} expected={} B/s | \
@@ -1590,7 +1811,8 @@ fn usb_audio_pusher_thread(
                     click_count,
                 );
                 if !s.state.has_feedback_ep {
-                    if let (Some(cal_rate_hz), Some(sample_debt)) = (cal_rate, sample_debt_per_sec) {
+                    if let (Some(cal_rate_hz), Some(sample_debt)) = (cal_rate, sample_debt_per_sec)
+                    {
                         if sample_debt.abs() >= 0.5
                             && last_no_feedback_drift_log.elapsed().as_secs_f64() >= 5.0
                         {
@@ -1703,7 +1925,9 @@ fn usb_audio_startup_prefill_target_bytes(
         (usb_audio::transfer::N_TRANSFERS * usb_audio::transfer::N_PACKETS_TARGET_MS * 2) as u64;
     let bytes =
         rate as u128 * channels as u128 * bytes_per_sample as u128 * startup_ms as u128 / 1000;
-    bytes.min(usize::MAX as u128) as usize
+    bytes
+        .min(usb_audio::FrameQueue::capacity_bytes() as u128)
+        .min(usize::MAX as u128) as usize
 }
 
 /// Map a GStreamer format preference string to a bit depth.
@@ -2206,6 +2430,8 @@ pub struct Engine {
     source_depth: i32,
     preferred_output_format: String,
     spectrum_enabled: bool,
+    spectrum_stereo_enabled: bool,
+    spectrum_active_bands: u32,
     mmap_sink: Option<MmapSink>,
     usb_sink: Option<UsbSinkHandle>,
     /// USB rawlink clock alignment: 0 = push (default), 1 = pull (Level 3).
@@ -2914,6 +3140,16 @@ impl Engine {
         let _ = self.sync_audio_filter_graph();
     }
 
+    fn set_spectrum_stereo_enabled(&mut self, enabled: bool) {
+        self.spectrum_stereo_enabled = enabled;
+        let _ = self.sync_audio_filter_graph();
+    }
+
+    fn set_spectrum_active_bands(&mut self, bands: u32) {
+        self.spectrum_active_bands = bands.clamp(2, SPECTRUM_BANDS_MAX as u32);
+        let _ = self.sync_audio_filter_graph();
+    }
+
     /// Returns whether a DSP bin is currently attached as playbin's audio-filter.
     /// Queries playbin directly, so it is always in sync with GStreamer's internal
     /// state (e.g. after set_state(Null) resets the property automatically).
@@ -2945,18 +3181,16 @@ impl Engine {
             return Ok(());
         };
 
-        graph.set_spectrum_messages_enabled(self.spectrum_enabled);
+        graph.set_spectrum_runtime_enabled(
+            self.spectrum_enabled,
+            self.spectrum_stereo_enabled,
+            self.spectrum_active_bands,
+        );
         graph.apply_config(&self.dsp_config)?;
 
-        if self.spectrum_enabled || self.dsp_config.has_active_processing() {
-            if !filter_attached {
-                let elem = graph.bin_element();
-                self.playbin.set_property("audio-filter", &elem);
-            }
-            // Already attached; apply_config already hot-updated plugin properties.
-        } else if filter_attached {
-            self.playbin
-                .set_property("audio-filter", Option::<gst::Element>::None);
+        if !filter_attached {
+            let elem = graph.bin_element();
+            self.playbin.set_property("audio-filter", &elem);
         }
         Ok(())
     }
@@ -3813,8 +4047,7 @@ impl Engine {
                     if self.spectrum_lead_ms <= 0.0 {
                         self.spectrum_lead_ms = lead_ms;
                     } else {
-                        self.spectrum_lead_ms =
-                            self.spectrum_lead_ms * 0.9 + lead_ms * 0.1;
+                        self.spectrum_lead_ms = self.spectrum_lead_ms * 0.9 + lead_ms * 0.1;
                     }
                 }
             }
@@ -3878,9 +4111,10 @@ impl Engine {
         }
 
         let dsp_config = DspGraphConfig::default();
+        let spectrum_enabled = false;
         let mut audio_filter_graph = DspGraphRuntime::build(&dsp_config).ok();
         if let Some(ref mut graph) = audio_filter_graph {
-            graph.set_spectrum_messages_enabled(true);
+            graph.set_spectrum_runtime_enabled(spectrum_enabled, false, SPECTRUM_ACTIVE_BANDS_DEFAULT);
             let _ = graph.apply_config(&dsp_config);
             let elem = graph.bin_element();
             playbin.set_property("audio-filter", &elem);
@@ -3923,7 +4157,9 @@ impl Engine {
             source_rate: 0,
             source_depth: 0,
             preferred_output_format: String::new(),
-            spectrum_enabled: true,
+            spectrum_enabled,
+            spectrum_stereo_enabled: false,
+            spectrum_active_bands: SPECTRUM_ACTIVE_BANDS_DEFAULT,
             mmap_sink: None,
             usb_sink: None,
             usb_clock_mode: 0,
@@ -4065,10 +4301,7 @@ impl Engine {
                     let percent = b.percent();
                     let prev_pct = self.buffering_pct.swap(percent, Ordering::Relaxed);
                     if percent == 0 || percent == 100 || (prev_pct < 100 && percent >= 100) {
-                        eprintln!(
-                            "usb-audio: network buffering {}%",
-                            percent,
-                        );
+                        eprintln!("usb-audio: network buffering {}%", percent,);
                     }
                     self.emit_event(EVT_STATE, &format!("buffering={}", percent));
                 }
@@ -4158,7 +4391,7 @@ impl Engine {
     fn build_appsink_usb(
         &self,
         device_id: &str,
-    ) -> Result<(gst::Element, UsbSinkHandle, AlsaHwClock), String> {
+    ) -> Result<(gst::Element, String, UsbSinkHandle, AlsaHwClock), String> {
         // Enumerate to find the device and determine its native format.
         let dev = usb_audio::device::enumerate_usb_audio_devices()
             .into_iter()
@@ -4177,28 +4410,20 @@ impl Engine {
         // `best_alt()` will choose in the lazy-open path (which also prefers
         // largest max_packet for UAC 2.0).  Using a mismatched alt here would
         // give wrong `channels`/`gst_format` in the appsink caps.
-        use usb_audio::descriptor::UacVersion;
-        let alt = if dev.uac_version == UacVersion::V2 {
-            let with_depth: Vec<_> = dev
-                .alts
-                .iter()
-                .filter(|a| pref_depth == 0 || a.bit_depth == pref_depth)
-                .collect();
-            if let Some(a) = with_depth.iter().max_by_key(|a| a.max_packet) {
-                *a
-            } else {
-                dev.alts
-                    .iter()
-                    .max_by_key(|a| (a.bit_depth, a.max_packet))
-                    .ok_or_else(|| "USB device has no usable alt-settings".to_string())?
-            }
-        } else {
-            dev.alts
-                .iter()
-                .find(|a| pref_depth == 0 || a.bit_depth == pref_depth)
-                .or_else(|| dev.alts.iter().max_by_key(|a| a.bit_depth))
-                .ok_or_else(|| "USB device has no usable alt-settings".to_string())?
-        };
+        let alt_profile = dev
+            .best_alt_profile(pref_depth)
+            .ok_or_else(|| "USB device has no usable alt-settings".to_string())?;
+        let alt = dev
+            .alts
+            .iter()
+            .filter(|alt| {
+                alt.format == alt_profile.format
+                    && alt.bit_depth == alt_profile.bit_depth
+                    && alt.subframe_size == alt_profile.subframe_size
+                    && alt.channels == alt_profile.channels
+            })
+            .max_by_key(|alt| alt.max_packet)
+            .ok_or_else(|| "USB device has no usable alt-settings".to_string())?;
 
         // Detect DoP mode: device carries DSD-over-PCM at 176400/352800 Hz
         // with a S24_3LE carrier.  The appsink requests raw DSD (DSDU8);
@@ -4283,12 +4508,29 @@ impl Engine {
         let anchor_stream_pos = Arc::new(AtomicU64::new(0));
         let anchor_stream_pos_clone = Arc::clone(&anchor_stream_pos);
         let clock_mode = Arc::new(AtomicU8::new(self.usb_clock_mode));
+        let hw_volume_target = Arc::new(AtomicI32::new(i32::MIN));
+        let hw_volume_target_clone = Arc::clone(&hw_volume_target);
+        let hw_volume_min = Arc::new(AtomicI32::new(0));
+        let hw_volume_max = Arc::new(AtomicI32::new(0));
+        let hw_volume_res = Arc::new(AtomicI32::new(1));
+        let hw_volume_current = Arc::new(AtomicI32::new(i32::MIN));
+        let hw_volume_min_clone = Arc::clone(&hw_volume_min);
+        let hw_volume_max_clone = Arc::clone(&hw_volume_max);
+        let hw_volume_res_clone = Arc::clone(&hw_volume_res);
+        let hw_volume_current_clone = Arc::clone(&hw_volume_current);
+        // Detect Feature Unit volume support from the enumerated device.
+        let hw_vol_supported = dev.feature_unit.as_ref().map_or(false, |fu| fu.has_volume);
+        eprintln!(
+            "usb-audio: build_appsink hw_volume_supported={} feature_unit={:?}",
+            hw_vol_supported, dev.feature_unit
+        );
         let events: ThreadEventQueue = Arc::new(Mutex::new(VecDeque::new()));
         let events_clone = Arc::clone(&events);
         let appsink_clone = appsink.clone();
         let lazy = LazyUsbOpen {
             device_id: device_id.to_string(),
             bit_depth: alt.bit_depth,
+            alt_profile,
             feed: Arc::clone(&feed),
             dop_channels: if is_dop { alt.channels as usize } else { 0 },
             dop_carrier_rate,
@@ -4298,22 +4540,31 @@ impl Engine {
             reset_pending: reset_pending_clone,
             spectrum_reset_after_open: spectrum_reset_clone,
             anchor_stream_pos_ns: anchor_stream_pos_clone,
+            hw_volume_target: hw_volume_target_clone,
+            hw_volume_min: hw_volume_min_clone,
+            hw_volume_max: hw_volume_max_clone,
+            hw_volume_res: hw_volume_res_clone,
+            hw_volume_current: hw_volume_current_clone,
         };
         let buffering_clone = Arc::clone(&self.buffering_pct);
         let thread = thread::spawn(move || {
-            usb_audio_pusher_thread(appsink_clone, lazy, events_clone, stop_clone, buffering_clone);
+            usb_audio_pusher_thread(
+                appsink_clone,
+                lazy,
+                events_clone,
+                stop_clone,
+                buffering_clone,
+            );
         });
 
-        self.emit_event(
-            EVT_STATE,
-            &format!(
-                "usb-audio configured device={} format={} channels={} dop={} (rate: lazy)",
-                device_id, gst_format, alt.channels, is_dop
-            ),
+        let configured_msg = format!(
+            "usb-audio configured device={} format={} channels={} dop={} (rate: lazy)",
+            device_id, gst_format, alt.channels, is_dop
         );
 
         Ok((
             appsink.clone(),
+            configured_msg,
             UsbSinkHandle {
                 stop,
                 thread: Some(thread),
@@ -4327,6 +4578,12 @@ impl Engine {
                 anchor_stream_pos_ns: anchor_stream_pos,
                 bit_depth: alt.bit_depth,
                 device_name: dev.name.clone(),
+                hw_volume_target,
+                hw_volume_supported: hw_vol_supported,
+                hw_volume_min,
+                hw_volume_max,
+                hw_volume_res,
+                hw_volume_current,
             },
             hw_clock,
         ))
@@ -4520,12 +4777,18 @@ impl Engine {
         }
 
         let driver_norm = normalized_driver_label(driver);
-        self.spectrum_enabled = true;
         if let Err(err) = self.sync_audio_filter_graph() {
             self.set_error(format!("audio-filter setup failed: {err}"));
             self.emit_event(EVT_ERROR, &format!("audio-filter setup failed: {err}"));
         }
-        self.emit_event(EVT_STATE, "spectrum-path=enabled");
+        self.emit_event(
+            EVT_STATE,
+            if self.spectrum_enabled {
+                "spectrum-path=enabled"
+            } else {
+                "spectrum-path=disabled"
+            },
+        );
         let original_device = device
             .map(|d| d.trim().to_string())
             .filter(|d| !d.is_empty());
@@ -4710,8 +4973,9 @@ impl Engine {
             // `device_norm` must be a "usb:VID:PID" or "usb:VID:PID:SERIAL" ID.
             let usb_device_id = device_norm.unwrap_or("");
             match self.build_appsink_usb(usb_device_id) {
-                Ok((elem, usb_handle, hw_clock)) => {
+                Ok((elem, configured_msg, usb_handle, hw_clock)) => {
                     self.usb_sink = Some(usb_handle);
+                    self.emit_event(EVT_STATE, &configured_msg);
                     if let Ok(pipeline) = self.playbin.clone().dynamic_cast::<gst::Pipeline>() {
                         pipeline.use_clock(Some(hw_clock.upcast_ref::<gst::Clock>()));
                     }
@@ -5158,6 +5422,24 @@ pub extern "C" fn rac_set_spectrum_enabled(ptr: *mut Engine, enabled: c_int) -> 
         engine.spectrum_len = 0;
         engine.spectrum_ring_count = 0;
     }
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn rac_set_spectrum_stereo_enabled(ptr: *mut Engine, enabled: c_int) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    engine.set_spectrum_stereo_enabled(enabled != 0);
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn rac_set_spectrum_active_bands(ptr: *mut Engine, bands: c_uint) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    engine.set_spectrum_active_bands(bands as u32);
     0
 }
 
@@ -6601,7 +6883,10 @@ pub extern "C" fn rac_set_uri(ptr: *mut Engine, uri: *const c_char) -> c_int {
                     .set_property("audio-sink", &Option::<gst::Element>::None);
                 engine.uri.clear();
                 engine.set_error("usb-audio: pusher thread exited; output needs rebuild");
-                engine.emit_event(EVT_ERROR, "usb-audio: pusher thread exited; output needs rebuild");
+                engine.emit_event(
+                    EVT_ERROR,
+                    "usb-audio: pusher thread exited; output needs rebuild",
+                );
                 return -1;
             }
         } else if let Some(ref us) = engine.usb_sink {
@@ -6731,6 +7016,91 @@ pub extern "C" fn rac_set_volume(ptr: *mut Engine, vol: c_double) -> c_int {
     0
 }
 
+// ---------------------------------------------------------------------------
+// Hardware volume (USB Feature Unit)
+// ---------------------------------------------------------------------------
+
+/// Returns 1 if the current USB sink supports hardware volume, 0 otherwise.
+#[no_mangle]
+pub extern "C" fn rac_usb_hw_volume_supported(ptr: *const Engine) -> c_int {
+    let Some(engine) = as_engine(ptr) else {
+        return 0;
+    };
+    match engine.usb_sink.as_ref() {
+        Some(us) if us.hw_volume_supported => 1,
+        _ => 0,
+    }
+}
+
+/// Query the hardware volume range (1/256 dB units).
+///
+/// On success writes `min`, `max`, `res` and returns 0.
+/// Returns -1 if no USB sink or no hardware volume support.
+#[no_mangle]
+pub extern "C" fn rac_usb_hw_volume_get_range(
+    ptr: *const Engine,
+    min_out: *mut c_int,
+    max_out: *mut c_int,
+    res_out: *mut c_int,
+) -> c_int {
+    let Some(engine) = as_engine(ptr) else {
+        return -1;
+    };
+    let Some(us) = engine.usb_sink.as_ref().filter(|u| u.hw_volume_supported) else {
+        return -1;
+    };
+    if min_out.is_null() || max_out.is_null() || res_out.is_null() {
+        return -2;
+    }
+    unsafe {
+        *min_out = us.hw_volume_min.load(Ordering::Relaxed);
+        *max_out = us.hw_volume_max.load(Ordering::Relaxed);
+        *res_out = us.hw_volume_res.load(Ordering::Relaxed);
+    }
+    0
+}
+
+/// Set the hardware volume.  `value_raw` is in 1/256 dB units.
+///
+/// The value is stored in an atomic and applied by the pusher thread on
+/// its next loop iteration (~10 ms latency).
+#[no_mangle]
+pub extern "C" fn rac_usb_hw_volume_set(ptr: *mut Engine, value_raw: c_int) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    let Some(us) = engine.usb_sink.as_ref().filter(|u| u.hw_volume_supported) else {
+        return -1;
+    };
+    us.hw_volume_target.store(value_raw, Ordering::Relaxed);
+    0
+}
+
+/// Read the last observed hardware volume current value (1/256 dB units).
+///
+/// Writes the value to `*value_out`. Returns -3 when the current value is not
+/// yet known (for example before the USB sink has opened).
+#[no_mangle]
+pub extern "C" fn rac_usb_hw_volume_get(ptr: *const Engine, value_out: *mut c_int) -> c_int {
+    let Some(engine) = as_engine(ptr) else {
+        return -1;
+    };
+    let Some(us) = engine.usb_sink.as_ref().filter(|u| u.hw_volume_supported) else {
+        return -1;
+    };
+    if value_out.is_null() {
+        return -2;
+    }
+    let v = us.hw_volume_current.load(Ordering::Relaxed);
+    if v == i32::MIN {
+        return -3;
+    }
+    unsafe {
+        *value_out = v;
+    }
+    0
+}
+
 #[no_mangle]
 pub extern "C" fn rac_get_position(ptr: *const Engine, pos_out: *mut c_double) -> c_int {
     let Some(engine) = as_engine(ptr) else {
@@ -6802,8 +7172,8 @@ fn probe_latency(engine: &Engine) -> (f64, &'static str) {
         }
         // Fallback before clock is anchored (first samples not yet sent):
         // use the ISO ring depth as a conservative estimate.
-        let ring_ms = (usb_audio::transfer::N_TRANSFERS
-            * usb_audio::transfer::N_PACKETS_TARGET_MS) as f64;
+        let ring_ms =
+            (usb_audio::transfer::N_TRANSFERS * usb_audio::transfer::N_PACKETS_TARGET_MS) as f64;
         return (ring_ms / 1000.0, "usb-rawlink-ring-fallback");
     }
 
@@ -7946,8 +8316,8 @@ pub extern "C" fn rac_get_runtime_snapshot(ptr: *const Engine) -> *mut c_char {
         // ISO ring latency = N_TRANSFERS × N_PACKETS_TARGET_MS.
         // This is the physical write-ahead regardless of clock mode
         // (buffer_depth_ns is 0 in Pull mode for clock math, not latency).
-        let usb_latency_ms = (usb_audio::transfer::N_TRANSFERS
-            * usb_audio::transfer::N_PACKETS_TARGET_MS) as f64;
+        let usb_latency_ms =
+            (usb_audio::transfer::N_TRANSFERS * usb_audio::transfer::N_PACKETS_TARGET_MS) as f64;
         s.push_str(&format!(
             "{{\"rate\":{},\"depth\":{},\"latency_ms\":{:.1},\"device_name\":\"{}\"}}",
             usb_rate,

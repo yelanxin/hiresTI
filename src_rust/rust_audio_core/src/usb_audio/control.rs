@@ -19,13 +19,20 @@ use rusb::{DeviceHandle, Direction, Recipient, RequestType, UsbContext};
 /// Class request codes (bRequest).
 const SET_CUR: u8 = 0x01;
 const GET_CUR: u8 = 0x81;
+/// UAC 1.0 GET_MIN / UAC 2.0 GET_RANGE share the same request code.
+const GET_MIN: u8 = 0x82;
 const GET_RANGE: u8 = 0x82;
+const GET_MAX: u8 = 0x83;
+const GET_RES: u8 = 0x84;
 
 /// UAC 1.0 — Sampling Frequency Control selector (wValue high byte).
 const UAC1_CS_SAM_FREQ: u8 = 0x01;
 
 /// UAC 2.0 — Clock Frequency Control selector (wValue high byte).
 const UAC2_CS_SAM_FREQ: u8 = 0x01;
+
+/// Feature Unit — Volume Control selector (wValue high byte), same for UAC 1.0/2.0.
+const FU_VOLUME_CONTROL: u8 = 0x02;
 
 const CTRL_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -189,4 +196,200 @@ pub fn query_sample_rates_uac2<T: UsbContext>(
 
     rates.sort_unstable();
     rates
+}
+
+// ---------------------------------------------------------------------------
+// Feature Unit — Hardware Volume Control
+// ---------------------------------------------------------------------------
+//
+// Volume values are in 1/256 dB (i16).  E.g. 0x0000 = 0.0 dB,
+// 0xFF00 = -1.0 dB (-256 in i16 / 256 = -1.0).
+
+/// UAC 1.0: query volume range (min, max, resolution) from a Feature Unit.
+///
+/// Issues GET_MIN (0x82) and GET_MAX (0x83).
+/// `channel`: 0 = master, 1/2/… = per-channel.
+/// Returns `(min_raw, max_raw, res_raw)` in 1/256 dB units.
+pub fn get_volume_range_uac1<T: UsbContext>(
+    handle: &DeviceHandle<T>,
+    ctrl_iface: u8,
+    unit_id: u8,
+    channel: u8,
+) -> Option<(i16, i16, i16)> {
+    let rt_in = rusb::request_type(Direction::In, RequestType::Class, Recipient::Interface);
+    let w_value = ((FU_VOLUME_CONTROL as u16) << 8) | (channel as u16);
+    let w_index = ((unit_id as u16) << 8) | (ctrl_iface as u16);
+
+    let mut buf = [0u8; 2];
+
+    // GET_MIN
+    let min_raw = handle
+        .read_control(rt_in, GET_MIN, w_value, w_index, &mut buf, CTRL_TIMEOUT)
+        .ok()
+        .filter(|&n| n >= 2)
+        .map(|_| i16::from_le_bytes(buf))?;
+
+    // GET_MAX
+    let max_raw = handle
+        .read_control(rt_in, GET_MAX, w_value, w_index, &mut buf, CTRL_TIMEOUT)
+        .ok()
+        .filter(|&n| n >= 2)
+        .map(|_| i16::from_le_bytes(buf))?;
+
+    // GET_RES — optional; default to 1 (= 1/256 dB ≈ 0.004 dB)
+    let res_raw = handle
+        .read_control(rt_in, GET_RES, w_value, w_index, &mut buf, CTRL_TIMEOUT)
+        .ok()
+        .filter(|&n| n >= 2)
+        .map(|_| i16::from_le_bytes(buf))
+        .unwrap_or(1);
+
+    Some((min_raw, max_raw, res_raw.max(1)))
+}
+
+/// UAC 2.0: query volume range from a Feature Unit via GET_RANGE.
+///
+/// `channel`: 0 = master, 1/2/… = per-channel.
+/// Returns `(min_raw, max_raw, res_raw)` aggregated across all sub-ranges.
+pub fn get_volume_range_uac2<T: UsbContext>(
+    handle: &DeviceHandle<T>,
+    ctrl_iface: u8,
+    unit_id: u8,
+    channel: u8,
+) -> Option<(i16, i16, i16)> {
+    let rt_in = rusb::request_type(Direction::In, RequestType::Class, Recipient::Interface);
+    let w_value = ((FU_VOLUME_CONTROL as u16) << 8) | (channel as u16);
+    let w_index = ((unit_id as u16) << 8) | (ctrl_iface as u16);
+
+    let mut hdr = [0u8; 2];
+    if handle
+        .read_control(rt_in, GET_RANGE, w_value, w_index, &mut hdr, CTRL_TIMEOUT)
+        .is_err()
+    {
+        return get_volume_range_uac2_legacy(handle, ctrl_iface, unit_id, channel);
+    }
+
+    let num_ranges = u16::from_le_bytes(hdr) as usize;
+    if num_ranges == 0 || num_ranges > 64 {
+        return get_volume_range_uac2_legacy(handle, ctrl_iface, unit_id, channel);
+    }
+
+    let total = 2 + num_ranges * 6;
+    let mut buf = vec![0u8; total];
+    let n = handle
+        .read_control(rt_in, GET_RANGE, w_value, w_index, &mut buf, CTRL_TIMEOUT)
+        .ok()?;
+    if n < total {
+        return get_volume_range_uac2_legacy(handle, ctrl_iface, unit_id, channel);
+    }
+
+    let mut min_raw = i16::MAX;
+    let mut max_raw = i16::MIN;
+    let mut res_raw = i16::MAX;
+    for index in 0..num_ranges {
+        let off = 2 + index * 6;
+        let d_min = i16::from_le_bytes(buf[off..off + 2].try_into().unwrap());
+        let d_max = i16::from_le_bytes(buf[off + 2..off + 4].try_into().unwrap());
+        let d_res = i16::from_le_bytes(buf[off + 4..off + 6].try_into().unwrap()).abs();
+        min_raw = min_raw.min(d_min);
+        max_raw = max_raw.max(d_max);
+        if d_res > 0 {
+            res_raw = res_raw.min(d_res);
+        }
+    }
+
+    if min_raw == i16::MAX || max_raw == i16::MIN {
+        return None;
+    }
+
+    Some((
+        min_raw,
+        max_raw,
+        if res_raw == i16::MAX { 1 } else { res_raw },
+    ))
+}
+
+fn get_volume_range_uac2_legacy<T: UsbContext>(
+    handle: &DeviceHandle<T>,
+    ctrl_iface: u8,
+    unit_id: u8,
+    channel: u8,
+) -> Option<(i16, i16, i16)> {
+    eprintln!(
+        "usb-audio: UAC2 volume range probe falling back to legacy GET_MIN/GET_MAX/GET_RES (unit={} channel={})",
+        unit_id, channel
+    );
+    let rt_in = rusb::request_type(Direction::In, RequestType::Class, Recipient::Interface);
+    let w_value = ((FU_VOLUME_CONTROL as u16) << 8) | (channel as u16);
+    let w_index = ((unit_id as u16) << 8) | (ctrl_iface as u16);
+    let mut buf = [0u8; 2];
+
+    let min_raw = handle
+        .read_control(rt_in, GET_MIN, w_value, w_index, &mut buf, CTRL_TIMEOUT)
+        .ok()
+        .filter(|&n| n >= 2)
+        .map(|_| i16::from_le_bytes(buf))?;
+    let max_raw = handle
+        .read_control(rt_in, GET_MAX, w_value, w_index, &mut buf, CTRL_TIMEOUT)
+        .ok()
+        .filter(|&n| n >= 2)
+        .map(|_| i16::from_le_bytes(buf))?;
+    let res_raw = handle
+        .read_control(rt_in, GET_RES, w_value, w_index, &mut buf, CTRL_TIMEOUT)
+        .ok()
+        .filter(|&n| n >= 2)
+        .map(|_| i16::from_le_bytes(buf))
+        .unwrap_or(1)
+        .abs()
+        .max(1);
+
+    Some((min_raw, max_raw, res_raw))
+}
+
+/// Get the current volume from a Feature Unit (UAC 1.0 or 2.0).
+///
+/// `channel`: 0 = master, 1/2/… = per-channel.
+pub fn get_volume_cur<T: UsbContext>(
+    handle: &DeviceHandle<T>,
+    ctrl_iface: u8,
+    unit_id: u8,
+    channel: u8,
+) -> Option<i16> {
+    let rt_in = rusb::request_type(Direction::In, RequestType::Class, Recipient::Interface);
+    let w_value = ((FU_VOLUME_CONTROL as u16) << 8) | (channel as u16);
+    let w_index = ((unit_id as u16) << 8) | (ctrl_iface as u16);
+    let mut buf = [0u8; 2];
+
+    handle
+        .read_control(rt_in, GET_CUR, w_value, w_index, &mut buf, CTRL_TIMEOUT)
+        .ok()
+        .filter(|&n| n >= 2)
+        .map(|_| i16::from_le_bytes(buf))
+}
+
+/// Set the volume on a Feature Unit (UAC 1.0 or 2.0).
+///
+/// `channel`: 0 = master, 1/2/… = per-channel.
+/// `value_raw` is in 1/256 dB units (e.g. -7680 = -30.0 dB).
+pub fn set_volume_cur<T: UsbContext>(
+    handle: &DeviceHandle<T>,
+    ctrl_iface: u8,
+    unit_id: u8,
+    channel: u8,
+    value_raw: i16,
+) -> Result<(), String> {
+    let rt_out = rusb::request_type(Direction::Out, RequestType::Class, Recipient::Interface);
+    let w_value = ((FU_VOLUME_CONTROL as u16) << 8) | (channel as u16);
+    let w_index = ((unit_id as u16) << 8) | (ctrl_iface as u16);
+    let buf = value_raw.to_le_bytes();
+
+    handle
+        .write_control(rt_out, SET_CUR, w_value, w_index, &buf, CTRL_TIMEOUT)
+        .map(|_| ())
+        .map_err(|e| {
+            format!(
+                "SET_CUR Volume (unit_id={}, ch={}, val={}): {}",
+                unit_id, channel, value_raw, e
+            )
+        })
 }

@@ -25,13 +25,57 @@ DR is computed by the Rust DSP meter from time-domain PCM samples:
 """
 
 import math
+import os
 
 import gi
 gi.require_version('Gtk', '4.0')
 from gi.repository import Gtk
 
+from _rust.viz import RustVizCore
+
 
 _NEG_INF = -70.0   # display floor for FFT-derived dB values
+_RUST_LEVEL_METRICS_ENABLED = str(os.getenv("HIRESTI_VIZ_RUST_LEVEL_METRICS", "0")).strip().lower() in ("1", "true", "yes", "on")
+_RUST_VIZ_CORE = None
+_RUST_VIZ_CORE_INIT = False
+
+
+def _get_rust_viz_core():
+    global _RUST_VIZ_CORE, _RUST_VIZ_CORE_INIT
+    if not _RUST_LEVEL_METRICS_ENABLED:
+        return None
+    if not _RUST_VIZ_CORE_INIT:
+        _RUST_VIZ_CORE_INIT = True
+        try:
+            _RUST_VIZ_CORE = RustVizCore()
+        except Exception:
+            _RUST_VIZ_CORE = None
+    return _RUST_VIZ_CORE
+
+
+def _compute_level_metrics(left_mags, right_mags):
+    left = list(left_mags or [])
+    right = list(right_mags or [])
+    rust_core = _get_rust_viz_core()
+    if rust_core is not None and getattr(rust_core, "available", False):
+        try:
+            out = rust_core.compute_level_metrics(left, right)
+        except Exception:
+            out = None
+        if out is not None:
+            return out
+
+    raw_peak_l = _NEG_INF if not left else max(_NEG_INF, max(float(m) for m in left))
+    raw_peak_r = _NEG_INF if not right else max(_NEG_INF, max(float(m) for m in right))
+
+    def _mean_power_db(vals):
+        if not vals:
+            return _NEG_INF
+        lin_sum = sum(10.0 ** (max(_NEG_INF, float(m)) / 10.0) for m in vals)
+        mean = lin_sum / len(vals)
+        return 10.0 * math.log10(mean) if mean > 0.0 else _NEG_INF
+
+    return (raw_peak_l, _mean_power_db(left), raw_peak_r, _mean_power_db(right))
 
 
 class LevelMonitor(Gtk.DrawingArea):
@@ -70,10 +114,7 @@ class LevelMonitor(Gtk.DrawingArea):
 
     def update(self, left_mags, right_mags):
         """Update level bars from FFT magnitude arrays (called each frame)."""
-        raw_peak_l = self._bins_max(left_mags)
-        raw_peak_r = self._bins_max(right_mags)
-        raw_mean_l = self._mean_power_db(left_mags)
-        raw_mean_r = self._mean_power_db(right_mags)
+        raw_peak_l, raw_mean_l, raw_peak_r, raw_mean_r = _compute_level_metrics(left_mags, right_mags)
 
         # Level bar (mean power, smoothed)
         a = self._LEVEL_ALPHA
@@ -113,22 +154,6 @@ class LevelMonitor(Gtk.DrawingArea):
         self._lra     = 0.0
         self._dr_val  = 0
         self.queue_draw()
-
-    # ------------------------------------------------------------------
-    # Computation helpers (FFT-based, for level bars and DR only)
-    # ------------------------------------------------------------------
-
-    def _bins_max(self, mags):
-        if not mags:
-            return _NEG_INF
-        return max(_NEG_INF, max(float(m) for m in mags))
-
-    def _mean_power_db(self, mags):
-        if not mags:
-            return _NEG_INF
-        lin_sum = sum(10.0 ** (max(_NEG_INF, float(m)) / 10.0) for m in mags)
-        mean = lin_sum / len(mags)
-        return 10.0 * math.log10(mean) if mean > 0.0 else _NEG_INF
 
     # ------------------------------------------------------------------
     # Layout constants (computed from actual height)

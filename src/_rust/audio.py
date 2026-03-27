@@ -13,10 +13,13 @@ import gi
 gi.require_version("Gst", "1.0")
 gi.require_version("GstPbutils", "1.0")
 from gi.repository import Gst, GstPbutils
+from _rust.viz import RustVizCore
+from core.viz_perf import VizPerfWindow
 
 logger = logging.getLogger(__name__)
+_NOOP_VIZ_PERF_AUDIO = VizPerfWindow("audio", logger, enabled=False)
 
-_MAX_SPECTRUM_BANDS = 512
+_MAX_SPECTRUM_BANDS = 2048
 _LV2_HOST_MANAGED_PORT_SYMBOLS = {"enabled", "enable", "bypass"}
 
 DRIVER_ALSA_AUTO = "ALSA（auto）"
@@ -118,6 +121,27 @@ class _RustAudioCore:
 
             lib.rac_set_volume.restype = ctypes.c_int
             lib.rac_set_volume.argtypes = [ctypes.c_void_p, ctypes.c_double]
+
+            if hasattr(lib, "rac_usb_hw_volume_supported"):
+                lib.rac_usb_hw_volume_supported.restype = ctypes.c_int
+                lib.rac_usb_hw_volume_supported.argtypes = [ctypes.c_void_p]
+            if hasattr(lib, "rac_usb_hw_volume_get_range"):
+                lib.rac_usb_hw_volume_get_range.restype = ctypes.c_int
+                lib.rac_usb_hw_volume_get_range.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.POINTER(ctypes.c_int),
+                    ctypes.POINTER(ctypes.c_int),
+                    ctypes.POINTER(ctypes.c_int),
+                ]
+            if hasattr(lib, "rac_usb_hw_volume_set"):
+                lib.rac_usb_hw_volume_set.restype = ctypes.c_int
+                lib.rac_usb_hw_volume_set.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            if hasattr(lib, "rac_usb_hw_volume_get"):
+                lib.rac_usb_hw_volume_get.restype = ctypes.c_int
+                lib.rac_usb_hw_volume_get.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.POINTER(ctypes.c_int),
+                ]
 
             lib.rac_get_position.restype = ctypes.c_int
             lib.rac_get_position.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_double)]
@@ -361,6 +385,17 @@ class _RustAudioCore:
                 self._rac_get_stereo_spectrum_frames_since = lib.rac_get_stereo_spectrum_frames_since
             lib.rac_set_spectrum_enabled.restype = ctypes.c_int
             lib.rac_set_spectrum_enabled.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            self._rac_set_spectrum_stereo_enabled = None
+            if hasattr(lib, "rac_set_spectrum_stereo_enabled"):
+                lib.rac_set_spectrum_stereo_enabled.restype = ctypes.c_int
+                lib.rac_set_spectrum_stereo_enabled.argtypes = [ctypes.c_void_p, ctypes.c_int]
+                self._rac_set_spectrum_stereo_enabled = lib.rac_set_spectrum_stereo_enabled
+            self._rac_set_spectrum_active_bands = None
+            if hasattr(lib, "rac_set_spectrum_active_bands"):
+                lib.rac_set_spectrum_active_bands.restype = ctypes.c_int
+                lib.rac_set_spectrum_active_bands.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+                self._rac_set_spectrum_active_bands = lib.rac_set_spectrum_active_bands
+            self._spectrum_stereo_enabled = False
 
             self._rac_get_lufs = None
             if hasattr(lib, "rac_get_lufs"):
@@ -474,6 +509,42 @@ class _RustAudioCore:
 
     def set_volume(self, vol):
         return self._call_int("rac_set_volume", ctypes.c_double(float(vol or 0.0)), default_rc=-3)
+
+    def usb_hw_volume_supported(self):
+        """Return 1 if the current USB sink supports hardware volume, 0 otherwise."""
+        return self._call_int("rac_usb_hw_volume_supported", default_rc=0)
+
+    def usb_hw_volume_get_range(self):
+        """Return (min_raw, max_raw, res_raw) in 1/256 dB, or None."""
+        if not self.available or self.handle is None:
+            return None
+        fn = getattr(self.lib, "rac_usb_hw_volume_get_range", None)
+        if fn is None:
+            return None
+        mn = ctypes.c_int(0)
+        mx = ctypes.c_int(0)
+        rs = ctypes.c_int(0)
+        rc = fn(self.handle, ctypes.byref(mn), ctypes.byref(mx), ctypes.byref(rs))
+        if rc != 0:
+            return None
+        return (mn.value, mx.value, rs.value)
+
+    def usb_hw_volume_set(self, value_raw):
+        """Set hardware volume (1/256 dB raw units)."""
+        return self._call_int("rac_usb_hw_volume_set", ctypes.c_int(int(value_raw)), default_rc=-3)
+
+    def usb_hw_volume_get(self):
+        """Read the current hardware volume (1/256 dB raw), or None."""
+        if not self.available or self.handle is None:
+            return None
+        fn = getattr(self.lib, "rac_usb_hw_volume_get", None)
+        if fn is None:
+            return None
+        val = ctypes.c_int(0)
+        rc = fn(self.handle, ctypes.byref(val))
+        if rc != 0:
+            return None
+        return val.value
 
     def set_output(self, driver, device_id=None, buffer_us=100000, latency_us=10000, exclusive=False):
         if not self.available:
@@ -1203,7 +1274,8 @@ class _RustAudioCore:
                 out_pos = cache["out_pos"]
                 out_seq = cache["out_seq"]
                 out_frames.value = 0
-                if self._rac_get_stereo_spectrum_frames_since is not None:
+                use_stereo = bool(getattr(self, "_spectrum_stereo_enabled", False)) and self._rac_get_stereo_spectrum_frames_since is not None
+                if use_stereo:
                     rc = int(
                         self._rac_get_stereo_spectrum_frames_since(
                             self.handle,
@@ -1241,7 +1313,7 @@ class _RustAudioCore:
                     ln = max(0, min(int(out_lens[i]), mb))
                     base = i * mb
                     mono = mono_vals[base:base + ln]
-                    if self._rac_get_stereo_spectrum_frames_since is not None:
+                    if use_stereo:
                         left = left_vals[base:base + ln]
                         right = right_vals[base:base + ln]
                         payload = {
@@ -1270,6 +1342,31 @@ class _RustAudioCore:
             if fn is None:
                 return False
             rc = int(fn(self.handle, 1 if enabled else 0))
+            return rc == 0
+        except Exception:
+            return False
+
+    def set_spectrum_stereo_enabled(self, enabled):
+        self._spectrum_stereo_enabled = bool(enabled)
+        if (not self.available) or self.handle is None or self.lib is None:
+            return False
+        try:
+            fn = getattr(self, "_rac_set_spectrum_stereo_enabled", None)
+            if fn is None:
+                return False
+            rc = int(fn(self.handle, 1 if enabled else 0))
+            return rc == 0
+        except Exception:
+            return False
+
+    def set_spectrum_active_bands(self, bands):
+        if (not self.available) or self.handle is None or self.lib is None:
+            return False
+        try:
+            fn = getattr(self, "_rac_set_spectrum_active_bands", None)
+            if fn is None:
+                return False
+            rc = int(fn(self.handle, int(max(2, min(int(bands), _MAX_SPECTRUM_BANDS)))))
             return rc == 0
         except Exception:
             return False
@@ -1693,6 +1790,7 @@ class RustAudioPlayerAdapter:
         self._last_rust_error_msg = ""
         self._last_rust_error_ts = 0.0
         self._rust_error_repeat = 0
+        self._last_usb_hw_volume_raw = None
         self._rust_disconnect_recovering = False
         self._rust_pump_source = 0
         self._last_enum_signature_by_driver = {}
@@ -1707,6 +1805,8 @@ class RustAudioPlayerAdapter:
         self._rust_spectrum_requested = False
         self._rust_spectrum_forced_off = False
         self._rust_spectrum_enabled = False
+        self._rust_spectrum_stereo_enabled = False
+        self._rust_spectrum_active_bands = 512
         self._limiter_negotiation_retry_pending = False
         self._viz_latency_cached_ms = 0.0
         self._viz_latency_smooth_ms = 0.0
@@ -1720,6 +1820,19 @@ class RustAudioPlayerAdapter:
         self._viz_trace_last_frame_ts = 0.0
         self._viz_trace_tick_count = 0
         self._viz_diag_last_ts = 0.0
+        self._viz_perf_audio = VizPerfWindow("audio", logger)
+        self._viz_rust_core = RustVizCore()
+        self._viz_rust_sampler_enabled = str(os.getenv("HIRESTI_VIZ_RUST_SAMPLER", "0")).strip().lower() in ("1", "true", "yes", "on")
+        self._viz_rust_sampler = None
+        try:
+            if (
+                self._viz_rust_sampler_enabled
+                and self._viz_rust_core is not None
+                and getattr(self._viz_rust_core, "available", False)
+            ):
+                self._viz_rust_sampler = self._viz_rust_core.create_spectrum_frame_sampler(max_frames=8)
+        except Exception:
+            self._viz_rust_sampler = None
         self._viz_render_source = 0
         self._viz_spectrum_queue = deque(maxlen=1024)
         self._viz_last_render_frame = None
@@ -2219,10 +2332,36 @@ class RustAudioPlayerAdapter:
         )
         return True
 
+    def set_spectrum_stereo_enabled(self, enabled):
+        stereo_enabled = bool(enabled)
+        self._rust_spectrum_stereo_enabled = stereo_enabled
+        if self._rust.available:
+            try:
+                self._rust.set_spectrum_stereo_enabled(stereo_enabled)
+            except Exception:
+                pass
+        return True
+
+    def set_spectrum_active_bands(self, bands):
+        try:
+            target = int(bands)
+        except Exception:
+            target = 512
+        target = max(2, min(target, _MAX_SPECTRUM_BANDS))
+        self._rust_spectrum_active_bands = target
+        if self._rust.available:
+            try:
+                self._rust.set_spectrum_active_bands(target)
+            except Exception:
+                pass
+        return True
+
     def _apply_driver_spectrum_policy(self, driver):
         if bool(getattr(self, "_rust_spectrum_forced_off", False)):
             self._rust_spectrum_forced_off = False
             logger.info("Rust spectrum driver policy: restored")
+        self.set_spectrum_active_bands(int(getattr(self, "_rust_spectrum_active_bands", 512) or 512))
+        self.set_spectrum_stereo_enabled(bool(getattr(self, "_rust_spectrum_stereo_enabled", False)))
         self.set_spectrum_enabled(bool(getattr(self, "_rust_spectrum_requested", False)))
 
     def _classify_rust_error(self, text):
@@ -2964,6 +3103,29 @@ class RustAudioPlayerAdapter:
             except Exception:
                 pass
         elif evt == _RustAudioCore.EVENT_STATE:
+            if msg and str(msg).startswith("usb-hw-volume="):
+                try:
+                    raw = int(str(msg).split("=", 1)[1].strip())
+                except Exception:
+                    raw = None
+                if raw is not None:
+                    self._last_usb_hw_volume_raw = raw
+                    cb = getattr(self, "_on_hw_volume_changed_callback", None)
+                    if callable(cb):
+                        try:
+                            GLib.idle_add(cb, raw)
+                        except Exception:
+                            pass
+                return
+            if msg and "usb-audio configured" in msg:
+                # USB sink just became available — check if hw volume is now
+                # supported and notify the app so it can unlock the slider.
+                cb = getattr(self, "_on_hw_volume_ready_callback", None)
+                if callable(cb) and self.usb_hw_volume_supported():
+                    try:
+                        GLib.idle_add(cb)
+                    except Exception:
+                        pass
             if msg and "output-switched" in msg:
                 self.output_state = "active"
                 self.output_error = None
@@ -3030,26 +3192,27 @@ class RustAudioPlayerAdapter:
         return False
 
     def _refresh_rust_cache(self, force=False):
-        if not self._rust.available:
-            return
-        now = time.monotonic()
-        if (not force) and (now - self._last_cache_poll_ts) < 0.10:
-            return
-        self._last_cache_poll_ts = now
-        try:
-            self._cached_is_playing = bool(self._rust.is_playing())
-        except Exception:
-            pass
-        # Keep position/duration cache fresh for UI progress updates.
-        try:
-            p = float(self._rust.get_position() or 0.0)
-            d = float(self._rust.get_duration() or 0.0)
-            if p >= 0.0:
-                self._cached_pos_s = p
-            if d >= 0.0:
-                self._cached_dur_s = d
-        except Exception:
-            pass
+        with getattr(self, "_viz_perf_audio", _NOOP_VIZ_PERF_AUDIO).track("refresh_cache"):
+            if not self._rust.available:
+                return
+            now = time.monotonic()
+            if (not force) and (now - self._last_cache_poll_ts) < 0.10:
+                return
+            self._last_cache_poll_ts = now
+            try:
+                self._cached_is_playing = bool(self._rust.is_playing())
+            except Exception:
+                pass
+            # Keep position/duration cache fresh for UI progress updates.
+            try:
+                p = float(self._rust.get_position() or 0.0)
+                d = float(self._rust.get_duration() or 0.0)
+                if p >= 0.0:
+                    self._cached_pos_s = p
+                if d >= 0.0:
+                    self._cached_dur_s = d
+            except Exception:
+                pass
 
     def _reset_rust_visual_sync_state(self):
         self._viz_latency_cached_ms = 0.0
@@ -3061,6 +3224,12 @@ class RustAudioPlayerAdapter:
         self._last_rust_spectrum_seq = 0
         try:
             self._viz_spectrum_queue.clear()
+        except Exception:
+            pass
+        try:
+            sampler = getattr(self, "_viz_rust_sampler", None)
+            if sampler is not None:
+                sampler.clear()
         except Exception:
             pass
         self._viz_last_render_frame = None
@@ -3098,12 +3267,24 @@ class RustAudioPlayerAdapter:
                 self._viz_spectrum_queue.clear()
                 self._last_rust_spectrum_seq = 0
                 self._viz_last_render_frame = None
+                try:
+                    sampler = getattr(self, "_viz_rust_sampler", None)
+                    if sampler is not None:
+                        sampler.clear()
+                except Exception:
+                    pass
                 logger.info(
                     "Rust spectrum timeline reset: backward jump detected (last=%.3fs new=%.3fs)",
                     last_p,
                     p,
                 )
         self._viz_spectrum_queue.append((p, vals))
+        try:
+            sampler = getattr(self, "_viz_rust_sampler", None)
+            if sampler is not None:
+                sampler.push_frame(p, vals)
+        except Exception:
+            pass
         # Keep only a few seconds of history.
         cur = float(self._cached_pos_s or 0.0)
         floor = max(0.0, cur - 4.0)
@@ -3123,99 +3304,115 @@ class RustAudioPlayerAdapter:
                 )
 
     def _sample_spectrum_at_pos(self, target_pos_s):
-        def _copy_frame(frame):
-            if isinstance(frame, dict):
-                return {
-                    "mono": list(frame.get("mono") or []),
-                    "left": list(frame.get("left") or frame.get("mono") or []),
-                    "right": list(frame.get("right") or frame.get("mono") or []),
-                }
-            return list(frame or [])
+        with getattr(self, "_viz_perf_audio", _NOOP_VIZ_PERF_AUDIO).track("sample_at_pos"):
+            sampler = getattr(self, "_viz_rust_sampler", None)
+            if sampler is not None:
+                try:
+                    with getattr(self, "_viz_perf_audio", _NOOP_VIZ_PERF_AUDIO).track("sample_at_pos_rust"):
+                        out = sampler.sample(
+                            float(target_pos_s),
+                            stereo=bool(getattr(self, "_rust_spectrum_stereo_enabled", False)),
+                            out_len=int(getattr(self, "_rust_spectrum_active_bands", _MAX_SPECTRUM_BANDS) or _MAX_SPECTRUM_BANDS),
+                        )
+                    if out is not None:
+                        return out
+                except Exception:
+                    pass
 
-        def _blend_lists(a, b, t):
-            n = min(len(a), len(b))
-            if n <= 0:
-                return []
-            return [(a[i] * (1.0 - t)) + (b[i] * t) for i in range(n)]
+            def _copy_frame(frame):
+                if isinstance(frame, dict):
+                    return {
+                        "mono": list(frame.get("mono") or []),
+                        "left": list(frame.get("left") or frame.get("mono") or []),
+                        "right": list(frame.get("right") or frame.get("mono") or []),
+                    }
+                return list(frame or [])
 
-        q = self._viz_spectrum_queue
-        if not q:
-            return None
-        prev_item = None
-        next_item = None
-        for item in q:
-            p = item[0]
-            if p <= target_pos_s:
-                prev_item = item
-            elif p > target_pos_s:
-                next_item = item
-                break
+            def _blend_lists(a, b, t):
+                n = min(len(a), len(b))
+                if n <= 0:
+                    return []
+                return [(a[i] * (1.0 - t)) + (b[i] * t) for i in range(n)]
 
-        if prev_item is None:
-            return _copy_frame(q[0][1])
-        if next_item is None:
-            return _copy_frame(prev_item[1])
-
-        p0, f0 = prev_item
-        p1, f1 = next_item
-        if p1 <= p0:
-            return _copy_frame(f0)
-        t = max(0.0, min(1.0, (target_pos_s - p0) / (p1 - p0)))
-        if isinstance(f0, dict) or isinstance(f1, dict):
-            d0 = _copy_frame(f0)
-            d1 = _copy_frame(f1)
-            mono = _blend_lists(d0.get("mono", []), d1.get("mono", []), t)
-            if not mono:
+            q = self._viz_spectrum_queue
+            if not q:
                 return None
-            left = _blend_lists(d0.get("left", d0.get("mono", [])), d1.get("left", d1.get("mono", [])), t)
-            right = _blend_lists(d0.get("right", d0.get("mono", [])), d1.get("right", d1.get("mono", [])), t)
-            return {"mono": mono, "left": left or mono, "right": right or mono}
-        n = min(len(f0), len(f1))
-        if n <= 0:
-            return None
-        return [(f0[i] * (1.0 - t)) + (f1[i] * t) for i in range(n)]
+            prev_item = None
+            next_item = None
+            for item in q:
+                p = item[0]
+                if p <= target_pos_s:
+                    prev_item = item
+                elif p > target_pos_s:
+                    next_item = item
+                    break
+
+            if prev_item is None:
+                return _copy_frame(q[0][1])
+            if next_item is None:
+                return _copy_frame(prev_item[1])
+
+            p0, f0 = prev_item
+            p1, f1 = next_item
+            if p1 <= p0:
+                return _copy_frame(f0)
+            t = max(0.0, min(1.0, (target_pos_s - p0) / (p1 - p0)))
+            if isinstance(f0, dict) or isinstance(f1, dict):
+                d0 = _copy_frame(f0)
+                d1 = _copy_frame(f1)
+                mono = _blend_lists(d0.get("mono", []), d1.get("mono", []), t)
+                if not mono:
+                    return None
+                left = _blend_lists(d0.get("left", d0.get("mono", [])), d1.get("left", d1.get("mono", [])), t)
+                right = _blend_lists(d0.get("right", d0.get("mono", [])), d1.get("right", d1.get("mono", [])), t)
+                return {"mono": mono, "left": left or mono, "right": right or mono}
+            n = min(len(f0), len(f1))
+            if n <= 0:
+                return None
+            return [(f0[i] * (1.0 - t)) + (f1[i] * t) for i in range(n)]
 
     def _viz_render_tick(self):
-        if not self._rust.available:
-            self._viz_render_source = 0
-            return False
-        if self._on_spectrum_callback is None or (not bool(self._rust_spectrum_enabled)):
-            return True
-        try:
-            self._refresh_rust_cache(force=True)
-            cur_pos = float(self._cached_pos_s or 0.0)
-            delay_ms = self._estimate_rust_visual_delay_ms(current_pos_s=cur_pos, msg_pos_s=None)
-            target_pos = max(
-                0.0,
-                cur_pos - (float(delay_ms) / 1000.0) - float(getattr(self, "_viz_interp_lookback_s", 0.12)),
-            )
-            frame = self._sample_spectrum_at_pos(target_pos)
-            if frame is None:
+        with getattr(self, "_viz_perf_audio", _NOOP_VIZ_PERF_AUDIO).track("render_tick"):
+            if not self._rust.available:
+                self._viz_render_source = 0
+                return False
+            if self._on_spectrum_callback is None or (not bool(self._rust_spectrum_enabled)):
                 return True
-            if self._viz_trace_enabled:
-                now = time.monotonic()
-                if (now - float(getattr(self, "_viz_diag_last_ts", 0.0) or 0.0)) >= 1.0:
-                    self._viz_diag_last_ts = now
-                    latest_pos = -1.0
-                    try:
-                        if self._viz_spectrum_queue:
-                            latest_pos = float(self._viz_spectrum_queue[-1][0])
-                    except Exception:
+            try:
+                self._refresh_rust_cache(force=True)
+                cur_pos = float(self._cached_pos_s or 0.0)
+                delay_ms = self._estimate_rust_visual_delay_ms(current_pos_s=cur_pos, msg_pos_s=None)
+                target_pos = max(
+                    0.0,
+                    cur_pos - (float(delay_ms) / 1000.0) - float(getattr(self, "_viz_interp_lookback_s", 0.12)),
+                )
+                frame = self._sample_spectrum_at_pos(target_pos)
+                if frame is None:
+                    return True
+                if self._viz_trace_enabled:
+                    now = time.monotonic()
+                    if (now - float(getattr(self, "_viz_diag_last_ts", 0.0) or 0.0)) >= 1.0:
+                        self._viz_diag_last_ts = now
                         latest_pos = -1.0
-                    logger.info(
-                        "VIZ TRACE align: cur=%.3fs target=%.3fs latest=%.3fs delta(cur-latest)=%.3fs delay=%.1fms q=%d",
-                        cur_pos,
-                        target_pos,
-                        latest_pos,
-                        (cur_pos - latest_pos) if latest_pos >= 0.0 else -1.0,
-                        float(delay_ms),
-                        len(self._viz_spectrum_queue),
-                    )
-            self._viz_last_render_frame = frame
-            self._on_spectrum_callback(frame, target_pos)
-        except Exception:
-            pass
-        return True
+                        try:
+                            if self._viz_spectrum_queue:
+                                latest_pos = float(self._viz_spectrum_queue[-1][0])
+                        except Exception:
+                            latest_pos = -1.0
+                        logger.info(
+                            "VIZ TRACE align: cur=%.3fs target=%.3fs latest=%.3fs delta(cur-latest)=%.3fs delay=%.1fms q=%d",
+                            cur_pos,
+                            target_pos,
+                            latest_pos,
+                            (cur_pos - latest_pos) if latest_pos >= 0.0 else -1.0,
+                            float(delay_ms),
+                            len(self._viz_spectrum_queue),
+                        )
+                self._viz_last_render_frame = frame
+                self._on_spectrum_callback(frame, target_pos)
+            except Exception:
+                pass
+            return True
 
     def _estimate_rust_visual_delay_ms(self, current_pos_s=None, msg_pos_s=None):
         now = time.monotonic()
@@ -3277,96 +3474,99 @@ class RustAudioPlayerAdapter:
         return int(max(0.0, min(total_ms, 2000.0)))
 
     def _pump_rust_events_tick(self):
-        if not self._rust.available:
-            self._rust_pump_source = 0
-            return False
-        now_tick = time.monotonic()
-        if not bool(self._rust_spectrum_enabled):
-            is_playing_cached = bool(getattr(self, "_cached_is_playing", False))
-            min_interval = self._rust_pump_idle_interval_playing_s if is_playing_cached else self._rust_pump_idle_interval_paused_s
-            last_pump = float(getattr(self, "_rust_last_pump_ts", 0.0) or 0.0)
-            if last_pump > 0.0 and (now_tick - last_pump) < float(min_interval):
-                return True
-        self._rust_last_pump_ts = now_tick
-        if self._viz_trace_enabled:
-            if self._viz_trace_last_tick_ts > 0.0:
-                tick_gap_ms = (now_tick - self._viz_trace_last_tick_ts) * 1000.0
-                if tick_gap_ms >= 45.0:
-                    logger.info("VIZ TRACE rust-pump-gap: %.1fms", tick_gap_ms)
-            self._viz_trace_last_tick_ts = now_tick
-        self._rust.pump_events()
-        try:
-            # Refresh position/duration cache first so visual delay estimate
-            # doesn't start from stale position on first frames after open.
-            self._refresh_rust_cache(force=False)
+        with getattr(self, "_viz_perf_audio", _NOOP_VIZ_PERF_AUDIO).track("pump_tick"):
+            if not self._rust.available:
+                self._rust_pump_source = 0
+                return False
+            now_tick = time.monotonic()
+            if not bool(self._rust_spectrum_enabled):
+                is_playing_cached = bool(getattr(self, "_cached_is_playing", False))
+                min_interval = self._rust_pump_idle_interval_playing_s if is_playing_cached else self._rust_pump_idle_interval_paused_s
+                last_pump = float(getattr(self, "_rust_last_pump_ts", 0.0) or 0.0)
+                if last_pump > 0.0 and (now_tick - last_pump) < float(min_interval):
+                    return True
+            self._rust_last_pump_ts = now_tick
+            if self._viz_trace_enabled:
+                if self._viz_trace_last_tick_ts > 0.0:
+                    tick_gap_ms = (now_tick - self._viz_trace_last_tick_ts) * 1000.0
+                    if tick_gap_ms >= 45.0:
+                        logger.info("VIZ TRACE rust-pump-gap: %.1fms", tick_gap_ms)
+                self._viz_trace_last_tick_ts = now_tick
+            self._rust.pump_events()
+            try:
+                # Refresh position/duration cache first so visual delay estimate
+                # doesn't start from stale position on first frames after open.
+                self._refresh_rust_cache(force=False)
 
-            frames = []
-            if bool(self._rust_spectrum_enabled):
-                frames = self._rust.get_spectrum_frames_since(
-                    self._last_rust_spectrum_seq,
-                    max_frames=48,
-                    max_bands=_MAX_SPECTRUM_BANDS,
-                )
-            if self._viz_trace_enabled and bool(self._rust_spectrum_enabled):
-                self._viz_trace_tick_count += 1
-                # Log densely only right after enabling, then sparse.
-                age_s = now_tick - float(self._viz_trace_enable_ts or 0.0)
-                if (age_s <= 3.0 and self._viz_trace_tick_count <= 120) or (self._viz_trace_tick_count % 60 == 0):
-                    logger.info(
-                        "VIZ TRACE rust-batch: frames=%d enabled=%s age=%.2fs",
-                        len(frames),
-                        bool(self._rust_spectrum_enabled),
-                        age_s,
-                    )
-            for seq, pos_s, vals in frames:
-                if not vals:
-                    continue
-                # Pipeline restart / seek can reset spectrum sequence in Rust core.
-                # Detect rollback and realign local cursor + queue to avoid stall.
-                if int(seq) < int(self._last_rust_spectrum_seq):
-                    self._last_rust_spectrum_seq = 0
-                    try:
-                        self._viz_spectrum_queue.clear()
-                    except Exception:
-                        pass
-                self._last_rust_spectrum_seq = max(self._last_rust_spectrum_seq, seq)
-                self._rust_spectrum_frames_seen += 1
-                self._rust_last_spectrum_seen_ts = time.monotonic()
-                self._spectrum_stall_count = 0
-                if self._viz_trace_enabled and bool(self._rust_spectrum_enabled):
-                    now_f = time.monotonic()
-                    if self._viz_trace_last_frame_ts > 0.0:
-                        fgap_ms = (now_f - self._viz_trace_last_frame_ts) * 1000.0
-                        if fgap_ms >= 60.0:
-                            logger.info("VIZ TRACE rust-frame-gap: %.1fms", fgap_ms)
-                    self._viz_trace_last_frame_ts = now_f
-                if self._rust_spectrum_frames_seen % 1800 == 0:
-                    logger.debug("Rust spectrum frames delivered: %d", self._rust_spectrum_frames_seen)
+                frames = []
                 if bool(self._rust_spectrum_enabled):
-                    self._enqueue_rust_spectrum(pos_s, vals)
-            # Self-heal: if spectrum is enabled/playing but no frames arrive for a while
-            # (often after seek/reset), re-sync from seq=0 once with cooldown.
-            if bool(self._rust_spectrum_enabled) and (not frames):
-                now_s = time.monotonic()
-                last_seen = float(getattr(self, "_rust_last_spectrum_seen_ts", 0.0) or 0.0)
-                last_recover = float(getattr(self, "_rust_last_spectrum_recover_ts", 0.0) or 0.0)
-                playing = bool(getattr(self, "_cached_is_playing", False))
-                if (
-                    playing
-                    and (now_s - last_seen) > 0.75
-                    and (now_s - last_recover) > 1.5
-                ):
-                    self._rust_last_spectrum_recover_ts = now_s
-                    self._last_rust_spectrum_seq = 0
-                    try:
-                        self._viz_spectrum_queue.clear()
-                    except Exception:
-                        pass
-                    self._spectrum_stall_count = getattr(self, "_spectrum_stall_count", 0) + 1
-                    logger.info(
-                        "Rust spectrum auto-resync: reset cursor after stall (count=%d)",
-                        self._spectrum_stall_count,
-                    )
+                    with getattr(self, "_viz_perf_audio", _NOOP_VIZ_PERF_AUDIO).track("get_frames_since"):
+                        frames = self._rust.get_spectrum_frames_since(
+                            self._last_rust_spectrum_seq,
+                            max_frames=48,
+                            max_bands=_MAX_SPECTRUM_BANDS,
+                        )
+                if self._viz_trace_enabled and bool(self._rust_spectrum_enabled):
+                    self._viz_trace_tick_count += 1
+                    # Log densely only right after enabling, then sparse.
+                    age_s = now_tick - float(self._viz_trace_enable_ts or 0.0)
+                    if (age_s <= 3.0 and self._viz_trace_tick_count <= 120) or (self._viz_trace_tick_count % 60 == 0):
+                        logger.info(
+                            "VIZ TRACE rust-batch: frames=%d enabled=%s age=%.2fs",
+                            len(frames),
+                            bool(self._rust_spectrum_enabled),
+                            age_s,
+                        )
+                with getattr(self, "_viz_perf_audio", _NOOP_VIZ_PERF_AUDIO).track("process_frame_batch"):
+                    for seq, pos_s, vals in frames:
+                        if not vals:
+                            continue
+                        # Pipeline restart / seek can reset spectrum sequence in Rust core.
+                        # Detect rollback and realign local cursor + queue to avoid stall.
+                        if int(seq) < int(self._last_rust_spectrum_seq):
+                            self._last_rust_spectrum_seq = 0
+                            try:
+                                self._viz_spectrum_queue.clear()
+                            except Exception:
+                                pass
+                        self._last_rust_spectrum_seq = max(self._last_rust_spectrum_seq, seq)
+                        self._rust_spectrum_frames_seen += 1
+                        self._rust_last_spectrum_seen_ts = time.monotonic()
+                        self._spectrum_stall_count = 0
+                        if self._viz_trace_enabled and bool(self._rust_spectrum_enabled):
+                            now_f = time.monotonic()
+                            if self._viz_trace_last_frame_ts > 0.0:
+                                fgap_ms = (now_f - self._viz_trace_last_frame_ts) * 1000.0
+                                if fgap_ms >= 60.0:
+                                    logger.info("VIZ TRACE rust-frame-gap: %.1fms", fgap_ms)
+                            self._viz_trace_last_frame_ts = now_f
+                        if self._rust_spectrum_frames_seen % 1800 == 0:
+                            logger.debug("Rust spectrum frames delivered: %d", self._rust_spectrum_frames_seen)
+                        if bool(self._rust_spectrum_enabled):
+                            self._enqueue_rust_spectrum(pos_s, vals)
+                # Self-heal: if spectrum is enabled/playing but no frames arrive for a while
+                # (often after seek/reset), re-sync from seq=0 once with cooldown.
+                if bool(self._rust_spectrum_enabled) and (not frames):
+                    now_s = time.monotonic()
+                    last_seen = float(getattr(self, "_rust_last_spectrum_seen_ts", 0.0) or 0.0)
+                    last_recover = float(getattr(self, "_rust_last_spectrum_recover_ts", 0.0) or 0.0)
+                    playing = bool(getattr(self, "_cached_is_playing", False))
+                    if (
+                        playing
+                        and (now_s - last_seen) > 0.75
+                        and (now_s - last_recover) > 1.5
+                    ):
+                        self._rust_last_spectrum_recover_ts = now_s
+                        self._last_rust_spectrum_seq = 0
+                        try:
+                            self._viz_spectrum_queue.clear()
+                        except Exception:
+                            pass
+                        self._spectrum_stall_count = getattr(self, "_spectrum_stall_count", 0) + 1
+                        logger.info(
+                            "Rust spectrum auto-resync: reset cursor after stall (count=%d)",
+                            self._spectrum_stall_count,
+                        )
                     # After 5 consecutive stall cycles (~7.5 s with no frames),
                     # the audio-filter is likely broken (e.g. DSP graph rebuild
                     # failed silently after an LV2 toggle).  Force a pipeline
@@ -3399,18 +3599,18 @@ class RustAudioPlayerAdapter:
                                     "Rust spectrum stall recovery: reload failed",
                                     exc_info=True,
                                 )
-        except Exception:
-            pass
-        try:
-            now = time.monotonic()
-            if (now - float(self._pw_last_probe_ts or 0.0)) >= 3.0:
-                self._pw_last_probe_ts = now
-                if self.is_playing():
-                    current_rate = int((getattr(self, "stream_info", {}) or {}).get("rate", 0) or 0)
-                    self._maybe_enforce_pipewire_rate(current_rate, reason="periodic")
-        except Exception:
-            pass
-        return True
+            except Exception:
+                pass
+            try:
+                now = time.monotonic()
+                if (now - float(self._pw_last_probe_ts or 0.0)) >= 3.0:
+                    self._pw_last_probe_ts = now
+                    if self.is_playing():
+                        current_rate = int((getattr(self, "stream_info", {}) or {}).get("rate", 0) or 0)
+                        self._maybe_enforce_pipewire_rate(current_rate, reason="periodic")
+            except Exception:
+                pass
+            return True
 
     def cleanup(self):
         if self._rust_pump_source:
@@ -3422,6 +3622,13 @@ class RustAudioPlayerAdapter:
         if self._seek_flush_source:
             GLib.source_remove(self._seek_flush_source)
             self._seek_flush_source = 0
+        try:
+            sampler = getattr(self, "_viz_rust_sampler", None)
+            if sampler is not None:
+                sampler.close()
+                self._viz_rust_sampler = None
+        except Exception:
+            pass
         try:
             self._release_pipewire_clock_override(reason="cleanup")
             self._release_alsa_reservation()
@@ -3678,11 +3885,73 @@ class RustAudioPlayerAdapter:
             logger.info("RustAdapter.set_volume ignored while bit-perfect mode is active")
             self.output_error = None
             return
+        # If USB hw volume is available, route to hardware and keep software at unity.
+        if self.usb_hw_volume_supported():
+            self.usb_hw_volume_set_percent(vol * 100.0)
+            # Keep GStreamer volume at unity so PCM data is untouched.
+            self._rust.set_volume(1.0)
+            self.output_error = None
+            return
         rc = self._rust.set_volume(vol)
         if rc != 0:
             self._mark_transport_error("set_volume", rc)
         else:
             self.output_error = None
+
+    def usb_hw_volume_supported(self):
+        """Return True if the current USB sink supports hardware volume."""
+        return self._rust.usb_hw_volume_supported() == 1
+
+    def usb_hw_volume_get_range(self):
+        """Return (min_raw, max_raw, res_raw) in 1/256 dB, or None."""
+        return self._rust.usb_hw_volume_get_range()
+
+    @staticmethod
+    def _usb_hw_volume_slider_max(min_raw, max_raw):
+        """Map the UI's 100% point to the DAC's actual hardware maximum."""
+        return max_raw
+
+    def usb_hw_volume_set_percent(self, percent):
+        """Convert 0-100 slider percentage to raw 1/256 dB and send to hardware."""
+        rng = self._rust.usb_hw_volume_get_range()
+        if not rng:
+            return
+        min_raw, max_raw, res_raw = rng
+        if min_raw > max_raw:
+            return
+        effective_max = self._usb_hw_volume_slider_max(min_raw, max_raw)
+        raw = int(min_raw + (effective_max - min_raw) * max(0.0, min(100.0, percent)) / 100.0)
+        # Quantize to resolution steps
+        if res_raw > 0:
+            raw = min_raw + round((raw - min_raw) / res_raw) * res_raw
+        raw = max(min_raw, min(effective_max, raw))
+        self._rust.usb_hw_volume_set(raw)
+
+    def usb_hw_volume_raw_to_percent(self, raw_value):
+        """Convert a hardware volume raw value (1/256 dB) to the UI's 0-100 scale."""
+        rng = self._rust.usb_hw_volume_get_range()
+        if not rng:
+            return None
+        min_raw, max_raw, _res = rng
+        if min_raw > max_raw:
+            return None
+        effective_max = self._usb_hw_volume_slider_max(min_raw, max_raw)
+        if effective_max <= min_raw:
+            return 100.0
+        raw = max(min_raw, min(effective_max, int(raw_value)))
+        return (raw - min_raw) * 100.0 / (effective_max - min_raw)
+
+    def usb_hw_volume_percent_to_db(self, percent):
+        """Convert slider percentage (0-100) to dB value for display."""
+        rng = self._rust.usb_hw_volume_get_range()
+        if not rng:
+            return None
+        min_raw, max_raw, _res = rng
+        if min_raw > max_raw:
+            return None
+        effective_max = self._usb_hw_volume_slider_max(min_raw, max_raw)
+        raw = min_raw + (effective_max - min_raw) * max(0.0, min(100.0, percent)) / 100.0
+        return raw / 256.0
 
     def set_output(self, driver, device_id=None):
         req_driver = driver

@@ -206,7 +206,7 @@ pub struct AlsaHwClockFeed {
     /// Active clock mode (0 = Push, 1 = Pull).
     mode: AtomicU8,
     /// Write-ahead depth of the ISO transfer ring in nanoseconds.
-    /// Approximately 128 ms for the standard 16-transfer × 8 ms ring.
+    /// Approximately 128 ms for the current 16-transfer × 8 ms ring.
     pub(crate) buffer_depth_ns: AtomicU64,
     /// ISO completion timestamp (ns) of the calibration anchor.
     pull_anchor_ns: AtomicU64,
@@ -362,30 +362,30 @@ impl AlsaHwClockFeed {
             // reader thread never sees a stale pull_anchor_ns.
             if let Some(&(anchor_ts, anchor_frames)) = cal.window.back() {
                 // On first activation: compute a seamless anchor so the pull clock
-        // is continuous with the push clock (no backwards jump).
-        // On subsequent calls: anchor is NEVER updated — only ns_per_frame
-        // changes.  This eliminates the triple-atomic race where GStreamer
-        // could read a mismatched (new anchor_ns, old anchor_frames) pair
-        // and compute a clock value that jumps by ~8 ms.
-        if !was_ready {
-            let final_anchor_ns = {
-                let rate = self.rate.load(Ordering::Relaxed) as u64;
-                if rate > 0 {
-                    let push_base = self.anchor_ns.load(Ordering::Relaxed);
-                    let buffer_depth = self.buffer_depth_ns.load(Ordering::Relaxed);
-                    let push_now = push_base
-                        .saturating_add(anchor_frames.saturating_mul(1_000_000_000) / rate);
-                    push_now.saturating_add(buffer_depth)
-                } else {
-                    anchor_ts
+                // is continuous with the push clock (no backwards jump).
+                // On subsequent calls: anchor is NEVER updated — only ns_per_frame
+                // changes.  This eliminates the triple-atomic race where GStreamer
+                // could read a mismatched (new anchor_ns, old anchor_frames) pair
+                // and compute a clock value that jumps by ~8 ms.
+                if !was_ready {
+                    let final_anchor_ns = {
+                        let rate = self.rate.load(Ordering::Relaxed) as u64;
+                        if rate > 0 {
+                            let push_base = self.anchor_ns.load(Ordering::Relaxed);
+                            let buffer_depth = self.buffer_depth_ns.load(Ordering::Relaxed);
+                            let push_now = push_base
+                                .saturating_add(anchor_frames.saturating_mul(1_000_000_000) / rate);
+                            push_now.saturating_add(buffer_depth)
+                        } else {
+                            anchor_ts
+                        }
+                    };
+                    self.pull_anchor_ns
+                        .store(final_anchor_ns, Ordering::Relaxed);
+                    self.pull_anchor_frames
+                        .store(anchor_frames, Ordering::Relaxed);
                 }
-            };
-            self.pull_anchor_ns
-                .store(final_anchor_ns, Ordering::Relaxed);
-            self.pull_anchor_frames
-                .store(anchor_frames, Ordering::Relaxed);
-        }
-        // (else: anchor_ns and anchor_frames stay fixed forever)
+                // (else: anchor_ns and anchor_frames stay fixed forever)
             }
             self.pull_ns_per_frame_fp32.store(fp32, Ordering::Relaxed);
             // Release fence: all stores above become visible before pull_ready.

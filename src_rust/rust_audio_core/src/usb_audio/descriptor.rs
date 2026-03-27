@@ -5,6 +5,8 @@
 //! For UAC 2.0, sample rates live in the Clock Source entity and must be
 //! queried at open time; [`UacStreamAlt::sample_rates`] is left empty here.
 
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
 use rusb::{SyncType, UsageType};
 
 // ---------------------------------------------------------------------------
@@ -20,8 +22,16 @@ const CS_INTERFACE: u8 = 0x24;
 
 /// AC interface descriptor subtypes.
 const AC_HEADER: u8 = 0x01;
+const AC_INPUT_TERMINAL: u8 = 0x02;
 const AC_OUTPUT_TERMINAL: u8 = 0x03;
+const AC_MIXER_UNIT: u8 = 0x04;
+const AC_SELECTOR_UNIT: u8 = 0x05;
+const AC_FEATURE_UNIT: u8 = 0x06;
+const AC_PROCESSING_UNIT: u8 = 0x07;
+const AC_EXTENSION_UNIT: u8 = 0x08;
 const AC_CLOCK_SELECTOR: u8 = 0x0B;
+const USB_STREAMING_TERMINAL_TYPE: u16 = 0x0101;
+const FU_VOLUME_CONTROL: u8 = 0x02;
 
 /// AS interface descriptor subtypes.
 const AS_GENERAL: u8 = 0x01;
@@ -339,6 +349,323 @@ pub fn parse_stream_alt(
         max_packet,
         out_ep_interval,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Feature Unit (volume / mute) extraction
+// ---------------------------------------------------------------------------
+
+/// Information about a playback-path Feature Unit that supports writable volume.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeatureUnitInfo {
+    /// Feature Unit descriptor `bUnitID`.
+    pub unit_id: u8,
+    /// `true` if volume control is available (master or per-channel).
+    pub has_volume: bool,
+    /// `true` if mute control is available (master or per-channel).
+    pub has_mute: bool,
+    /// `true` if volume is on the master channel (channel 0).
+    /// When `false`, volume is per-channel only (channel 1, 2, …).
+    pub volume_is_master: bool,
+    /// Number of per-channel entries that have volume control.
+    /// Used to know how many SET_CUR calls are needed for per-channel mode.
+    pub volume_channels: u8,
+    /// Writable volume channels. `vec![0]` means master; otherwise per-channel IDs.
+    pub channels: Vec<u8>,
+}
+
+/// Extract the playback-path Feature Unit with writable Volume Control from the
+/// Audio Control interface descriptors.
+pub fn parse_feature_unit_from_ac(
+    ac_extra: &[u8],
+    uac_version: UacVersion,
+) -> Option<FeatureUnitInfo> {
+    let mut playback_roots = Vec::new();
+    let mut entity_sources = BTreeMap::<u8, Vec<u8>>::new();
+    let mut feature_units = BTreeMap::<u8, FeatureUnitInfo>::new();
+
+    for desc in CsDescIter::new(ac_extra) {
+        if desc.len() < 3 || desc[1] != CS_INTERFACE {
+            continue;
+        }
+
+        if let Some((entity_id, sources)) = parse_entity_sources(desc) {
+            entity_sources.insert(entity_id, sources);
+        }
+
+        if desc[2] == AC_OUTPUT_TERMINAL {
+            if let Some((terminal_type, source_id)) = parse_output_terminal(desc) {
+                if source_id != 0 && terminal_type != USB_STREAMING_TERMINAL_TYPE {
+                    playback_roots.push(source_id);
+                }
+            }
+        }
+
+        if desc[2] == AC_FEATURE_UNIT {
+            if let Some(unit) = parse_feature_unit_desc(desc, uac_version) {
+                feature_units.insert(unit.unit_id, unit);
+            }
+        }
+    }
+
+    if playback_roots.is_empty() {
+        return None;
+    }
+
+    let mut queue = VecDeque::from(playback_roots);
+    let mut visited = BTreeSet::new();
+
+    while let Some(entity_id) = queue.pop_front() {
+        if entity_id == 0 || !visited.insert(entity_id) {
+            continue;
+        }
+
+        if let Some(unit) = feature_units.get(&entity_id) {
+            return Some(unit.clone());
+        }
+
+        if let Some(sources) = entity_sources.get(&entity_id) {
+            for &source_id in sources {
+                if source_id != 0 {
+                    queue.push_back(source_id);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn parse_output_terminal(desc: &[u8]) -> Option<(u16, u8)> {
+    if desc.len() < 8 || desc[2] != AC_OUTPUT_TERMINAL {
+        return None;
+    }
+    let terminal_type = u16::from_le_bytes([desc[4], desc[5]]);
+    let source_id = desc[7];
+    Some((terminal_type, source_id))
+}
+
+fn parse_entity_sources(desc: &[u8]) -> Option<(u8, Vec<u8>)> {
+    match desc[2] {
+        AC_OUTPUT_TERMINAL => {
+            let (_, source_id) = parse_output_terminal(desc)?;
+            Some((desc[3], vec![source_id]))
+        }
+        AC_MIXER_UNIT | AC_SELECTOR_UNIT => {
+            if desc.len() < 6 {
+                return None;
+            }
+            let entity_id = desc[3];
+            let n_pins = desc[4] as usize;
+            let start = 5usize;
+            let end = start + n_pins;
+            let sources = desc.get(start..end)?.to_vec();
+            Some((entity_id, sources))
+        }
+        AC_FEATURE_UNIT => {
+            if desc.len() < 5 {
+                return None;
+            }
+            Some((desc[3], vec![desc[4]]))
+        }
+        AC_PROCESSING_UNIT | AC_EXTENSION_UNIT => {
+            if desc.len() < 8 {
+                return None;
+            }
+            let entity_id = desc[3];
+            let n_pins = desc[6] as usize;
+            let start = 7usize;
+            let end = start + n_pins;
+            let sources = desc.get(start..end)?.to_vec();
+            Some((entity_id, sources))
+        }
+        AC_INPUT_TERMINAL | AC_CLOCK_SELECTOR | AC_HEADER => None,
+        _ => None,
+    }
+}
+
+fn parse_feature_unit_desc(desc: &[u8], uac_version: UacVersion) -> Option<FeatureUnitInfo> {
+    let unit_id = *desc.get(3)?;
+    let (channels, has_mute) = match uac_version {
+        UacVersion::V1 => parse_uac1_feature_unit_channels(desc),
+        UacVersion::V2 => parse_uac2_feature_unit_channels(desc),
+    };
+    if channels.is_empty() {
+        return None;
+    }
+    let volume_is_master = channels == [0];
+    Some(FeatureUnitInfo {
+        unit_id,
+        has_volume: true,
+        has_mute,
+        volume_is_master,
+        volume_channels: if volume_is_master {
+            0
+        } else {
+            channels.len() as u8
+        },
+        channels,
+    })
+}
+
+fn parse_uac1_feature_unit_channels(desc: &[u8]) -> (Vec<u8>, bool) {
+    if desc.len() < 8 {
+        return (Vec::new(), false);
+    }
+    let control_size = desc[5] as usize;
+    if control_size == 0 {
+        return (Vec::new(), false);
+    }
+    let payload = match desc.get(6..desc.len().saturating_sub(1)) {
+        Some(payload) if !payload.is_empty() => payload,
+        _ => return (Vec::new(), false),
+    };
+    let control_count = payload.len() / control_size;
+    if control_count == 0 {
+        return (Vec::new(), false);
+    }
+
+    let mut master_has_volume = false;
+    let mut any_mute = false;
+    let mut per_channel = Vec::new();
+    for index in 0..control_count {
+        let off = index * control_size;
+        let control = decode_bitmap(payload.get(off..off + control_size).unwrap_or_default());
+        if control & 0x01 != 0 {
+            any_mute = true;
+        }
+        if control & (1 << (FU_VOLUME_CONTROL - 1)) == 0 {
+            continue;
+        }
+        if index == 0 {
+            master_has_volume = true;
+        } else {
+            per_channel.push(index as u8);
+        }
+    }
+
+    if master_has_volume {
+        (vec![0], any_mute)
+    } else {
+        (per_channel, any_mute)
+    }
+}
+
+fn parse_uac2_feature_unit_channels(desc: &[u8]) -> (Vec<u8>, bool) {
+    if desc.len() < 10 {
+        return (Vec::new(), false);
+    }
+    let payload = match desc.get(5..desc.len().saturating_sub(1)) {
+        Some(payload) if !payload.is_empty() => payload,
+        _ => return (Vec::new(), false),
+    };
+    let control_count = payload.len() / 4;
+    if control_count == 0 {
+        return (Vec::new(), false);
+    }
+
+    let mut master_has_volume = false;
+    let mut any_mute = false;
+    let mut per_channel = Vec::new();
+    for index in 0..control_count {
+        let off = index * 4;
+        let Some(raw) = payload.get(off..off + 4) else {
+            break;
+        };
+        let bitmap = u32::from_le_bytes(raw.try_into().unwrap());
+        if (bitmap & 0x03) >= 1 {
+            any_mute = true;
+        }
+        if !uac2_control_writable(bitmap, FU_VOLUME_CONTROL) {
+            continue;
+        }
+        if index == 0 {
+            master_has_volume = true;
+        } else {
+            per_channel.push(index as u8);
+        }
+    }
+
+    if master_has_volume {
+        (vec![0], any_mute)
+    } else {
+        (per_channel, any_mute)
+    }
+}
+
+fn decode_bitmap(bytes: &[u8]) -> u32 {
+    bytes
+        .iter()
+        .take(4)
+        .enumerate()
+        .fold(0u32, |acc, (index, byte)| {
+            acc | ((*byte as u32) << (index * 8))
+        })
+}
+
+fn uac2_control_writable(bitmap: u32, selector: u8) -> bool {
+    let shift = (selector.saturating_sub(1) as u32) * 2;
+    ((bitmap >> shift) & 0b11) == 0b11
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finds_uac1_master_volume_on_playback_path() {
+        let ac = [
+            0x09, 0x24, 0x02, 0x01, 0x01, 0x01, 0x00, 0x02, 0x00, 0x0A, 0x24, 0x06, 0x05, 0x01,
+            0x01, 0x03, 0x03, 0x00, 0x00, 0x09, 0x24, 0x03, 0x06, 0x01, 0x03, 0x00, 0x05, 0x00,
+        ];
+
+        assert_eq!(
+            parse_feature_unit_from_ac(&ac, UacVersion::V1),
+            Some(FeatureUnitInfo {
+                unit_id: 0x05,
+                has_volume: true,
+                has_mute: true,
+                volume_is_master: true,
+                volume_channels: 0,
+                channels: vec![0],
+            })
+        );
+    }
+
+    #[test]
+    fn prefers_playback_path_feature_unit_over_unrelated_first_unit() {
+        let ac = [
+            0x09, 0x24, 0x02, 0x01, 0x01, 0x01, 0x00, 0x02, 0x00, 0x0A, 0x24, 0x06, 0x05, 0x01,
+            0x01, 0x03, 0x03, 0x00, 0x00, 0x0A, 0x24, 0x06, 0x09, 0x02, 0x01, 0x03, 0x03, 0x00,
+            0x00, 0x09, 0x24, 0x03, 0x0A, 0x01, 0x03, 0x00, 0x09, 0x00,
+        ];
+
+        assert_eq!(
+            parse_feature_unit_from_ac(&ac, UacVersion::V1).map(|fu| fu.unit_id),
+            Some(0x09)
+        );
+    }
+
+    #[test]
+    fn falls_back_to_per_channel_uac2_volume() {
+        let ac = [
+            0x09, 0x24, 0x02, 0x01, 0x01, 0x01, 0x00, 0x02, 0x00, 0x12, 0x24, 0x06, 0x09, 0x02,
+            0x01, 0x00, 0x00, 0x00, 0x0C, 0x00, 0x00, 0x00, 0x0C, 0x00, 0x00, 0x00, 0x00, 0x09,
+            0x24, 0x03, 0x0A, 0x01, 0x03, 0x00, 0x09, 0x00,
+        ];
+
+        assert_eq!(
+            parse_feature_unit_from_ac(&ac, UacVersion::V2),
+            Some(FeatureUnitInfo {
+                unit_id: 0x09,
+                has_volume: true,
+                has_mute: true,
+                volume_is_master: false,
+                volume_channels: 2,
+                channels: vec![1, 2],
+            })
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

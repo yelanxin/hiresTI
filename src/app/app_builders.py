@@ -222,7 +222,7 @@ def _dsp_overview_module_title(self, module_id):
     return module_id.title()
 
 
-def _volume_icon_name(percent):
+def _volume_icon_name(percent, hardware=False):
     value = float(percent or 0.0)
     if value <= 0.0:
         return "hiresti-volume-muted-symbolic"
@@ -2997,9 +2997,113 @@ def _reset_search_focus_after_layout_change(self, duration_ms=260):
     GLib.timeout_add(int(duration_ms), _clear)
 
 
+def _on_hw_volume_ready(self):
+    """Refresh the volume UI when hardware-volume capability becomes available."""
+    sync_fn = getattr(self, "_sync_volume_ui_state", None)
+    if callable(sync_fn):
+        sync_fn()
+    if not bool(getattr(self, "settings", {}).get("bit_perfect", False)):
+        _update_volume_device_label(self)
+        return False
+    _lock_volume_controls(self, True)
+    _update_volume_device_label(self)
+    return False  # remove idle source
+
+
+def _on_hw_volume_changed(self, raw_value):
+    """Sync UI/settings when the DAC reports a new hardware volume value."""
+    if bool(getattr(self, "settings", {}).get("bit_perfect", False)):
+        return False
+    player = getattr(self, "player", None)
+    if player is None or not hasattr(player, "usb_hw_volume_raw_to_percent"):
+        return False
+    try:
+        percent = player.usb_hw_volume_raw_to_percent(raw_value)
+    except Exception:
+        logger.debug("hw volume feedback conversion failed", exc_info=True)
+        return False
+    if percent is None:
+        return False
+    percent = max(0.0, min(100.0, float(percent)))
+    logger.info(
+        "Hardware volume actual raw=%s db=%+.2f percent=%.2f",
+        raw_value,
+        float(raw_value) / 256.0,
+        percent,
+    )
+    settings = getattr(self, "settings", None)
+    if isinstance(settings, dict):
+        settings["volume"] = int(round(percent))
+    save_fn = getattr(self, "schedule_save_settings", None)
+    if callable(save_fn):
+        save_fn()
+    sync_fn = getattr(self, "_sync_volume_ui_state", None)
+    if callable(sync_fn):
+        sync_fn(value=percent)
+    if hasattr(self, "_update_volume_db_label"):
+        self._update_volume_db_label(percent)
+    if hasattr(self, "_mpris_sync_volume"):
+        self._mpris_sync_volume()
+    _update_volume_device_label(self)
+    return False
+
+
+def _update_volume_db_label(self, percent):
+    """Update the dB label on volume popovers.  `percent` is 0-100 or None to clear."""
+    player = getattr(self, "player", None)
+    for attr in ("vol_db_label", "now_playing_vol_db_label"):
+        label = getattr(self, attr, None)
+        if label is None:
+            continue
+        if percent is None or player is None:
+            label.set_text("")
+            continue
+        db = None
+        if hasattr(player, "usb_hw_volume_percent_to_db"):
+            try:
+                db = player.usb_hw_volume_percent_to_db(percent)
+            except Exception:
+                pass
+        if db is not None:
+            label.set_text(f"{db:+.1f} dB")
+        else:
+            label.set_text("")
+
+
+def _update_volume_device_label(self):
+    """Show a hardware-volume hint and current output device when applicable."""
+    player = getattr(self, "player", None)
+    hw_vol = (
+        player is not None
+        and hasattr(player, "usb_hw_volume_supported")
+        and player.usb_hw_volume_supported()
+    )
+    device_name = str(getattr(self, "current_device_name", "") or "").strip()
+    for attr in ("vol_device_label", "now_playing_vol_device_label"):
+        label = getattr(self, attr, None)
+        if label is None:
+            continue
+        if hw_vol:
+            label.set_text(
+                f"Hardware Volume\n{device_name}" if device_name else "Hardware Volume"
+            )
+            label.set_visible(True)
+        else:
+            label.set_text("")
+            label.set_visible(False)
+
+
 def _build_volume_popover(self, scale_attr="vol_scale"):
     pop = Gtk.Popover()
     vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
+
+    # dB label at the top of the volume popover
+    db_label_attr = scale_attr.replace("vol_scale", "vol_db_label")
+    db_label = Gtk.Label(label="")
+    db_label.add_css_class("dim-label")
+    db_label.add_css_class("caption")
+    setattr(self, db_label_attr, db_label)
+    vbox.append(db_label)
 
     scale = Gtk.Scale.new_with_range(Gtk.Orientation.VERTICAL, 0, 100, 5)
     scale.set_inverted(True)
@@ -3012,7 +3116,20 @@ def _build_volume_popover(self, scale_attr="vol_scale"):
     setattr(self, scale_attr, scale)
 
     vbox.append(scale)
+    device_label_attr = scale_attr.replace("vol_scale", "vol_device_label")
+    device_label = Gtk.Label(label="")
+    device_label.add_css_class("dim-label")
+    device_label.add_css_class("caption")
+    device_label.set_xalign(0.5)
+    device_label.set_justify(Gtk.Justification.CENTER)
+    device_label.set_ellipsize(Pango.EllipsizeMode.END)
+    device_label.set_max_width_chars(18)
+    device_label.set_visible(False)
+    setattr(self, device_label_attr, device_label)
+    vbox.append(device_label)
+    pop.connect("notify::visible", lambda *_args: _update_volume_device_label(self))
     pop.set_child(vbox)
+    _update_volume_device_label(self)
     return pop
 
 
@@ -3165,6 +3282,13 @@ def _build_eq_popover(self, sliders_attr="sliders"):
 
 
 def _lock_volume_controls(self, locked):
+    player = getattr(self, "player", None)
+    hw_vol = (
+        player is not None
+        and hasattr(player, "usb_hw_volume_supported")
+        and player.usb_hw_volume_supported()
+    )
+
     target_volume = 100.0 if locked else float(getattr(self, "settings", {}).get("volume", 80) or 80)
     target_volume = max(0.0, min(100.0, target_volume))
     sync_fn = getattr(self, "_sync_volume_ui_state", None)
@@ -3180,7 +3304,6 @@ def _lock_volume_controls(self, locked):
         finally:
             self._volume_ui_syncing = volume_syncing
 
-    player = getattr(self, "player", None)
     if player is not None and hasattr(player, "set_volume"):
         try:
             player.set_volume(1.0 if locked else (target_volume / 100.0))
@@ -3201,10 +3324,12 @@ def _lock_volume_controls(self, locked):
         else:
             btn.set_sensitive(True)
             btn.set_tooltip_text("Adjust Volume")
+    _update_volume_db_label(self, target_volume if not locked else None)
 
     for pop in (getattr(self, "vol_pop", None), getattr(self, "now_playing_vol_pop", None)):
         if locked and pop is not None:
             pop.popdown()
+    _update_volume_device_label(self)
 
     for btn in (
         getattr(self, "eq_btn", None),

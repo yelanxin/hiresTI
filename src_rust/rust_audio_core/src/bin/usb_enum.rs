@@ -27,6 +27,14 @@ fn main() {
             dev.vendor_id, dev.product_id
         );
         println!("  UAC version: {:?}", dev.uac_version);
+        if let Some(ref fu) = dev.feature_unit {
+            println!(
+                "  Feature Unit: id={} volume={} mute={} master={} channels={:?}",
+                fu.unit_id, fu.has_volume, fu.has_mute, fu.volume_is_master, fu.channels
+            );
+        } else {
+            println!("  Feature Unit: none");
+        }
         println!("  Alt-settings ({}):", dev.alts.len());
 
         for alt in &dev.alts {

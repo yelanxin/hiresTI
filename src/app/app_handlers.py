@@ -95,17 +95,19 @@ def on_settings_clicked(self, btn):
 def on_volume_changed_ui(self, scale):
     if getattr(self, "_volume_ui_syncing", False):
         return
+    val = scale.get_value()
     if bool(getattr(self, "settings", {}).get("bit_perfect", False)):
         if hasattr(self, "_sync_volume_ui_state"):
             self._sync_volume_ui_state(value=100.0, source_scale=scale)
         return
-    val = scale.get_value()
     self.player.set_volume(val / 100.0)
     self.settings["volume"] = int(round(val))
     self.schedule_save_settings()
 
     if hasattr(self, "_sync_volume_ui_state"):
         self._sync_volume_ui_state(value=val, source_scale=scale)
+    if hasattr(self, "_update_volume_db_label"):
+        self._update_volume_db_label(val)
     if hasattr(self, "_mpris_sync_volume"):
         self._mpris_sync_volume()
 
