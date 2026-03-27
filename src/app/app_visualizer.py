@@ -15,6 +15,7 @@ from core.viz_perf import VizPerfWindow
 logger = logging.getLogger(__name__)
 _APP_VIZ_PERF = VizPerfWindow("callback", logger)
 _LINEAR_ACTIVE_BANDS_DEFAULT = 128
+_DR_METER_UPDATE_INTERVAL_S = 1.0 / 60.0
 
 
 def _hide_dr_meter_debug():
@@ -886,7 +887,7 @@ def _apply_viz_frame(self, frame):
             if (not _hide_dr_meter_debug()) and dr_meter is not None and dr_meter.get_visible():
                 now = time.monotonic()
                 last_update = float(getattr(self, "_dr_meter_last_update_ts", 0.0) or 0.0)
-                if last_update <= 0.0 or (now - last_update) >= 0.05:
+                if last_update <= 0.0 or (now - last_update) >= _DR_METER_UPDATE_INTERVAL_S:
                     left  = _spectrum_frame_get(frame, "left")
                     right = _spectrum_frame_get(frame, "right")
                     with _APP_VIZ_PERF.track("dr_meter_update"):
