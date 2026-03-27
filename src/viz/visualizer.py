@@ -2,17 +2,22 @@ import gi
 import os
 import sys
 import ctypes
+import hashlib
+import colorsys
+from threading import Thread
 
 _src_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _src_dir not in sys.path:
     sys.path.insert(0, _src_dir)
 
 gi.require_version('Gtk', '4.0')
-from gi.repository import Gtk, GLib
+from gi.repository import Gtk, GLib, GdkPixbuf
 import cairo
 import math
 import logging
+from core.viz_perf import VizPerfWindow, viz_perf_enabled
 from _rust.viz import RustVizCore
+import utils.helpers as helpers
 
 try:
     from OpenGL import GL
@@ -22,6 +27,13 @@ except Exception:
     gl_shaders = None
 
 logger = logging.getLogger(__name__)
+_VIZ_MAP_PERF = VizPerfWindow("map", logger)
+_VIZ_UPDATE_PERF = VizPerfWindow("update", logger)
+_VIZ_DRAW_PERF = VizPerfWindow("draw", logger)
+
+
+def _hide_freq_axis_debug() -> bool:
+    return str(os.getenv("HIRESTI_VIZ_HIDE_FREQ_AXIS", "0")).strip().lower() in ("1", "true", "yes", "on")
 
 _FREQ_SCALE_LINEAR = "Linear"
 _FREQ_SCALE_LOG = "Log"
@@ -34,59 +46,293 @@ _LOG_DISPLAY_ANCHOR_FREQS_HZ = (200.0, 500.0, 1000.0, 4000.0, 8000.0, 12000.0)
 _LOG_DISPLAY_ANCHOR_FRACTIONS = (0.15, 0.32, 0.50, 0.70, 0.87, 0.95)
 _LOG_DISPLAY_MAX_FREQ_HZ = 16000.0
 _LEGACY_LOG_BIN_EXPONENT = 2.15
+_AUTO_COVER_THEME_NAME = "Auto"
+_STEREO_SPECTRUM_EFFECTS = frozenset({
+    "Stereo",
+    "Stereo Mirror",
+    "Lissajous",
+    "Stereo Scope",
+    "Balance Wave",
+    "Center Side",
+    "Phase Flower",
+    "Stereo Meter",
+})
+
+
+def _theme_rgba_lighten(rgba, amount):
+    r, g, b, a = rgba
+    mix = max(0.0, min(1.0, float(amount)))
+    return (
+        min(1.0, r + ((1.0 - r) * mix)),
+        min(1.0, g + ((1.0 - g) * mix)),
+        min(1.0, b + ((1.0 - b) * mix)),
+        a,
+    )
+
+
+def _theme_rgba_darken(rgba, amount):
+    r, g, b, a = rgba
+    scale = max(0.0, 1.0 - float(amount))
+    return (max(0.0, r * scale), max(0.0, g * scale), max(0.0, b * scale), a)
+
+
+def _boost_rgb_brightness(rgb, target_peak, max_gain):
+    r, g, b = (max(0.0, min(1.0, float(v))) for v in tuple(rgb or (0.0, 0.0, 0.0))[:3])
+    peak = max(r, g, b, 1e-6)
+    if peak < float(target_peak):
+        gain = min(float(max_gain), float(target_peak) / peak)
+        r = min(1.0, r * gain)
+        g = min(1.0, g * gain)
+        b = min(1.0, b * gain)
+    return (r, g, b)
+
+
+def _boost_rgb_saturation(rgb, amount):
+    r, g, b = (max(0.0, min(1.0, float(v))) for v in tuple(rgb or (0.0, 0.0, 0.0))[:3])
+    lum = (0.2126 * r) + (0.7152 * g) + (0.0722 * b)
+    gain = max(0.0, 1.0 + float(amount))
+    return (
+        max(0.0, min(1.0, lum + ((r - lum) * gain))),
+        max(0.0, min(1.0, lum + ((g - lum) * gain))),
+        max(0.0, min(1.0, lum + ((b - lum) * gain))),
+    )
+
+
+def _cover_theme_from_rgbs(colors, template):
+    if isinstance(colors, dict):
+        bright_src = colors.get("bright")
+        dark_src = colors.get("dark")
+    else:
+        bright_src = None
+        dark_src = None
+    bright_base = tuple(float(v) for v in tuple(bright_src or (0.36, 0.68, 0.98))[:3])
+
+    br, bg, bb = _boost_rgb_brightness(bright_base, 0.62, 3.1)
+
+    sat_br, sat_bg, sat_bb = _boost_rgb_saturation((br, bg, bb), 0.42)
+    hue, light, sat = colorsys.rgb_to_hls(br, bg, bb)
+    deep_light = max(0.14, min(0.24, (light * 0.40) + 0.05))
+    deep_sat = max(0.62, min(1.0, (sat * 1.28) + 0.10))
+    deep_r, deep_g, deep_b = colorsys.hls_to_rgb(hue, deep_light, deep_sat)
+
+    bright = (
+        min(1.0, (sat_br * 1.06) + 0.16),
+        min(1.0, (sat_bg * 1.04) + 0.14),
+        min(1.0, (sat_bb * 1.04) + 0.12),
+        1.0,
+    )
+    mid = (
+        min(1.0, ((br * 0.64) + (deep_r * 0.36)) + 0.06),
+        min(1.0, ((bg * 0.64) + (deep_g * 0.36)) + 0.05),
+        min(1.0, ((bb * 0.60) + (deep_b * 0.40)) + 0.03),
+        0.98,
+    )
+    deep = (
+        max(0.0, (deep_r * 0.98) + 0.01),
+        max(0.0, (deep_g * 0.98) + 0.01),
+        max(0.0, (deep_b * 0.98) + 0.01),
+        0.82,
+    )
+    theme = dict(template or {})
+    theme["gradient"] = (
+        (0.0, _theme_rgba_lighten(bright, 0.20)),
+        (0.42, mid),
+        (1.0, _theme_rgba_darken(deep, 0.10)),
+    )
+    return theme
+
+
+def _pick_cover_theme_colors(samples):
+    vals = [
+        (
+            max(0.0, min(1.0, float(r))),
+            max(0.0, min(1.0, float(g))),
+            max(0.0, min(1.0, float(b))),
+        )
+        for r, g, b in list(samples or [])
+    ]
+    if not vals:
+        return None
+
+    bins = 10
+    buckets = {}
+    for r, g, b in vals:
+        key = (
+            min(bins - 1, int(r * bins)),
+            min(bins - 1, int(g * bins)),
+            min(bins - 1, int(b * bins)),
+        )
+        lum = (0.2126 * r) + (0.7152 * g) + (0.0722 * b)
+        mx = max(r, g, b)
+        mn = min(r, g, b)
+        sat = 0.0 if mx <= 1e-6 else (mx - mn) / mx
+        stats = buckets.get(key)
+        if stats is None:
+            stats = {
+                "count": 0,
+                "rs": 0.0,
+                "gs": 0.0,
+                "bs": 0.0,
+                "lum": 0.0,
+                "sat": 0.0,
+            }
+            buckets[key] = stats
+        stats["count"] += 1
+        stats["rs"] += r
+        stats["gs"] += g
+        stats["bs"] += b
+        stats["lum"] += lum
+        stats["sat"] += sat
+
+    total = max(1, sum(int(stats["count"]) for stats in buckets.values()))
+    min_count = max(4, int(math.ceil(total * 0.08)))
+    candidates = []
+    for stats in buckets.values():
+        count = max(1, int(stats["count"]))
+        candidates.append({
+            "count": count,
+            "rgb": (
+                stats["rs"] / count,
+                stats["gs"] / count,
+                stats["bs"] / count,
+            ),
+            "lum": stats["lum"] / count,
+            "sat": stats["sat"] / count,
+        })
+
+    eligible = [c for c in candidates if c["count"] >= min_count]
+    if not eligible:
+        eligible = list(candidates)
+
+    vivid = [c for c in eligible if c["sat"] >= 0.10]
+    if vivid:
+        eligible = vivid
+
+    def _coverage(candidate):
+        return min(1.0, float(candidate["count"]) / max(1.0, float(total) * 0.22))
+
+    def _bright_score(candidate):
+        return (
+            (float(candidate["lum"]) * 0.58)
+            + (float(candidate["sat"]) * 0.24)
+            + (_coverage(candidate) * 0.18)
+        )
+
+    bright_candidates = [c for c in eligible if c["lum"] >= 0.24]
+    if bright_candidates:
+        eligible_bright = bright_candidates
+    else:
+        eligible_bright = list(eligible)
+    bright = max(
+        eligible_bright,
+        key=lambda c: (_bright_score(c), float(c["lum"]), float(c["sat"]), int(c["count"])),
+    )
+
+    def _dark_score(candidate):
+        return (
+            ((1.0 - float(candidate["lum"])) * 0.52)
+            + (float(candidate["sat"]) * 0.16)
+            + (_coverage(candidate) * 0.32)
+        )
+
+    dark_candidates = [
+        c for c in eligible
+        if c["lum"] <= (float(bright["lum"]) - 0.10)
+    ]
+    if not dark_candidates:
+        dark_candidates = [c for c in eligible if c is not bright]
+    if not dark_candidates:
+        dark_candidates = list(eligible)
+    dark = max(
+        dark_candidates,
+        key=lambda c: (_dark_score(c), int(c["count"]), float(c["sat"])),
+    )
+    return {
+        "bright": tuple(float(v) for v in bright["rgb"]),
+        "dark": tuple(float(v) for v in dark["rgb"]),
+    }
+
+
+def _cover_theme_colors_from_pixbuf(pb):
+    if pb is None:
+        return None
+    try:
+        pixels = pb.get_pixels()
+        rowstride = pb.get_rowstride()
+        n_channels = pb.get_n_channels()
+        width = pb.get_width()
+        height = pb.get_height()
+    except Exception:
+        return None
+    if width <= 0 or height <= 0 or n_channels < 3:
+        return None
+    step = max(1, min(width, height) // 24)
+    samples = []
+    for y in range(0, height, step):
+        base = y * rowstride
+        for x in range(0, width, step):
+            idx = base + (x * n_channels)
+            samples.append((
+                pixels[idx] / 255.0,
+                pixels[idx + 1] / 255.0,
+                pixels[idx + 2] / 255.0,
+            ))
+    return _pick_cover_theme_colors(samples)
 
 
 def _normalize_spectrum_magnitudes(values, db_min=-80.0, db_range=80.0):
-    vals = list(values or [])
-    if not vals:
-        return []
-    out = [0.0] * len(vals)
-    for i, val in enumerate(vals):
-        if val <= db_min:
-            h = 0.0
-        else:
-            h = (val - db_min) / db_range
-        # gamma=1.5: compresses the low-level noise floor toward zero while
-        # keeping the main musical content range (~-30..0 dBFS) nearly identical
-        # to the old linear -60/60 mapping.
-        out[i] = max(0.0, min(1.0, h)) ** 1.5
-    return out
+    with _VIZ_MAP_PERF.track("normalize_db"):
+        vals = list(values or [])
+        if not vals:
+            return []
+        out = [0.0] * len(vals)
+        for i, val in enumerate(vals):
+            if val <= db_min:
+                h = 0.0
+            else:
+                h = (val - db_min) / db_range
+            # gamma=1.5: compresses the low-level noise floor toward zero while
+            # keeping the main musical content range (~-30..0 dBFS) nearly identical
+            # to the old linear -60/60 mapping.
+            out[i] = max(0.0, min(1.0, h)) ** 1.5
+        return out
 
 
 def _resample_linear_values(values, out_count, use_peak=False):
-    vals = list(values or [])
-    if out_count <= 0:
-        return []
-    if not vals:
-        return [0.0] * out_count
-    in_count = len(vals)
-    out = [0.0] * out_count
-    for i in range(out_count):
-        t0 = i / float(out_count)
-        t1 = (i + 1) / float(out_count)
-        x0 = int(t0 * in_count)
-        x1 = int(t1 * in_count)
-        if x0 >= in_count:
-            x0 = in_count - 1
-        if x1 <= x0:
-            x1 = min(in_count, x0 + 1)
-        elif x1 > in_count:
-            x1 = in_count
-        if use_peak:
-            peak = 0.0
-            for j in range(x0, x1):
-                v = float(vals[j])
-                if v > peak:
-                    peak = v
-            out[i] = peak
-        else:
-            s = 0.0
-            c = 0
-            for j in range(x0, x1):
-                s += float(vals[j])
-                c += 1
-            out[i] = (s / float(c)) if c > 0 else 0.0
-    return out
+    with _VIZ_MAP_PERF.track("resample_linear"):
+        vals = list(values or [])
+        if out_count <= 0:
+            return []
+        if not vals:
+            return [0.0] * out_count
+        in_count = len(vals)
+        out = [0.0] * out_count
+        for i in range(out_count):
+            t0 = i / float(out_count)
+            t1 = (i + 1) / float(out_count)
+            x0 = int(t0 * in_count)
+            x1 = int(t1 * in_count)
+            if x0 >= in_count:
+                x0 = in_count - 1
+            if x1 <= x0:
+                x1 = min(in_count, x0 + 1)
+            elif x1 > in_count:
+                x1 = in_count
+            if use_peak:
+                peak = 0.0
+                for j in range(x0, x1):
+                    v = float(vals[j])
+                    if v > peak:
+                        peak = v
+                out[i] = peak
+            else:
+                s = 0.0
+                c = 0
+                for j in range(x0, x1):
+                    s += float(vals[j])
+                    c += 1
+                out[i] = (s / float(c)) if c > 0 else 0.0
+        return out
 
 
 def _build_linear_spectrum_bins(
@@ -98,43 +344,44 @@ def _build_linear_spectrum_bins(
     db_range=80.0,
     half_rate_hz=_SPECTRUM_HALF_RATE_HZ,
 ):
-    vals = list(values or [])
-    if out_count <= 0:
-        return []
-    if not vals:
-        return [0.0] * out_count
+    with _VIZ_MAP_PERF.track("build_linear"):
+        vals = list(values or [])
+        if out_count <= 0:
+            return []
+        if not vals:
+            return [0.0] * out_count
 
-    analysis_n = max(1, int(analysis_bands))
-    base = None
-    if rust_core is not None and getattr(rust_core, "available", False):
-        try:
-            base = rust_core.process_spectrum(
-                vals,
+        analysis_n = max(1, int(analysis_bands))
+        base = None
+        if rust_core is not None and getattr(rust_core, "available", False):
+            try:
+                base = rust_core.process_spectrum(
+                    vals,
+                    analysis_n,
+                    db_min=db_min,
+                    db_range=db_range,
+                )
+            except Exception:
+                base = None
+        if base is None:
+            base = _resample_linear_values(
+                _normalize_spectrum_magnitudes(vals, db_min=db_min, db_range=db_range),
                 analysis_n,
-                db_min=db_min,
-                db_range=db_range,
             )
-        except Exception:
-            base = None
-    if base is None:
-        base = _resample_linear_values(
-            _normalize_spectrum_magnitudes(vals, db_min=db_min, db_range=db_range),
-            analysis_n,
-        )
-    if out_count == analysis_n:
-        return list(base or [])
-    # Blend peak and mean aggregation: peak preserves sparse mid/high-freq tones
-    # while mean smooths out transient jumpiness.  50% peak + 50% mean keeps
-    # more body in dense bands without fully diluting narrow-bin signals.
-    out_peak = _resample_linear_values(base or [], out_count, use_peak=True)
-    out_mean = _resample_linear_values(base or [], out_count, use_peak=False)
-    out = [p * 0.5 + m * 0.5 for p, m in zip(out_peak, out_mean)]
-    # Apply per-bar voicing: rolls off bass (prevents peak saturation) and
-    # boosts mid/high (compensates for narrow-bin bandwidth vs 96-band FFT).
-    for i in range(out_count):
-        center_f = (i + 0.5) / float(out_count) * half_rate_hz
-        out[i] = min(1.0, out[i] * _linear_display_voicing(center_f, half_rate_hz))
-    return out
+        if out_count == analysis_n:
+            return list(base or [])
+        # Blend peak and mean aggregation: peak preserves sparse mid/high-freq tones
+        # while mean smooths out transient jumpiness.  50% peak + 50% mean keeps
+        # more body in dense bands without fully diluting narrow-bin signals.
+        out_peak = _resample_linear_values(base or [], out_count, use_peak=True)
+        out_mean = _resample_linear_values(base or [], out_count, use_peak=False)
+        out = [p * 0.5 + m * 0.5 for p, m in zip(out_peak, out_mean)]
+        # Apply per-bar voicing: rolls off bass (prevents peak saturation) and
+        # boosts mid/high (compensates for narrow-bin bandwidth vs 96-band FFT).
+        for i in range(out_count):
+            center_f = (i + 0.5) / float(out_count) * half_rate_hz
+            out[i] = min(1.0, out[i] * _linear_display_voicing(center_f, half_rate_hz))
+        return out
 
 
 def _interpolate_series_value(values, pos):
@@ -352,70 +599,115 @@ def _draw_freq_axis_cairo(cr, width, height, frequency_scale_name,
 
 
 def _build_log_spectrum_bins(values, out_count, half_rate_hz=_SPECTRUM_HALF_RATE_HZ, rust_core=None):
+    with _VIZ_MAP_PERF.track("build_log"):
+        vals = list(values or [])
+        if out_count <= 0:
+            return []
+        if not vals:
+            return [0.0] * out_count
+        if len(vals) <= 1:
+            return [float(vals[0])] * out_count
+
+        if rust_core is not None and getattr(rust_core, "available", False):
+            try:
+                out = rust_core.build_log_bins(vals, out_count)
+            except Exception:
+                out = None
+            if out is not None:
+                return out
+
+        # Band 0 is the DC component. Keep log mode aligned with the normal
+        # spectrum path by skipping it when real spectrum bands are provided.
+        usable = vals[1:] if len(vals) > 1 else vals
+        if not usable:
+            return [0.0] * out_count
+        if len(usable) == 1:
+            return [float(usable[0])] * out_count
+
+        total_bands = len(vals)
+        band_hz = float(half_rate_hz) / max(1.0, float(total_bands))
+        _min_f, max_f = _log_display_frequency_range(total_bands, half_rate_hz=half_rate_hz)
+        if max_f <= 0.0:
+            return _resample_linear_values(usable, out_count)
+        log_points = _log_display_anchor_points(total_bands, half_rate_hz=half_rate_hz)
+
+        out = [0.0] * out_count
+        for i in range(out_count):
+            t0 = i / float(out_count)
+            t1 = (i + 1) / float(out_count)
+            f0 = _log_display_frequency_at_fraction_from_points(t0, log_points)
+            f1 = _log_display_frequency_at_fraction_from_points(t1, log_points)
+            pos0 = max(0.0, (f0 / band_hz) - 1.0)
+            pos1 = max(pos0 + 1e-6, (f1 / band_hz) - 1.0)
+            center_f = math.sqrt(f0 * f1)  # geometric mean -> log-scale centre freq
+            span = pos1 - pos0
+            if span < 1.0:
+                # A display bucket narrower than one FFT band should not be smoothed
+                # with multiple probes from the same coarse source bin; doing so
+                # makes the low end look like a flat plateau. Probe once at the
+                # center and add a light contrast curve so adjacent sub-band bars
+                # remain visually distinct.
+                probe = max(0.0, min(1.0, _interpolate_series_value(usable, pos0 + (span * 0.5))))
+                voiced = (probe ** 1.35) * _log_display_eq_gain(center_f)
+            else:
+                sample_count = max(2, min(32, int(math.ceil(span * 2.0))))
+                sum_sq = 0.0
+                peak = 0.0
+                for s in range(sample_count):
+                    t = (s + 0.5) / float(sample_count)
+                    pos = pos0 + (span * t)
+                    v = _interpolate_series_value(usable, pos)
+                    sum_sq += v * v
+                    if v > peak:
+                        peak = v
+                rms = math.sqrt(sum_sq / float(sample_count))
+                voiced = ((rms * 0.50) + (peak * 0.50)) * _log_display_eq_gain(center_f)
+            out[i] = max(0.0, min(1.0, voiced))
+        return out
+
+
+def _try_rust_map_spectrum(
+    values,
+    out_count,
+    *,
+    frequency_scale_name,
+    rust_core=None,
+    analysis_bands=_LINEAR_ANALYSIS_BANDS,
+    db_min=-80.0,
+    db_range=80.0,
+):
+    if rust_core is None or not getattr(rust_core, "available", False):
+        return None
     vals = list(values or [])
-    if out_count <= 0:
+    out_n = int(out_count or 0)
+    if out_n <= 0:
         return []
     if not vals:
-        return [0.0] * out_count
-    if len(vals) <= 1:
-        return [float(vals[0])] * out_count
-
-    if rust_core is not None and getattr(rust_core, "available", False):
-        try:
-            out = rust_core.build_log_bins(vals, out_count)
-        except Exception:
-            out = None
-        if out is not None:
-            return out
-
-    # Band 0 is the DC component. Keep log mode aligned with the normal
-    # spectrum path by skipping it when real spectrum bands are provided.
-    usable = vals[1:] if len(vals) > 1 else vals
-    if not usable:
-        return [0.0] * out_count
-    if len(usable) == 1:
-        return [float(usable[0])] * out_count
-
-    total_bands = len(vals)
-    band_hz = float(half_rate_hz) / max(1.0, float(total_bands))
-    _min_f, max_f = _log_display_frequency_range(total_bands, half_rate_hz=half_rate_hz)
-    if max_f <= 0.0:
-        return _resample_linear_values(usable, out_count)
-    log_points = _log_display_anchor_points(total_bands, half_rate_hz=half_rate_hz)
-
-    out = [0.0] * out_count
-    for i in range(out_count):
-        t0 = i / float(out_count)
-        t1 = (i + 1) / float(out_count)
-        f0 = _log_display_frequency_at_fraction_from_points(t0, log_points)
-        f1 = _log_display_frequency_at_fraction_from_points(t1, log_points)
-        pos0 = max(0.0, (f0 / band_hz) - 1.0)
-        pos1 = max(pos0 + 1e-6, (f1 / band_hz) - 1.0)
-        center_f = math.sqrt(f0 * f1)  # geometric mean → log-scale centre freq
-        span = pos1 - pos0
-        if span < 1.0:
-            # A display bucket narrower than one FFT band should not be smoothed
-            # with multiple probes from the same coarse source bin; doing so
-            # makes the low end look like a flat plateau. Probe once at the
-            # center and add a light contrast curve so adjacent sub-band bars
-            # remain visually distinct.
-            probe = max(0.0, min(1.0, _interpolate_series_value(usable, pos0 + (span * 0.5))))
-            voiced = (probe ** 1.35) * _log_display_eq_gain(center_f)
-        else:
-            sample_count = max(2, min(32, int(math.ceil(span * 2.0))))
-            sum_sq = 0.0
-            peak = 0.0
-            for s in range(sample_count):
-                t = (s + 0.5) / float(sample_count)
-                pos = pos0 + (span * t)
-                v = _interpolate_series_value(usable, pos)
-                sum_sq += v * v
-                if v > peak:
-                    peak = v
-            rms = math.sqrt(sum_sq / float(sample_count))
-            voiced = ((rms * 0.50) + (peak * 0.50)) * _log_display_eq_gain(center_f)
-        out[i] = max(0.0, min(1.0, voiced))
-    return out
+        return [0.0] * out_n
+    try:
+        if frequency_scale_name == _FREQ_SCALE_LOG:
+            mapper = getattr(rust_core, "map_spectrum_log", None)
+            if callable(mapper):
+                with _VIZ_MAP_PERF.track("rust_map_log"):
+                    return mapper(
+                        vals,
+                        out_n,
+                        db_min=db_min,
+                        db_range=db_range,
+                    )
+        mapper = getattr(rust_core, "map_spectrum_linear", None)
+        if callable(mapper):
+            with _VIZ_MAP_PERF.track("rust_map_linear"):
+                return mapper(
+                    vals,
+                    out_n,
+                    analysis_bands=int(analysis_bands or _LINEAR_ANALYSIS_BANDS),
+                    db_min=db_min,
+                    db_range=db_range,
+                )
+    except Exception:
+        return None
+    return None
 
 
 def _build_log_bins_python(values, out_count):
@@ -448,7 +740,7 @@ class SpectrumVisualizer(Gtk.DrawingArea):
         super().__init__()
         self.set_draw_func(self._draw_callback, None)
         self.set_size_request(-1, 0) # 允许 Revealer 完全折叠
-        self.theme_name = "Aurora (Default)"
+        self.theme_name = _AUTO_COVER_THEME_NAME
         self.effect_name = "Dots"
         self.frequency_scale_name = _FREQ_SCALE_LINEAR
         self.frequency_scale_names = list(_FREQ_SCALE_NAMES)
@@ -559,9 +851,7 @@ class SpectrumVisualizer(Gtk.DrawingArea):
                 "beat_mul": 0.80,
             },
         }
-        self.themes = {
-            # Keep existing look as the default theme.
-            "Aurora (Default)": {
+        aurora_theme = {
                 "grid_alpha": 0.02,
                 "bar_spacing": 1.5,
                 "height_gain": 1.6,
@@ -570,7 +860,17 @@ class SpectrumVisualizer(Gtk.DrawingArea):
                     (0.5, (0.0, 0.5, 1.0, 0.9)),   # blue-purple
                     (1.0, (0.2, 0.0, 0.5, 0.6)),   # deep purple
                 ),
-            },
+            }
+        self.themes = {
+            _AUTO_COVER_THEME_NAME: _cover_theme_from_rgbs(
+                {
+                    "bright": (0.28, 0.56, 0.92),
+                    "dark": (0.12, 0.18, 0.34),
+                },
+                aurora_theme,
+            ),
+            # Keep existing look available as the manual fallback theme.
+            "Aurora": aurora_theme,
             "Amber Pulse": {
                 "grid_alpha": 0.028,
                 "bar_spacing": 1.6,
@@ -816,12 +1116,22 @@ class SpectrumVisualizer(Gtk.DrawingArea):
         self._logged_python_dots_img = False
         self._logged_rust_bars_img = False
         self._logged_python_bars_img = False
-        self._theme_cfg = self.themes["Aurora (Default)"]
+        self._theme_cfg = self.themes[self.theme_name]
         self._profile_cfg = self.profiles["Dynamic"]
         self._effect_code = 0
+        self._rust_state_engine = None
+        self._rust_stereo_state_engine = None
+        self._rust_cur_arr = []
+        self._rust_trail_arr = []
+        self._rust_peak_arr = []
+        self._rust_left_cur_arr = []
+        self._rust_right_cur_arr = []
+        self._rust_left_peak_arr = []
+        self._rust_right_peak_arr = []
         self._refresh_theme_cache()
         self._refresh_profile_cache()
         self._refresh_effect_cache()
+        self._reset_rust_state_engine()
         self._active = False
         self._anim_source = None
 
@@ -848,6 +1158,9 @@ class SpectrumVisualizer(Gtk.DrawingArea):
     def get_effect_names(self):
         return list(self.effects)
 
+    def requires_stereo_spectrum(self):
+        return self.effect_name in _STEREO_SPECTRUM_EFFECTS
+
     def get_profile_names(self):
         return list(self.profiles.keys())
 
@@ -855,7 +1168,7 @@ class SpectrumVisualizer(Gtk.DrawingArea):
         return list(self.frequency_scale_names)
 
     def _refresh_theme_cache(self):
-        self._theme_cfg = self.themes[self.theme_name] if self.theme_name in self.themes else self.themes["Aurora (Default)"]
+        self._theme_cfg = self.themes[self.theme_name] if self.theme_name in self.themes else self.themes[_AUTO_COVER_THEME_NAME]
 
     def _refresh_profile_cache(self):
         self._profile_cfg = self.profiles[self.profile_name] if self.profile_name in self.profiles else self.profiles["Dynamic"]
@@ -866,6 +1179,15 @@ class SpectrumVisualizer(Gtk.DrawingArea):
     def set_theme(self, theme_name):
         if theme_name in self.themes:
             self.theme_name = theme_name
+            self._refresh_theme_cache()
+            self.queue_draw()
+
+    def set_auto_cover_theme_rgb(self, colors):
+        self.themes[_AUTO_COVER_THEME_NAME] = _cover_theme_from_rgbs(
+            colors,
+            self.themes.get("Aurora", self.themes.get(_AUTO_COVER_THEME_NAME, {})),
+        )
+        if self.theme_name == _AUTO_COVER_THEME_NAME:
             self._refresh_theme_cache()
             self.queue_draw()
 
@@ -884,11 +1206,28 @@ class SpectrumVisualizer(Gtk.DrawingArea):
         if profile_name in self.profiles:
             self.profile_name = profile_name
             self._refresh_profile_cache()
+            if self._rust_state_engine is not None:
+                self._rust_state_engine.set_params(
+                    smooth=float(self._profile_cfg["smooth"]),
+                    trail_decay=float(self._profile_cfg["trail_decay"]),
+                    peak_hold_frames=int(self._profile_cfg["peak_hold_frames"]),
+                    peak_fall=float(self._profile_cfg["peak_fall"]),
+                    bass_smooth=max(0.12, min(0.62, 0.28 * float(self._profile_cfg["beat_mul"]))),
+                )
             self.queue_draw()
 
     def set_frequency_scale(self, scale_name):
         if scale_name in self.frequency_scale_names:
             self.frequency_scale_name = scale_name
+            self.queue_draw()
+
+    def set_input_band_count(self, count):
+        try:
+            n = int(count)
+        except Exception:
+            return
+        if n > 1:
+            self._input_band_count = n
             self.queue_draw()
 
     def set_num_bars(self, count):
@@ -919,32 +1258,95 @@ class SpectrumVisualizer(Gtk.DrawingArea):
         self.right_log_heat_history = []
         self.pro_heat_history = []
         self.pro_fall_history = []
+        self._reset_rust_state_engine()
         self.queue_draw()
 
+    def _reset_rust_state_engine(self):
+        try:
+            if self._rust_state_engine is not None:
+                self._rust_state_engine.close()
+        except Exception:
+            pass
+        self._rust_state_engine = None
+        try:
+            if self._rust_stereo_state_engine is not None:
+                self._rust_stereo_state_engine.close()
+        except Exception:
+            pass
+        self._rust_stereo_state_engine = None
+        self._rust_cur_arr = (ctypes.c_float * self.num_bars)(*([0.0] * self.num_bars))
+        self._rust_trail_arr = (ctypes.c_float * self.num_bars)(*([0.0] * self.num_bars))
+        self._rust_peak_arr = (ctypes.c_float * self.num_bars)(*([0.0] * self.num_bars))
+        self._rust_left_cur_arr = (ctypes.c_float * self.num_bars)(*([0.0] * self.num_bars))
+        self._rust_right_cur_arr = (ctypes.c_float * self.num_bars)(*([0.0] * self.num_bars))
+        self._rust_left_peak_arr = (ctypes.c_float * self.num_bars)(*([0.0] * self.num_bars))
+        self._rust_right_peak_arr = (ctypes.c_float * self.num_bars)(*([0.0] * self.num_bars))
+        if self._rust_core is not None and getattr(self._rust_core, "available", False):
+            try:
+                self._rust_state_engine = self._rust_core.create_state_engine(
+                    self.num_bars,
+                    smooth=float(self._profile_cfg["smooth"]),
+                    trail_decay=float(self._profile_cfg["trail_decay"]),
+                    peak_hold_frames=int(self._profile_cfg["peak_hold_frames"]),
+                    peak_fall=float(self._profile_cfg["peak_fall"]),
+                    bass_smooth=max(0.12, min(0.62, 0.28 * float(self._profile_cfg["beat_mul"]))),
+                )
+            except Exception:
+                self._rust_state_engine = None
+            try:
+                self._rust_stereo_state_engine = self._rust_core.create_stereo_state_engine(
+                    self.num_bars,
+                    smooth=float(self._profile_cfg["smooth"]),
+                    trail_decay=float(self._profile_cfg["trail_decay"]),
+                    peak_hold_frames=int(self._profile_cfg["peak_hold_frames"]),
+                    peak_fall=float(self._profile_cfg["peak_fall"]),
+                    bass_smooth=max(0.12, min(0.62, 0.28 * float(self._profile_cfg["beat_mul"]))),
+                    balance_smooth=float(self._profile_cfg["smooth"]),
+                )
+            except Exception:
+                self._rust_stereo_state_engine = None
+
     def _map_magnitudes_to_heights(self, magnitudes, use_rust=False, log_rust=False):
-        vals = list(magnitudes or [])
-        if not vals:
-            return [0.0] * self.num_bars
-        if self.frequency_scale_name == _FREQ_SCALE_LOG:
-            return _build_log_spectrum_bins(
-                _normalize_spectrum_magnitudes(vals),
+        with _VIZ_UPDATE_PERF.track("spectrum_map"):
+            vals = list(magnitudes or [])
+            if not vals:
+                return [0.0] * self.num_bars
+            rust_out = None
+            if use_rust:
+                rust_out = _try_rust_map_spectrum(
+                    vals,
+                    self.num_bars,
+                    frequency_scale_name=self.frequency_scale_name,
+                    rust_core=self._rust_core,
+                    analysis_bands=int(getattr(self, "_input_band_count", _LINEAR_ANALYSIS_BANDS) or _LINEAR_ANALYSIS_BANDS),
+                    db_min=-80.0,
+                    db_range=80.0,
+                )
+            if rust_out is not None:
+                if log_rust and not self._logged_rust_path:
+                    logger.info("Spectrum preprocessing path: Rust mapper")
+                    self._logged_rust_path = True
+                return rust_out
+            if self.frequency_scale_name == _FREQ_SCALE_LOG:
+                return _build_log_spectrum_bins(
+                    _normalize_spectrum_magnitudes(vals),
+                    self.num_bars,
+                    rust_core=self._rust_core,
+                )
+            if use_rust and self._rust_core.available and log_rust and not self._logged_rust_path:
+                logger.info("Spectrum preprocessing path: Rust")
+                self._logged_rust_path = True
+            if (not use_rust or not self._rust_core.available) and not self._logged_python_fallback:
+                logger.info("Spectrum preprocessing path: Python fallback")
+                self._logged_python_fallback = True
+            return _build_linear_spectrum_bins(
+                vals,
                 self.num_bars,
-                rust_core=self._rust_core,
+                rust_core=self._rust_core if use_rust else None,
+                analysis_bands=int(getattr(self, "_input_band_count", _LINEAR_ANALYSIS_BANDS) or _LINEAR_ANALYSIS_BANDS),
+                db_min=-80.0,
+                db_range=80.0,
             )
-        if use_rust and self._rust_core.available and log_rust and not self._logged_rust_path:
-            logger.info("Spectrum preprocessing path: Rust")
-            self._logged_rust_path = True
-        if (not use_rust or not self._rust_core.available) and not self._logged_python_fallback:
-            logger.info("Spectrum preprocessing path: Python fallback")
-            self._logged_python_fallback = True
-        return _build_linear_spectrum_bins(
-            vals,
-            self.num_bars,
-            rust_core=self._rust_core if use_rust else None,
-            analysis_bands=_LINEAR_ANALYSIS_BANDS,
-            db_min=-80.0,
-            db_range=80.0,
-        )
 
     def _resample_channel_heights(self, values, out_count):
         vals = list(values or [])
@@ -974,197 +1376,269 @@ class SpectrumVisualizer(Gtk.DrawingArea):
         return out
 
     def update_data(self, magnitudes):
-        if not magnitudes:
-            return
+        with _VIZ_UPDATE_PERF.track("spectrum_update_data"):
+            if not magnitudes:
+                return
+            stereo_needed = bool(getattr(self, "requires_stereo_spectrum", lambda: True)())
 
-        if isinstance(magnitudes, dict):
-            mono_vals = magnitudes.get("mono") or magnitudes.get("left") or magnitudes.get("right") or ()
-            left_vals = magnitudes.get("left") or mono_vals
-            right_vals = magnitudes.get("right") or mono_vals
-        else:
-            mono_vals = magnitudes
-            left_vals = magnitudes
-            right_vals = magnitudes
+            if isinstance(magnitudes, dict):
+                mono_vals = magnitudes.get("mono") or magnitudes.get("left") or magnitudes.get("right") or ()
+                if stereo_needed:
+                    left_vals = magnitudes.get("left") or mono_vals
+                    right_vals = magnitudes.get("right") or mono_vals
+                else:
+                    left_vals = right_vals = mono_vals
+            else:
+                mono_vals = magnitudes
+                left_vals = magnitudes
+                right_vals = magnitudes
 
-        try:
-            actual_count = int(len(mono_vals))
-        except Exception:
-            actual_count = 0
-        if actual_count > 1:
-            self._input_band_count = actual_count
-        new_heights = self._map_magnitudes_to_heights(mono_vals, use_rust=True, log_rust=True)
-        self.target_left_channel_heights = self._map_magnitudes_to_heights(left_vals, use_rust=False)
-        self.target_right_channel_heights = self._map_magnitudes_to_heights(right_vals, use_rust=False)
-        self.target_heights = new_heights
-        bass_count = max(1, min(len(new_heights), self.num_bars // 8))
-        self._bass_target = sum(new_heights[:bass_count]) / float(bass_count)
+            try:
+                actual_count = int(len(mono_vals))
+            except Exception:
+                actual_count = 0
+            if actual_count > 1:
+                self._input_band_count = actual_count
+            new_heights = self._map_magnitudes_to_heights(mono_vals, use_rust=True, log_rust=True)
+            if self._rust_state_engine is not None and not stereo_needed:
+                self._rust_state_engine.set_target(new_heights)
+                self.target_heights = new_heights
+                self.target_left_channel_heights = list(new_heights)
+                self.target_right_channel_heights = list(new_heights)
+                return
+            if stereo_needed and self._rust_stereo_state_engine is not None:
+                left_heights = self._map_magnitudes_to_heights(left_vals, use_rust=False)
+                right_heights = self._map_magnitudes_to_heights(right_vals, use_rust=False)
+                self.target_heights = new_heights
+                self.target_left_channel_heights = left_heights
+                self.target_right_channel_heights = right_heights
+                self._rust_stereo_state_engine.set_targets(left_heights, right_heights)
+                return
+            self.target_heights = new_heights
+            if stereo_needed:
+                self.target_left_channel_heights = self._map_magnitudes_to_heights(left_vals, use_rust=False)
+                self.target_right_channel_heights = self._map_magnitudes_to_heights(right_vals, use_rust=False)
+            else:
+                self.target_left_channel_heights = new_heights
+                self.target_right_channel_heights = new_heights
+            bass_count = max(1, min(len(new_heights), self.num_bars // 8))
+            self._bass_target = sum(new_heights[:bass_count]) / float(bass_count)
 
     def _on_animation_tick(self):
-        if not self._active:
-            self._anim_source = None
-            return False
-        profile = self._profile_cfg
-        changed = False
-        self.phase += 0.045
-        bass_response = max(0.12, min(0.62, 0.28 * float(profile["beat_mul"])))
-        self.bass_level += (self._bass_target - self.bass_level) * bass_response
-        for i in range(self.num_bars):
-            diff = self.target_heights[i] - self.current_heights[i]
-            if abs(diff) > 0.001:
-                self.current_heights[i] += diff * float(profile["smooth"])
-                changed = True
-            ldiff = self.target_left_channel_heights[i] - self.left_channel_heights[i]
-            if abs(ldiff) > 0.001:
-                self.left_channel_heights[i] += ldiff * float(profile["smooth"])
-                changed = True
-            rdiff = self.target_right_channel_heights[i] - self.right_channel_heights[i]
-            if abs(rdiff) > 0.001:
-                self.right_channel_heights[i] += rdiff * float(profile["smooth"])
-                changed = True
-            lcur = self.left_channel_heights[i]
-            if lcur >= self.left_peak_holds[i]:
-                self.left_peak_holds[i] = lcur
-                self.left_peak_ttl[i] = int(profile["peak_hold_frames"])
-            else:
-                if self.left_peak_ttl[i] > 0:
-                    self.left_peak_ttl[i] -= 1
+        with _VIZ_UPDATE_PERF.track("spectrum_anim_tick"):
+            if not self._active:
+                self._anim_source = None
+                return False
+            profile = self._profile_cfg
+            self.phase += 0.045
+            stereo_needed = self.requires_stereo_spectrum()
+            if stereo_needed and self._rust_stereo_state_engine is not None:
+                written, bass, _balance = self._rust_stereo_state_engine.tick_copy(
+                    self._rust_left_cur_arr,
+                    self._rust_right_cur_arr,
+                    self._rust_left_peak_arr,
+                    self._rust_right_peak_arr,
+                )
+                changed = written > 0
+                if changed:
+                    for i in range(self.num_bars):
+                        lcur = float(self._rust_left_cur_arr[i])
+                        rcur = float(self._rust_right_cur_arr[i])
+                        lpeak = float(self._rust_left_peak_arr[i])
+                        rpeak = float(self._rust_right_peak_arr[i])
+                        self.left_channel_heights[i] = lcur
+                        self.right_channel_heights[i] = rcur
+                        self.left_peak_holds[i] = lpeak
+                        self.right_peak_holds[i] = rpeak
+                        self.current_heights[i] = (lcur + rcur) * 0.5
+                        self.peak_holds[i] = max(lpeak, rpeak)
+                    self.bass_level = bass
                 else:
-                    self.left_peak_holds[i] = max(0.0, self.left_peak_holds[i] - float(profile["peak_fall"]))
-            rcur = self.right_channel_heights[i]
-            if rcur >= self.right_peak_holds[i]:
-                self.right_peak_holds[i] = rcur
-                self.right_peak_ttl[i] = int(profile["peak_hold_frames"])
+                    self.bass_level = bass
+                if changed:
+                    self.queue_draw()
+                return True
+            if self._rust_state_engine is not None and not stereo_needed:
+                written, bass = self._rust_state_engine.tick_copy(
+                    self._rust_cur_arr,
+                    self._rust_trail_arr,
+                    self._rust_peak_arr,
+                )
+                changed = written > 0
+                if changed:
+                    self.current_heights[:self.num_bars] = self._rust_cur_arr[:self.num_bars]
+                    self.trail_heights[:self.num_bars] = self._rust_trail_arr[:self.num_bars]
+                    self.peak_holds[:self.num_bars] = self._rust_peak_arr[:self.num_bars]
+                    self.left_channel_heights[:self.num_bars] = self._rust_cur_arr[:self.num_bars]
+                    self.right_channel_heights[:self.num_bars] = self._rust_cur_arr[:self.num_bars]
+                    self.left_peak_holds[:self.num_bars] = self._rust_peak_arr[:self.num_bars]
+                    self.right_peak_holds[:self.num_bars] = self._rust_peak_arr[:self.num_bars]
+                self.bass_level = bass
             else:
-                if self.right_peak_ttl[i] > 0:
-                    self.right_peak_ttl[i] -= 1
-                else:
-                    self.right_peak_holds[i] = max(0.0, self.right_peak_holds[i] - float(profile["peak_fall"]))
-            cur = self.current_heights[i]
-            self.trail_heights[i] = max(cur, self.trail_heights[i] * float(profile["trail_decay"]))
-            if cur >= self.peak_holds[i]:
-                self.peak_holds[i] = cur
-                self.peak_ttl[i] = int(profile["peak_hold_frames"])
-            else:
-                if self.peak_ttl[i] > 0:
-                    self.peak_ttl[i] -= 1
-                else:
-                    self.peak_holds[i] = max(0.0, self.peak_holds[i] - float(profile["peak_fall"]))
-        # Keep short history for waterfall-style effects.
-        self.heat_history.append(list(self.current_heights))
-        self.left_heat_history.append(list(self.left_channel_heights))
-        self.right_heat_history.append(list(self.right_channel_heights))
-        dual_rows = max(8, min(self.num_bars, 48))
-        self.left_log_heat_history.append(self._build_log_bins(self.left_channel_heights, dual_rows))
-        self.right_log_heat_history.append(self._build_log_bins(self.right_channel_heights, dual_rows))
-        if len(self.heat_history) > 800:
-            self.heat_history = self.heat_history[-800:]
-        if len(self.left_heat_history) > 800:
-            self.left_heat_history = self.left_heat_history[-800:]
-        if len(self.right_heat_history) > 800:
-            self.right_heat_history = self.right_heat_history[-800:]
-        if len(self.left_log_heat_history) > 800:
-            self.left_log_heat_history = self.left_log_heat_history[-800:]
-        if len(self.right_log_heat_history) > 800:
-            self.right_log_heat_history = self.right_log_heat_history[-800:]
-        # Pre-binned history for Pro Analyzer Waterfall (avoids heavy per-draw binning).
-        pro_rows = max(4, min(self.num_bars, 64))
-        pro_bins = self._build_log_bins(self.current_heights, pro_rows)
-        self.pro_heat_history.append(pro_bins)
-        self.pro_fall_history.append(self._summarize_pro_fall_bins(pro_bins))
-        if len(self.pro_heat_history) > 900:
-            self.pro_heat_history = self.pro_heat_history[-900:]
-        if len(self.pro_fall_history) > 900:
-            self.pro_fall_history = self.pro_fall_history[-900:]
-        if changed:
-            self.queue_draw()
-        return True
+                changed = False
+                bass_response = max(0.12, min(0.62, 0.28 * float(profile["beat_mul"])))
+                self.bass_level += (self._bass_target - self.bass_level) * bass_response
+                for i in range(self.num_bars):
+                    diff = self.target_heights[i] - self.current_heights[i]
+                    if abs(diff) > 0.001:
+                        self.current_heights[i] += diff * float(profile["smooth"])
+                        changed = True
+                    ldiff = self.target_left_channel_heights[i] - self.left_channel_heights[i]
+                    if abs(ldiff) > 0.001:
+                        self.left_channel_heights[i] += ldiff * float(profile["smooth"])
+                        changed = True
+                    rdiff = self.target_right_channel_heights[i] - self.right_channel_heights[i]
+                    if abs(rdiff) > 0.001:
+                        self.right_channel_heights[i] += rdiff * float(profile["smooth"])
+                        changed = True
+                    lcur = self.left_channel_heights[i]
+                    if lcur >= self.left_peak_holds[i]:
+                        self.left_peak_holds[i] = lcur
+                        self.left_peak_ttl[i] = int(profile["peak_hold_frames"])
+                    else:
+                        if self.left_peak_ttl[i] > 0:
+                            self.left_peak_ttl[i] -= 1
+                        else:
+                            self.left_peak_holds[i] = max(0.0, self.left_peak_holds[i] - float(profile["peak_fall"]))
+                    rcur = self.right_channel_heights[i]
+                    if rcur >= self.right_peak_holds[i]:
+                        self.right_peak_holds[i] = rcur
+                        self.right_peak_ttl[i] = int(profile["peak_hold_frames"])
+                    else:
+                        if self.right_peak_ttl[i] > 0:
+                            self.right_peak_ttl[i] -= 1
+                        else:
+                            self.right_peak_holds[i] = max(0.0, self.right_peak_holds[i] - float(profile["peak_fall"]))
+                    cur = self.current_heights[i]
+                    self.trail_heights[i] = max(cur, self.trail_heights[i] * float(profile["trail_decay"]))
+                    if cur >= self.peak_holds[i]:
+                        self.peak_holds[i] = cur
+                        self.peak_ttl[i] = int(profile["peak_hold_frames"])
+                    else:
+                        if self.peak_ttl[i] > 0:
+                            self.peak_ttl[i] -= 1
+                        else:
+                            self.peak_holds[i] = max(0.0, self.peak_holds[i] - float(profile["peak_fall"]))
+            effect = self._effect_code
+            # Waterfall histories are only needed for effects that actually read them.
+            if effect == 25:
+                dual_rows = max(8, min(self.num_bars, 48))
+                self.left_log_heat_history.append(self._build_log_bins(self.left_channel_heights, dual_rows))
+                self.right_log_heat_history.append(self._build_log_bins(self.right_channel_heights, dual_rows))
+                if len(self.left_log_heat_history) > 800:
+                    self.left_log_heat_history = self.left_log_heat_history[-800:]
+                if len(self.right_log_heat_history) > 800:
+                    self.right_log_heat_history = self.right_log_heat_history[-800:]
+            elif effect == 16:
+                # Pre-binned history for Pro Analyzer Waterfall (avoids heavy per-draw binning).
+                pro_rows = max(4, min(self.num_bars, 64))
+                pro_bins = self._build_log_bins(self.current_heights, pro_rows)
+                self.pro_fall_history.append(self._summarize_pro_fall_bins(pro_bins))
+                if len(self.pro_fall_history) > 900:
+                    self.pro_fall_history = self.pro_fall_history[-900:]
+            if changed:
+                self.queue_draw()
+            return True
 
     def _draw_callback(self, area, cr, width, height, data=None):
-        theme = self._theme_cfg
-        profile = self._profile_cfg
-        if width <= 0 or height <= 0:
-            return
+        with _VIZ_DRAW_PERF.track("spectrum_draw_callback"):
+            theme = self._theme_cfg
+            profile = self._profile_cfg
+            if width <= 0 or height <= 0:
+                return
 
-        # Opaque black background (matches GL renderers).
-        cr.set_source_rgba(0.0, 0.0, 0.0, 1.0)
-        cr.paint()
+            # Opaque black background (matches GL renderers).
+            cr.set_source_rgba(0.0, 0.0, 0.0, 1.0)
+            cr.paint()
 
-        n = self.num_bars
-        spacing = max(0.8, theme["bar_spacing"] * float(profile["spacing_mul"]))
-        gain = theme["height_gain"] * float(profile["gain_mul"])
-        gain *= _display_gain_multiplier(self.frequency_scale_name)
-        bar_w = max(1.0, (width - (n - 1) * spacing) / n)
-        effect = self._effect_code
-        if effect not in (14, 15, 16, 17, 18, 20, 21, 22, 23, 24, 25, 26):
-            self._draw_freq_axis(cr, width, height)
-        if effect == 0:
-            gradient = self._make_gradient(height, theme)
-            self._draw_bars(cr, width, height, gain, gradient, bar_w, spacing)
-        elif effect == 1:
-            gradient = self._make_gradient(height, theme)
-            self._draw_wave_line(cr, width, height, gain, gradient, filled=False)
-        elif effect == 2:
-            gradient = self._make_gradient(height, theme)
-            self._draw_wave_line(cr, width, height, gain, gradient, filled=True)
-        elif effect == 3:
-            gradient = self._make_gradient(height, theme)
-            self._draw_mirror_bars(cr, width, height, gain, gradient, bar_w, spacing)
-        elif effect == 4:
-            self._draw_dot_matrix(cr, width, height, gain, bar_w, spacing, theme["gradient"])
-        elif effect == 5:
-            self._draw_neon_tunnel(cr, width, height, gain, theme["gradient"])
-        elif effect == 6:
-            gradient = self._make_gradient(height, theme)
-            self._draw_bars(cr, width, height, gain, gradient, bar_w, spacing)
-            self._draw_peak_caps(cr, width, height, gain, bar_w, spacing)
-        elif effect == 7:
-            gradient = self._make_gradient(height, theme)
-            self._draw_trail_glow(cr, width, height, gain, bar_w, spacing)
-            self._draw_bars(cr, width, height, gain, gradient, bar_w, spacing)
-        elif effect == 8:
-            gradient = self._make_gradient(height, theme)
-            self._draw_beat_pulse_bg(cr, width, height, theme, float(profile["beat_mul"]))
-            self._draw_bars(cr, width, height, gain, gradient, bar_w, spacing)
-        elif effect == 9:
-            self._draw_split_stereo(cr, width, height, gain, theme["gradient"])
-        elif effect == 10:
-            self._draw_particle_burst(cr, width, height, gain, theme["gradient"])
-        elif effect == 11:
-            self._draw_starscape(cr, width, height, gain, theme["gradient"])
-        elif effect == 12:
-            self._draw_ribbon(cr, width, height, gain, theme["gradient"])
-        elif effect == 13:
-            self._draw_spiral(cr, width, height, gain, theme["gradient"])
-        elif effect == 14:
-            self._draw_pro_analyzer(cr, width, height, gain, theme["gradient"])
-        elif effect == 15:
-            self._draw_pro_analyzer_line(cr, width, height, gain, theme["gradient"])
-        elif effect == 16:
-            self._draw_pro_analyzer_waterfall(cr, width, height, gain, theme["gradient"])
-        elif effect == 17:
-            self._draw_orbit(cr, width, height, gain, theme["gradient"])
-        elif effect == 18:
-            self._draw_shards(cr, width, height, gain, theme["gradient"])
-        elif effect == 19:
-            gradient = self._make_gradient(height, theme)
-            self._draw_stereo_mirror_bars(cr, width, height, gain, gradient, bar_w, spacing)
-        elif effect == 20:
-            self._draw_lissajous(cr, width, height, gain, theme["gradient"])
-        elif effect == 21:
-            self._draw_stereo_scope(cr, width, height, gain, theme["gradient"])
-        elif effect == 22:
-            self._draw_balance_wave(cr, width, height, gain, theme["gradient"])
-        elif effect == 23:
-            self._draw_center_side(cr, width, height, gain, theme["gradient"])
-        elif effect == 24:
-            self._draw_phase_flower(cr, width, height, gain, theme["gradient"])
-        elif effect == 26:
-            self._draw_stereo_meter(cr, width, height, gain, theme["gradient"])
-        elif effect == 25:
-            self._draw_dual_fall(cr, width, height, gain, theme["gradient"])
-        else:
-            gradient = self._make_gradient(height, theme)
-            self._draw_bars(cr, width, height, gain, gradient, bar_w, spacing)
+            n = self.num_bars
+            spacing = max(0.8, theme["bar_spacing"] * float(profile["spacing_mul"]))
+            gain = theme["height_gain"] * float(profile["gain_mul"])
+            gain *= _display_gain_multiplier(self.frequency_scale_name)
+            bar_w = max(1.0, (width - (n - 1) * spacing) / n)
+            effect = self._effect_code
+            if effect not in (14, 15, 16, 17, 18, 20, 21, 22, 23, 24, 25, 26):
+                self._draw_freq_axis(cr, width, height)
+            if effect == 0:
+                gradient = self._make_gradient(height, theme)
+                with _VIZ_DRAW_PERF.track("bars"):
+                    self._draw_bars(cr, width, height, gain, gradient, bar_w, spacing)
+            elif effect == 1:
+                gradient = self._make_gradient(height, theme)
+                with _VIZ_DRAW_PERF.track("wave"):
+                    self._draw_wave_line(cr, width, height, gain, gradient, filled=False)
+            elif effect == 2:
+                gradient = self._make_gradient(height, theme)
+                with _VIZ_DRAW_PERF.track("wave_fill"):
+                    self._draw_wave_line(cr, width, height, gain, gradient, filled=True)
+            elif effect == 3:
+                gradient = self._make_gradient(height, theme)
+                with _VIZ_DRAW_PERF.track("mirror"):
+                    self._draw_mirror_bars(cr, width, height, gain, gradient, bar_w, spacing)
+            elif effect == 4:
+                with _VIZ_DRAW_PERF.track("dots"):
+                    self._draw_dot_matrix(cr, width, height, gain, bar_w, spacing, theme["gradient"])
+            elif effect == 5:
+                self._draw_neon_tunnel(cr, width, height, gain, theme["gradient"])
+            elif effect == 6:
+                gradient = self._make_gradient(height, theme)
+                with _VIZ_DRAW_PERF.track("bars"):
+                    self._draw_bars(cr, width, height, gain, gradient, bar_w, spacing)
+                self._draw_peak_caps(cr, width, height, gain, bar_w, spacing)
+            elif effect == 7:
+                gradient = self._make_gradient(height, theme)
+                self._draw_trail_glow(cr, width, height, gain, bar_w, spacing)
+                with _VIZ_DRAW_PERF.track("bars"):
+                    self._draw_bars(cr, width, height, gain, gradient, bar_w, spacing)
+            elif effect == 8:
+                gradient = self._make_gradient(height, theme)
+                self._draw_beat_pulse_bg(cr, width, height, theme, float(profile["beat_mul"]))
+                with _VIZ_DRAW_PERF.track("bars"):
+                    self._draw_bars(cr, width, height, gain, gradient, bar_w, spacing)
+            elif effect == 9:
+                self._draw_split_stereo(cr, width, height, gain, theme["gradient"])
+            elif effect == 10:
+                self._draw_particle_burst(cr, width, height, gain, theme["gradient"])
+            elif effect == 11:
+                self._draw_starscape(cr, width, height, gain, theme["gradient"])
+            elif effect == 12:
+                self._draw_ribbon(cr, width, height, gain, theme["gradient"])
+            elif effect == 13:
+                self._draw_spiral(cr, width, height, gain, theme["gradient"])
+            elif effect == 14:
+                with _VIZ_DRAW_PERF.track("pro_analyzer"):
+                    self._draw_pro_analyzer(cr, width, height, gain, theme["gradient"])
+            elif effect == 15:
+                with _VIZ_DRAW_PERF.track("pro_line"):
+                    self._draw_pro_analyzer_line(cr, width, height, gain, theme["gradient"])
+            elif effect == 16:
+                with _VIZ_DRAW_PERF.track("pro_fall"):
+                    self._draw_pro_analyzer_waterfall(cr, width, height, gain, theme["gradient"])
+            elif effect == 17:
+                self._draw_orbit(cr, width, height, gain, theme["gradient"])
+            elif effect == 18:
+                self._draw_shards(cr, width, height, gain, theme["gradient"])
+            elif effect == 19:
+                gradient = self._make_gradient(height, theme)
+                self._draw_stereo_mirror_bars(cr, width, height, gain, gradient, bar_w, spacing)
+            elif effect == 20:
+                self._draw_lissajous(cr, width, height, gain, theme["gradient"])
+            elif effect == 21:
+                self._draw_stereo_scope(cr, width, height, gain, theme["gradient"])
+            elif effect == 22:
+                self._draw_balance_wave(cr, width, height, gain, theme["gradient"])
+            elif effect == 23:
+                self._draw_center_side(cr, width, height, gain, theme["gradient"])
+            elif effect == 24:
+                self._draw_phase_flower(cr, width, height, gain, theme["gradient"])
+            elif effect == 26:
+                self._draw_stereo_meter(cr, width, height, gain, theme["gradient"])
+            elif effect == 25:
+                self._draw_dual_fall(cr, width, height, gain, theme["gradient"])
+            else:
+                gradient = self._make_gradient(height, theme)
+                with _VIZ_DRAW_PERF.track("bars"):
+                    self._draw_bars(cr, width, height, gain, gradient, bar_w, spacing)
 
     def _draw_grid(self, cr, width, height, alpha):
         cr.set_line_width(1.0)
@@ -3604,7 +4078,7 @@ class DotsGLVisualizer(Gtk.GLArea):
         self._rust_core = _sv._rust_core
 
         self.num_bars     = 32
-        self.theme_name   = "Aurora (Default)"
+        self.theme_name   = _AUTO_COVER_THEME_NAME
         self.profile_name = "Dynamic"
         self.frequency_scale_name = _FREQ_SCALE_LINEAR
         self.frequency_scale_names = list(_FREQ_SCALE_NAMES)
@@ -3646,6 +4120,9 @@ class DotsGLVisualizer(Gtk.GLArea):
         self._cached_h       = -1
         # True when num_bars/colors/gain/spacing need re-upload to GPU
         self._dirty_static   = True
+        self._rust_state_engine = None
+        self._state_tr_arr = (ctypes.c_float * 512)(*([0.0] * 512))
+        self._state_ph_arr = (ctypes.c_float * 512)(*([0.0] * 512))
 
         self.set_auto_render(False)
         self.set_hexpand(True)
@@ -3653,6 +4130,7 @@ class DotsGLVisualizer(Gtk.GLArea):
         self.connect("realize",   self._on_realize)
         self.connect("unrealize", self._on_unrealize)
         self.connect("render",    self._on_render)
+        self._reset_rust_state_engine()
         logger.info("Visualizer backend selected: GL (Dots)")
 
     # ------------------------------------------------------------------
@@ -3683,6 +4161,26 @@ class DotsGLVisualizer(Gtk.GLArea):
         if self._program is not None:
             GL.glDeleteProgram(self._program)
             self._program = None
+
+    def _reset_rust_state_engine(self):
+        try:
+            if self._rust_state_engine is not None:
+                self._rust_state_engine.close()
+        except Exception:
+            pass
+        self._rust_state_engine = None
+        if self._rust_core is not None and getattr(self._rust_core, "available", False):
+            try:
+                self._rust_state_engine = self._rust_core.create_state_engine(
+                    self.num_bars,
+                    smooth=float(self._profile_cfg["smooth"]),
+                    trail_decay=1.0,
+                    peak_hold_frames=0,
+                    peak_fall=0.0,
+                    bass_smooth=0.22,
+                )
+            except Exception:
+                self._rust_state_engine = None
 
     def _setup_gl(self):
         if self._program is not None:
@@ -3753,7 +4251,8 @@ class DotsGLVisualizer(Gtk.GLArea):
             self._dirty_static = False
 
         # Heights change every animated frame
-        self._h_arr[:512] = self.current_heights[:512]
+        if self._rust_state_engine is None:
+            self._h_arr[:512] = self.current_heights[:512]
         GL.glUniform1fv(self._u_heights, 512, self._h_arr)
 
         GL.glBindVertexArray(self._vao)
@@ -3767,19 +4266,25 @@ class DotsGLVisualizer(Gtk.GLArea):
     # ------------------------------------------------------------------
 
     def _on_animation_tick(self):
-        if not self._active:
-            self._anim_source = None
-            return False
-        smooth = float(self._profile_cfg["smooth"])
-        changed = False
-        for i in range(self.num_bars):
-            diff = self.target_heights[i] - self.current_heights[i]
-            if abs(diff) > 0.001:
-                self.current_heights[i] += diff * smooth
-                changed = True
-        if changed:
-            self.queue_render()
-        return True
+        with _VIZ_UPDATE_PERF.track("dots_gl_anim_tick"):
+            if not self._active:
+                self._anim_source = None
+                return False
+            if self._rust_state_engine is not None:
+                written, _bass = self._rust_state_engine.tick_copy(self._h_arr, self._state_tr_arr, self._state_ph_arr)
+                if written > 0:
+                    self.queue_render()
+                return True
+            smooth = float(self._profile_cfg["smooth"])
+            changed = False
+            for i in range(self.num_bars):
+                diff = self.target_heights[i] - self.current_heights[i]
+                if abs(diff) > 0.001:
+                    self.current_heights[i] += diff * smooth
+                    changed = True
+            if changed:
+                self.queue_render()
+            return True
 
     # ------------------------------------------------------------------
     # Color cache
@@ -3842,32 +4347,55 @@ class DotsGLVisualizer(Gtk.GLArea):
                 self._anim_source = None
 
     def update_data(self, magnitudes):
-        if not magnitudes:
-            return
-        if isinstance(magnitudes, dict):
-            vals = magnitudes.get("mono") or magnitudes.get("left") or ()
-        else:
-            vals = magnitudes
-        vals = list(vals or [])
-        if len(vals) > 1:
-            self._input_band_count = len(vals)
-        if self.frequency_scale_name == _FREQ_SCALE_LOG:
-            new_heights = _build_log_spectrum_bins(
-                _normalize_spectrum_magnitudes(vals),
+        with _VIZ_UPDATE_PERF.track("dots_gl_update_data"):
+            if not magnitudes:
+                return
+            if isinstance(magnitudes, dict):
+                vals = magnitudes.get("mono") or magnitudes.get("left") or ()
+            else:
+                vals = magnitudes
+            vals = list(vals or [])
+            if len(vals) > 1:
+                self._input_band_count = len(vals)
+            rust_out = _try_rust_map_spectrum(
+                vals,
+                self.num_bars,
+                frequency_scale_name=self.frequency_scale_name,
+                rust_core=getattr(self, "_rust_core", None),
+                analysis_bands=int(getattr(self, "_input_band_count", _LINEAR_ANALYSIS_BANDS) or _LINEAR_ANALYSIS_BANDS),
+                db_min=-80.0,
+                db_range=80.0,
+            )
+            if rust_out is not None:
+                new_heights = rust_out
+                if self._rust_state_engine is not None:
+                    self._rust_state_engine.set_target(new_heights)
+                else:
+                    self.target_heights[:self.num_bars] = new_heights[:self.num_bars]
+                return
+            if self.frequency_scale_name == _FREQ_SCALE_LOG:
+                new_heights = _build_log_spectrum_bins(
+                    _normalize_spectrum_magnitudes(vals),
+                    self.num_bars,
+                    rust_core=self._rust_core,
+                )
+                if self._rust_state_engine is not None:
+                    self._rust_state_engine.set_target(new_heights)
+                else:
+                    self.target_heights[:self.num_bars] = new_heights[:self.num_bars]
+                return
+            new_heights = _build_linear_spectrum_bins(
+                vals,
                 self.num_bars,
                 rust_core=self._rust_core,
+                analysis_bands=_LINEAR_ANALYSIS_BANDS,
+                db_min=-80.0,
+                db_range=80.0,
             )
-            self.target_heights[:self.num_bars] = new_heights[:self.num_bars]
-            return
-        new_heights = _build_linear_spectrum_bins(
-            vals,
-            self.num_bars,
-            rust_core=self._rust_core,
-            analysis_bands=_LINEAR_ANALYSIS_BANDS,
-            db_min=-80.0,
-            db_range=80.0,
-        )
-        self.target_heights[:self.num_bars] = new_heights[:self.num_bars]
+            if self._rust_state_engine is not None:
+                self._rust_state_engine.set_target(new_heights)
+            else:
+                self.target_heights[:self.num_bars] = new_heights[:self.num_bars]
 
     def _build_log_bins(self, values, out_count):
         if self._rust_core.available:
@@ -3902,8 +4430,17 @@ class DotsGLVisualizer(Gtk.GLArea):
         self.num_bars = min(n, 512)
         self.target_heights  = [0.0] * 512
         self.current_heights = [0.0] * 512
+        self._reset_rust_state_engine()
         self._color_cache    = None
         self._dirty_static   = True
+
+    def set_input_band_count(self, count):
+        try:
+            n = int(count)
+        except Exception:
+            return
+        if n > 1:
+            self._input_band_count = n
 
     def set_theme(self, name):
         if name in self.themes:
@@ -3911,6 +4448,18 @@ class DotsGLVisualizer(Gtk.GLArea):
             self._theme_cfg = self.themes[name]
             self._color_cache = None
             self._update_render_cache()
+
+    def set_auto_cover_theme_rgb(self, colors):
+        self.themes[_AUTO_COVER_THEME_NAME] = _cover_theme_from_rgbs(
+            colors,
+            self.themes.get("Aurora", self.themes.get(_AUTO_COVER_THEME_NAME, {})),
+        )
+        if self.theme_name == _AUTO_COVER_THEME_NAME:
+            self._theme_cfg = self.themes[self.theme_name]
+            self._color_cache = None
+            self._update_render_cache()
+            if self.get_realized():
+                self.queue_render()
 
     def set_effect(self, _name):
         pass   # DotsGLVisualizer only renders Dots
@@ -3925,6 +4474,14 @@ class DotsGLVisualizer(Gtk.GLArea):
         if name in self.profiles:
             self.profile_name = name
             self._profile_cfg = self.profiles[name]
+            if self._rust_state_engine is not None:
+                self._rust_state_engine.set_params(
+                    smooth=float(self._profile_cfg["smooth"]),
+                    trail_decay=1.0,
+                    peak_hold_frames=0,
+                    peak_fall=0.0,
+                    bass_smooth=0.22,
+                )
             self._update_render_cache()
 
     def get_theme_names(self):
@@ -4656,14 +5213,14 @@ class BarsGLVisualizer(Gtk.GLArea):
         self._rust_core           = proto._rust_core
 
         self.num_bars            = 32
-        self.theme_name          = "Aurora (Default)"
+        self.theme_name          = _AUTO_COVER_THEME_NAME
         self.profile_name        = "Dynamic"
         self.frequency_scale_name = _FREQ_SCALE_LINEAR
         self.frequency_scale_names = list(_FREQ_SCALE_NAMES)
         self.effect_mode         = 0   # 0=Bars 1=Peak 2=Trail
 
         self._profile_cfg = self.profiles["Dynamic"]
-        self._theme_cfg   = self.themes["Aurora (Default)"]
+        self._theme_cfg   = self.themes[self.theme_name]
         self._cached_gain    = float(self._theme_cfg["height_gain"]) * float(self._profile_cfg["gain_mul"])
         self._cached_spacing = max(0.8, float(self._theme_cfg["bar_spacing"]) * float(self._profile_cfg["spacing_mul"]))
 
@@ -4700,6 +5257,10 @@ class BarsGLVisualizer(Gtk.GLArea):
 
         self._active       = False
         self._anim_source  = None
+        self._rust_state_engine = None
+        self._rust_stereo_state_engine = None
+        self._lph_arr = (ctypes.c_float * 512)(*([0.0] * 512))
+        self._rph_arr = (ctypes.c_float * 512)(*([0.0] * 512))
 
         self.set_auto_render(False)
         self.set_hexpand(True)
@@ -4707,6 +5268,7 @@ class BarsGLVisualizer(Gtk.GLArea):
         self.connect("realize",   self._on_realize)
         self.connect("unrealize", self._on_unrealize)
         self.connect("render",    self._on_render)
+        self._reset_rust_state_engine()
         logger.info("Visualizer backend selected: GL (Bars/Peak/Trail)")
 
     # ------------------------------------------------------------------
@@ -4728,6 +5290,44 @@ class BarsGLVisualizer(Gtk.GLArea):
         if self._vao:
             GL.glDeleteVertexArrays(1, [self._vao])
         self._vbo = self._vao = self._program = None
+
+    def _reset_rust_state_engine(self):
+        try:
+            if self._rust_state_engine is not None:
+                self._rust_state_engine.close()
+        except Exception:
+            pass
+        self._rust_state_engine = None
+        try:
+            if self._rust_stereo_state_engine is not None:
+                self._rust_stereo_state_engine.close()
+        except Exception:
+            pass
+        self._rust_stereo_state_engine = None
+        if self._rust_core is not None and getattr(self._rust_core, "available", False):
+            try:
+                self._rust_state_engine = self._rust_core.create_state_engine(
+                    self.num_bars,
+                    smooth=float(self._profile_cfg["smooth"]),
+                    trail_decay=float(self._profile_cfg["trail_decay"]),
+                    peak_hold_frames=int(self._profile_cfg["peak_hold_frames"]),
+                    peak_fall=float(self._profile_cfg["peak_fall"]),
+                    bass_smooth=max(0.12, min(0.62, 0.28 * float(self._profile_cfg["beat_mul"]))),
+                )
+            except Exception:
+                self._rust_state_engine = None
+            try:
+                self._rust_stereo_state_engine = self._rust_core.create_stereo_state_engine(
+                    self.num_bars,
+                    smooth=float(self._profile_cfg["smooth"]),
+                    trail_decay=float(self._profile_cfg["trail_decay"]),
+                    peak_hold_frames=int(self._profile_cfg["peak_hold_frames"]),
+                    peak_fall=float(self._profile_cfg["peak_fall"]),
+                    bass_smooth=max(0.12, min(0.62, 0.28 * float(self._profile_cfg["beat_mul"]))),
+                    balance_smooth=float(self._profile_cfg["smooth"]),
+                )
+            except Exception:
+                self._rust_stereo_state_engine = None
 
     def _setup_gl(self):
         self._program = None
@@ -4834,11 +5434,12 @@ class BarsGLVisualizer(Gtk.GLArea):
             self._cached_w     = pw
             self._cached_h     = ph
             self._dirty_static = False
-        self._h_arr[:512]  = self.current_heights[:512]
-        self._ph_arr[:512] = self.peak_holds[:512]
-        self._tr_arr[:512] = self.trail_heights[:512]
-        self._lh_arr[:512] = self.left_heights[:512]
-        self._rh_arr[:512] = self.right_heights[:512]
+        if self._rust_state_engine is None or self.requires_stereo_spectrum():
+            self._h_arr[:512]  = self.current_heights[:512]
+            self._ph_arr[:512] = self.peak_holds[:512]
+            self._tr_arr[:512] = self.trail_heights[:512]
+            self._lh_arr[:512] = self.left_heights[:512]
+            self._rh_arr[:512] = self.right_heights[:512]
         GL.glUniform1fv(self._u_heights,        512, self._h_arr)
         GL.glUniform1fv(self._u_peak_heights,   512, self._ph_arr)
         GL.glUniform1fv(self._u_trail_heights,  512, self._tr_arr)
@@ -4856,44 +5457,64 @@ class BarsGLVisualizer(Gtk.GLArea):
     # ------------------------------------------------------------------
 
     def _on_animation_tick(self):
-        if not self._active:
-            self._anim_source = None
-            return False
-        profile = self._profile_cfg
-        smooth      = float(profile["smooth"])
-        trail_decay = float(profile["trail_decay"])
-        peak_fall   = float(profile["peak_fall"])
-        peak_hold_f = int(profile["peak_hold_frames"])
-        bass_resp   = max(0.12, min(0.62, 0.28 * float(profile["beat_mul"])))
-        changed = False
-        for i in range(self.num_bars):
-            diff = self.target_heights[i] - self.current_heights[i]
-            if abs(diff) > 0.001:
-                self.current_heights[i] += diff * smooth
-                changed = True
-            ldiff = self.target_left_heights[i] - self.left_heights[i]
-            if abs(ldiff) > 0.001:
-                self.left_heights[i] += ldiff * smooth
-                changed = True
-            rdiff = self.target_right_heights[i] - self.right_heights[i]
-            if abs(rdiff) > 0.001:
-                self.right_heights[i] += rdiff * smooth
-                changed = True
-            cur = self.current_heights[i]
-            self.trail_heights[i] = max(cur, self.trail_heights[i] * trail_decay)
-            if cur >= self.peak_holds[i]:
-                self.peak_holds[i] = cur
-                self.peak_ttl[i]   = peak_hold_f
-            else:
-                if self.peak_ttl[i] > 0:
-                    self.peak_ttl[i] -= 1
+        with _VIZ_UPDATE_PERF.track("bars_gl_anim_tick"):
+            if not self._active:
+                self._anim_source = None
+                return False
+            if self._rust_stereo_state_engine is not None and self.requires_stereo_spectrum():
+                written, bass, balance = self._rust_stereo_state_engine.tick_copy(
+                    self._lh_arr,
+                    self._rh_arr,
+                    self._lph_arr,
+                    self._rph_arr,
+                )
+                self.bass_level = bass
+                self.balance = balance
+                if written > 0:
+                    self.queue_render()
+                return True
+            if self._rust_state_engine is not None and not self.requires_stereo_spectrum():
+                written, bass = self._rust_state_engine.tick_copy(self._h_arr, self._tr_arr, self._ph_arr)
+                self.bass_level = bass
+                self.balance = 0.0
+                if written > 0:
+                    self.queue_render()
+                return True
+            profile = self._profile_cfg
+            smooth      = float(profile["smooth"])
+            trail_decay = float(profile["trail_decay"])
+            peak_fall   = float(profile["peak_fall"])
+            peak_hold_f = int(profile["peak_hold_frames"])
+            bass_resp   = max(0.12, min(0.62, 0.28 * float(profile["beat_mul"])))
+            changed = False
+            for i in range(self.num_bars):
+                diff = self.target_heights[i] - self.current_heights[i]
+                if abs(diff) > 0.001:
+                    self.current_heights[i] += diff * smooth
+                    changed = True
+                ldiff = self.target_left_heights[i] - self.left_heights[i]
+                if abs(ldiff) > 0.001:
+                    self.left_heights[i] += ldiff * smooth
+                    changed = True
+                rdiff = self.target_right_heights[i] - self.right_heights[i]
+                if abs(rdiff) > 0.001:
+                    self.right_heights[i] += rdiff * smooth
+                    changed = True
+                cur = self.current_heights[i]
+                self.trail_heights[i] = max(cur, self.trail_heights[i] * trail_decay)
+                if cur >= self.peak_holds[i]:
+                    self.peak_holds[i] = cur
+                    self.peak_ttl[i]   = peak_hold_f
                 else:
-                    self.peak_holds[i] = max(0.0, self.peak_holds[i] - peak_fall)
-        self.bass_level += (self._bass_target - self.bass_level) * bass_resp
-        self.balance    += (self._balance_target - self.balance) * smooth
-        if changed:
-            self.queue_render()
-        return True
+                    if self.peak_ttl[i] > 0:
+                        self.peak_ttl[i] -= 1
+                    else:
+                        self.peak_holds[i] = max(0.0, self.peak_holds[i] - peak_fall)
+            self.bass_level += (self._bass_target - self.bass_level) * bass_resp
+            self.balance    += (self._balance_target - self.balance) * smooth
+            if changed:
+                self.queue_render()
+            return True
 
     def set_active(self, active):
         if self._active == active:
@@ -4916,49 +5537,86 @@ class BarsGLVisualizer(Gtk.GLArea):
     # ------------------------------------------------------------------
 
     def update_data(self, magnitudes):
-        if not magnitudes:
-            return
-        if isinstance(magnitudes, dict):
-            mono_vals  = magnitudes.get("mono") or magnitudes.get("left") or ()
-            left_vals  = magnitudes.get("left")  or mono_vals
-            right_vals = magnitudes.get("right") or mono_vals
-        else:
-            mono_vals = left_vals = right_vals = magnitudes
-        mono_vals  = list(mono_vals  or [])
-        left_vals  = list(left_vals  or [])
-        right_vals = list(right_vals or [])
+        with _VIZ_UPDATE_PERF.track("bars_gl_update_data"):
+            if not magnitudes:
+                return
+            stereo_needed = bool(getattr(self, "requires_stereo_spectrum", lambda: True)())
+            if isinstance(magnitudes, dict):
+                mono_vals  = magnitudes.get("mono") or magnitudes.get("left") or ()
+                if stereo_needed:
+                    left_vals = magnitudes.get("left") or mono_vals
+                    right_vals = magnitudes.get("right") or mono_vals
+                else:
+                    left_vals = right_vals = mono_vals
+            else:
+                mono_vals = left_vals = right_vals = magnitudes
+            mono_vals = list(mono_vals or [])
+            if len(mono_vals) > 1:
+                self._input_band_count = len(mono_vals)
+            if stereo_needed:
+                left_vals = list(left_vals or [])
+                right_vals = list(right_vals or [])
+            else:
+                left_vals = right_vals = mono_vals
 
-        def _build(vals):
-            if self.frequency_scale_name == _FREQ_SCALE_LOG:
-                return _build_log_spectrum_bins(
-                    _normalize_spectrum_magnitudes(vals),
+            def _build(vals):
+                rust_out = _try_rust_map_spectrum(
+                    vals,
                     self.num_bars,
-                    rust_core=self._rust_core,
+                    frequency_scale_name=self.frequency_scale_name,
+                    rust_core=getattr(self, "_rust_core", None),
+                    analysis_bands=int(getattr(self, "_input_band_count", _LINEAR_ANALYSIS_BANDS) or _LINEAR_ANALYSIS_BANDS),
+                    db_min=-80.0,
+                    db_range=80.0,
                 )
-            return _build_linear_spectrum_bins(
-                vals, self.num_bars,
-                rust_core=None,
-                analysis_bands=_LINEAR_ANALYSIS_BANDS,
-                db_min=-80.0, db_range=80.0,
-            )
+                if rust_out is not None:
+                    return rust_out
+                if self.frequency_scale_name == _FREQ_SCALE_LOG:
+                    return _build_log_spectrum_bins(
+                        _normalize_spectrum_magnitudes(vals),
+                        self.num_bars,
+                        rust_core=self._rust_core,
+                    )
+                return _build_linear_spectrum_bins(
+                    vals, self.num_bars,
+                    rust_core=None,
+                    analysis_bands=int(getattr(self, "_input_band_count", _LINEAR_ANALYSIS_BANDS) or _LINEAR_ANALYSIS_BANDS),
+                    db_min=-80.0, db_range=80.0,
+                )
 
-        new_heights  = _build(mono_vals)
-        self.target_heights[:self.num_bars] = new_heights[:self.num_bars]
+            new_heights  = _build(mono_vals)
+            if self._rust_state_engine is not None and not stereo_needed:
+                self._rust_state_engine.set_target(new_heights)
+                self._bass_target = sum(new_heights[:max(1, min(len(new_heights), self.num_bars // 8))]) / float(max(1, min(len(new_heights), self.num_bars // 8)))
+                self._balance_target = 0.0
+                return
+            if stereo_needed and self._rust_stereo_state_engine is not None:
+                lh = _build(left_vals)
+                rh = _build(right_vals)
+                self._rust_stereo_state_engine.set_targets(lh, rh)
+                return
+            self.target_heights[:self.num_bars] = new_heights[:self.num_bars]
 
-        lh = _build(left_vals)
-        rh = _build(right_vals)
-        self.target_left_heights[:self.num_bars]  = lh[:self.num_bars]
-        self.target_right_heights[:self.num_bars] = rh[:self.num_bars]
+            if stereo_needed:
+                lh = _build(left_vals)
+                rh = _build(right_vals)
+            else:
+                lh = rh = new_heights
+            self.target_left_heights[:self.num_bars]  = lh[:self.num_bars]
+            self.target_right_heights[:self.num_bars] = rh[:self.num_bars]
 
-        bass_count = max(1, min(len(new_heights), self.num_bars // 8))
-        self._bass_target = sum(new_heights[:bass_count]) / float(bass_count)
+            bass_count = max(1, min(len(new_heights), self.num_bars // 8))
+            self._bass_target = sum(new_heights[:bass_count]) / float(bass_count)
 
-        left_avg  = sum(lh) / float(max(1, len(lh))) if lh else 0.0
-        right_avg = sum(rh) / float(max(1, len(rh))) if rh else 0.0
-        total = left_avg + right_avg
-        # Amplify so small L/R differences produce visible ball movement.
-        raw = (right_avg - left_avg) / total if total > 1e-6 else 0.0
-        self._balance_target = max(-1.0, min(1.0, raw * 5.0))
+        if stereo_needed:
+            left_avg  = sum(lh) / float(max(1, len(lh))) if lh else 0.0
+            right_avg = sum(rh) / float(max(1, len(rh))) if rh else 0.0
+            total = left_avg + right_avg
+            # Amplify so small L/R differences produce visible ball movement.
+            raw = (right_avg - left_avg) / total if total > 1e-6 else 0.0
+            self._balance_target = max(-1.0, min(1.0, raw * 5.0))
+        else:
+            self._balance_target = 0.0
 
     # ------------------------------------------------------------------
     # Configuration
@@ -4988,6 +5646,7 @@ class BarsGLVisualizer(Gtk.GLArea):
         self.trail_heights   = [0.0] * 512
         self._color_cache    = None
         self._dirty_static   = True
+        self._reset_rust_state_engine()
 
     def set_theme(self, name):
         if name in self.themes:
@@ -4996,16 +5655,39 @@ class BarsGLVisualizer(Gtk.GLArea):
             self._color_cache = None
             self._update_render_cache()
 
+    def set_auto_cover_theme_rgb(self, colors):
+        self.themes[_AUTO_COVER_THEME_NAME] = _cover_theme_from_rgbs(
+            colors,
+            self.themes.get("Aurora", self.themes.get(_AUTO_COVER_THEME_NAME, {})),
+        )
+        if self.theme_name == _AUTO_COVER_THEME_NAME:
+            self._theme_cfg = self.themes[self.theme_name]
+            self._color_cache = None
+            self._update_render_cache()
+            if self.get_realized():
+                self.queue_render()
+
     def set_effect(self, name):
         mode = _BARS_GL_EFFECT_MODES.get(name, 0)
         if mode != self.effect_mode:
             self.effect_mode   = mode
             self._dirty_static = True
 
+    def requires_stereo_spectrum(self):
+        return self.effect_mode in {7, 10, 11}
+
     def set_profile(self, name):
         if name in self.profiles:
             self.profile_name = name
             self._profile_cfg = self.profiles[name]
+            if self._rust_state_engine is not None:
+                self._rust_state_engine.set_params(
+                    smooth=float(self._profile_cfg["smooth"]),
+                    trail_decay=float(self._profile_cfg["trail_decay"]),
+                    peak_hold_frames=int(self._profile_cfg["peak_hold_frames"]),
+                    peak_fall=float(self._profile_cfg["peak_fall"]),
+                    bass_smooth=max(0.12, min(0.62, 0.28 * float(self._profile_cfg["beat_mul"]))),
+                )
             self._update_render_cache()
 
     def set_frequency_scale(self, name):
@@ -5031,10 +5713,10 @@ class HybridVisualizer(Gtk.Overlay):
     Combined visualizer that keeps the Cairo renderer available for the full
     effect list while exposing the GL dots path as an extra selectable effect.
 
-    Uses a Gtk.Overlay so a transparent frequency-axis DrawingArea can be
-    layered on top of the GL renderers (which cannot draw text natively).
-    The Cairo renderer draws its own axis, so the overlay is hidden when the
-    Cairo backend is active.
+    The GL backends render into a stack below a dedicated top strip for the
+    frequency axis. The strip is cached and only rebuilt when its size or
+    scale parameters change, avoiding a transparent overlay across the whole
+    GL surface.
     """
 
     GL_EFFECT_NAME   = "Dots"
@@ -5043,18 +5725,33 @@ class HybridVisualizer(Gtk.Overlay):
     _BARS_GL_CHILD_NAME = "bars_gl"
     # Effects routed to BarsGLVisualizer
     _BARS_GL_EFFECTS = frozenset(_BARS_GL_EFFECT_MODES.keys())
+    _FREQ_AXIS_STRIP_HEIGHT = 18
 
     def __init__(self):
         super().__init__()
         self.set_hexpand(True)
         self.set_vexpand(True)
 
+        self._layout = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self._layout.set_hexpand(True)
+        self._layout.set_vexpand(True)
+        self.set_child(self._layout)
+
+        self._freq_axis_da = Gtk.DrawingArea()
+        self._freq_axis_da.set_hexpand(True)
+        self._freq_axis_da.set_vexpand(False)
+        self._freq_axis_da.set_can_target(False)
+        self._freq_axis_da.set_size_request(-1, self._FREQ_AXIS_STRIP_HEIGHT)
+        self._freq_axis_da.set_draw_func(self._draw_freq_axis_strip)
+        self._freq_axis_da.set_visible(False)
+        self._layout.append(self._freq_axis_da)
+
         # Internal stack holds Cairo / GL / BarsGL backends.
         self._stack = Gtk.Stack()
         self._stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
         self._stack.set_hexpand(True)
         self._stack.set_vexpand(True)
-        self.set_child(self._stack)
+        self._layout.append(self._stack)
 
         self._cairo_viz = SpectrumVisualizer()
         self._cairo_viz.set_hexpand(True)
@@ -5065,8 +5762,14 @@ class HybridVisualizer(Gtk.Overlay):
         self._bars_gl_viz = None
         self._last_frame  = None
         self._active      = False
+        self._cover_theme_request_id = 0
+        self._cover_theme_last_key = ""
+        self._viz_perf_backend_sig = ""
+        self._freq_axis_cache_key = None
+        self._freq_axis_cache_surface = None
         self._freq_scale_name = _FREQ_SCALE_LINEAR
-        self._theme_name   = str(getattr(self._cairo_viz, "theme_name",   "Aurora (Default)") or "Aurora (Default)")
+        self._input_band_count = _DEFAULT_SPECTRUM_BANDS
+        self._theme_name   = str(getattr(self._cairo_viz, "theme_name",   _AUTO_COVER_THEME_NAME) or _AUTO_COVER_THEME_NAME)
         self._profile_name = str(getattr(self._cairo_viz, "profile_name", "Dynamic") or "Dynamic")
         self._effect_name  = str(getattr(self._cairo_viz, "effect_name",  "Bars") or "Bars")
         try:
@@ -5100,31 +5803,46 @@ class HybridVisualizer(Gtk.Overlay):
             self._bars_gl_viz = None
             logger.warning("BarsGL backend unavailable", exc_info=True)
 
-        # Transparent frequency-axis overlay — visible only when a GL backend
-        # is active (the Cairo renderer draws its own axis).
-        self._freq_axis_da = Gtk.DrawingArea()
-        self._freq_axis_da.set_hexpand(True)
-        self._freq_axis_da.set_vexpand(True)
-        self._freq_axis_da.set_draw_func(self._draw_freq_axis_overlay)
-        self._freq_axis_da.set_can_target(False)  # pass-through mouse events
-        self._freq_axis_da.set_visible(False)
-        self.add_overlay(self._freq_axis_da)
-
         self._stack.set_visible_child_name(self._CAIRO_CHILD_NAME)
         self._sync_backend_state(seed_visible=False)
 
     @staticmethod
-    def _copy_frame(frame):
+    def _copy_frame(frame, stereo=False):
         if isinstance(frame, dict):
             mono = list(frame.get("mono") or [])
+            if not stereo:
+                return mono
             left = list(frame.get("left") or mono)
             right = list(frame.get("right") or mono)
             return {"mono": mono, "left": left, "right": right}
         return list(frame or [])
 
-    def _draw_freq_axis_overlay(self, _da, cr, width, height):
-        """Draw frequency ticks on the transparent overlay above GL backends."""
-        _draw_freq_axis_cairo(cr, width, height, self._freq_scale_name)
+    def _invalidate_freq_axis_cache(self):
+        self._freq_axis_cache_key = None
+        self._freq_axis_cache_surface = None
+
+    def _draw_freq_axis_strip(self, _da, cr, width, height):
+        """Draw a cached frequency-axis strip above GL backends."""
+        if _hide_freq_axis_debug():
+            return
+        w = max(1, int(width or 0))
+        h = max(1, int(height or 0))
+        cache_key = (
+            w,
+            h,
+            str(self._freq_scale_name or _FREQ_SCALE_LINEAR),
+            int(self._input_band_count or _DEFAULT_SPECTRUM_BANDS),
+        )
+        if self._freq_axis_cache_key != cache_key or self._freq_axis_cache_surface is None:
+            surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, w, h)
+            ctx = cairo.Context(surf)
+            ctx.set_source_rgba(0.0, 0.0, 0.0, 1.0)
+            ctx.paint()
+            _draw_freq_axis_cairo(ctx, w, h, self._freq_scale_name, self._input_band_count)
+            self._freq_axis_cache_surface = surf
+            self._freq_axis_cache_key = cache_key
+        cr.set_source_surface(self._freq_axis_cache_surface, 0.0, 0.0)
+        cr.paint()
 
     def _active_child_name(self):
         if self._effect_name == self.GL_EFFECT_NAME and self._gl_viz is not None:
@@ -5150,9 +5868,10 @@ class HybridVisualizer(Gtk.Overlay):
         use_gl      = child_name == self._GL_CHILD_NAME
         use_bars_gl = child_name == self._BARS_GL_CHILD_NAME
 
-        # Show the frequency axis overlay only for GL backends (Cairo draws
-        # its own axis).
-        self._freq_axis_da.set_visible(use_gl or use_bars_gl)
+        # Show the dedicated frequency-axis strip only for GL backends (Cairo
+        # draws its own axis inside the visualizer).
+        self._freq_axis_da.set_visible(bool((use_gl or use_bars_gl) and (not _hide_freq_axis_debug())))
+        self._log_backend_perf_state(child_name)
 
         self._cairo_viz.set_active(bool(self._active and use_cairo))
         if self._gl_viz is not None:
@@ -5167,6 +5886,36 @@ class HybridVisualizer(Gtk.Overlay):
                     backend.update_data(self._last_frame)
                 except Exception:
                     pass
+
+    def _log_backend_perf_state(self, child_name):
+        if not viz_perf_enabled():
+            return
+        backend = str(child_name or self._CAIRO_CHILD_NAME)
+        effect = str(getattr(self, "_effect_name", "") or "")
+        freq_scale = str(getattr(self, "_freq_scale_name", _FREQ_SCALE_LINEAR) or _FREQ_SCALE_LINEAR)
+        stereo = 1 if self.requires_stereo_spectrum() else 0
+        try:
+            bars = int(getattr(self, "_num_bars", 0) or 0)
+        except Exception:
+            bars = 0
+        try:
+            input_bands = int(getattr(self, "_input_band_count", 0) or 0)
+        except Exception:
+            input_bands = 0
+        sig = f"{backend}|{effect}|{stereo}|{bars}|{input_bands}|{freq_scale}|{1 if self._active else 0}"
+        if sig == getattr(self, "_viz_perf_backend_sig", ""):
+            return
+        self._viz_perf_backend_sig = sig
+        logger.info(
+            "VIZ PERF backend: effect=%s backend=%s stereo=%d bars=%d input_bands=%d scale=%s active=%d",
+            effect,
+            backend,
+            stereo,
+            bars,
+            input_bands,
+            freq_scale,
+            1 if self._active else 0,
+        )
 
     def _reseed_visible_backend(self):
         backend = self._visible_backend()
@@ -5184,11 +5933,48 @@ class HybridVisualizer(Gtk.Overlay):
     def update_data(self, magnitudes):
         if not magnitudes:
             return
-        frame = self._copy_frame(magnitudes)
+        frame = self._copy_frame(magnitudes, stereo=self.requires_stereo_spectrum())
         self._last_frame = frame
         backend = self._visible_backend()
         if backend is not None:
             backend.update_data(frame)
+
+    def requires_stereo_spectrum(self):
+        return str(getattr(self, "_effect_name", "") or "") in _STEREO_SPECTRUM_EFFECTS
+
+    def prewarm_backends(self):
+        if getattr(self, "_prewarmed", False):
+            return True
+        root = self.get_root()
+        if root is None:
+            return False
+
+        warmed_any = False
+        current_child = str(self._stack.get_visible_child_name() or self._CAIRO_CHILD_NAME)
+        for child_name, backend in (
+            (self._GL_CHILD_NAME, self._gl_viz),
+            (self._BARS_GL_CHILD_NAME, self._bars_gl_viz),
+        ):
+            if backend is None:
+                continue
+            try:
+                if current_child != child_name:
+                    self._stack.set_visible_child_name(child_name)
+                if not backend.get_realized():
+                    backend.realize()
+                if hasattr(backend, "make_current"):
+                    backend.make_current()
+                if hasattr(backend, "queue_render"):
+                    backend.queue_render()
+                warmed_any = warmed_any or bool(backend.get_realized())
+            except Exception:
+                logger.debug("Visualizer backend prewarm skipped for %s", child_name, exc_info=True)
+
+        if self._stack.get_visible_child_name() != current_child:
+            self._stack.set_visible_child_name(current_child)
+        if warmed_any:
+            self._prewarmed = True
+        return warmed_any
 
     def set_num_bars(self, count):
         try:
@@ -5205,6 +5991,22 @@ class HybridVisualizer(Gtk.Overlay):
             self._bars_gl_viz.set_num_bars(self._num_bars)
         self._reseed_visible_backend()
 
+    def set_input_band_count(self, count):
+        try:
+            n = int(count)
+        except Exception:
+            return
+        if n <= 1:
+            return
+        self._input_band_count = n
+        self._cairo_viz.set_input_band_count(n)
+        if self._gl_viz is not None and hasattr(self._gl_viz, "set_input_band_count"):
+            self._gl_viz.set_input_band_count(n)
+        if self._bars_gl_viz is not None and hasattr(self._bars_gl_viz, "set_input_band_count"):
+            self._bars_gl_viz.set_input_band_count(n)
+        self._invalidate_freq_axis_cache()
+        self._freq_axis_da.queue_draw()
+
     def set_theme(self, name):
         theme_name = str(name or "")
         if theme_name not in (self._cairo_viz.get_theme_names() or []):
@@ -5215,6 +6017,48 @@ class HybridVisualizer(Gtk.Overlay):
             self._gl_viz.set_theme(self._theme_name)
         if self._bars_gl_viz is not None:
             self._bars_gl_viz.set_theme(self._theme_name)
+
+    def set_cover_theme_rgb(self, colors):
+        self._cairo_viz.set_auto_cover_theme_rgb(colors)
+        if self._gl_viz is not None:
+            self._gl_viz.set_auto_cover_theme_rgb(colors)
+        if self._bars_gl_viz is not None:
+            self._bars_gl_viz.set_auto_cover_theme_rgb(colors)
+        if self._theme_name == _AUTO_COVER_THEME_NAME:
+            self.set_theme(_AUTO_COVER_THEME_NAME)
+
+    def set_cover_theme_from_cover(self, cover_url, cache_dir):
+        self._cover_theme_request_id = int(getattr(self, "_cover_theme_request_id", 0) or 0) + 1
+        request_id = self._cover_theme_request_id
+        cover_key = hashlib.md5(str(cover_url or "").encode()).hexdigest() if cover_url else ""
+        self._cover_theme_last_key = cover_key
+
+        if not cover_url or not cache_dir:
+            return
+
+        def task():
+            try:
+                cache_path = helpers.download_to_cache(str(cover_url), cache_dir, cover_key, timeout=8)
+                if not cache_path:
+                    return
+                pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(cache_path, 64, 64, True)
+                colors = _cover_theme_colors_from_pixbuf(pixbuf)
+                if colors is None:
+                    return
+
+                def apply():
+                    if request_id != int(getattr(self, "_cover_theme_request_id", 0) or 0):
+                        return False
+                    if str(getattr(self, "_cover_theme_last_key", "") or "") != cover_key:
+                        return False
+                    self.set_cover_theme_rgb(colors)
+                    return False
+
+                GLib.idle_add(apply)
+            except Exception:
+                logger.debug("Visualizer cover theme update failed", exc_info=True)
+
+        Thread(target=task, daemon=True).start()
 
     def set_profile(self, name):
         profile_name = str(name or "")
@@ -5237,6 +6081,7 @@ class HybridVisualizer(Gtk.Overlay):
             self._gl_viz.set_frequency_scale(scale_name)
         if self._bars_gl_viz is not None:
             self._bars_gl_viz.set_frequency_scale(scale_name)
+        self._invalidate_freq_axis_cache()
         self._freq_axis_da.queue_draw()
         self._reseed_visible_backend()
 

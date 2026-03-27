@@ -10,8 +10,15 @@ import logging
 
 from gi.repository import Gtk, GLib
 from ui import config as ui_config
+from core.viz_perf import VizPerfWindow
 
 logger = logging.getLogger(__name__)
+_APP_VIZ_PERF = VizPerfWindow("callback", logger)
+_LINEAR_ACTIVE_BANDS_DEFAULT = 128
+
+
+def _hide_dr_meter_debug():
+    return str(os.getenv("HIRESTI_VIZ_HIDE_DR_METER", "0")).strip().lower() in ("1", "true", "yes", "on")
 
 
 # ---------------------------------------------------------------------------
@@ -342,9 +349,66 @@ def _apply_viz_bars_by_count(self, count, update_dropdown=False):
         c = 64
     if self.viz is not None:
         self.viz.set_num_bars(c)
+        if hasattr(self.viz, "set_input_band_count"):
+            self.viz.set_input_band_count(
+                _viz_analysis_bands_for_bar_count(
+                    c,
+                    frequency_scale_name=_current_viz_frequency_scale_name(self),
+                )
+            )
+    player = getattr(self, "player", None)
+    if player is not None and hasattr(player, "set_spectrum_active_bands"):
+        player.set_spectrum_active_bands(
+            _viz_analysis_bands_for_bar_count(
+                c,
+                frequency_scale_name=_current_viz_frequency_scale_name(self),
+            )
+        )
     self.settings["viz_bar_count"] = c
     if update_dropdown and self.viz_bars_dd is not None:
         self.viz_bars_dd.set_selected(self.VIZ_BAR_OPTIONS.index(c))
+
+
+def _current_viz_frequency_scale_name(self):
+    viz = getattr(self, "viz", None)
+    if viz is not None:
+        try:
+            name = str(getattr(viz, "frequency_scale_name", "") or "")
+            if name:
+                return name
+        except Exception:
+            pass
+    settings = getattr(self, "settings", {}) or {}
+    idx = int(settings.get("viz_frequency_scale", 0) or 0)
+    return "Log" if idx == 1 else "Linear"
+
+
+def _linear_active_bands_value():
+    raw = str(os.getenv("HIRESTI_VIZ_LINEAR_ACTIVE_BANDS", "") or "").strip()
+    if raw:
+        try:
+            return max(2, min(2048, int(raw)))
+        except Exception:
+            pass
+    return _LINEAR_ACTIVE_BANDS_DEFAULT
+
+
+def _viz_analysis_bands_for_bar_count(count, frequency_scale_name=None):
+    try:
+        bars = int(count)
+    except Exception:
+        bars = 32
+    if str(frequency_scale_name or "Linear") == "Linear":
+        return _linear_active_bands_value()
+    if bars <= 8:
+        return 128
+    if bars <= 16:
+        return 256
+    if bars <= 32:
+        return 512
+    if bars <= 64:
+        return 1024
+    return 2048
 
 
 def _apply_viz_frequency_scale_by_index(self, idx, update_dropdown=False):
@@ -371,9 +435,42 @@ def _apply_spectrum_theme_by_index(self, idx, update_dropdown=False):
     if not isinstance(idx, int) or idx < 0 or idx >= len(names):
         idx = 0
     self.viz.set_theme(names[idx])
+    if names[idx] == "Auto" and hasattr(self, "_refresh_visualizer_cover_theme"):
+        self._refresh_visualizer_cover_theme()
     self.settings["spectrum_theme"] = idx
     if update_dropdown and self.viz_theme_dd is not None:
         self.viz_theme_dd.set_selected(idx)
+
+
+def _current_visualizer_cover_url(self):
+    track = getattr(self, "playing_track", None)
+    if track is None:
+        return None
+    backend = getattr(self, "backend", None)
+    if backend is not None and hasattr(backend, "get_artwork_url"):
+        try:
+            cover_url = backend.get_artwork_url(track, 640)
+        except Exception:
+            cover_url = None
+        if cover_url:
+            return cover_url
+    cover_id = getattr(track, "cover", None) or getattr(getattr(track, "album", None), "cover", None)
+    if cover_id and hasattr(self, "_get_tidal_image_url"):
+        try:
+            return self._get_tidal_image_url(cover_id, width=640, height=640)
+        except Exception:
+            return None
+    return None
+
+
+def _refresh_visualizer_cover_theme(self):
+    viz = getattr(self, "viz", None)
+    if viz is None or not hasattr(viz, "set_cover_theme_from_cover"):
+        return False
+    cover_url = _current_visualizer_cover_url(self)
+    cache_dir = str(getattr(self, "cache_dir", "") or "")
+    viz.set_cover_theme_from_cover(cover_url, cache_dir)
+    return False
 
 
 def on_viz_frequency_scale_changed(self, dd, _param):
@@ -422,6 +519,8 @@ def _apply_viz_effect_by_index(self, idx, update_dropdown=False):
         eff_idx = names.index(effect_name)
     else:
         eff_idx = 0
+    if hasattr(self, "_sync_spectrum_stream_state"):
+        self._sync_spectrum_stream_state()
     self.settings["viz_effect"] = eff_idx
     if update_dropdown and self.viz_effect_dd is not None:
         self._viz_ui_syncing = True
@@ -560,7 +659,7 @@ def on_viz_page_changed(self, stack, _param):
         self._update_dsp_ui_state()
     dr_meter = getattr(self, "dr_meter", None)
     if dr_meter is not None:
-        dr_meter.set_visible(is_spectrum)
+        dr_meter.set_visible(bool(is_spectrum and (not _hide_dr_meter_debug())))
     self._sync_viz_tab_runtime_state()
     self._sync_spectrum_stream_state()
 
@@ -583,53 +682,66 @@ def _sync_viz_tab_runtime_state(self):
 
 
 def _should_enable_spectrum_stream(self):
-    # Keep the spectrum stream alive regardless of viz visibility so that
-    # _last_spectrum_frame stays fresh and the viz opens instantly without
-    # a 0.5-1 s FFT-restart stutter.  on_spectrum_data() already skips
-    # rendering (early-return) when the revealer is closed, so no extra
-    # draw work is done while the viz is hidden.
     if getattr(self, "player", None) is None:
         return False
-    # Lyrics static mode genuinely needs no live data.
+    if not self._is_viz_surface_visible():
+        return False
     page = str(getattr(self, "_viz_current_page", "spectrum") or "spectrum")
+    if page == "spectrum":
+        return True
     if page == "lyrics":
-        if self._is_viz_surface_visible():
-            motion_idx = int(self.settings.get("lyrics_bg_motion", 1) or 0)
-            if motion_idx == 0:
-                return False
-    return True
+        settings = getattr(self, "settings", {}) or {}
+        motion_idx = int(settings.get("lyrics_bg_motion", 1) or 0)
+        return motion_idx != 0
+    return False
 
 
 def _sync_spectrum_stream_state(self):
     self._sync_viz_tab_runtime_state()
+    stereo_needed = False
+    page = str(getattr(self, "_viz_current_page", "spectrum") or "spectrum")
+    if page == "spectrum":
+        stereo_fn = getattr(getattr(self, "viz", None), "requires_stereo_spectrum", None)
+        if callable(stereo_fn):
+            try:
+                stereo_needed = bool(stereo_fn())
+            except Exception:
+                stereo_needed = False
+    if self.player is not None and hasattr(self.player, "set_spectrum_stereo_enabled"):
+        self.player.set_spectrum_stereo_enabled(stereo_needed)
     if self.player is not None and hasattr(self.player, "set_spectrum_enabled"):
         self.player.set_spectrum_enabled(self._should_enable_spectrum_stream())
 
 
 def _start_spectrum_stream_prewarm(self):
-    # Warm up spectrum pipeline once in background to avoid first-open hitch.
-    if self.player is None or (not hasattr(self.player, "set_spectrum_enabled")):
-        return False
-    revealer = getattr(self, "viz_revealer", None)
-    if revealer is not None and bool(revealer.get_reveal_child()):
-        return False
-    try:
-        self.player.set_spectrum_enabled(True)
-    except Exception:
-        return False
-
+    # Legacy hook: the spectrum stream now follows visibility/page state
+    # directly, so startup no longer forces a hidden FFT warmup.
     if self._viz_stream_prewarm_source:
         GLib.source_remove(self._viz_stream_prewarm_source)
         self._viz_stream_prewarm_source = 0
-
-    def _finish():
-        self._viz_stream_prewarm_source = 0
-        self._sync_spectrum_stream_state()
-        return False
-
-    # Keep warm briefly, then restore to intended state.
-    self._viz_stream_prewarm_source = GLib.timeout_add(900, _finish)
+    self._sync_spectrum_stream_state()
     return False
+
+
+def _prewarm_visualizer_cold_start(self):
+    if bool(getattr(self, "_viz_opened_once", False)):
+        self._viz_cold_prewarm_source = 0
+        return False
+    viz = getattr(self, "viz", None)
+    if viz is None or not hasattr(viz, "prewarm_backends"):
+        self._viz_cold_prewarm_source = 0
+        return False
+    self._viz_cold_prewarm_attempts = int(getattr(self, "_viz_cold_prewarm_attempts", 0) or 0) + 1
+    warmed = False
+    try:
+        warmed = bool(viz.prewarm_backends())
+    except Exception:
+        logger.debug("Visualizer cold prewarm failed", exc_info=True)
+        warmed = False
+    if warmed or self._viz_cold_prewarm_attempts >= 6:
+        self._viz_cold_prewarm_source = 0
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -711,71 +823,92 @@ def _spectrum_frame_len(frame):
 
 
 def on_spectrum_data(self, magnitudes, position_s=None):
-    if not magnitudes:
-        return
-    trace = str(os.getenv("HIRESTI_VIZ_TRACE", "0")).strip().lower() in ("1", "true", "yes", "on")
-    now_cb = time.monotonic()
-    frame = _copy_spectrum_frame(magnitudes)
-    self._last_spectrum_frame = frame  # reuse the same copy; callers never mutate it
-    self._last_spectrum_ts = now_cb
-    if trace:
-        if self._viz_trace_open_ts > 0.0 and (not self._viz_trace_first_real_logged):
-            self._viz_trace_first_real_logged = True
-            logger.info(
-                "VIZ TRACE first-real: delta_open=%.1fms len=%d page=%s",
-                (now_cb - self._viz_trace_open_ts) * 1000.0,
-                _spectrum_frame_len(frame),
-                str(getattr(self, "_viz_current_page", "spectrum")),
-            )
-        if self._viz_trace_last_cb_ts > 0.0:
-            gap_ms = (now_cb - self._viz_trace_last_cb_ts) * 1000.0
-            if gap_ms >= 80.0:
-                logger.info("VIZ TRACE callback-gap: %.1fms", gap_ms)
-        self._viz_trace_last_cb_ts = now_cb
-    # Soft handoff: don't cut placeholder on first real frame.
-    # Wait for a short real-frame streak and blend from current placeholder frame.
-    if int(getattr(self, "_viz_placeholder_source", 0) or 0):
-        self._viz_real_frame_streak = int(getattr(self, "_viz_real_frame_streak", 0) or 0) + 1
-        if self._viz_real_frame_streak == 1 and self._viz_placeholder_frame:
-            self._viz_seed_frame = list(self._viz_placeholder_frame)
-            self._viz_warmup_until = time.monotonic() + 0.32
-        if self._viz_real_frame_streak >= 4:
-            self._stop_viz_placeholder()
-    else:
-        self._viz_real_frame_streak = 0
-    if not self._is_viz_surface_visible():
-        return
-    now = time.monotonic()
-    if self._viz_warmup_until > now and self._viz_seed_frame:
-        t = 1.0 - ((self._viz_warmup_until - now) / max(1e-6, float(self._viz_warmup_duration_s)))
-        t = max(0.0, min(1.0, t))
-        frame = self._blend_spectrum_frames(self._viz_seed_frame, frame, t)
-    elif self._viz_warmup_until <= now:
-        self._viz_seed_frame = None
-        self._viz_warmup_until = 0.0
-    self._apply_viz_frame(frame)
+    with _APP_VIZ_PERF.track("on_spectrum_data"):
+        if not magnitudes:
+            return
+        trace = str(os.getenv("HIRESTI_VIZ_TRACE", "0")).strip().lower() in ("1", "true", "yes", "on")
+        now_cb = time.monotonic()
+        with _APP_VIZ_PERF.track("copy_frame"):
+            frame = _copy_spectrum_frame(magnitudes)
+        self._last_spectrum_frame = frame  # reuse the same copy; callers never mutate it
+        self._last_spectrum_ts = now_cb
+        if trace:
+            if self._viz_trace_open_ts > 0.0 and (not self._viz_trace_first_real_logged):
+                self._viz_trace_first_real_logged = True
+                logger.info(
+                    "VIZ TRACE first-real: delta_open=%.1fms len=%d page=%s",
+                    (now_cb - self._viz_trace_open_ts) * 1000.0,
+                    _spectrum_frame_len(frame),
+                    str(getattr(self, "_viz_current_page", "spectrum")),
+                )
+            if self._viz_trace_last_cb_ts > 0.0:
+                gap_ms = (now_cb - self._viz_trace_last_cb_ts) * 1000.0
+                if gap_ms >= 80.0:
+                    logger.info("VIZ TRACE callback-gap: %.1fms", gap_ms)
+            self._viz_trace_last_cb_ts = now_cb
+        # Soft handoff: don't cut placeholder on first real frame.
+        # Wait for a short real-frame streak and blend from current placeholder frame.
+        if int(getattr(self, "_viz_placeholder_source", 0) or 0):
+            self._viz_real_frame_streak = int(getattr(self, "_viz_real_frame_streak", 0) or 0) + 1
+            if self._viz_real_frame_streak == 1 and self._viz_placeholder_frame:
+                self._viz_seed_frame = list(self._viz_placeholder_frame)
+                self._viz_warmup_until = time.monotonic() + 0.32
+            if self._viz_real_frame_streak >= 4:
+                self._stop_viz_placeholder()
+        else:
+            self._viz_real_frame_streak = 0
+        if not self._is_viz_surface_visible():
+            return
+        now = time.monotonic()
+        if self._viz_warmup_until > now and self._viz_seed_frame:
+            t = 1.0 - ((self._viz_warmup_until - now) / max(1e-6, float(self._viz_warmup_duration_s)))
+            t = max(0.0, min(1.0, t))
+            with _APP_VIZ_PERF.track("blend_frame"):
+                frame = self._blend_spectrum_frames(self._viz_seed_frame, frame, t)
+        elif self._viz_warmup_until <= now:
+            self._viz_seed_frame = None
+            self._viz_warmup_until = 0.0
+        self._apply_viz_frame(frame)
 
 
 def _apply_viz_frame(self, frame):
-    if not frame:
-        return
-    current_page = self._viz_current_page
-    if current_page == "lyrics" and self.bg_viz is not None:
-        self.bg_viz.update_energy(_spectrum_frame_get(frame, "mono"))
-    if current_page == "spectrum" and self.viz is not None:
-        self.viz.update_data(frame)
-        dr_meter = getattr(self, "dr_meter", None)
-        if dr_meter is not None and dr_meter.get_visible():
-            left  = _spectrum_frame_get(frame, "left")
-            right = _spectrum_frame_get(frame, "right")
-            dr_meter.update(left, right)
-            # Poll accurate K-weighted LUFS from the Rust backend.
-            try:
-                lufs = self.player.get_lufs()
-                if lufs is not None:
-                    dr_meter.set_lufs(*lufs)
-            except Exception:
-                pass
+    with _APP_VIZ_PERF.track("apply_viz_frame"):
+        if not frame:
+            return
+        current_page = self._viz_current_page
+        if current_page == "lyrics" and self.bg_viz is not None:
+            with _APP_VIZ_PERF.track("lyrics_energy"):
+                self.bg_viz.update_energy(_spectrum_frame_get(frame, "mono"))
+        if current_page == "spectrum" and self.viz is not None:
+            with _APP_VIZ_PERF.track("viz_update_data"):
+                self.viz.update_data(frame)
+            dr_meter = getattr(self, "dr_meter", None)
+            if (not _hide_dr_meter_debug()) and dr_meter is not None and dr_meter.get_visible():
+                now = time.monotonic()
+                last_update = float(getattr(self, "_dr_meter_last_update_ts", 0.0) or 0.0)
+                if last_update <= 0.0 or (now - last_update) >= 0.05:
+                    left  = _spectrum_frame_get(frame, "left")
+                    right = _spectrum_frame_get(frame, "right")
+                    with _APP_VIZ_PERF.track("dr_meter_update"):
+                        dr_meter.update(left, right)
+                    self._dr_meter_last_update_ts = now
+                # LUFS evolves slowly enough that polling at ~8 Hz is visually
+                # indistinguishable from per-frame updates, but much cheaper.
+                try:
+                    with _APP_VIZ_PERF.track("dr_meter_lufs"):
+                        last_poll = float(getattr(self, "_dr_lufs_last_poll_ts", 0.0) or 0.0)
+                        lufs = getattr(self, "_dr_lufs_cached", None)
+                        did_poll = False
+                        if lufs is None or (now - last_poll) >= 0.12:
+                            lufs = self.player.get_lufs()
+                            did_poll = True
+                            if lufs is not None:
+                                self._dr_lufs_cached = lufs
+                                self._dr_lufs_last_poll_ts = now
+                        if did_poll and lufs is not None:
+                            dr_meter.set_lufs(*lufs)
+                except Exception:
+                    pass
 
 
 def _stop_viz_placeholder(self):
@@ -789,7 +922,7 @@ def _stop_viz_placeholder(self):
 def _start_viz_placeholder_if_needed(self):
     self._stop_viz_placeholder()
     dr_meter = getattr(self, "dr_meter", None)
-    if dr_meter is not None:
+    if dr_meter is not None and not _hide_dr_meter_debug():
         dr_meter.reset()
     if not self._is_viz_surface_visible():
         return
@@ -983,10 +1116,8 @@ def _set_visualizer_expanded(self, expanded):
         self._viz_trace_last_cb_ts = 0.0
         self._viz_trace_first_real_logged = False
         self._viz_seed_frame = _copy_spectrum_frame(self._last_spectrum_frame) if self._last_spectrum_frame else None
-        # If the stream was kept alive (always-on policy), _last_spectrum_frame
-        # is fresh (<= 0.5 s old) — no blending warmup is needed.  Only warm up
-        # when opening from a cold state (first ever open, or after a long pause
-        # where no spectrum callbacks arrived).
+        # Re-opening shortly after close can still reuse a recent spectrum
+        # frame, but hidden panels no longer keep the FFT stream alive.
         now_open = time.monotonic()
         last_ts = float(getattr(self, "_last_spectrum_ts", 0.0) or 0.0)
         frame_is_fresh = self._viz_seed_frame and ((now_open - last_ts) < 0.5)
@@ -1016,9 +1147,7 @@ def _set_visualizer_expanded(self, expanded):
     if expanded:
         self._start_viz_handle_follow_transition()
     if expanded:
-        # Stream is kept alive (always-on policy), so _sync here is a no-op
-        # in the normal case.  Call it anyway as a safety net for edge cases
-        # (first open, lyrics-static mode change, etc.).
+        # Opening the panel is what re-enables the spectrum stream.
         self._sync_spectrum_stream_state()
         # Layout padding / handle position can be deferred (not latency-critical).
         def _defer_open_layout():
@@ -1042,13 +1171,10 @@ def _set_visualizer_expanded(self, expanded):
         # (e.g. app just started, no audio ever played).
         self._start_viz_placeholder_if_needed()
     else:
-        # Keep the spectrum stream running (always-on) so _last_spectrum_frame
-        # stays fresh for instant re-open.  We only clean up layout and the
-        # placeholder animation — no need to call _sync_spectrum_stream_state()
-        # which would (no longer) disable the stream anyway.
         self._apply_overlay_scroll_padding(False)
         self._position_viz_handle(False)
         self._stop_viz_placeholder()
+        self._sync_spectrum_stream_state()
         if trace:
             logger.info("VIZ TRACE drawer-close")
     if expanded:

@@ -13,6 +13,7 @@ from viz.visualizer import (
     _log_display_frequency_range,
     _normalize_spectrum_magnitudes,
     _resample_linear_values,
+    _try_rust_map_spectrum,
 )
 
 
@@ -60,6 +61,58 @@ def test_log_frequency_mapping_uses_rust_helper_for_high_bar_counts():
     assert len(mapped) == 512
     assert mapped[:3] == [0.25, 0.25, 0.25]
     assert rust_core.calls and rust_core.calls[0][1] == 512
+
+
+def test_try_rust_map_spectrum_uses_linear_mapper_when_available():
+    class _RustCore:
+        available = True
+
+        def __init__(self):
+            self.calls = []
+
+        def map_spectrum_linear(self, values, out_count, **kwargs):
+            self.calls.append((list(values), int(out_count), dict(kwargs)))
+            return [0.4] * int(out_count)
+
+    rust_core = _RustCore()
+    mapped = _try_rust_map_spectrum(
+        [1.0, 2.0, 3.0],
+        4,
+        frequency_scale_name="Linear",
+        rust_core=rust_core,
+        analysis_bands=512,
+        db_min=-80.0,
+        db_range=80.0,
+    )
+
+    assert mapped == [0.4, 0.4, 0.4, 0.4]
+    assert rust_core.calls == [([1.0, 2.0, 3.0], 4, {"analysis_bands": 512, "db_min": -80.0, "db_range": 80.0})]
+
+
+def test_try_rust_map_spectrum_uses_log_mapper_when_available():
+    class _RustCore:
+        available = True
+
+        def __init__(self):
+            self.calls = []
+
+        def map_spectrum_log(self, values, out_count, **kwargs):
+            self.calls.append((list(values), int(out_count), dict(kwargs)))
+            return [0.7] * int(out_count)
+
+    rust_core = _RustCore()
+    mapped = _try_rust_map_spectrum(
+        [1.0, 2.0, 3.0],
+        3,
+        frequency_scale_name="Log",
+        rust_core=rust_core,
+        analysis_bands=2048,
+        db_min=-80.0,
+        db_range=80.0,
+    )
+
+    assert mapped == [0.7, 0.7, 0.7]
+    assert rust_core.calls == [([1.0, 2.0, 3.0], 3, {"db_min": -80.0, "db_range": 80.0})]
 
 
 def test_log_frequency_range_covers_extended_audible_window():

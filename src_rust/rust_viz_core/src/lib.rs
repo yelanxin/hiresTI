@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::os::raw::c_int;
 use std::slice;
 
@@ -27,6 +27,13 @@ pub struct VizStateEngine {
     bass_smooth: f32,
 }
 
+pub struct StereoVizStateEngine {
+    left: VizStateEngine,
+    right: VizStateEngine,
+    balance: f32,
+    balance_smooth: f32,
+}
+
 pub struct BarsRenderer {
     width: usize,
     height: usize,
@@ -34,6 +41,18 @@ pub struct BarsRenderer {
     colors: Vec<f32>, // RGBA per bar, len=num_bars*4
     rgba: Vec<u8>,    // premultiplied BGRA (Cairo ARGB32 little-endian)
     seq: u64,
+}
+
+struct SpectrumFrame {
+    pos_s: f64,
+    mono: Vec<f32>,
+    left: Vec<f32>,
+    right: Vec<f32>,
+}
+
+pub struct SpectrumFrameSampler {
+    max_frames: usize,
+    frames: VecDeque<SpectrumFrame>,
 }
 
 impl BarsRenderer {
@@ -84,6 +103,127 @@ impl BarsRenderer {
             }
         }
     }
+}
+
+impl SpectrumFrameSampler {
+    fn new(max_frames: usize) -> Self {
+        Self {
+            max_frames: max_frames.max(2),
+            frames: VecDeque::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.frames.clear();
+    }
+
+    fn push_mono(&mut self, pos_s: f64, mono: &[f32]) {
+        let mono_vals = mono.to_vec();
+        self.frames.push_back(SpectrumFrame {
+            pos_s,
+            mono: mono_vals.clone(),
+            left: mono_vals.clone(),
+            right: mono_vals,
+        });
+        while self.frames.len() > self.max_frames {
+            self.frames.pop_front();
+        }
+    }
+
+    fn push_stereo(&mut self, pos_s: f64, mono: &[f32], left: &[f32], right: &[f32]) {
+        let mono_vals = mono.to_vec();
+        let n = mono_vals.len();
+        let mut left_vals = vec![0.0_f32; n];
+        let mut right_vals = vec![0.0_f32; n];
+        for i in 0..n {
+            left_vals[i] = if i < left.len() { left[i] } else { mono_vals[i] };
+            right_vals[i] = if i < right.len() { right[i] } else { mono_vals[i] };
+        }
+        self.frames.push_back(SpectrumFrame {
+            pos_s,
+            mono: mono_vals,
+            left: left_vals,
+            right: right_vals,
+        });
+        while self.frames.len() > self.max_frames {
+            self.frames.pop_front();
+        }
+    }
+
+    fn sample_mono(&self, target_pos_s: f64, out: &mut [f32]) -> usize {
+        let (mono, _left, _right) = self.sample_impl(target_pos_s);
+        let n = mono.len().min(out.len());
+        if n == 0 {
+            return 0;
+        }
+        out[..n].copy_from_slice(&mono[..n]);
+        n
+    }
+
+    fn sample_stereo(&self, target_pos_s: f64, mono_out: &mut [f32], left_out: &mut [f32], right_out: &mut [f32]) -> usize {
+        let (mono, left, right) = self.sample_impl(target_pos_s);
+        let n = mono
+            .len()
+            .min(left.len())
+            .min(right.len())
+            .min(mono_out.len())
+            .min(left_out.len())
+            .min(right_out.len());
+        if n == 0 {
+            return 0;
+        }
+        mono_out[..n].copy_from_slice(&mono[..n]);
+        left_out[..n].copy_from_slice(&left[..n]);
+        right_out[..n].copy_from_slice(&right[..n]);
+        n
+    }
+
+    fn sample_impl(&self, target_pos_s: f64) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        if self.frames.is_empty() {
+            return (Vec::new(), Vec::new(), Vec::new());
+        }
+        let mut prev_idx: Option<usize> = None;
+        let mut next_idx: Option<usize> = None;
+        for (idx, item) in self.frames.iter().enumerate() {
+            if item.pos_s <= target_pos_s {
+                prev_idx = Some(idx);
+            } else {
+                next_idx = Some(idx);
+                break;
+            }
+        }
+
+        if prev_idx.is_none() {
+            if let Some(first) = self.frames.front() {
+                return (first.mono.clone(), first.left.clone(), first.right.clone());
+            }
+            return (Vec::new(), Vec::new(), Vec::new());
+        }
+
+        let prev = &self.frames[prev_idx.unwrap()];
+        if next_idx.is_none() {
+            return (prev.mono.clone(), prev.left.clone(), prev.right.clone());
+        }
+        let next = &self.frames[next_idx.unwrap()];
+        if next.pos_s <= prev.pos_s {
+            return (prev.mono.clone(), prev.left.clone(), prev.right.clone());
+        }
+        let t = ((target_pos_s - prev.pos_s) / (next.pos_s - prev.pos_s)).clamp(0.0, 1.0) as f32;
+        (
+            blend_series(&prev.mono, &next.mono, t),
+            blend_series(&prev.left, &next.left, t),
+            blend_series(&prev.right, &next.right, t),
+        )
+    }
+}
+
+fn blend_series(a: &[f32], b: &[f32], t: f32) -> Vec<f32> {
+    let n = a.len().min(b.len());
+    let mut out = vec![0.0_f32; n];
+    for i in 0..n {
+        out[i] = (a[i] * (1.0 - t)) + (b[i] * t);
+    }
+    out
 }
 
 impl VizProcessor {
@@ -196,6 +336,251 @@ impl VizStateEngine {
         }
         let bass_tgt = bass_acc / (bass_n as f32);
         self.bass_level += (bass_tgt - self.bass_level) * self.bass_smooth;
+    }
+}
+
+impl StereoVizStateEngine {
+    fn new(
+        num_bars: usize,
+        smooth: f32,
+        trail_decay: f32,
+        peak_hold_frames: u16,
+        peak_fall: f32,
+        bass_smooth: f32,
+        balance_smooth: f32,
+    ) -> Self {
+        Self {
+            left: VizStateEngine::new(
+                num_bars,
+                smooth,
+                trail_decay,
+                peak_hold_frames,
+                peak_fall,
+                bass_smooth,
+            ),
+            right: VizStateEngine::new(
+                num_bars,
+                smooth,
+                trail_decay,
+                peak_hold_frames,
+                peak_fall,
+                bass_smooth,
+            ),
+            balance: 0.0,
+            balance_smooth: balance_smooth.clamp(0.0, 1.0),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.left.reset();
+        self.right.reset();
+        self.balance = 0.0;
+    }
+
+    fn set_params(
+        &mut self,
+        smooth: f32,
+        trail_decay: f32,
+        peak_hold_frames: u16,
+        peak_fall: f32,
+        bass_smooth: f32,
+        balance_smooth: f32,
+    ) {
+        self.left
+            .set_params(smooth, trail_decay, peak_hold_frames, peak_fall, bass_smooth);
+        self.right
+            .set_params(smooth, trail_decay, peak_hold_frames, peak_fall, bass_smooth);
+        self.balance_smooth = balance_smooth.clamp(0.0, 1.0);
+    }
+
+    fn set_targets_from_slices(&mut self, left: &[f32], right: &[f32]) -> usize {
+        let ln = self.left.set_target_from_slice(left);
+        let rn = self.right.set_target_from_slice(right);
+        ln.min(rn)
+    }
+
+    fn tick(&mut self) {
+        self.left.tick();
+        self.right.tick();
+        let left_avg = if self.left.current.is_empty() {
+            0.0
+        } else {
+            self.left.current.iter().copied().sum::<f32>() / (self.left.current.len() as f32)
+        };
+        let right_avg = if self.right.current.is_empty() {
+            0.0
+        } else {
+            self.right.current.iter().copied().sum::<f32>() / (self.right.current.len() as f32)
+        };
+        let total = left_avg + right_avg;
+        let target = if total > 1e-6 {
+            ((right_avg - left_avg) / total).clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+        self.balance += (target - self.balance) * self.balance_smooth;
+    }
+}
+
+fn normalize_spectrum_magnitudes_impl(values: &[f32], out: &mut [f32], db_min: f32, db_range: f32) {
+    let safe_range = if db_range.abs() < f32::EPSILON {
+        80.0
+    } else {
+        db_range
+    };
+    let n = values.len().min(out.len());
+    for i in 0..n {
+        let val = values[i];
+        let h = if val <= db_min {
+            0.0
+        } else {
+            (val - db_min) / safe_range
+        };
+        out[i] = h.clamp(0.0, 1.0).powf(1.5);
+    }
+    if n < out.len() {
+        out[n..].fill(0.0);
+    }
+}
+
+fn resample_linear_values_impl(values: &[f32], out: &mut [f32], use_peak: bool) {
+    let in_count = values.len();
+    let out_count = out.len();
+    if in_count == 0 || out_count == 0 {
+        if out_count > 0 {
+            out.fill(0.0);
+        }
+        return;
+    }
+    for i in 0..out_count {
+        let t0 = (i as f32) / (out_count as f32);
+        let t1 = ((i + 1) as f32) / (out_count as f32);
+        let mut x0 = (t0 * (in_count as f32)) as usize;
+        let mut x1 = (t1 * (in_count as f32)) as usize;
+        if x0 >= in_count {
+            x0 = in_count - 1;
+        }
+        if x1 <= x0 {
+            x1 = (x0 + 1).min(in_count);
+        } else if x1 > in_count {
+            x1 = in_count;
+        }
+        if use_peak {
+            let mut peak = 0.0_f32;
+            for &v in &values[x0..x1] {
+                if v > peak {
+                    peak = v;
+                }
+            }
+            out[i] = peak;
+        } else {
+            let mut sum = 0.0_f32;
+            let mut cnt = 0usize;
+            for &v in &values[x0..x1] {
+                sum += v;
+                cnt += 1;
+            }
+            out[i] = if cnt > 0 { sum / (cnt as f32) } else { 0.0 };
+        }
+    }
+}
+
+fn linear_display_voicing(freq_hz: f32, half_rate_hz: f32) -> f32 {
+    let f = 20.0_f32.max(freq_hz);
+    if f < 1_000.0 {
+        let t = (f / 20.0).log10() / (1_000.0_f32 / 20.0_f32).log10();
+        return 0.55 + (0.45 * t);
+    }
+    let log_max = (1_001.0_f32.max(half_rate_hz) / 1_000.0).log10();
+    let t = if log_max > 1e-9 {
+        (f / 1_000.0).log10() / log_max
+    } else {
+        0.0
+    };
+    1.0 + (0.2 * t.min(1.0))
+}
+
+fn map_linear_spectrum_impl(
+    input: &[f32],
+    out: &mut [f32],
+    analysis_bands: usize,
+    db_min: f32,
+    db_range: f32,
+    half_rate_hz: f32,
+) {
+    if out.is_empty() {
+        return;
+    }
+    if input.is_empty() {
+        out.fill(0.0);
+        return;
+    }
+
+    let analysis_n = analysis_bands.max(1);
+    let mut normalized = vec![0.0_f32; input.len()];
+    normalize_spectrum_magnitudes_impl(input, &mut normalized, db_min, db_range);
+
+    let base = if analysis_n == normalized.len() {
+        normalized
+    } else {
+        let mut resampled = vec![0.0_f32; analysis_n];
+        resample_linear_values_impl(&normalized, &mut resampled, false);
+        resampled
+    };
+
+    if out.len() == analysis_n {
+        out.copy_from_slice(&base[..analysis_n]);
+        return;
+    }
+
+    let mut out_peak = vec![0.0_f32; out.len()];
+    let mut out_mean = vec![0.0_f32; out.len()];
+    resample_linear_values_impl(&base, &mut out_peak, true);
+    resample_linear_values_impl(&base, &mut out_mean, false);
+    for i in 0..out.len() {
+        let center_f = ((i as f32) + 0.5) / (out.len() as f32) * half_rate_hz;
+        let mixed = (out_peak[i] * 0.5) + (out_mean[i] * 0.5);
+        out[i] = (mixed * linear_display_voicing(center_f, half_rate_hz)).min(1.0);
+    }
+}
+
+fn map_log_spectrum_impl(input: &[f32], out: &mut [f32], db_min: f32, db_range: f32) {
+    if out.is_empty() {
+        return;
+    }
+    if input.is_empty() {
+        out.fill(0.0);
+        return;
+    }
+    let mut normalized = vec![0.0_f32; input.len()];
+    normalize_spectrum_magnitudes_impl(input, &mut normalized, db_min, db_range);
+    build_log_bins_impl(&normalized, out);
+}
+
+fn bins_max_db(values: &[f32]) -> f32 {
+    if values.is_empty() {
+        return -70.0;
+    }
+    values
+        .iter()
+        .copied()
+        .fold(-70.0_f32, f32::max)
+        .max(-70.0)
+}
+
+fn mean_power_db(values: &[f32]) -> f32 {
+    if values.is_empty() {
+        return -70.0;
+    }
+    let mut lin_sum = 0.0_f32;
+    for &v in values {
+        lin_sum += 10.0_f32.powf(v.max(-70.0) / 10.0);
+    }
+    let mean = lin_sum / (values.len() as f32);
+    if mean > 0.0 {
+        10.0 * mean.log10()
+    } else {
+        -70.0
     }
 }
 
@@ -467,7 +852,7 @@ fn build_log_bins_impl(input: &[f32], out: &mut [f32]) {
 
 #[cfg(test)]
 mod tests {
-    use super::build_log_bins_impl;
+    use super::{bins_max_db, build_log_bins_impl, map_linear_spectrum_impl, map_log_spectrum_impl, mean_power_db};
 
     #[test]
     fn build_log_bins_preserves_low_end_shape_for_dense_outputs() {
@@ -489,6 +874,31 @@ mod tests {
         let peak = out.iter().copied().fold(0.0_f32, f32::max);
         assert!(peak > 0.0);
         assert!(out[0] < (peak * 0.30));
+    }
+
+    #[test]
+    fn map_linear_spectrum_preserves_sparse_peak_energy() {
+        let input = vec![-80.0_f32, -80.0, 0.0, -80.0];
+        let mut out = vec![0.0_f32; 1];
+        map_linear_spectrum_impl(&input, &mut out, 4, -80.0, 80.0, 22_050.0);
+        assert!(out[0] > 0.45);
+    }
+
+    #[test]
+    fn map_log_spectrum_handles_empty_input() {
+        let input = Vec::<f32>::new();
+        let mut out = vec![1.0_f32; 8];
+        map_log_spectrum_impl(&input, &mut out, -80.0, 80.0);
+        assert_eq!(out, vec![0.0_f32; 8]);
+    }
+
+    #[test]
+    fn level_metrics_match_expected_peak_and_mean() {
+        let input = vec![-80.0_f32, -20.0, -10.0];
+        assert_eq!(bins_max_db(&input), -10.0);
+        let mean = mean_power_db(&input);
+        assert!(mean > -16.0);
+        assert!(mean < -11.0);
     }
 }
 
@@ -665,6 +1075,138 @@ pub extern "C" fn viz_state_tick_copy(
 }
 
 #[no_mangle]
+pub extern "C" fn viz_state_stereo_new(
+    num_bars: usize,
+    smooth: f32,
+    trail_decay: f32,
+    peak_hold_frames: usize,
+    peak_fall: f32,
+    bass_smooth: f32,
+    balance_smooth: f32,
+) -> *mut StereoVizStateEngine {
+    let hold = peak_hold_frames.min(u16::MAX as usize) as u16;
+    let st = StereoVizStateEngine::new(
+        num_bars,
+        smooth,
+        trail_decay,
+        hold,
+        peak_fall,
+        bass_smooth,
+        balance_smooth,
+    );
+    Box::into_raw(Box::new(st))
+}
+
+#[no_mangle]
+pub extern "C" fn viz_state_stereo_free(ptr: *mut StereoVizStateEngine) {
+    if ptr.is_null() {
+        return;
+    }
+    unsafe {
+        drop(Box::from_raw(ptr));
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn viz_state_stereo_reset(ptr: *mut StereoVizStateEngine) {
+    if ptr.is_null() {
+        return;
+    }
+    let st = unsafe { &mut *ptr };
+    st.reset();
+}
+
+#[no_mangle]
+pub extern "C" fn viz_state_stereo_set_params(
+    ptr: *mut StereoVizStateEngine,
+    smooth: f32,
+    trail_decay: f32,
+    peak_hold_frames: usize,
+    peak_fall: f32,
+    bass_smooth: f32,
+    balance_smooth: f32,
+) -> c_int {
+    if ptr.is_null() {
+        return -1;
+    }
+    let st = unsafe { &mut *ptr };
+    let hold = peak_hold_frames.min(u16::MAX as usize) as u16;
+    st.set_params(
+        smooth,
+        trail_decay,
+        hold,
+        peak_fall,
+        bass_smooth,
+        balance_smooth,
+    );
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn viz_state_stereo_set_targets(
+    ptr: *mut StereoVizStateEngine,
+    left_ptr: *const f32,
+    right_ptr: *const f32,
+    input_len: usize,
+) -> usize {
+    if ptr.is_null() || left_ptr.is_null() || right_ptr.is_null() || input_len == 0 {
+        return 0;
+    }
+    let st = unsafe { &mut *ptr };
+    let left = unsafe { slice::from_raw_parts(left_ptr, input_len) };
+    let right = unsafe { slice::from_raw_parts(right_ptr, input_len) };
+    st.set_targets_from_slices(left, right)
+}
+
+#[no_mangle]
+pub extern "C" fn viz_state_stereo_tick_copy(
+    ptr: *mut StereoVizStateEngine,
+    left_cur_out_ptr: *mut f32,
+    right_cur_out_ptr: *mut f32,
+    left_peak_out_ptr: *mut f32,
+    right_peak_out_ptr: *mut f32,
+    out_len: usize,
+    bass_out_ptr: *mut f32,
+    balance_out_ptr: *mut f32,
+) -> usize {
+    if ptr.is_null()
+        || left_cur_out_ptr.is_null()
+        || right_cur_out_ptr.is_null()
+        || left_peak_out_ptr.is_null()
+        || right_peak_out_ptr.is_null()
+        || out_len == 0
+    {
+        return 0;
+    }
+    let st = unsafe { &mut *ptr };
+    let n = st.left.num_bars.min(out_len);
+    if n == 0 {
+        return 0;
+    }
+    st.tick();
+
+    let left_cur_out = unsafe { slice::from_raw_parts_mut(left_cur_out_ptr, n) };
+    let right_cur_out = unsafe { slice::from_raw_parts_mut(right_cur_out_ptr, n) };
+    let left_peak_out = unsafe { slice::from_raw_parts_mut(left_peak_out_ptr, n) };
+    let right_peak_out = unsafe { slice::from_raw_parts_mut(right_peak_out_ptr, n) };
+    left_cur_out.copy_from_slice(&st.left.current[..n]);
+    right_cur_out.copy_from_slice(&st.right.current[..n]);
+    left_peak_out.copy_from_slice(&st.left.peak[..n]);
+    right_peak_out.copy_from_slice(&st.right.peak[..n]);
+    if !bass_out_ptr.is_null() {
+        unsafe {
+            *bass_out_ptr = (st.left.bass_level + st.right.bass_level) * 0.5;
+        }
+    }
+    if !balance_out_ptr.is_null() {
+        unsafe {
+            *balance_out_ptr = st.balance;
+        }
+    }
+    n
+}
+
+#[no_mangle]
 pub extern "C" fn process_spectrum(
     input_ptr: *const f32,
     input_len: usize,
@@ -703,6 +1245,188 @@ pub extern "C" fn build_log_bins(
     let out = unsafe { slice::from_raw_parts_mut(output_ptr, output_len) };
     build_log_bins_impl(input, out);
     output_len
+}
+
+#[no_mangle]
+pub extern "C" fn map_spectrum_linear(
+    input_ptr: *const f32,
+    input_len: usize,
+    num_bars: usize,
+    analysis_bands: usize,
+    db_min: f32,
+    db_range: f32,
+    output_ptr: *mut f32,
+    output_len: usize,
+) -> usize {
+    if input_ptr.is_null() || output_ptr.is_null() || num_bars == 0 || output_len == 0 {
+        return 0;
+    }
+    let n = num_bars.min(output_len);
+    let input = unsafe { slice::from_raw_parts(input_ptr, input_len) };
+    let out = unsafe { slice::from_raw_parts_mut(output_ptr, n) };
+    map_linear_spectrum_impl(input, out, analysis_bands, db_min, db_range, 22_050.0);
+    n
+}
+
+#[no_mangle]
+pub extern "C" fn map_spectrum_log(
+    input_ptr: *const f32,
+    input_len: usize,
+    num_bars: usize,
+    db_min: f32,
+    db_range: f32,
+    output_ptr: *mut f32,
+    output_len: usize,
+) -> usize {
+    if input_ptr.is_null() || output_ptr.is_null() || num_bars == 0 || output_len == 0 {
+        return 0;
+    }
+    let n = num_bars.min(output_len);
+    let input = unsafe { slice::from_raw_parts(input_ptr, input_len) };
+    let out = unsafe { slice::from_raw_parts_mut(output_ptr, n) };
+    map_log_spectrum_impl(input, out, db_min, db_range);
+    n
+}
+
+#[no_mangle]
+pub extern "C" fn compute_level_metrics(
+    left_ptr: *const f32,
+    left_len: usize,
+    right_ptr: *const f32,
+    right_len: usize,
+    left_peak_out: *mut f32,
+    left_mean_out: *mut f32,
+    right_peak_out: *mut f32,
+    right_mean_out: *mut f32,
+) -> c_int {
+    if left_ptr.is_null() || right_ptr.is_null() {
+        return -1;
+    }
+    let left = unsafe { slice::from_raw_parts(left_ptr, left_len) };
+    let right = unsafe { slice::from_raw_parts(right_ptr, right_len) };
+    if !left_peak_out.is_null() {
+        unsafe { *left_peak_out = bins_max_db(left); }
+    }
+    if !left_mean_out.is_null() {
+        unsafe { *left_mean_out = mean_power_db(left); }
+    }
+    if !right_peak_out.is_null() {
+        unsafe { *right_peak_out = bins_max_db(right); }
+    }
+    if !right_mean_out.is_null() {
+        unsafe { *right_mean_out = mean_power_db(right); }
+    }
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn viz_spectrum_sampler_new(max_frames: usize) -> *mut SpectrumFrameSampler {
+    Box::into_raw(Box::new(SpectrumFrameSampler::new(max_frames)))
+}
+
+#[no_mangle]
+pub extern "C" fn viz_spectrum_sampler_free(ptr: *mut SpectrumFrameSampler) {
+    if ptr.is_null() {
+        return;
+    }
+    unsafe {
+        drop(Box::from_raw(ptr));
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn viz_spectrum_sampler_clear(ptr: *mut SpectrumFrameSampler) -> c_int {
+    if ptr.is_null() {
+        return -1;
+    }
+    let sampler = unsafe { &mut *ptr };
+    sampler.clear();
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn viz_spectrum_sampler_push_mono(
+    ptr: *mut SpectrumFrameSampler,
+    pos_s: f64,
+    mono_ptr: *const f32,
+    mono_len: usize,
+) -> c_int {
+    if ptr.is_null() || mono_ptr.is_null() {
+        return -1;
+    }
+    let sampler = unsafe { &mut *ptr };
+    let mono = unsafe { slice::from_raw_parts(mono_ptr, mono_len) };
+    sampler.push_mono(pos_s, mono);
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn viz_spectrum_sampler_push_stereo(
+    ptr: *mut SpectrumFrameSampler,
+    pos_s: f64,
+    mono_ptr: *const f32,
+    mono_len: usize,
+    left_ptr: *const f32,
+    left_len: usize,
+    right_ptr: *const f32,
+    right_len: usize,
+) -> c_int {
+    if ptr.is_null() || mono_ptr.is_null() {
+        return -1;
+    }
+    let sampler = unsafe { &mut *ptr };
+    let mono = unsafe { slice::from_raw_parts(mono_ptr, mono_len) };
+    let left = if left_ptr.is_null() {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(left_ptr, left_len) }
+    };
+    let right = if right_ptr.is_null() {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(right_ptr, right_len) }
+    };
+    sampler.push_stereo(pos_s, mono, left, right);
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn viz_spectrum_sampler_sample_mono(
+    ptr: *mut SpectrumFrameSampler,
+    target_pos_s: f64,
+    out_ptr: *mut f32,
+    out_len: usize,
+) -> usize {
+    if ptr.is_null() || out_ptr.is_null() || out_len == 0 {
+        return 0;
+    }
+    let sampler = unsafe { &mut *ptr };
+    let out = unsafe { slice::from_raw_parts_mut(out_ptr, out_len) };
+    sampler.sample_mono(target_pos_s, out)
+}
+
+#[no_mangle]
+pub extern "C" fn viz_spectrum_sampler_sample_stereo(
+    ptr: *mut SpectrumFrameSampler,
+    target_pos_s: f64,
+    mono_out_ptr: *mut f32,
+    left_out_ptr: *mut f32,
+    right_out_ptr: *mut f32,
+    out_len: usize,
+) -> usize {
+    if ptr.is_null()
+        || mono_out_ptr.is_null()
+        || left_out_ptr.is_null()
+        || right_out_ptr.is_null()
+        || out_len == 0
+    {
+        return 0;
+    }
+    let sampler = unsafe { &mut *ptr };
+    let mono_out = unsafe { slice::from_raw_parts_mut(mono_out_ptr, out_len) };
+    let left_out = unsafe { slice::from_raw_parts_mut(left_out_ptr, out_len) };
+    let right_out = unsafe { slice::from_raw_parts_mut(right_out_ptr, out_len) };
+    sampler.sample_stereo(target_pos_s, mono_out, left_out, right_out)
 }
 
 #[no_mangle]

@@ -29,6 +29,41 @@ class RustVizCore:
         fn.restype = ctypes.c_size_t
         self._process_spectrum = fn
 
+        self._map_spectrum_linear = None
+        try:
+            map_linear = self._lib.map_spectrum_linear
+            map_linear.argtypes = [
+                ctypes.POINTER(ctypes.c_float),  # input ptr
+                ctypes.c_size_t,                 # input len
+                ctypes.c_size_t,                 # num bars
+                ctypes.c_size_t,                 # analysis bands
+                ctypes.c_float,                  # db min
+                ctypes.c_float,                  # db range
+                ctypes.POINTER(ctypes.c_float),  # output ptr
+                ctypes.c_size_t,                 # output len
+            ]
+            map_linear.restype = ctypes.c_size_t
+            self._map_spectrum_linear = map_linear
+        except Exception:
+            logger.info("Rust viz core lacks map_spectrum_linear symbol; using existing linear path.")
+
+        self._map_spectrum_log = None
+        try:
+            map_log = self._lib.map_spectrum_log
+            map_log.argtypes = [
+                ctypes.POINTER(ctypes.c_float),  # input ptr
+                ctypes.c_size_t,                 # input len
+                ctypes.c_size_t,                 # num bars
+                ctypes.c_float,                  # db min
+                ctypes.c_float,                  # db range
+                ctypes.POINTER(ctypes.c_float),  # output ptr
+                ctypes.c_size_t,                 # output len
+            ]
+            map_log.restype = ctypes.c_size_t
+            self._map_spectrum_log = map_log
+        except Exception:
+            logger.info("Rust viz core lacks map_spectrum_log symbol; using existing log path.")
+
         self._build_log_bins = None
         try:
             bins = self._lib.build_log_bins
@@ -42,6 +77,89 @@ class RustVizCore:
             self._build_log_bins = bins
         except Exception:
             logger.info("Rust viz core lacks build_log_bins symbol; using Python fallback for log bins.")
+
+        self._compute_level_metrics = None
+        try:
+            level_metrics = self._lib.compute_level_metrics
+            level_metrics.argtypes = [
+                ctypes.POINTER(ctypes.c_float),  # left ptr
+                ctypes.c_size_t,                 # left len
+                ctypes.POINTER(ctypes.c_float),  # right ptr
+                ctypes.c_size_t,                 # right len
+                ctypes.POINTER(ctypes.c_float),  # left peak out
+                ctypes.POINTER(ctypes.c_float),  # left mean out
+                ctypes.POINTER(ctypes.c_float),  # right peak out
+                ctypes.POINTER(ctypes.c_float),  # right mean out
+            ]
+            level_metrics.restype = ctypes.c_int
+            self._compute_level_metrics = level_metrics
+        except Exception:
+            logger.info("Rust viz core lacks compute_level_metrics symbol; using Python fallback for level meter.")
+
+        self._spectrum_sampler_new = None
+        self._spectrum_sampler_free = None
+        self._spectrum_sampler_clear = None
+        self._spectrum_sampler_push_mono = None
+        self._spectrum_sampler_push_stereo = None
+        self._spectrum_sampler_sample_mono = None
+        self._spectrum_sampler_sample_stereo = None
+        try:
+            sampler_new = self._lib.viz_spectrum_sampler_new
+            sampler_new.argtypes = [ctypes.c_size_t]
+            sampler_new.restype = ctypes.c_void_p
+            sampler_free = self._lib.viz_spectrum_sampler_free
+            sampler_free.argtypes = [ctypes.c_void_p]
+            sampler_free.restype = None
+            sampler_clear = self._lib.viz_spectrum_sampler_clear
+            sampler_clear.argtypes = [ctypes.c_void_p]
+            sampler_clear.restype = ctypes.c_int
+            sampler_push_mono = self._lib.viz_spectrum_sampler_push_mono
+            sampler_push_mono.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_double,
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.c_size_t,
+            ]
+            sampler_push_mono.restype = ctypes.c_int
+            sampler_push_stereo = self._lib.viz_spectrum_sampler_push_stereo
+            sampler_push_stereo.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_double,
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.c_size_t,
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.c_size_t,
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.c_size_t,
+            ]
+            sampler_push_stereo.restype = ctypes.c_int
+            sampler_sample_mono = self._lib.viz_spectrum_sampler_sample_mono
+            sampler_sample_mono.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_double,
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.c_size_t,
+            ]
+            sampler_sample_mono.restype = ctypes.c_size_t
+            sampler_sample_stereo = self._lib.viz_spectrum_sampler_sample_stereo
+            sampler_sample_stereo.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_double,
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.c_size_t,
+            ]
+            sampler_sample_stereo.restype = ctypes.c_size_t
+            self._spectrum_sampler_new = sampler_new
+            self._spectrum_sampler_free = sampler_free
+            self._spectrum_sampler_clear = sampler_clear
+            self._spectrum_sampler_push_mono = sampler_push_mono
+            self._spectrum_sampler_push_stereo = sampler_push_stereo
+            self._spectrum_sampler_sample_mono = sampler_sample_mono
+            self._spectrum_sampler_sample_stereo = sampler_sample_stereo
+        except Exception:
+            logger.info("Rust viz core lacks spectrum sampler symbols; using Python interpolation path.")
 
         self._build_spiral_points = None
         try:
@@ -373,6 +491,12 @@ class RustVizCore:
         self._viz_state_set_params = None
         self._viz_state_set_target = None
         self._viz_state_tick_copy = None
+        self._viz_state_stereo_new = None
+        self._viz_state_stereo_free = None
+        self._viz_state_stereo_reset = None
+        self._viz_state_stereo_set_params = None
+        self._viz_state_stereo_set_targets = None
+        self._viz_state_stereo_tick_copy = None
         try:
             st_new = self._lib.viz_state_new
             st_new.argtypes = [
@@ -421,6 +545,63 @@ class RustVizCore:
             self._viz_state_tick_copy = st_tick
         except Exception:
             logger.info("Rust viz core lacks viz_state_* symbols; using Python animation fallback.")
+        try:
+            st_new = self._lib.viz_state_stereo_new
+            st_new.argtypes = [
+                ctypes.c_size_t,
+                ctypes.c_float,
+                ctypes.c_float,
+                ctypes.c_size_t,
+                ctypes.c_float,
+                ctypes.c_float,
+                ctypes.c_float,
+            ]
+            st_new.restype = ctypes.c_void_p
+            st_free = self._lib.viz_state_stereo_free
+            st_free.argtypes = [ctypes.c_void_p]
+            st_free.restype = None
+            st_reset = self._lib.viz_state_stereo_reset
+            st_reset.argtypes = [ctypes.c_void_p]
+            st_reset.restype = None
+            st_setp = self._lib.viz_state_stereo_set_params
+            st_setp.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_float,
+                ctypes.c_float,
+                ctypes.c_size_t,
+                ctypes.c_float,
+                ctypes.c_float,
+                ctypes.c_float,
+            ]
+            st_setp.restype = ctypes.c_int
+            st_sett = self._lib.viz_state_stereo_set_targets
+            st_sett.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.c_size_t,
+            ]
+            st_sett.restype = ctypes.c_size_t
+            st_tick = self._lib.viz_state_stereo_tick_copy
+            st_tick.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.c_size_t,
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.POINTER(ctypes.c_float),
+            ]
+            st_tick.restype = ctypes.c_size_t
+            self._viz_state_stereo_new = st_new
+            self._viz_state_stereo_free = st_free
+            self._viz_state_stereo_reset = st_reset
+            self._viz_state_stereo_set_params = st_setp
+            self._viz_state_stereo_set_targets = st_sett
+            self._viz_state_stereo_tick_copy = st_tick
+        except Exception:
+            logger.info("Rust viz core lacks viz_state_stereo_* symbols; using Python stereo animation fallback.")
 
     @property
     def available(self) -> bool:
@@ -452,6 +633,82 @@ class RustVizCore:
                 ctypes.c_float(db_range),
                 out_buf,
                 out_n,
+            )
+        )
+        if written <= 0:
+            return None
+        out = [float(out_buf[i]) for i in range(min(written, out_n))]
+        if len(out) < out_n:
+            out.extend([0.0] * (out_n - len(out)))
+        return out
+
+    def map_spectrum_linear(
+        self,
+        magnitudes: Iterable[float],
+        out_count: int,
+        *,
+        analysis_bands: int = 2048,
+        db_min: float = -80.0,
+        db_range: float = 80.0,
+    ) -> Optional[List[float]]:
+        if self._lib is None or self._map_spectrum_linear is None:
+            return None
+        out_n = int(out_count)
+        if out_n <= 0:
+            return []
+        vals = [float(v) for v in magnitudes]
+        if not vals:
+            return [0.0] * out_n
+        in_len = len(vals)
+        in_buf = (ctypes.c_float * in_len)(*vals)
+        out_buf = (ctypes.c_float * out_n)()
+        written = int(
+            self._map_spectrum_linear(
+                in_buf,
+                in_len,
+                ctypes.c_size_t(out_n),
+                ctypes.c_size_t(max(1, int(analysis_bands))),
+                ctypes.c_float(db_min),
+                ctypes.c_float(db_range),
+                out_buf,
+                ctypes.c_size_t(out_n),
+            )
+        )
+        if written <= 0:
+            return None
+        out = [float(out_buf[i]) for i in range(min(written, out_n))]
+        if len(out) < out_n:
+            out.extend([0.0] * (out_n - len(out)))
+        return out
+
+    def map_spectrum_log(
+        self,
+        magnitudes: Iterable[float],
+        out_count: int,
+        *,
+        db_min: float = -80.0,
+        db_range: float = 80.0,
+    ) -> Optional[List[float]]:
+        if self._lib is None or self._map_spectrum_log is None:
+            return None
+        out_n = int(out_count)
+        if out_n <= 0:
+            return []
+        vals = [float(v) for v in magnitudes]
+        if not vals:
+            return [0.0] * out_n
+        in_len = len(vals)
+        in_buf = (ctypes.c_float * in_len)(*vals)
+        out_buf = (ctypes.c_float * out_n)()
+        written = int(
+            self._map_spectrum_log(
+                in_buf,
+                in_len,
+                ctypes.c_size_t(out_n),
+                ctypes.c_float(db_min),
+                ctypes.c_float(db_range),
+                out_buf,
+                ctypes.c_size_t(out_n),
             )
         )
         if written <= 0:
@@ -505,6 +762,31 @@ class RustVizCore:
             return None
         return RustVizStateEngine(self, ptr, int(num_bars))
 
+    def create_stereo_state_engine(
+        self,
+        num_bars: int,
+        smooth: float = 0.45,
+        trail_decay: float = 0.90,
+        peak_hold_frames: int = 8,
+        peak_fall: float = 0.02,
+        bass_smooth: float = 0.22,
+        balance_smooth: float = 0.22,
+    ) -> Optional["RustStereoVizStateEngine"]:
+        if self._lib is None or self._viz_state_stereo_new is None:
+            return None
+        ptr = self._viz_state_stereo_new(
+            int(num_bars),
+            ctypes.c_float(float(smooth)),
+            ctypes.c_float(float(trail_decay)),
+            ctypes.c_size_t(max(0, int(peak_hold_frames))),
+            ctypes.c_float(float(peak_fall)),
+            ctypes.c_float(float(bass_smooth)),
+            ctypes.c_float(float(balance_smooth)),
+        )
+        if not ptr:
+            return None
+        return RustStereoVizStateEngine(self, ptr, int(num_bars))
+
     def build_log_bins(self, values: Iterable[float], out_count: int) -> Optional[List[float]]:
         if self._lib is None:
             return None
@@ -526,6 +808,52 @@ class RustVizCore:
         if len(out) < out_n:
             out.extend([0.0] * (out_n - len(out)))
         return out
+
+    def compute_level_metrics(
+        self,
+        left_values: Iterable[float],
+        right_values: Iterable[float],
+    ) -> Optional[tuple]:
+        if self._lib is None or self._compute_level_metrics is None:
+            return None
+        left = [float(v) for v in left_values]
+        right = [float(v) for v in right_values]
+        left_len = len(left)
+        right_len = len(right)
+        left_buf = (ctypes.c_float * max(1, left_len))(*left) if left_len > 0 else (ctypes.c_float * 1)(0.0)
+        right_buf = (ctypes.c_float * max(1, right_len))(*right) if right_len > 0 else (ctypes.c_float * 1)(0.0)
+        out_lp = ctypes.c_float(0.0)
+        out_lm = ctypes.c_float(0.0)
+        out_rp = ctypes.c_float(0.0)
+        out_rm = ctypes.c_float(0.0)
+        rc = int(
+            self._compute_level_metrics(
+                left_buf,
+                ctypes.c_size_t(left_len),
+                right_buf,
+                ctypes.c_size_t(right_len),
+                ctypes.byref(out_lp),
+                ctypes.byref(out_lm),
+                ctypes.byref(out_rp),
+                ctypes.byref(out_rm),
+            )
+        )
+        if rc != 0:
+            return None
+        return (
+            float(out_lp.value),
+            float(out_lm.value),
+            float(out_rp.value),
+            float(out_rm.value),
+        )
+
+    def create_spectrum_frame_sampler(self, max_frames: int = 8):
+        if self._lib is None or self._spectrum_sampler_new is None:
+            return None
+        ptr = self._spectrum_sampler_new(ctypes.c_size_t(max(2, int(max_frames))))
+        if not ptr:
+            return None
+        return RustSpectrumFrameSampler(self, ctypes.c_void_p(ptr))
 
     def build_spiral_points(
         self,
@@ -1297,6 +1625,106 @@ class RustBarsRenderer:
         )
 
 
+class RustSpectrumFrameSampler:
+    def __init__(self, core: RustVizCore, ptr: ctypes.c_void_p):
+        self._core = core
+        self._ptr = ptr
+
+    def close(self):
+        if self._ptr:
+            self._core._spectrum_sampler_free(self._ptr)
+            self._ptr = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def clear(self) -> bool:
+        if not self._ptr:
+            return False
+        rc = int(self._core._spectrum_sampler_clear(self._ptr))
+        return rc == 0
+
+    def push_frame(self, pos_s: float, frame) -> bool:
+        if not self._ptr:
+            return False
+        if isinstance(frame, dict):
+            mono = [float(v) for v in (frame.get("mono") or [])]
+            left = [float(v) for v in (frame.get("left") or mono)]
+            right = [float(v) for v in (frame.get("right") or mono)]
+            if not mono:
+                return False
+            mono_buf = (ctypes.c_float * len(mono))(*mono)
+            left_buf = (ctypes.c_float * len(left))(*left)
+            right_buf = (ctypes.c_float * len(right))(*right)
+            rc = int(
+                self._core._spectrum_sampler_push_stereo(
+                    self._ptr,
+                    ctypes.c_double(float(pos_s)),
+                    mono_buf,
+                    ctypes.c_size_t(len(mono)),
+                    left_buf,
+                    ctypes.c_size_t(len(left)),
+                    right_buf,
+                    ctypes.c_size_t(len(right)),
+                )
+            )
+            return rc == 0
+        mono = [float(v) for v in (frame or [])]
+        if not mono:
+            return False
+        mono_buf = (ctypes.c_float * len(mono))(*mono)
+        rc = int(
+            self._core._spectrum_sampler_push_mono(
+                self._ptr,
+                ctypes.c_double(float(pos_s)),
+                mono_buf,
+                ctypes.c_size_t(len(mono)),
+            )
+        )
+        return rc == 0
+
+    def sample(self, target_pos_s: float, *, stereo: bool = False, out_len: int = 2048):
+        if not self._ptr:
+            return None
+        n = max(1, int(out_len))
+        if stereo:
+            mono_buf = (ctypes.c_float * n)()
+            left_buf = (ctypes.c_float * n)()
+            right_buf = (ctypes.c_float * n)()
+            written = int(
+                self._core._spectrum_sampler_sample_stereo(
+                    self._ptr,
+                    ctypes.c_double(float(target_pos_s)),
+                    mono_buf,
+                    left_buf,
+                    right_buf,
+                    ctypes.c_size_t(n),
+                )
+            )
+            if written <= 0:
+                return None
+            return {
+                "mono": [float(mono_buf[i]) for i in range(written)],
+                "left": [float(left_buf[i]) for i in range(written)],
+                "right": [float(right_buf[i]) for i in range(written)],
+            }
+        mono_buf = (ctypes.c_float * n)()
+        written = int(
+            self._core._spectrum_sampler_sample_mono(
+                self._ptr,
+                ctypes.c_double(float(target_pos_s)),
+                mono_buf,
+                ctypes.c_size_t(n),
+            )
+        )
+        if written <= 0:
+            return None
+        return [float(mono_buf[i]) for i in range(written)]
+
+
 class RustVizProcessor:
     def __init__(self, core: RustVizCore, ptr: ctypes.c_void_p, num_bars: int):
         self._core = core
@@ -1427,3 +1855,111 @@ class RustVizStateEngine:
             )
         )
         return written, float(self._bass_buf.value)
+
+
+class RustStereoVizStateEngine:
+    def __init__(self, core: RustVizCore, ptr: ctypes.c_void_p, num_bars: int):
+        self._core = core
+        self._ptr = ptr
+        self._num_bars = max(1, int(num_bars))
+        self._left_target_buf = (ctypes.c_float * self._num_bars)()
+        self._right_target_buf = (ctypes.c_float * self._num_bars)()
+        self._bass_buf = ctypes.c_float(0.0)
+        self._balance_buf = ctypes.c_float(0.0)
+
+    def close(self):
+        if self._ptr:
+            self._core._viz_state_stereo_free(self._ptr)
+            self._ptr = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def reset(self):
+        if self._ptr:
+            self._core._viz_state_stereo_reset(self._ptr)
+
+    def set_params(
+        self,
+        smooth: float,
+        trail_decay: float,
+        peak_hold_frames: int,
+        peak_fall: float,
+        bass_smooth: float = 0.22,
+        balance_smooth: float = 0.22,
+    ) -> bool:
+        if not self._ptr:
+            return False
+        rc = int(
+            self._core._viz_state_stereo_set_params(
+                self._ptr,
+                ctypes.c_float(float(smooth)),
+                ctypes.c_float(float(trail_decay)),
+                ctypes.c_size_t(max(0, int(peak_hold_frames))),
+                ctypes.c_float(float(peak_fall)),
+                ctypes.c_float(float(bass_smooth)),
+                ctypes.c_float(float(balance_smooth)),
+            )
+        )
+        return rc == 0
+
+    def set_targets(self, left_levels: Iterable[float], right_levels: Iterable[float]) -> int:
+        if not self._ptr:
+            return 0
+        left = [float(v) for v in left_levels]
+        right = [float(v) for v in right_levels]
+        if len(left) < self._num_bars:
+            left.extend([0.0] * (self._num_bars - len(left)))
+        elif len(left) > self._num_bars:
+            left = left[:self._num_bars]
+        if len(right) < self._num_bars:
+            right.extend([0.0] * (self._num_bars - len(right)))
+        elif len(right) > self._num_bars:
+            right = right[:self._num_bars]
+        for i, v in enumerate(left):
+            self._left_target_buf[i] = v
+        for i, v in enumerate(right):
+            self._right_target_buf[i] = v
+        return int(
+            self._core._viz_state_stereo_set_targets(
+                self._ptr,
+                self._left_target_buf,
+                self._right_target_buf,
+                self._num_bars,
+            )
+        )
+
+    def tick_copy(
+        self,
+        left_cur_out,
+        right_cur_out,
+        left_peak_out,
+        right_peak_out,
+    ):
+        if not self._ptr:
+            return 0, 0.0, 0.0
+        out_len = min(
+            self._num_bars,
+            len(left_cur_out),
+            len(right_cur_out),
+            len(left_peak_out),
+            len(right_peak_out),
+        )
+        if out_len <= 0:
+            return 0, 0.0, 0.0
+        written = int(
+            self._core._viz_state_stereo_tick_copy(
+                self._ptr,
+                left_cur_out,
+                right_cur_out,
+                left_peak_out,
+                right_peak_out,
+                ctypes.c_size_t(out_len),
+                ctypes.byref(self._bass_buf),
+                ctypes.byref(self._balance_buf),
+            )
+        )
+        return written, float(self._bass_buf.value), float(self._balance_buf.value)

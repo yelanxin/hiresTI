@@ -22,6 +22,10 @@ logger = logging.getLogger(__name__)
 _SEARCH_HEADER_DRAG_THRESHOLD_PX = 6.0
 
 
+def _hide_dr_meter_debug() -> bool:
+    return str(os.getenv("HIRESTI_VIZ_HIDE_DR_METER", "0")).strip().lower() in ("1", "true", "yes", "on")
+
+
 def _sidebar_nav_sections():
     return [
         (
@@ -986,7 +990,10 @@ def build_body(app, container):
     app.dr_meter.set_vexpand(False)
     app.dr_meter.set_valign(Gtk.Align.END)
     app.dr_meter.set_size_request(84, _dr_h)
-    app.viz_main_row.append(app.dr_meter)
+    if not _hide_dr_meter_debug():
+        app.viz_main_row.append(app.dr_meter)
+    else:
+        app.dr_meter.set_visible(False)
 
     app.viz_content_overlay = Gtk.Overlay()
     app.viz_content_overlay.set_hexpand(True)
