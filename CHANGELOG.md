@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.8.4 - 2026-03-31
+
+### Changed
+- **Adaptive player bar layout**: the bottom playback bar now responds to window width with three layout tiers — full (all controls visible), medium (right-side controls hidden), and compact (only transport controls and progress bar visible) — allowing the window to be resized much narrower than before.
+- **Player bar no longer enforces a fixed minimum width**: the left panel (album art + track info), center panel (timeline / progress bar), and right panel (volume / playback controls) no longer use hard-coded `set_size_request` values, so the window minimum width is determined naturally by visible content.
+- **Progress bar fills available space**: the timeline / seek bar now expands horizontally to fill the center panel instead of being fixed at 450 px.
+- **Sidebar width stays stable when shrinking the window**: the `GtkPaned` sidebar no longer shrinks proportionally below the default window width; only the content area narrows. The sidebar's start child is now marked non-shrinkable (`set_shrink_start_child(False)`).
+- **Album art position is now fixed**: removed the `Adw.Clamp` wrapper around the player bar info area that caused the album art to shift horizontally when track metadata changed length.
+- **Updated application icons** (16 × 16, 24 × 24, 32 × 32, 48 × 48 and source SVG).
+
+### Fixed
+- **Long track titles no longer push the transport controls off-screen**: the title label is now capped at `max_width_chars=20` with ellipsis truncation, and the text box no longer requests horizontal expansion, preventing the left panel from squeezing the center playback area.
+
 ## 1.8.3 - 2026-03-27
 
 ### Added

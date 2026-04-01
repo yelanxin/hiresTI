@@ -1037,6 +1037,7 @@ def build_body(app, container):
 
     app.sidebar_box.append(app.nav_list)
     app.paned.set_start_child(app.sidebar_box)
+    app.paned.set_shrink_start_child(False)
     _body_mark("sidebar")
     app.right_stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
     app.paned.set_end_child(app.right_stack)
@@ -1088,11 +1089,9 @@ def build_player_bar(app, container):
     left_panel = Gtk.Box()
     left_panel.set_hexpand(False)
     left_panel.set_halign(Gtk.Align.START)
-    left_panel.set_size_request(side_panel_width, -1)
 
     app.info_area = Gtk.Box(spacing=14, valign=Gtk.Align.CENTER, halign=Gtk.Align.START)
     app.info_area.set_hexpand(False)
-    app.info_area.set_size_request(side_panel_width, -1)
     app.art_img = Gtk.Image()
     app.art_img.set_size_request(80, 80)
     app.art_img.set_margin_top(6)
@@ -1104,13 +1103,13 @@ def build_player_bar(app, container):
     app.art_img.add_controller(gest)
 
     text_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER, spacing=0)
-    text_box.set_hexpand(True)
-    text_box.set_size_request(240, -1)
-    title_row = Gtk.Box(spacing=2, valign=Gtk.Align.CENTER, hexpand=True)
+    text_box.set_hexpand(False)
+    text_box.set_size_request(120, -1)
+    title_row = Gtk.Box(spacing=2, valign=Gtk.Align.CENTER, hexpand=False)
     app.lbl_title = Gtk.Label(xalign=0, css_classes=["player-title"], ellipsize=3)
     app.lbl_title.set_single_line_mode(True)
     app.lbl_title.set_width_chars(-1)
-    app.lbl_title.set_max_width_chars(-1)
+    app.lbl_title.set_max_width_chars(20)
     app.lbl_title.set_hexpand(False)
     app.lbl_title.set_halign(Gtk.Align.START)
     app.track_fav_btn = Gtk.Button(css_classes=["flat", "circular", "player-heart-btn"], icon_name="hiresti-favorite-outline-symbolic", valign=Gtk.Align.START)
@@ -1148,11 +1147,10 @@ def build_player_bar(app, container):
 
     app.info_area.append(app.art_img)
     app.info_area.append(text_box)
-    left_clamp = Adw.Clamp(maximum_size=side_panel_width, tightening_threshold=240)
-    left_clamp.set_child(app.info_area)
-    left_panel.append(left_clamp)
+    left_panel.set_overflow(Gtk.Overflow.HIDDEN)
+    left_panel.append(app.info_area)
     app.player_left_panel = left_panel
-    app.player_left_clamp = left_clamp
+    app.player_left_clamp = None
     app.player_text_box = text_box
     app.bottom_bar.set_start_widget(left_panel)
 
@@ -1163,7 +1161,8 @@ def build_player_bar(app, container):
     center_box = Gtk.Box(
         orientation=Gtk.Orientation.VERTICAL,
         valign=Gtk.Align.CENTER,
-        halign=Gtk.Align.CENTER,
+        halign=Gtk.Align.FILL,
+        hexpand=True,
         spacing=8,
     )
     ctrls = Gtk.Box(spacing=12, halign=Gtk.Align.CENTER)
@@ -1200,8 +1199,9 @@ def build_player_bar(app, container):
     app.timeline_box.append(app.lbl_current_time)
     app.timeline_box.append(app.scale)
     app.timeline_box.append(app.lbl_total_time)
-    app.timeline_box.set_size_request(450, -1)
-    app.timeline_box.set_halign(Gtk.Align.CENTER)
+    app.timeline_box.set_size_request(200, -1)
+    app.timeline_box.set_hexpand(True)
+    app.timeline_box.set_halign(Gtk.Align.FILL)
     center_box.append(app.timeline_box)
 
     app.tech_box = Gtk.Box(spacing=8, halign=Gtk.Align.CENTER, margin_top=4)
@@ -1218,8 +1218,6 @@ def build_player_bar(app, container):
     right_panel = Gtk.Box()
     right_panel.set_hexpand(False)
     right_panel.set_halign(Gtk.Align.END)
-    # Keep start/end widths symmetric so transport controls stay truly centered.
-    right_panel.set_size_request(side_panel_width, -1)
 
     app.vol_box = Gtk.Box(spacing=4, valign=Gtk.Align.CENTER)
     app.vol_box.set_hexpand(False)
@@ -1253,5 +1251,42 @@ def build_player_bar(app, container):
     right_panel.append(app.vol_box)
     app.player_right_panel = right_panel
     app.bottom_bar.set_end_widget(right_panel)
+
+    # Adaptive play bar: hide side panels when the bar is too narrow.
+    app._player_bar_layout_tier = "full"
+
+    def _on_player_bar_width_changed(*_args):
+        if getattr(app, "is_mini_mode", False):
+            return
+        w = app.bottom_bar.get_width()
+        if w <= 0:
+            return
+        prev = app._player_bar_layout_tier
+        if w < 700:
+            tier = "compact"
+        elif w < 920:
+            tier = "medium"
+        else:
+            tier = "full"
+        if tier == prev:
+            return
+        app._player_bar_layout_tier = tier
+        if tier == "compact":
+            app.info_area.set_visible(False)
+            app.vol_box.set_visible(False)
+            app.timeline_box.set_visible(True)
+            app.tech_box.set_visible(False)
+        elif tier == "medium":
+            app.info_area.set_visible(True)
+            app.vol_box.set_visible(False)
+            app.timeline_box.set_visible(True)
+            app.tech_box.set_visible(True)
+        else:
+            app.info_area.set_visible(True)
+            app.vol_box.set_visible(True)
+            app.timeline_box.set_visible(True)
+            app.tech_box.set_visible(True)
+
+    app.bottom_bar.connect("notify::width", _on_player_bar_width_changed)
 
     # Start/end use content width to avoid large dead space on wide windows.

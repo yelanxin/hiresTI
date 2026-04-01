@@ -182,8 +182,15 @@ def update_layout_proportions(self, w, p):
     if login_box is not None and login_box.get_visible():
         GLib.idle_add(lambda: (self._schedule_viz_handle_realign(animate=False), False)[1])
         return
-    s_px = int(max(120, self.win.get_width() * float(ui_config.SIDEBAR_RATIO)))
-    self.paned.set_position(s_px)
+    # Keep sidebar at its current width when the window shrinks; only
+    # recalculate from the ratio when the window is at or above the
+    # default width so the sidebar grows proportionally on large screens.
+    win_w = self.win.get_width()
+    default_w = int(ui_config.WINDOW_WIDTH)
+    if win_w >= default_w:
+        s_px = int(max(120, win_w * float(ui_config.SIDEBAR_RATIO)))
+        self.paned.set_position(s_px)
+    # else: leave paned position as-is so the sidebar stays stable
     overlay_h = 0
     if getattr(self, "body_overlay", None) is not None:
         try:
