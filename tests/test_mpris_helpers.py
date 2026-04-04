@@ -34,13 +34,14 @@ def _variant_to_python(value):
 
 def _make_app():
     app = SimpleNamespace()
+    app.MODE_NORMAL = 4
     app.MODE_LOOP = 0
     app.MODE_ONE = 1
     app.MODE_SHUFFLE = 2
     app.MODE_SMART = 3
     app.MODE_ICONS = {}
     app.MODE_TOOLTIPS = {}
-    app.play_mode = app.MODE_LOOP
+    app.play_mode = app.MODE_NORMAL
     app.player = _Player()
     app.playing_track = None
     app.playing_track_id = None
@@ -61,6 +62,7 @@ def test_track_id_to_object_path_sanitizes_tokens():
 
 
 def test_play_mode_mapping():
+    assert play_mode_to_loop_shuffle(4) == ("None", False)
     assert play_mode_to_loop_shuffle(0) == ("Playlist", False)
     assert play_mode_to_loop_shuffle(1) == ("Track", False)
     assert play_mode_to_loop_shuffle(2) == ("Playlist", True)
@@ -101,11 +103,14 @@ def test_mpris_property_setters_update_play_mode_and_volume():
     svc._apply_shuffle(True)
     assert app.play_mode == app.MODE_SHUFFLE
 
+    svc._apply_shuffle(False)
+    assert app.play_mode == app.MODE_NORMAL
+
     svc._apply_loop_status("Track")
     assert app.play_mode == app.MODE_ONE
 
-    svc._apply_shuffle(False)
-    assert app.play_mode == app.MODE_ONE
+    svc._apply_loop_status("None")
+    assert app.play_mode == app.MODE_NORMAL
 
     svc._apply_loop_status("Playlist")
     assert app.play_mode == app.MODE_LOOP

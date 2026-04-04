@@ -111,6 +111,7 @@ def _queue_snapshot(app):
 def _play_mode_name(app) -> str:
     mode = _safe_int(getattr(app, "play_mode", 0), 0)
     mapping = {
+        getattr(app, "MODE_NORMAL", 4): "normal",
         getattr(app, "MODE_LOOP", 0): "loop",
         getattr(app, "MODE_ONE", 1): "one",
         getattr(app, "MODE_SHUFFLE", 2): "shuffle",

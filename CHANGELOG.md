@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.8.6 - 2026-04-04
+
+### Changed
+- **Added a `Normal` playback mode** that plays the current album / playlist in order and stops at the end instead of always looping. New installs now default to `Normal`, and the playback-mode button includes a dedicated symbolic icon for it.
+
+### Fixed
+- **End-of-queue playback now stops cleanly in `Normal` mode**: after the last track finishes, hiresTI now stops the backend pipeline, updates the play button / playback status, and avoids the repeated USB rawlink `pull timeout` spam caused by leaving the appsink pull loop alive after EOS.
+
 ## 1.8.5 - 2026-04-03
 
 ### Changed

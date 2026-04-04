@@ -1223,8 +1223,8 @@ def build_player_bar(app, container):
     app.vol_box.set_hexpand(False)
     app.vol_box.set_halign(Gtk.Align.END)
 
-    app.mode_btn = Gtk.Button(icon_name=app.MODE_ICONS[app.MODE_LOOP], css_classes=["flat", "circular", "player-side-btn"])
-    app.mode_btn.set_tooltip_text(app.MODE_TOOLTIPS[app.MODE_LOOP])
+    app.mode_btn = Gtk.Button(icon_name=app.MODE_ICONS[app.MODE_NORMAL], css_classes=["flat", "circular", "player-side-btn"])
+    app.mode_btn.set_tooltip_text(app.MODE_TOOLTIPS[app.MODE_NORMAL])
     app.mode_btn.connect("clicked", app.on_toggle_mode)
     app.vol_box.append(app.mode_btn)
 

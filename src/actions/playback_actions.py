@@ -8,6 +8,32 @@ _PREV_RESTART_THRESHOLD_S = 5.0
 _PREV_DOUBLE_TAP_WINDOW_S = 2.0
 
 
+def _stop_after_queue_end(app):
+    player = getattr(app, "player", None)
+    if player is not None and hasattr(player, "stop"):
+        try:
+            player.stop()
+        except Exception:
+            pass
+    play_btn = getattr(app, "play_btn", None)
+    if play_btn is not None and hasattr(play_btn, "set_icon_name"):
+        try:
+            play_btn.set_icon_name("media-playback-start-symbolic")
+        except Exception:
+            pass
+    if hasattr(app, "_sync_playback_status_icon"):
+        try:
+            app._sync_playback_status_icon()
+        except Exception:
+            pass
+    if hasattr(app, "_mpris_sync_playback"):
+        app._mpris_sync_playback()
+    if hasattr(app, "_mpris_sync_position"):
+        app._mpris_sync_position(force=True)
+    if hasattr(app, "_remote_publish_playback_event"):
+        app._remote_publish_playback_event("stopped")
+
+
 def _choose_shuffle_index(app, current, total):
     if not hasattr(app, "shuffle_indices") or not app.shuffle_indices:
         app._generate_shuffle_list()
@@ -80,6 +106,9 @@ def on_next_track(app, btn=None):
 
     next_idx = -1
 
+    mode_normal = getattr(app, "MODE_NORMAL", 4)
+    mode_loop = getattr(app, "MODE_LOOP", 0)
+
     if app.play_mode == app.MODE_ONE:
         if btn is None:
             next_idx = current
@@ -90,11 +119,16 @@ def on_next_track(app, btn=None):
             next_idx = 0
         else:
             next_idx = _choose_shuffle_index(app, current, total)
-    else:
+    elif app.play_mode == mode_loop:
         next_idx = (current + 1) % total
+    elif app.play_mode == mode_normal:
+        if current + 1 < total:
+            next_idx = current + 1
 
     if 0 <= next_idx < total:
         app.play_track(next_idx)
+    elif app.play_mode == mode_normal:
+        _stop_after_queue_end(app)
 
 
 def on_prev_track(app, btn=None):
@@ -156,8 +190,10 @@ def get_next_index(app, direction=1):
     if current is None or current < 0 or current >= total:
         current = 0
 
+    mode_normal = getattr(app, "MODE_NORMAL", 4)
+
     if app.play_mode == app.MODE_ONE:
-        pass
+        return current
 
     if app.play_mode in [app.MODE_SHUFFLE, app.MODE_SMART]:
         if direction == 1:
@@ -165,5 +201,10 @@ def get_next_index(app, direction=1):
             # actually predicts the track that will be played next.
             return _choose_shuffle_index(app, current, total)
         return (current - 1) % total
+
+    if app.play_mode == mode_normal:
+        if direction == 1:
+            return current + 1 if (current + 1) < total else -1
+        return current - 1 if current > 0 else -1
 
     return (current + direction) % total

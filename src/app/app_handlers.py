@@ -120,10 +120,23 @@ def on_tech_info_clicked(self, btn):
 
 
 def on_toggle_mode(self, btn):
-    self.play_mode = (self.play_mode + 1) % 4
+    cycle = tuple(getattr(self, "MODE_CYCLE_ORDER", ()) or ())
+    if not cycle:
+        cycle = (
+            getattr(self, "MODE_NORMAL", 4),
+            getattr(self, "MODE_LOOP", 0),
+            getattr(self, "MODE_ONE", 1),
+            getattr(self, "MODE_SHUFFLE", 2),
+            getattr(self, "MODE_SMART", 3),
+        )
+    try:
+        idx = cycle.index(self.play_mode)
+    except ValueError:
+        idx = 0
+    self.play_mode = cycle[(idx + 1) % len(cycle)]
 
-    icon = self.MODE_ICONS.get(self.play_mode, "hiresti-mode-loop-symbolic")
-    tooltip = self.MODE_TOOLTIPS.get(self.play_mode, "Loop")
+    icon = self.MODE_ICONS.get(self.play_mode, "hiresti-mode-normal-symbolic")
+    tooltip = self.MODE_TOOLTIPS.get(self.play_mode, "Normal Playback")
 
     for btn in (getattr(self, "mode_btn", None), getattr(self, "now_playing_mode_btn", None)):
         if btn is not None:

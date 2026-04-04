@@ -1310,10 +1310,10 @@ def _build_now_playing_left_panel(self, layout):
     tool_row.append(self.now_playing_track_fav_btn)
 
     self.now_playing_mode_btn = Gtk.Button(
-        icon_name=self.MODE_ICONS.get(self.play_mode, "hiresti-mode-loop-symbolic"),
+        icon_name=self.MODE_ICONS.get(self.play_mode, "hiresti-mode-normal-symbolic"),
         css_classes=["flat", "circular", "player-side-btn", "now-playing-tool-btn"],
     )
-    self.now_playing_mode_btn.set_tooltip_text(self.MODE_TOOLTIPS.get(self.play_mode, "Loop All (Album/Playlist)"))
+    self.now_playing_mode_btn.set_tooltip_text(self.MODE_TOOLTIPS.get(self.play_mode, "Normal Playback (Stop at End)"))
     self.now_playing_mode_btn.connect("clicked", self.on_toggle_mode)
     tool_row.append(self.now_playing_mode_btn)
 

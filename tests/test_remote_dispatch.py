@@ -92,7 +92,8 @@ def _make_app():
         "remote_api_port": 18473,
         "remote_api_bind_host": "0.0.0.0",
     }
-    app.play_mode = 0
+    app.play_mode = 4
+    app.MODE_NORMAL = 4
     app.MODE_LOOP = 0
     app.MODE_ONE = 1
     app.MODE_SHUFFLE = 2

@@ -58,9 +58,9 @@ def _init_paths_and_settings(self):
     else:
         self.settings["viz_sync_device_offsets"] = {}
 
-    self.play_mode = self.settings.get("play_mode", self.MODE_LOOP)
+    self.play_mode = self.settings.get("play_mode", self.MODE_NORMAL)
     if self.play_mode not in self.MODE_ICONS:
-        self.play_mode = self.MODE_LOOP
+        self.play_mode = self.MODE_NORMAL
     self.shuffle_indices = []  # 用来存随机播放的顺序列表
 
 

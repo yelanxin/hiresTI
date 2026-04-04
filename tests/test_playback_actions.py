@@ -11,6 +11,7 @@ class _Player:
         self.position = 0.0
         self.duration = 180.0
         self.seek_calls = []
+        self.stop_calls = 0
 
     def get_position(self):
         return (self.position, self.duration)
@@ -19,9 +20,21 @@ class _Player:
         self.position = float(value)
         self.seek_calls.append(float(value))
 
+    def stop(self):
+        self.stop_calls += 1
+
+
+class _Button:
+    def __init__(self):
+        self.icon_name = None
+
+    def set_icon_name(self, value):
+        self.icon_name = str(value)
+
 
 def _make_app():
     app = SimpleNamespace()
+    app.MODE_NORMAL = 4
     app.MODE_LOOP = 0
     app.MODE_ONE = 1
     app.MODE_SHUFFLE = 2
@@ -31,8 +44,17 @@ def _make_app():
     app.current_track_index = 1
     app.shuffle_indices = []
     app.player = _Player()
+    app.play_btn = _Button()
     app.play_track_calls = []
     app._generate_shuffle_list = lambda: setattr(app, "shuffle_indices", [0, 2, 3])
+    app._mpris_sync_playback_calls = []
+    app._mpris_sync_position_calls = []
+    app._remote_publish_playback_event_calls = []
+    app._sync_playback_status_icon_calls = []
+    app._mpris_sync_playback = lambda: app._mpris_sync_playback_calls.append(True)
+    app._mpris_sync_position = lambda force=False: app._mpris_sync_position_calls.append(bool(force))
+    app._remote_publish_playback_event = lambda reason: app._remote_publish_playback_event_calls.append(str(reason))
+    app._sync_playback_status_icon = lambda: app._sync_playback_status_icon_calls.append(True)
     app.play_track = lambda index: app.play_track_calls.append(int(index))
     return app
 
@@ -64,6 +86,30 @@ def test_get_next_index_shuffle_not_same_track():
         next_idx = playback_actions.get_next_index(app, 1)
         assert 0 <= next_idx < len(app.current_track_list)
         assert next_idx != app.current_track_index
+
+
+def test_get_next_index_normal_stops_at_end():
+    app = _make_app()
+    app.play_mode = app.MODE_NORMAL
+    app.current_track_index = len(app.current_track_list) - 1
+
+    assert playback_actions.get_next_index(app, 1) == -1
+
+
+def test_on_next_track_normal_does_not_wrap_at_end():
+    app = _make_app()
+    app.play_mode = app.MODE_NORMAL
+    app.current_track_index = len(app.current_track_list) - 1
+
+    playback_actions.on_next_track(app)
+
+    assert app.play_track_calls == []
+    assert app.player.stop_calls == 1
+    assert app.play_btn.icon_name == "media-playback-start-symbolic"
+    assert app._mpris_sync_playback_calls == [True]
+    assert app._mpris_sync_position_calls == [True]
+    assert app._remote_publish_playback_event_calls == ["stopped"]
+    assert app._sync_playback_status_icon_calls == [True]
 
 
 def test_on_prev_track_within_5_seconds_restarts_current_track():

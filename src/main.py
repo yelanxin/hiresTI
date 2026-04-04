@@ -24,11 +24,13 @@ from app import app_storage_scope
 logger = logging.getLogger(__name__)
 
 class TidalApp(Adw.Application):
+    MODE_NORMAL = PlayMode.NORMAL
     MODE_LOOP = PlayMode.LOOP
     MODE_ONE = PlayMode.ONE
     MODE_SHUFFLE = PlayMode.SHUFFLE
     MODE_SMART = PlayMode.SMART
 
+    MODE_CYCLE_ORDER = PlayMode.CYCLE_ORDER
     MODE_ICONS = PlayMode.ICONS
     MODE_TOOLTIPS = PlayMode.TOOLTIPS
 

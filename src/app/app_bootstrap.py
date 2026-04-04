@@ -153,8 +153,8 @@ def _restore_runtime_state(self):
     if self.player is not None:
         self.player.set_volume(saved_volume / 100.0)
 
-    mode_icon = self.MODE_ICONS.get(self.play_mode, "hiresti-mode-loop-symbolic")
-    mode_tip = self.MODE_TOOLTIPS.get(self.play_mode, "Loop All (Album/Playlist)")
+    mode_icon = self.MODE_ICONS.get(self.play_mode, "hiresti-mode-normal-symbolic")
+    mode_tip = self.MODE_TOOLTIPS.get(self.play_mode, "Normal Playback (Stop at End)")
     for btn in (getattr(self, "mode_btn", None), getattr(self, "now_playing_mode_btn", None)):
         if btn is not None:
             btn.set_icon_name(mode_icon)

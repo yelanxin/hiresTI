@@ -40,8 +40,9 @@ def test_init_paths_and_settings_migration_and_sanitize(tmp_path, monkeypatch):
     )
 
     app = SimpleNamespace()
+    app.MODE_NORMAL = 4
     app.MODE_LOOP = 0
-    app.MODE_ICONS = {0: "loop", 1: "one", 2: "shuffle", 3: "smart"}
+    app.MODE_ICONS = {0: "loop", 1: "one", 2: "shuffle", 3: "smart", 4: "normal"}
 
     mod._init_paths_and_settings(app)
 
@@ -55,7 +56,7 @@ def test_init_paths_and_settings_migration_and_sanitize(tmp_path, monkeypatch):
         {"slot_id": "lv2_0", "uri": "http://example.com/plugin", "enabled": True, "port_values": {}}
     ]
     assert app.settings["dsp_order"] == ["peq", "lv2_0", "tube", "convolver", "tape", "widener"]
-    assert app.play_mode == app.MODE_LOOP
+    assert app.play_mode == app.MODE_NORMAL
     assert app.shuffle_indices == []
     assert app._account_scope == "guest"
 
@@ -378,11 +379,13 @@ def test_init_audio_and_data_services_restores_saved_convolver(tmp_path, monkeyp
     monkeypatch.setattr(mod, "LyricsManager", lambda: "lyrics_mgr")
     monkeypatch.setattr(mod, "HistoryManager", _Mgr)
     monkeypatch.setattr(mod, "PlaylistManager", _Mgr)
+    monkeypatch.setattr(mod, "DspPresetManager", lambda config_dir: SimpleNamespace(config_dir=config_dir))
 
     root = tmp_path / "cache"
     root.mkdir()
     app = SimpleNamespace()
     app._cache_root = str(root)
+    app._config_root = str(root)
     app._account_scope = "guest"
     app.settings = {
         "viz_sync_device_offsets": {},
@@ -520,11 +523,13 @@ def test_init_audio_and_data_services_batches_lv2_restore(tmp_path, monkeypatch)
     monkeypatch.setattr(mod, "LyricsManager", lambda: "lyrics_mgr")
     monkeypatch.setattr(mod, "HistoryManager", _Mgr)
     monkeypatch.setattr(mod, "PlaylistManager", _Mgr)
+    monkeypatch.setattr(mod, "DspPresetManager", lambda config_dir: SimpleNamespace(config_dir=config_dir))
 
     root = tmp_path / "cache"
     root.mkdir()
     app = SimpleNamespace()
     app._cache_root = str(root)
+    app._config_root = str(root)
     app._account_scope = "guest"
     app.settings = {
         "viz_sync_device_offsets": {},

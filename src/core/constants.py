@@ -5,19 +5,24 @@ class PlayMode:
     ONE = 1
     SHUFFLE = 2
     SMART = 3
+    NORMAL = 4
+
+    CYCLE_ORDER = (NORMAL, LOOP, ONE, SHUFFLE, SMART)
 
     ICONS = {
         0: "hiresti-mode-loop-symbolic",
         1: "hiresti-mode-one-symbolic",
         2: "hiresti-mode-shuffle-symbolic",
-        3: "hiresti-mode-smart-symbolic"
+        3: "hiresti-mode-smart-symbolic",
+        4: "hiresti-mode-normal-symbolic",
     }
 
     TOOLTIPS = {
         0: "Loop All (Album/Playlist)",
         1: "Loop Single Track",
         2: "Shuffle (Randomize Order)",
-        3: "Smart Shuffle (Algorithm)"
+        3: "Smart Shuffle (Algorithm)",
+        4: "Normal Playback (Stop at End)",
     }
 
 
