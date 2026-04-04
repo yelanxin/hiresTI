@@ -116,12 +116,13 @@ def test_get_genre_section_skips_untitled_editorial_items_without_generic_unknow
     assert section is None
 
 
-def test_get_moods_page_filters_tabs_with_no_renderable_content():
+def test_get_moods_page_filters_unsupported_and_empty_tabs():
     backend = object.__new__(TidalBackend)
     moods_page = SimpleNamespace(
         categories=[
             SimpleNamespace(
                 items=[
+                    SimpleNamespace(title="Sleep", api_path="/pages/moods/sleep"),
                     SimpleNamespace(title="Women's History Month", api_path="/pages/moods/whm"),
                     SimpleNamespace(title="For DJs", api_path="/pages/moods/for-djs"),
                     SimpleNamespace(title="TIDAL Magazine", api_path="/pages/moods/magazine"),
@@ -142,6 +143,6 @@ def test_get_moods_page_filters_tabs_with_no_renderable_content():
 
     assert definitions == [
         ("For DJs", "pages/moods/for-djs"),
-        ("TIDAL Magazine", "pages/moods/magazine"),
+        ("Sleep", "pages/moods/sleep"),
     ]
-    assert [sec["title"] for sec in eager] == ["For DJs", "TIDAL Magazine"]
+    assert [sec["title"] for sec in eager] == ["For DJs", "Sleep"]

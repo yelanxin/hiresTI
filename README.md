@@ -62,6 +62,7 @@ Bundled Python dependencies used by packaging:
 - `tidalapi`
 - `requests`
 - `urllib3`
+- `PyOpenGL`
 - `pystray`
 - `pillow`
 

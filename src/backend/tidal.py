@@ -2349,7 +2349,7 @@ class TidalBackend:
                 return None
             return p[1:] if p.startswith("/") else p
 
-        _EXCLUDED_TABS = {"record labels", "record label"}
+        _EXCLUDED_TABS = {"record labels", "record label", "tidal magazine"}
 
         definitions = []
         seen = set()
@@ -2374,6 +2374,7 @@ class TidalBackend:
                         continue
                     seen.add(key)
                     definitions.append((title, path))
+            definitions.sort(key=lambda item: item[0].casefold())
             logger.info("Moods page: found %d tabs: %s", len(definitions),
                         [(t, p) for t, p in definitions])
         except Exception as e:

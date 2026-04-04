@@ -38,6 +38,7 @@ pyinstaller \
   "${ADD_DATA_ARGS[@]}" \
   --collect-submodules gi \
   --collect-submodules cairo \
+  --collect-submodules OpenGL \
   --collect-all PIL \
   --collect-all pystray \
   --collect-all qrcode \

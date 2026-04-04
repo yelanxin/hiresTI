@@ -209,7 +209,7 @@ fi
 # 4. 捆绑依赖
 echo "📦 Bundling Python dependencies..."
 mkdir -p "$INSTALL_DIR/libs"
-if ! pip3 install tidalapi requests urllib3 pystray pillow qrcode python-dateutil typing-extensions isodate mpegdash pyaes ratelimit six setproctitle -t "$INSTALL_DIR/libs" --no-cache-dir --upgrade; then
+if ! pip3 install tidalapi requests urllib3 PyOpenGL pystray pillow qrcode python-dateutil typing-extensions isodate mpegdash pyaes ratelimit six setproctitle -t "$INSTALL_DIR/libs" --no-cache-dir --upgrade; then
     echo "⚠️ Online dependency install failed, using local site-packages fallback..."
     python3 - "$INSTALL_DIR/libs" <<'PY'
 import os
@@ -223,6 +223,7 @@ modules = [
     "tidalapi",
     "requests",
     "urllib3",
+    "OpenGL",
     "qrcode",
     "PIL",
     "certifi",
@@ -382,6 +383,7 @@ depend = gst-plugins-ugly
 depend = gst-python
 depend = python-gobject
 depend = python-cairo
+depend = python-opengl
 depend = pipewire
 depend = libpulse
 EOF
@@ -412,7 +414,7 @@ Version: $VERSION
 Section: sound
 Priority: optional
 Architecture: $DEB_ARCH
-Depends: python3, python3-gi, python3-gi-cairo, python3-cairo, python3-dateutil, python3-typing-extensions, python3-isodate, python3-setproctitle, gir1.2-gtk-4.0, gir1.2-adw-1, gir1.2-gtksource-4, qrencode, python3-gst-1.0, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-plugins-ugly, libpipewire-0.3-0, libpulse0
+Depends: python3, python3-gi, python3-gi-cairo, python3-cairo, python3-opengl, python3-dateutil, python3-typing-extensions, python3-isodate, python3-setproctitle, gir1.2-gtk-4.0, gir1.2-adw-1, gir1.2-gtksource-4, qrencode, python3-gst-1.0, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-plugins-ugly, libpipewire-0.3-0, libpulse0
 Maintainer: $MAINTAINER
 Description: $DESCRIPTION
  $DISPLAY_NAME is a desktop client for Tidal focusing on High-Res audio.
@@ -433,14 +435,14 @@ POSTINST_EOF
 
 elif [ "$TYPE" == "rpm" ]; then
     echo "📦 Building Fedora + EL9 RPM packages..."
-    build_rpm_variant "fedora" "fedora" "python3, python3-gobject, python3-cairo, python3-setproctitle, gtk4, libadwaita, gstreamer1-plugins-base, gstreamer1-plugins-good, gstreamer1-plugins-bad-free, gstreamer1-plugins-ugly-free"
-    build_rpm_variant "el9" "el9" "python3, python3-gobject, python3-cairo, python3-setproctitle, gtk4, libadwaita, gstreamer1-plugins-base, gstreamer1-plugins-good, gstreamer1-plugins-bad-free, gstreamer1-plugins-ugly-free"
+    build_rpm_variant "fedora" "fedora" "python3, python3-gobject, python3-cairo, python3-pyopengl, python3-setproctitle, gtk4, libadwaita, gstreamer1-plugins-base, gstreamer1-plugins-good, gstreamer1-plugins-bad-free, gstreamer1-plugins-ugly-free"
+    build_rpm_variant "el9" "el9" "python3, python3-gobject, python3-cairo, python3-pyopengl, python3-setproctitle, gtk4, libadwaita, gstreamer1-plugins-base, gstreamer1-plugins-good, gstreamer1-plugins-bad-free, gstreamer1-plugins-ugly-free"
 elif [ "$TYPE" == "rpm-fedora" ]; then
     echo "📦 Building Fedora RPM package..."
-    build_rpm_variant "fedora" "fedora" "python3, python3-gobject, python3-cairo, python3-setproctitle, gtk4, libadwaita, gstreamer1-plugins-base, gstreamer1-plugins-good, gstreamer1-plugins-bad-free, gstreamer1-plugins-ugly-free"
+    build_rpm_variant "fedora" "fedora" "python3, python3-gobject, python3-cairo, python3-pyopengl, python3-setproctitle, gtk4, libadwaita, gstreamer1-plugins-base, gstreamer1-plugins-good, gstreamer1-plugins-bad-free, gstreamer1-plugins-ugly-free"
 elif [ "$TYPE" == "rpm-el9" ]; then
     echo "📦 Building EL9 RPM package..."
-    build_rpm_variant "el9" "el9" "python3, python3-gobject, python3-cairo, python3-setproctitle, gtk4, libadwaita, gstreamer1-plugins-base, gstreamer1-plugins-good, gstreamer1-plugins-bad-free, gstreamer1-plugins-ugly-free"
+    build_rpm_variant "el9" "el9" "python3, python3-gobject, python3-cairo, python3-pyopengl, python3-setproctitle, gtk4, libadwaita, gstreamer1-plugins-base, gstreamer1-plugins-good, gstreamer1-plugins-bad-free, gstreamer1-plugins-ugly-free"
 elif [ "$TYPE" == "arch" ]; then
     echo "📦 Building Arch package..."
     build_arch_package
@@ -453,7 +455,7 @@ Version: $VERSION
 Section: sound
 Priority: optional
 Architecture: $DEB_ARCH
-Depends: python3, python3-gi, python3-gi-cairo, python3-cairo, python3-dateutil, python3-typing-extensions, python3-isodate, python3-setproctitle, gir1.2-gtk-4.0, gir1.2-adw-1, gir1.2-gtksource-4, qrencode, python3-gst-1.0, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-plugins-ugly, libpipewire-0.3-0, libpulse0
+Depends: python3, python3-gi, python3-gi-cairo, python3-cairo, python3-opengl, python3-dateutil, python3-typing-extensions, python3-isodate, python3-setproctitle, gir1.2-gtk-4.0, gir1.2-adw-1, gir1.2-gtksource-4, qrencode, python3-gst-1.0, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-plugins-ugly, libpipewire-0.3-0, libpulse0
 Maintainer: $MAINTAINER
 Description: $DESCRIPTION
  $DISPLAY_NAME is a desktop client for Tidal focusing on High-Res audio.
@@ -476,8 +478,8 @@ POSTINST_EOF
     rm -rf "$BUILD_ROOT/DEBIAN"
 
     echo "📦 Building Fedora + EL9 RPM packages..."
-    build_rpm_variant "fedora" "fedora" "python3, python3-gobject, python3-cairo, python3-setproctitle, gtk4, libadwaita, gstreamer1-plugins-base, gstreamer1-plugins-good, gstreamer1-plugins-bad-free, gstreamer1-plugins-ugly-free"
-    build_rpm_variant "el9" "el9" "python3, python3-gobject, python3-cairo, python3-setproctitle, gtk4, libadwaita, gstreamer1-plugins-base, gstreamer1-plugins-good, gstreamer1-plugins-bad-free, gstreamer1-plugins-ugly-free"
+    build_rpm_variant "fedora" "fedora" "python3, python3-gobject, python3-cairo, python3-pyopengl, python3-setproctitle, gtk4, libadwaita, gstreamer1-plugins-base, gstreamer1-plugins-good, gstreamer1-plugins-bad-free, gstreamer1-plugins-ugly-free"
+    build_rpm_variant "el9" "el9" "python3, python3-gobject, python3-cairo, python3-pyopengl, python3-setproctitle, gtk4, libadwaita, gstreamer1-plugins-base, gstreamer1-plugins-good, gstreamer1-plugins-bad-free, gstreamer1-plugins-ugly-free"
     echo "📦 Building Arch package..."
     build_arch_package
 else

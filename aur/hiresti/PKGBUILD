@@ -25,6 +25,7 @@ depends=(
   'python-gobject'
   'python-isodate'
   'python-mpegdash'
+  'python-opengl'
   'python-pyaes'
   'python-requests'
   'python-six'

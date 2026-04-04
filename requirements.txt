@@ -1,6 +1,7 @@
 # hiresTI Desktop Dependencies
 tidalapi>=0.7.0
 PyGObject>=3.42.0
+PyOpenGL>=3.1.0
 requests>=2.28.0
 urllib3>=1.26.0
 pystray>=0.19.5

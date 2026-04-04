@@ -26,6 +26,7 @@ pkgbase = hiresti
 	depends = python-gobject
 	depends = python-isodate
 	depends = python-mpegdash
+	depends = python-opengl
 	depends = python-pyaes
 	depends = python-requests
 	depends = python-six

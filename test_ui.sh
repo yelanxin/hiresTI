@@ -49,6 +49,7 @@ else
             python3-gi \
             python3-gi-cairo \
             python3-cairo \
+            python3-opengl \
             python3-dateutil \
             python3-typing-extensions \
             python3-isodate \
