@@ -31,6 +31,7 @@ class _Scale:
     def __init__(self, value=0.0):
         self.value = float(value)
         self.sensitive_calls = []
+        self.visible = True
 
     def set_value(self, value):
         self.value = float(value)
@@ -40,6 +41,9 @@ class _Scale:
 
     def set_sensitive(self, value):
         self.sensitive_calls.append(bool(value))
+
+    def set_visible(self, value):
+        self.visible = bool(value)
 
 
 class _Button:
@@ -76,6 +80,24 @@ class _Label:
 
     def set_visible(self, value):
         self.visible = bool(value)
+
+
+class _Box:
+    def __init__(self):
+        self.visible = True
+        self.children = []
+
+    def set_visible(self, value):
+        self.visible = bool(value)
+
+    def get_first_child(self):
+        return self.children[0] if self.children else None
+
+    def remove(self, child):
+        self.children.remove(child)
+
+    def append(self, child):
+        self.children.append(child)
 
 
 def test_w_toggles_now_playing_when_search_is_not_focused():
@@ -241,3 +263,43 @@ def test_update_volume_device_label_shows_current_device_for_hw_volume():
     assert app.vol_device_label.visible is True
     assert app.now_playing_vol_device_label.text == "Hardware Volume\nFIIO KA13"
     assert app.now_playing_vol_device_label.visible is True
+
+
+def test_hw_volume_main_slider_controls_master_when_master_channel_exists():
+    player = SimpleNamespace(usb_hw_volume_channels=lambda: [0, 1, 2])
+
+    assert app_builders._hw_volume_main_slider_controls_master(player) is True
+    assert app_builders._hw_volume_extra_channel_entries(player) == [(1, 1), (2, 2)]
+
+
+def test_hw_volume_main_slider_hidden_when_only_per_channel_controls_exist():
+    player = SimpleNamespace(usb_hw_volume_channels=lambda: [1, 2])
+
+    assert app_builders._hw_volume_main_slider_controls_master(player) is False
+    assert app_builders._hw_volume_extra_channel_entries(player) == [(0, 1), (1, 2)]
+
+
+def test_rebuild_hw_volume_sliders_keeps_main_slider_for_master_plus_lr():
+    app = SimpleNamespace(
+        player=SimpleNamespace(
+            usb_hw_volume_channels=lambda: [0, 1, 2],
+            usb_hw_volume_get_range=lambda: (-5120, 0, 128),
+            usb_hw_volume_percent_to_db=lambda value: (float(value) - 100.0) / 5.0,
+            usb_hw_volume_set_percent_ch=lambda idx, value: None,
+        ),
+        vol_scale=_Scale(50),
+        now_playing_vol_scale=_Scale(50),
+        vol_db_label=_Label(),
+        now_playing_vol_db_label=_Label(),
+        vol_ch_box=_Box(),
+        now_playing_vol_ch_box=_Box(),
+    )
+
+    app_builders._rebuild_hw_volume_ch_sliders(app)
+
+    assert app.vol_scale.visible is True
+    assert app.now_playing_vol_scale.visible is True
+    assert app.vol_db_label.visible is True
+    assert app.now_playing_vol_db_label.visible is True
+    assert app.vol_ch_box.visible is True
+    assert app.now_playing_vol_ch_box.visible is True

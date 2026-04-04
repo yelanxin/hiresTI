@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.8.5 - 2026-04-03
+
+### Changed
+- **Moods tabs are now alphabetically sorted** and unsupported editorial tabs such as `TIDAL Magazine` are excluded from the tab strip, so users no longer land on empty non-mood pages.
+- **USB hardware-volume popovers now understand master vs per-channel controls**: when a DAC exposes a UAC master plus left/right controls, the main volume slider remains bound to `Master`, while the popover adds dedicated `Left` / `Right` hardware sliders instead of treating all three as unrelated channels.
+
+### Fixed
+- **Packaged builds now bundle or declare `PyOpenGL` consistently** across source requirements, DEB/RPM/Arch packaging, Flatpak inputs, and PyInstaller collection, preventing the `DotsGL backend unavailable` / `BarsGL backend unavailable` warnings caused by missing OpenGL Python bindings in packaged installs.
+- **USB hardware volume no longer overwrites per-channel DAC values on startup or main-slider moves** when a master control is present; the app now routes main-volume writes only to the DAC's master control and keeps left/right values independent.
+- **UAC2 hardware-volume probing is more compatible with real devices**: range/current queries now try the spec-correct request codes first and fall back to legacy variants, improving detection of writable master/per-channel feature-unit controls on more DACs.
+
 ## 1.8.4 - 2026-03-31
 
 ### Changed

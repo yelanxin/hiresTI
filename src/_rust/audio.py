@@ -142,6 +142,24 @@ class _RustAudioCore:
                     ctypes.c_void_p,
                     ctypes.POINTER(ctypes.c_int),
                 ]
+            if hasattr(lib, "rac_usb_hw_volume_channels"):
+                lib.rac_usb_hw_volume_channels.restype = ctypes.c_int
+                lib.rac_usb_hw_volume_channels.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.POINTER(ctypes.c_uint8),
+                    ctypes.c_int,
+                    ctypes.POINTER(ctypes.c_int),
+                ]
+            if hasattr(lib, "rac_usb_hw_volume_set_ch"):
+                lib.rac_usb_hw_volume_set_ch.restype = ctypes.c_int
+                lib.rac_usb_hw_volume_set_ch.argtypes = [
+                    ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                ]
+            if hasattr(lib, "rac_usb_hw_volume_get_ch"):
+                lib.rac_usb_hw_volume_get_ch.restype = ctypes.c_int
+                lib.rac_usb_hw_volume_get_ch.argtypes = [
+                    ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_int),
+                ]
 
             lib.rac_get_position.restype = ctypes.c_int
             lib.rac_get_position.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_double)]
@@ -542,6 +560,43 @@ class _RustAudioCore:
             return None
         val = ctypes.c_int(0)
         rc = fn(self.handle, ctypes.byref(val))
+        if rc != 0:
+            return None
+        return val.value
+
+    def usb_hw_volume_channels(self):
+        """Return list of UAC channel IDs (e.g. [0,1,2] for master/L/R), or empty list."""
+        if not self.available or self.handle is None:
+            return []
+        fn = getattr(self.lib, "rac_usb_hw_volume_channels", None)
+        if fn is None:
+            return []
+        buf = (ctypes.c_uint8 * 3)()
+        count = ctypes.c_int(0)
+        rc = fn(self.handle, buf, 3, ctypes.byref(count))
+        if rc != 0:
+            return []
+        n = min(count.value, 3)
+        return [int(buf[i]) for i in range(n)]
+
+    def usb_hw_volume_set_ch(self, channel_index, value_raw):
+        """Set hardware volume for a single channel (0-based index). 1/256 dB."""
+        return self._call_int(
+            "rac_usb_hw_volume_set_ch",
+            ctypes.c_int(int(channel_index)),
+            ctypes.c_int(int(value_raw)),
+            default_rc=-3,
+        )
+
+    def usb_hw_volume_get_ch(self, channel_index):
+        """Read current hardware volume for a single channel, or None."""
+        if not self.available or self.handle is None:
+            return None
+        fn = getattr(self.lib, "rac_usb_hw_volume_get_ch", None)
+        if fn is None:
+            return None
+        val = ctypes.c_int(0)
+        rc = fn(self.handle, ctypes.c_int(int(channel_index)), ctypes.byref(val))
         if rc != 0:
             return None
         return val.value
@@ -3117,17 +3172,22 @@ class RustAudioPlayerAdapter:
             except Exception:
                 pass
         elif evt == _RustAudioCore.EVENT_STATE:
-            if msg and str(msg).startswith("usb-hw-volume="):
+            if msg and str(msg).startswith("usb-hw-volume-ch"):
                 try:
-                    raw = int(str(msg).split("=", 1)[1].strip())
+                    # Format: usb-hw-volume-ch{uac_channel}={raw_value}
+                    rest = str(msg)[len("usb-hw-volume-ch"):]
+                    ch_str, val_str = rest.split("=", 1)
+                    uac_ch = int(ch_str.strip())
+                    raw = int(val_str.strip())
                 except Exception:
+                    uac_ch = None
                     raw = None
                 if raw is not None:
                     self._last_usb_hw_volume_raw = raw
                     cb = getattr(self, "_on_hw_volume_changed_callback", None)
                     if callable(cb):
                         try:
-                            GLib.idle_add(cb, raw)
+                            GLib.idle_add(cb, raw, uac_ch)
                         except Exception:
                             pass
                 return
@@ -3911,7 +3971,11 @@ class RustAudioPlayerAdapter:
             return
         # If USB hw volume is available, route to hardware and keep software at unity.
         if self.usb_hw_volume_supported():
-            self.usb_hw_volume_set_percent(vol * 100.0)
+            # Multi-channel mode: per-channel sliders control volume individually,
+            # but a UAC master control should still remain bound to the main slider.
+            chs = self.usb_hw_volume_channels()
+            if chs and (len(chs) <= 1 or 0 in chs):
+                self.usb_hw_volume_set_percent(vol * 100.0)
             # Keep GStreamer volume at unity so PCM data is untouched.
             self._rust.set_volume(1.0)
             self.output_error = None
@@ -3925,6 +3989,13 @@ class RustAudioPlayerAdapter:
     def usb_hw_volume_supported(self):
         """Return True if the current USB sink supports hardware volume."""
         return self._rust.usb_hw_volume_supported() == 1
+
+    def usb_hw_volume_has_master(self):
+        """Return True when the device exposes a UAC master volume control."""
+        try:
+            return 0 in self.usb_hw_volume_channels()
+        except Exception:
+            return False
 
     def usb_hw_volume_get_range(self):
         """Return (min_raw, max_raw, res_raw) in 1/256 dB, or None."""
@@ -3949,7 +4020,11 @@ class RustAudioPlayerAdapter:
         if res_raw > 0:
             raw = min_raw + round((raw - min_raw) / res_raw) * res_raw
         raw = max(min_raw, min(effective_max, raw))
-        self._rust.usb_hw_volume_set(raw)
+        channels = self.usb_hw_volume_channels()
+        if len(channels) > 1 and 0 in channels:
+            self._rust.usb_hw_volume_set_ch(channels.index(0), raw)
+        else:
+            self._rust.usb_hw_volume_set(raw)
 
     def usb_hw_volume_raw_to_percent(self, raw_value):
         """Convert a hardware volume raw value (1/256 dB) to the UI's 0-100 scale."""
@@ -3976,6 +4051,29 @@ class RustAudioPlayerAdapter:
         effective_max = self._usb_hw_volume_slider_max(min_raw, max_raw)
         raw = min_raw + (effective_max - min_raw) * max(0.0, min(100.0, percent)) / 100.0
         return raw / 256.0
+
+    def usb_hw_volume_channels(self):
+        """Return list of UAC channel IDs (e.g. [0,1,2]), or empty list."""
+        return self._rust.usb_hw_volume_channels()
+
+    def usb_hw_volume_set_percent_ch(self, channel_index, percent):
+        """Set hardware volume for one channel by index (0-based). Percent 0-100."""
+        rng = self._rust.usb_hw_volume_get_range()
+        if not rng:
+            return
+        min_raw, max_raw, res_raw = rng
+        if min_raw > max_raw:
+            return
+        effective_max = self._usb_hw_volume_slider_max(min_raw, max_raw)
+        raw = int(min_raw + (effective_max - min_raw) * max(0.0, min(100.0, percent)) / 100.0)
+        if res_raw > 0:
+            raw = min_raw + round((raw - min_raw) / res_raw) * res_raw
+        raw = max(min_raw, min(effective_max, raw))
+        self._rust.usb_hw_volume_set_ch(channel_index, raw)
+
+    def usb_hw_volume_get_ch(self, channel_index):
+        """Read current hardware volume raw value for one channel, or None."""
+        return self._rust.usb_hw_volume_get_ch(channel_index)
 
     def set_output(self, driver, device_id=None):
         req_driver = driver

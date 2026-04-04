@@ -493,17 +493,13 @@ fn parse_feature_unit_desc(desc: &[u8], uac_version: UacVersion) -> Option<Featu
     if channels.is_empty() {
         return None;
     }
-    let volume_is_master = channels == [0];
+    let volume_is_master = channels.contains(&0);
     Some(FeatureUnitInfo {
         unit_id,
         has_volume: true,
         has_mute,
         volume_is_master,
-        volume_channels: if volume_is_master {
-            0
-        } else {
-            channels.len() as u8
-        },
+        volume_channels: channels.len() as u8,
         channels,
     })
 }
@@ -545,7 +541,9 @@ fn parse_uac1_feature_unit_channels(desc: &[u8]) -> (Vec<u8>, bool) {
     }
 
     if master_has_volume {
-        (vec![0], any_mute)
+        let mut chs = vec![0u8];
+        chs.extend_from_slice(&per_channel);
+        (chs, any_mute)
     } else {
         (per_channel, any_mute)
     }
@@ -587,7 +585,9 @@ fn parse_uac2_feature_unit_channels(desc: &[u8]) -> (Vec<u8>, bool) {
     }
 
     if master_has_volume {
-        (vec![0], any_mute)
+        let mut chs = vec![0u8];
+        chs.extend_from_slice(&per_channel);
+        (chs, any_mute)
     } else {
         (per_channel, any_mute)
     }
@@ -626,8 +626,8 @@ mod tests {
                 has_volume: true,
                 has_mute: true,
                 volume_is_master: true,
-                volume_channels: 0,
-                channels: vec![0],
+                volume_channels: 2,
+                channels: vec![0, 1],
             })
         );
     }

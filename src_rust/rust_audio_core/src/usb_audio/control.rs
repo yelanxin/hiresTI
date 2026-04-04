@@ -18,12 +18,22 @@ use rusb::{DeviceHandle, Direction, Recipient, RequestType, UsbContext};
 
 /// Class request codes (bRequest).
 const SET_CUR: u8 = 0x01;
+/// UAC 2.0 CUR request — both GET and SET use bRequest=0x01; the direction
+/// is encoded in bmRequestType.  Some devices also respond to the UAC 1.0
+/// style GET_CUR=0x81, but not all.
+const UAC2_CUR: u8 = 0x01;
+/// UAC 1.0 GET_CUR — direction baked into bRequest.
 const GET_CUR: u8 = 0x81;
-/// UAC 1.0 GET_MIN / UAC 2.0 GET_RANGE share the same request code.
+/// UAC 1.0 legacy request codes.
 const GET_MIN: u8 = 0x82;
-const GET_RANGE: u8 = 0x82;
 const GET_MAX: u8 = 0x83;
 const GET_RES: u8 = 0x84;
+/// UAC 2.0 RANGE request.  Per the spec (Section 5.2.2) the bRequest for
+/// RANGE is **0x02**; the direction is encoded in bmRequestType, not bRequest.
+/// Some devices also accept the UAC 1.0-style 0x82, but not all.
+const UAC2_GET_RANGE: u8 = 0x02;
+/// Legacy alias used by some DACs that respond to 0x82 for RANGE.
+const UAC2_GET_RANGE_LEGACY: u8 = 0x82;
 
 /// UAC 1.0 — Sampling Frequency Control selector (wValue high byte).
 const UAC1_CS_SAM_FREQ: u8 = 0x01;
@@ -145,12 +155,20 @@ pub fn query_sample_rates_uac2<T: UsbContext>(
     let w_value = (UAC2_CS_SAM_FREQ as u16) << 8;
     let w_index = ((clock_id as u16) << 8) | (ctrl_iface as u16);
 
-    if handle
-        .read_control(rt, GET_RANGE, w_value, w_index, &mut hdr, CTRL_TIMEOUT)
-        .is_err()
+    // Try UAC2 spec-correct bRequest=0x02 first, fall back to legacy 0x82.
+    let range_req = if handle
+        .read_control(rt, UAC2_GET_RANGE, w_value, w_index, &mut hdr, CTRL_TIMEOUT)
+        .is_ok()
     {
+        UAC2_GET_RANGE
+    } else if handle
+        .read_control(rt, UAC2_GET_RANGE_LEGACY, w_value, w_index, &mut hdr, CTRL_TIMEOUT)
+        .is_ok()
+    {
+        UAC2_GET_RANGE_LEGACY
+    } else {
         return Vec::new();
-    }
+    };
 
     let num_ranges = u16::from_le_bytes(hdr) as usize;
     if num_ranges == 0 || num_ranges > 64 {
@@ -160,7 +178,7 @@ pub fn query_sample_rates_uac2<T: UsbContext>(
     // Second read: full response = 2 + num_ranges * 12 bytes
     let total = 2 + num_ranges * 12;
     let mut buf = vec![0u8; total];
-    let n = match handle.read_control(rt, GET_RANGE, w_value, w_index, &mut buf, CTRL_TIMEOUT) {
+    let n = match handle.read_control(rt, range_req, w_value, w_index, &mut buf, CTRL_TIMEOUT) {
         Ok(n) => n,
         Err(_) => return Vec::new(),
     };
@@ -262,24 +280,43 @@ pub fn get_volume_range_uac2<T: UsbContext>(
     let w_index = ((unit_id as u16) << 8) | (ctrl_iface as u16);
 
     let mut hdr = [0u8; 2];
-    if handle
-        .read_control(rt_in, GET_RANGE, w_value, w_index, &mut hdr, CTRL_TIMEOUT)
-        .is_err()
-    {
-        return get_volume_range_uac2_legacy(handle, ctrl_iface, unit_id, channel);
-    }
+    // Try UAC2 spec-correct bRequest=0x02 first, fall back to legacy 0x82.
+    let range_req = match handle.read_control(rt_in, UAC2_GET_RANGE, w_value, w_index, &mut hdr, CTRL_TIMEOUT) {
+        Ok(_) => {
+            eprintln!("usb-audio: UAC2 GET_RANGE(0x02) header ok (unit={} ch={})", unit_id, channel);
+            UAC2_GET_RANGE
+        }
+        Err(_) => {
+            match handle.read_control(rt_in, UAC2_GET_RANGE_LEGACY, w_value, w_index, &mut hdr, CTRL_TIMEOUT) {
+                Ok(_) => {
+                    eprintln!("usb-audio: UAC2 GET_RANGE(0x82) header ok (unit={} ch={})", unit_id, channel);
+                    UAC2_GET_RANGE_LEGACY
+                }
+                Err(e) => {
+                    eprintln!("usb-audio: UAC2 GET_RANGE header failed both 0x02 and 0x82 (unit={} ch={}): {}", unit_id, channel, e);
+                    return get_volume_range_uac2_legacy(handle, ctrl_iface, unit_id, channel);
+                }
+            }
+        }
+    };
 
     let num_ranges = u16::from_le_bytes(hdr) as usize;
     if num_ranges == 0 || num_ranges > 64 {
+        eprintln!("usb-audio: UAC2 GET_RANGE bad num_ranges={} (unit={} ch={})", num_ranges, unit_id, channel);
         return get_volume_range_uac2_legacy(handle, ctrl_iface, unit_id, channel);
     }
 
     let total = 2 + num_ranges * 6;
     let mut buf = vec![0u8; total];
-    let n = handle
-        .read_control(rt_in, GET_RANGE, w_value, w_index, &mut buf, CTRL_TIMEOUT)
-        .ok()?;
+    let n = match handle.read_control(rt_in, range_req, w_value, w_index, &mut buf, CTRL_TIMEOUT) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("usb-audio: UAC2 GET_RANGE payload failed (unit={} ch={}): {}", unit_id, channel, e);
+            return get_volume_range_uac2_legacy(handle, ctrl_iface, unit_id, channel);
+        }
+    };
     if n < total {
+        eprintln!("usb-audio: UAC2 GET_RANGE short payload {}/{} (unit={} ch={})", n, total, unit_id, channel);
         return get_volume_range_uac2_legacy(handle, ctrl_iface, unit_id, channel);
     }
 
@@ -324,16 +361,32 @@ fn get_volume_range_uac2_legacy<T: UsbContext>(
     let w_index = ((unit_id as u16) << 8) | (ctrl_iface as u16);
     let mut buf = [0u8; 2];
 
-    let min_raw = handle
+    let min_raw = match handle
         .read_control(rt_in, GET_MIN, w_value, w_index, &mut buf, CTRL_TIMEOUT)
-        .ok()
-        .filter(|&n| n >= 2)
-        .map(|_| i16::from_le_bytes(buf))?;
-    let max_raw = handle
+    {
+        Ok(n) if n >= 2 => i16::from_le_bytes(buf),
+        Ok(n) => {
+            eprintln!("usb-audio: GET_MIN short read {} bytes (unit={} ch={})", n, unit_id, channel);
+            return None;
+        }
+        Err(e) => {
+            eprintln!("usb-audio: GET_MIN failed (unit={} ch={}): {}", unit_id, channel, e);
+            return None;
+        }
+    };
+    let max_raw = match handle
         .read_control(rt_in, GET_MAX, w_value, w_index, &mut buf, CTRL_TIMEOUT)
-        .ok()
-        .filter(|&n| n >= 2)
-        .map(|_| i16::from_le_bytes(buf))?;
+    {
+        Ok(n) if n >= 2 => i16::from_le_bytes(buf),
+        Ok(n) => {
+            eprintln!("usb-audio: GET_MAX short read {} bytes (unit={} ch={})", n, unit_id, channel);
+            return None;
+        }
+        Err(e) => {
+            eprintln!("usb-audio: GET_MAX failed (unit={} ch={}): {}", unit_id, channel, e);
+            return None;
+        }
+    };
     let res_raw = handle
         .read_control(rt_in, GET_RES, w_value, w_index, &mut buf, CTRL_TIMEOUT)
         .ok()
@@ -360,6 +413,12 @@ pub fn get_volume_cur<T: UsbContext>(
     let w_index = ((unit_id as u16) << 8) | (ctrl_iface as u16);
     let mut buf = [0u8; 2];
 
+    // Try UAC2 bRequest=0x01 first, then UAC1 bRequest=0x81.
+    if let Ok(n) = handle.read_control(rt_in, UAC2_CUR, w_value, w_index, &mut buf, CTRL_TIMEOUT) {
+        if n >= 2 {
+            return Some(i16::from_le_bytes(buf));
+        }
+    }
     handle
         .read_control(rt_in, GET_CUR, w_value, w_index, &mut buf, CTRL_TIMEOUT)
         .ok()

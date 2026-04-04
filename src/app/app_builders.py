@@ -2999,9 +2999,15 @@ def _reset_search_focus_after_layout_change(self, duration_ms=260):
 
 def _on_hw_volume_ready(self):
     """Refresh the volume UI when hardware-volume capability becomes available."""
-    sync_fn = getattr(self, "_sync_volume_ui_state", None)
-    if callable(sync_fn):
-        sync_fn()
+    self._hw_vol_ch_initial_synced = False
+    _rebuild_hw_volume_ch_sliders(self)
+
+    player = getattr(self, "player", None)
+    if player is not None and _hw_volume_main_slider_controls_master(player):
+        sync_fn = getattr(self, "_sync_volume_ui_state", None)
+        if callable(sync_fn):
+            sync_fn()
+
     if not bool(getattr(self, "settings", {}).get("bit_perfect", False)):
         _update_volume_device_label(self)
         return False
@@ -3010,7 +3016,7 @@ def _on_hw_volume_ready(self):
     return False  # remove idle source
 
 
-def _on_hw_volume_changed(self, raw_value):
+def _on_hw_volume_changed(self, raw_value, uac_ch=None):
     """Sync UI/settings when the DAC reports a new hardware volume value."""
     if bool(getattr(self, "settings", {}).get("bit_perfect", False)):
         return False
@@ -3026,24 +3032,47 @@ def _on_hw_volume_changed(self, raw_value):
         return False
     percent = max(0.0, min(100.0, float(percent)))
     logger.info(
-        "Hardware volume actual raw=%s db=%+.2f percent=%.2f",
-        raw_value,
+        "Hardware volume actual ch=%s raw=%s db=%+.2f percent=%.2f",
+        uac_ch, raw_value,
         float(raw_value) / 256.0,
         percent,
     )
-    settings = getattr(self, "settings", None)
-    if isinstance(settings, dict):
-        settings["volume"] = int(round(percent))
-    save_fn = getattr(self, "schedule_save_settings", None)
-    if callable(save_fn):
-        save_fn()
-    sync_fn = getattr(self, "_sync_volume_ui_state", None)
-    if callable(sync_fn):
-        sync_fn(value=percent)
-    if hasattr(self, "_update_volume_db_label"):
-        self._update_volume_db_label(percent)
-    if hasattr(self, "_mpris_sync_volume"):
-        self._mpris_sync_volume()
+    # On first event, sync all channel sliders (they were at default until now)
+    if not getattr(self, "_hw_vol_ch_initial_synced", False):
+        self._hw_vol_ch_initial_synced = True
+        _sync_hw_volume_ch_slider_positions(self)
+    # Update per-channel slider and dB label if present
+    if uac_ch is not None:
+        scales = getattr(self, "_hw_vol_ch_scales_all", {}).get(uac_ch, [])
+        if scales:
+            try:
+                self._hw_vol_ch_programmatic = True
+                for scale in scales:
+                    scale.set_value(percent)
+            finally:
+                self._hw_vol_ch_programmatic = False
+        db_val = float(raw_value) / 256.0
+        text = f"{db_val:+.1f} dB"
+        for lbl in getattr(self, "_hw_vol_ch_db_labels_all", {}).get(uac_ch, []):
+            lbl.set_text(text)
+    # For the main volume slider, use master (ch0) or any channel
+    is_master = uac_ch is None or (
+        _hw_volume_main_slider_controls_master(player) and uac_ch == 0
+    )
+    if is_master:
+        settings = getattr(self, "settings", None)
+        if isinstance(settings, dict):
+            settings["volume"] = int(round(percent))
+        save_fn = getattr(self, "schedule_save_settings", None)
+        if callable(save_fn):
+            save_fn()
+        sync_fn = getattr(self, "_sync_volume_ui_state", None)
+        if callable(sync_fn):
+            sync_fn(value=percent)
+        if hasattr(self, "_update_volume_db_label"):
+            self._update_volume_db_label(percent)
+        if hasattr(self, "_mpris_sync_volume"):
+            self._mpris_sync_volume()
     _update_volume_device_label(self)
     return False
 
@@ -3116,6 +3145,14 @@ def _build_volume_popover(self, scale_attr="vol_scale"):
     setattr(self, scale_attr, scale)
 
     vbox.append(scale)
+
+    # Per-channel hardware volume sliders (hidden until hw volume is ready)
+    ch_box_attr = scale_attr.replace("vol_scale", "vol_ch_box")
+    ch_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    ch_box.set_visible(False)
+    setattr(self, ch_box_attr, ch_box)
+    vbox.append(ch_box)
+
     device_label_attr = scale_attr.replace("vol_scale", "vol_device_label")
     device_label = Gtk.Label(label="")
     device_label.add_css_class("dim-label")
@@ -3131,6 +3168,167 @@ def _build_volume_popover(self, scale_attr="vol_scale"):
     pop.set_child(vbox)
     _update_volume_device_label(self)
     return pop
+
+
+_UAC_CH_NAMES = {0: "Master", 1: "Left", 2: "Right"}
+
+
+def _hw_volume_main_slider_controls_master(player):
+    if player is None or not hasattr(player, "usb_hw_volume_channels"):
+        return True
+    try:
+        channels = list(player.usb_hw_volume_channels() or [])
+    except Exception:
+        return True
+    if not channels:
+        return True
+    return len(channels) == 1 or 0 in channels
+
+
+def _hw_volume_extra_channel_entries(player):
+    if player is None or not hasattr(player, "usb_hw_volume_channels"):
+        return []
+    try:
+        channels = list(player.usb_hw_volume_channels() or [])
+    except Exception:
+        return []
+    if not channels:
+        return []
+    if 0 in channels:
+        return [(idx, uac_ch) for idx, uac_ch in enumerate(channels) if uac_ch != 0]
+    return [(idx, uac_ch) for idx, uac_ch in enumerate(channels)]
+
+
+def _rebuild_hw_volume_ch_sliders(self):
+    """Build per-channel sliders when hardware volume channels are known."""
+    player = getattr(self, "player", None)
+    if player is None or not hasattr(player, "usb_hw_volume_channels"):
+        return
+    channels = player.usb_hw_volume_channels()
+    extra_entries = _hw_volume_extra_channel_entries(player)
+    main_controls_master = _hw_volume_main_slider_controls_master(player)
+    rng = player.usb_hw_volume_get_range() if hasattr(player, "usb_hw_volume_get_range") else None
+    logger.info("hw volume channels=%s extra=%s range=%s", channels, extra_entries, rng)
+    if not extra_entries:
+        for attr in ("vol_ch_box", "now_playing_vol_ch_box"):
+            box = getattr(self, attr, None)
+            if box is not None:
+                box.set_visible(False)
+        for attr in ("vol_scale", "now_playing_vol_scale"):
+            scale = getattr(self, attr, None)
+            if scale is not None:
+                scale.set_visible(True)
+        for attr in ("vol_db_label", "now_playing_vol_db_label"):
+            lbl = getattr(self, attr, None)
+            if lbl is not None:
+                lbl.set_visible(True)
+        return
+
+    for attr in ("vol_scale", "now_playing_vol_scale"):
+        scale = getattr(self, attr, None)
+        if scale is not None:
+            scale.set_visible(bool(main_controls_master))
+    for attr in ("vol_db_label", "now_playing_vol_db_label"):
+        lbl = getattr(self, attr, None)
+        if lbl is not None:
+            lbl.set_visible(bool(main_controls_master))
+
+    if not hasattr(self, "_hw_vol_ch_programmatic"):
+        self._hw_vol_ch_programmatic = False
+    self._hw_vol_ch_scales_all = {}
+    self._hw_vol_ch_db_labels_all = {}
+
+    for attr in ("vol_ch_box", "now_playing_vol_ch_box"):
+        ch_box = getattr(self, attr, None)
+        if ch_box is None:
+            continue
+        # Clear old children
+        while True:
+            child = ch_box.get_first_child()
+            if child is None:
+                break
+            ch_box.remove(child)
+
+        sliders_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, halign=Gtk.Align.CENTER)
+        for full_idx, uac_ch in extra_entries:
+            col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, halign=Gtk.Align.CENTER)
+            ch_label = Gtk.Label(label=_UAC_CH_NAMES.get(uac_ch, f"Ch{uac_ch}"))
+            ch_label.add_css_class("dim-label")
+            ch_label.add_css_class("caption")
+            col.append(ch_label)
+
+            # dB label per channel
+            db_label = Gtk.Label(label="-- dB")
+            db_label.add_css_class("dim-label")
+            db_label.add_css_class("caption")
+            self._hw_vol_ch_db_labels_all.setdefault(uac_ch, []).append(db_label)
+            col.append(db_label)
+
+            ch_scale = Gtk.Scale.new_with_range(Gtk.Orientation.VERTICAL, 0, 100, 5)
+            ch_scale.set_inverted(True)
+            ch_scale.set_size_request(-1, 120)
+            # Don't set initial value from settings — wait for hw events to report
+            # the actual DAC volume. This prevents resetting the DAC on playback.
+            ch_scale.set_value(50)  # neutral placeholder
+
+            _ch_idx = full_idx
+            _uac_ch = uac_ch
+
+            def _on_ch_vol_changed(s, ch_idx=_ch_idx, u_ch=_uac_ch):
+                if getattr(self, "_hw_vol_ch_programmatic", False):
+                    return
+                val = float(s.get_value())
+                try:
+                    self.player.usb_hw_volume_set_percent_ch(ch_idx, val)
+                except Exception:
+                    logger.debug("per-channel hw vol set failed", exc_info=True)
+                # Update dB labels for this channel (all boxes)
+                db = None
+                if hasattr(self.player, "usb_hw_volume_percent_to_db"):
+                    try:
+                        db = self.player.usb_hw_volume_percent_to_db(val)
+                    except Exception:
+                        pass
+                text = f"{db:+.1f} dB" if db is not None else ""
+                for lbl in getattr(self, "_hw_vol_ch_db_labels_all", {}).get(u_ch, []):
+                    lbl.set_text(text)
+
+            # Connect after set_value to avoid triggering a hw write on init
+            ch_scale.connect("value-changed", _on_ch_vol_changed)
+            self._hw_vol_ch_scales_all.setdefault(uac_ch, []).append(ch_scale)
+            col.append(ch_scale)
+            sliders_row.append(col)
+
+        ch_box.append(sliders_row)
+        ch_box.set_visible(True)
+
+
+def _sync_hw_volume_ch_slider_positions(self):
+    """Read current hw volume per channel and update slider positions + dB labels."""
+    player = getattr(self, "player", None)
+    ch_scales_all = getattr(self, "_hw_vol_ch_scales_all", {})
+    if not player or not ch_scales_all:
+        return
+    extra_entries = _hw_volume_extra_channel_entries(player)
+    try:
+        self._hw_vol_ch_programmatic = True
+        for full_idx, uac_ch in extra_entries:
+            scales = ch_scales_all.get(uac_ch, [])
+            if not scales:
+                continue
+            raw = player.usb_hw_volume_get_ch(full_idx)
+            pct = player.usb_hw_volume_raw_to_percent(raw) if raw is not None else None
+            if pct is not None:
+                pct = max(0.0, min(100.0, float(pct)))
+                for scale in scales:
+                    scale.set_value(pct)
+                # Update dB labels
+                db_val = float(raw) / 256.0
+                text = f"{db_val:+.1f} dB"
+                for lbl in getattr(self, "_hw_vol_ch_db_labels_all", {}).get(uac_ch, []):
+                    lbl.set_text(text)
+    finally:
+        self._hw_vol_ch_programmatic = False
 
 
 def on_key_pressed(self, controller, keyval, keycode, state):

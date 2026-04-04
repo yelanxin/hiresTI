@@ -849,21 +849,24 @@ struct UsbSinkHandle {
     bit_depth: u8,
     /// Human-readable device name (from USB string descriptor).
     device_name: String,
-    /// Hardware volume target in 1/256 dB raw units.
+    /// Hardware volume target in 1/256 dB raw units, per channel.
+    /// Index 0 = first channel (master or left), 1 = second, 2 = third.
     /// `i32::MIN` means "no change pending".
-    /// Written by the main thread (FFI), read by the pusher thread.
-    hw_volume_target: Arc<AtomicI32>,
+    /// Written by the main thread (FFI), read by the hw-volume worker thread.
+    hw_volume_targets: [Arc<AtomicI32>; 3],
     /// Whether the device supports hardware volume control (Feature Unit).
     hw_volume_supported: bool,
     /// Hardware volume range: (min_raw, max_raw, res_raw) in 1/256 dB.
-    /// Set by the pusher thread after the device is opened; read by FFI.
-    /// Packed as `(min << 16) | (max & 0xFFFF)` and `res` separately.
+    /// Set by the hw-volume worker after the device is opened; read by FFI.
     hw_volume_min: Arc<AtomicI32>,
     hw_volume_max: Arc<AtomicI32>,
     hw_volume_res: Arc<AtomicI32>,
-    /// Last observed hardware volume from GET_CUR in 1/256 dB raw units.
-    /// `i32::MIN` means "unknown / not yet observed".
-    hw_volume_current: Arc<AtomicI32>,
+    /// Last observed hardware volume from GET_CUR in 1/256 dB raw units,
+    /// per channel. `i32::MIN` means "unknown / not yet observed".
+    hw_volume_currents: [Arc<AtomicI32>; 3],
+    /// USB Audio Feature Unit channel IDs (0 = master, 1 = left, 2 = right).
+    /// Length determines how many independent controls are available.
+    hw_volume_channels: Vec<u8>,
 }
 
 impl std::fmt::Debug for UsbSinkHandle {
@@ -928,21 +931,25 @@ struct LazyUsbOpen {
     spectrum_reset_after_open: Arc<AtomicBool>,
     /// Shared with `UsbSinkHandle::anchor_stream_pos_ns`.
     anchor_stream_pos_ns: Arc<AtomicU64>,
-    /// Shared with `UsbSinkHandle::hw_volume_target`.
-    hw_volume_target: Arc<AtomicI32>,
+    /// Shared with `UsbSinkHandle::hw_volume_targets`.
+    hw_volume_targets: [Arc<AtomicI32>; 3],
     /// Shared with `UsbSinkHandle::hw_volume_{min,max,res}`.
     hw_volume_min: Arc<AtomicI32>,
     hw_volume_max: Arc<AtomicI32>,
     hw_volume_res: Arc<AtomicI32>,
-    /// Shared with `UsbSinkHandle::hw_volume_current`.
-    hw_volume_current: Arc<AtomicI32>,
+    /// Shared with `UsbSinkHandle::hw_volume_currents`.
+    hw_volume_currents: [Arc<AtomicI32>; 3],
+    /// USB Audio Feature Unit channel IDs.
+    hw_volume_channels: Vec<u8>,
 }
 
 fn reset_usb_hw_volume_state(lazy: &LazyUsbOpen) {
     lazy.hw_volume_min.store(0, Ordering::Relaxed);
     lazy.hw_volume_max.store(0, Ordering::Relaxed);
     lazy.hw_volume_res.store(1, Ordering::Relaxed);
-    lazy.hw_volume_current.store(i32::MIN, Ordering::Relaxed);
+    for c in &lazy.hw_volume_currents {
+        c.store(i32::MIN, Ordering::Relaxed);
+    }
 }
 
 struct UsbHwVolumeWorker {
@@ -961,24 +968,34 @@ impl UsbHwVolumeWorker {
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = Arc::clone(&stop);
-        let target = Arc::clone(&lazy.hw_volume_target);
+        let targets: Vec<Arc<AtomicI32>> = lazy.hw_volume_targets.iter().map(Arc::clone).collect();
         let min_raw = Arc::clone(&lazy.hw_volume_min);
         let max_raw = Arc::clone(&lazy.hw_volume_max);
         let res_raw = Arc::clone(&lazy.hw_volume_res);
-        let current_raw = Arc::clone(&lazy.hw_volume_current);
+        let currents: Vec<Arc<AtomicI32>> = lazy.hw_volume_currents.iter().map(Arc::clone).collect();
+        let channels = lazy.hw_volume_channels.clone();
 
         let thread = thread::spawn(move || {
-            let mut last_current = i32::MIN;
+            let n_ch = channels.len().min(3);
+            let mut last_currents = [i32::MIN; 3];
             let mut range_probed = false;
             let mut last_poll = std::time::Instant::now()
                 - std::time::Duration::from_millis(USB_HW_VOLUME_POLL_MS);
 
             while !stop_clone.load(Ordering::Relaxed) {
-                let target_raw = target.swap(i32::MIN, Ordering::Relaxed);
+                // Collect per-channel targets
+                let mut any_target = false;
+                let mut ch_targets = [i32::MIN; 3];
+                for i in 0..n_ch {
+                    ch_targets[i] = targets[i].swap(i32::MIN, Ordering::Relaxed);
+                    if ch_targets[i] != i32::MIN {
+                        any_target = true;
+                    }
+                }
                 let poll_now =
                     last_poll.elapsed() >= std::time::Duration::from_millis(USB_HW_VOLUME_POLL_MS);
 
-                if target_raw == i32::MIN && !poll_now {
+                if !any_target && !poll_now {
                     thread::sleep(std::time::Duration::from_millis(USB_HW_VOLUME_IDLE_MS));
                     continue;
                 }
@@ -986,56 +1003,140 @@ impl UsbHwVolumeWorker {
                 let open_dev = control_dev.lock().unwrap_or_else(|e| e.into_inner());
 
                 if !range_probed {
-                    match open_dev.get_hw_volume_range() {
-                        Some((min, max, res)) => {
-                            min_raw.store(min as i32, Ordering::Relaxed);
-                            max_raw.store(max as i32, Ordering::Relaxed);
-                            res_raw.store(res as i32, Ordering::Relaxed);
-                            eprintln!(
-                                "usb-audio: hw volume range min={} max={} res={} (1/256 dB) = {:.1}..{:.1} dB",
-                                min,
-                                max,
-                                res,
-                                min as f64 / 256.0,
-                                max as f64 / 256.0,
-                            );
+                    if let Some(fu) = open_dev.dev.feature_unit.as_ref().filter(|f| f.has_volume) {
+                        // Try each channel until range query succeeds (some DACs
+                        // don't support GET_MIN/MAX on the master channel).
+                        let mut range_result: Option<(i16, i16, i16)> = None;
+                        for &probe_ch in &channels {
+                            let r = match open_dev.dev.uac_version {
+                                usb_audio::descriptor::UacVersion::V1 => {
+                                    usb_audio::control::get_volume_range_uac1(
+                                        &open_dev.handle, open_dev.dev.ctrl_iface, fu.unit_id, probe_ch,
+                                    )
+                                }
+                                usb_audio::descriptor::UacVersion::V2 => {
+                                    usb_audio::control::get_volume_range_uac2(
+                                        &open_dev.handle, open_dev.dev.ctrl_iface, fu.unit_id, probe_ch,
+                                    )
+                                }
+                            };
+                            if r.is_some() {
+                                range_result = r;
+                                eprintln!("usb-audio: hw volume range probed on channel {}", probe_ch);
+                                break;
+                            }
                         }
-                        None => {
+                        // If range query fails on all channels, probe by writing
+                        // extremes and reading back what the DAC accepted.
+                        if range_result.is_none() {
                             eprintln!(
-                                "usb-audio: hw volume range query deferred worker returned None"
+                                "usb-audio: hw volume range query failed on all channels {:?}, probing by SET/GET_CUR",
+                                channels,
                             );
+                            let probe_ch = *channels.first().unwrap_or(&0);
+                            // Save current value
+                            let saved = usb_audio::control::get_volume_cur(
+                                &open_dev.handle, open_dev.dev.ctrl_iface, fu.unit_id, probe_ch,
+                            );
+                            // Try setting to extreme min (-32768) and read back
+                            let _ = usb_audio::control::set_volume_cur(
+                                &open_dev.handle, open_dev.dev.ctrl_iface, fu.unit_id, probe_ch, i16::MIN,
+                            );
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                            let probed_min = usb_audio::control::get_volume_cur(
+                                &open_dev.handle, open_dev.dev.ctrl_iface, fu.unit_id, probe_ch,
+                            );
+                            // Try setting to extreme max (32767) and read back
+                            let _ = usb_audio::control::set_volume_cur(
+                                &open_dev.handle, open_dev.dev.ctrl_iface, fu.unit_id, probe_ch, i16::MAX,
+                            );
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                            let probed_max = usb_audio::control::get_volume_cur(
+                                &open_dev.handle, open_dev.dev.ctrl_iface, fu.unit_id, probe_ch,
+                            );
+                            // Restore original value
+                            if let Some(orig) = saved {
+                                let _ = usb_audio::control::set_volume_cur(
+                                    &open_dev.handle, open_dev.dev.ctrl_iface, fu.unit_id, probe_ch, orig,
+                                );
+                            }
+                            if let (Some(mn), Some(mx)) = (probed_min, probed_max) {
+                                if mn < mx {
+                                    range_result = Some((mn, mx, 1));
+                                    eprintln!(
+                                        "usb-audio: hw volume range probed via SET/GET_CUR: min={} max={} ({:.1}..{:.1} dB)",
+                                        mn, mx, mn as f64 / 256.0, mx as f64 / 256.0,
+                                    );
+                                }
+                            }
+                        }
+                        match range_result {
+                            Some((min, max, res)) => {
+                                min_raw.store(min as i32, Ordering::Relaxed);
+                                max_raw.store(max as i32, Ordering::Relaxed);
+                                res_raw.store(res as i32, Ordering::Relaxed);
+                                eprintln!(
+                                    "usb-audio: hw volume range min={} max={} res={} (1/256 dB) = {:.1}..{:.1} dB channels={:?}",
+                                    min, max, res,
+                                    min as f64 / 256.0, max as f64 / 256.0,
+                                    channels,
+                                );
+                            }
+                            None => {
+                                eprintln!(
+                                    "usb-audio: hw volume range unavailable for channels {:?}",
+                                    channels,
+                                );
+                            }
                         }
                     }
                     range_probed = true;
                 }
 
-                if target_raw != i32::MIN {
-                    match open_dev.set_hw_volume(target_raw as i16) {
-                        Ok(()) => {
-                            eprintln!("usb-audio: hw volume set to {} (raw 1/256dB)", target_raw)
+                // Apply per-channel targets
+                if any_target {
+                    if let Some(fu) = open_dev.dev.feature_unit.as_ref().filter(|f| f.has_volume) {
+                        for i in 0..n_ch {
+                            if ch_targets[i] != i32::MIN {
+                                let ch = channels[i];
+                                match usb_audio::control::set_volume_cur(
+                                    &open_dev.handle, open_dev.dev.ctrl_iface,
+                                    fu.unit_id, ch, ch_targets[i] as i16,
+                                ) {
+                                    Ok(()) => {
+                                        eprintln!("usb-audio: hw volume ch{} set to {} (raw 1/256dB)", ch, ch_targets[i]);
+                                    }
+                                    Err(e) => eprintln!("usb-audio: hw volume ch{} set failed: {}", ch, e),
+                                }
+                            }
                         }
-                        Err(e) => eprintln!("usb-audio: hw volume set failed: {}", e),
                     }
                 }
 
-                if target_raw != i32::MIN || poll_now {
+                // Poll current values per channel
+                if any_target || poll_now {
                     if poll_now {
                         last_poll = std::time::Instant::now();
                     }
-                    if let Some(current) = open_dev.get_hw_volume() {
-                        let current = current as i32;
-                        current_raw.store(current, Ordering::Relaxed);
-                        if last_current != i32::MIN && current != last_current {
-                            eprintln!(
-                                "usb-audio: hw volume actual current={} ({:+.2} dB) previous={} ({:+.2} dB)",
-                                current,
-                                current as f64 / 256.0,
-                                last_current,
-                                last_current as f64 / 256.0,
-                            );
-                            push_thread_event(&events, EVT_STATE, format!("usb-hw-volume={current}"));
+                    if let Some(fu) = open_dev.dev.feature_unit.as_ref().filter(|f| f.has_volume) {
+                        for i in 0..n_ch {
+                            let ch = channels[i];
+                            if let Some(cur) = usb_audio::control::get_volume_cur(
+                                &open_dev.handle, open_dev.dev.ctrl_iface, fu.unit_id, ch,
+                            ) {
+                                let current = cur as i32;
+                                currents[i].store(current, Ordering::Relaxed);
+                                if current != last_currents[i] {
+                                    eprintln!(
+                                        "usb-audio: hw volume ch{} actual current={} ({:+.2} dB) previous={} ({:+.2} dB)",
+                                        ch, current, current as f64 / 256.0,
+                                        last_currents[i], last_currents[i] as f64 / 256.0,
+                                    );
+                                    push_thread_event(&events, EVT_STATE, format!("usb-hw-volume-ch{}={}", ch, current));
+                                }
+                                last_currents[i] = current;
+                            }
                         }
-                        last_current = current;
                     }
                 }
             }
@@ -4508,21 +4609,41 @@ impl Engine {
         let anchor_stream_pos = Arc::new(AtomicU64::new(0));
         let anchor_stream_pos_clone = Arc::clone(&anchor_stream_pos);
         let clock_mode = Arc::new(AtomicU8::new(self.usb_clock_mode));
-        let hw_volume_target = Arc::new(AtomicI32::new(i32::MIN));
-        let hw_volume_target_clone = Arc::clone(&hw_volume_target);
+        let hw_volume_targets: [Arc<AtomicI32>; 3] = [
+            Arc::new(AtomicI32::new(i32::MIN)),
+            Arc::new(AtomicI32::new(i32::MIN)),
+            Arc::new(AtomicI32::new(i32::MIN)),
+        ];
+        let hw_volume_targets_clone: [Arc<AtomicI32>; 3] = [
+            Arc::clone(&hw_volume_targets[0]),
+            Arc::clone(&hw_volume_targets[1]),
+            Arc::clone(&hw_volume_targets[2]),
+        ];
         let hw_volume_min = Arc::new(AtomicI32::new(0));
         let hw_volume_max = Arc::new(AtomicI32::new(0));
         let hw_volume_res = Arc::new(AtomicI32::new(1));
-        let hw_volume_current = Arc::new(AtomicI32::new(i32::MIN));
+        let hw_volume_currents: [Arc<AtomicI32>; 3] = [
+            Arc::new(AtomicI32::new(i32::MIN)),
+            Arc::new(AtomicI32::new(i32::MIN)),
+            Arc::new(AtomicI32::new(i32::MIN)),
+        ];
         let hw_volume_min_clone = Arc::clone(&hw_volume_min);
         let hw_volume_max_clone = Arc::clone(&hw_volume_max);
         let hw_volume_res_clone = Arc::clone(&hw_volume_res);
-        let hw_volume_current_clone = Arc::clone(&hw_volume_current);
+        let hw_volume_currents_clone: [Arc<AtomicI32>; 3] = [
+            Arc::clone(&hw_volume_currents[0]),
+            Arc::clone(&hw_volume_currents[1]),
+            Arc::clone(&hw_volume_currents[2]),
+        ];
         // Detect Feature Unit volume support from the enumerated device.
         let hw_vol_supported = dev.feature_unit.as_ref().map_or(false, |fu| fu.has_volume);
+        let hw_vol_channels: Vec<u8> = dev.feature_unit.as_ref()
+            .filter(|fu| fu.has_volume)
+            .map(|fu| fu.channels.clone())
+            .unwrap_or_default();
         eprintln!(
-            "usb-audio: build_appsink hw_volume_supported={} feature_unit={:?}",
-            hw_vol_supported, dev.feature_unit
+            "usb-audio: build_appsink hw_volume_supported={} channels={:?} feature_unit={:?}",
+            hw_vol_supported, hw_vol_channels, dev.feature_unit
         );
         let events: ThreadEventQueue = Arc::new(Mutex::new(VecDeque::new()));
         let events_clone = Arc::clone(&events);
@@ -4540,11 +4661,12 @@ impl Engine {
             reset_pending: reset_pending_clone,
             spectrum_reset_after_open: spectrum_reset_clone,
             anchor_stream_pos_ns: anchor_stream_pos_clone,
-            hw_volume_target: hw_volume_target_clone,
+            hw_volume_targets: hw_volume_targets_clone,
             hw_volume_min: hw_volume_min_clone,
             hw_volume_max: hw_volume_max_clone,
             hw_volume_res: hw_volume_res_clone,
-            hw_volume_current: hw_volume_current_clone,
+            hw_volume_currents: hw_volume_currents_clone,
+            hw_volume_channels: hw_vol_channels.clone(),
         };
         let buffering_clone = Arc::clone(&self.buffering_pct);
         let thread = thread::spawn(move || {
@@ -4578,12 +4700,13 @@ impl Engine {
                 anchor_stream_pos_ns: anchor_stream_pos,
                 bit_depth: alt.bit_depth,
                 device_name: dev.name.clone(),
-                hw_volume_target,
+                hw_volume_targets,
                 hw_volume_supported: hw_vol_supported,
                 hw_volume_min,
                 hw_volume_max,
                 hw_volume_res,
-                hw_volume_current,
+                hw_volume_currents,
+                hw_volume_channels: hw_vol_channels,
             },
             hw_clock,
         ))
@@ -7060,9 +7183,9 @@ pub extern "C" fn rac_usb_hw_volume_get_range(
     0
 }
 
-/// Set the hardware volume.  `value_raw` is in 1/256 dB units.
+/// Set the hardware volume on ALL channels.  `value_raw` is in 1/256 dB units.
 ///
-/// The value is stored in an atomic and applied by the pusher thread on
+/// The value is stored in atomics and applied by the volume worker thread on
 /// its next loop iteration (~10 ms latency).
 #[no_mangle]
 pub extern "C" fn rac_usb_hw_volume_set(ptr: *mut Engine, value_raw: c_int) -> c_int {
@@ -7072,12 +7195,15 @@ pub extern "C" fn rac_usb_hw_volume_set(ptr: *mut Engine, value_raw: c_int) -> c
     let Some(us) = engine.usb_sink.as_ref().filter(|u| u.hw_volume_supported) else {
         return -1;
     };
-    us.hw_volume_target.store(value_raw, Ordering::Relaxed);
+    for t in &us.hw_volume_targets {
+        t.store(value_raw, Ordering::Relaxed);
+    }
     0
 }
 
 /// Read the last observed hardware volume current value (1/256 dB units).
 ///
+/// Returns channel 0 (master if present, otherwise left).
 /// Writes the value to `*value_out`. Returns -3 when the current value is not
 /// yet known (for example before the USB sink has opened).
 #[no_mangle]
@@ -7091,7 +7217,93 @@ pub extern "C" fn rac_usb_hw_volume_get(ptr: *const Engine, value_out: *mut c_in
     if value_out.is_null() {
         return -2;
     }
-    let v = us.hw_volume_current.load(Ordering::Relaxed);
+    let v = us.hw_volume_currents[0].load(Ordering::Relaxed);
+    if v == i32::MIN {
+        return -3;
+    }
+    unsafe {
+        *value_out = v;
+    }
+    0
+}
+
+/// Query the number of hardware volume channels and their UAC channel indices.
+///
+/// Writes up to `max_count` channel IDs into `channels_out` and the actual
+/// count into `count_out`.  Returns 0 on success, -1 if no USB sink.
+/// Channel semantics: 0 = master, 1 = left, 2 = right (UAC standard).
+#[no_mangle]
+pub extern "C" fn rac_usb_hw_volume_channels(
+    ptr: *const Engine,
+    channels_out: *mut u8,
+    max_count: c_int,
+    count_out: *mut c_int,
+) -> c_int {
+    let Some(engine) = as_engine(ptr) else {
+        return -1;
+    };
+    let Some(us) = engine.usb_sink.as_ref().filter(|u| u.hw_volume_supported) else {
+        return -1;
+    };
+    let chs = &us.hw_volume_channels;
+    if !count_out.is_null() {
+        unsafe { *count_out = chs.len() as c_int; }
+    }
+    if !channels_out.is_null() && max_count > 0 {
+        let n = std::cmp::min(chs.len(), max_count as usize);
+        unsafe {
+            std::ptr::copy_nonoverlapping(chs.as_ptr(), channels_out, n);
+        }
+    }
+    0
+}
+
+/// Set hardware volume for a single channel by index (0-based into the
+/// channel list returned by `rac_usb_hw_volume_channels`).
+/// `value_raw` is in 1/256 dB units.
+#[no_mangle]
+pub extern "C" fn rac_usb_hw_volume_set_ch(
+    ptr: *mut Engine,
+    channel_index: c_int,
+    value_raw: c_int,
+) -> c_int {
+    let Some(engine) = as_mut_engine(ptr) else {
+        return -1;
+    };
+    let Some(us) = engine.usb_sink.as_ref().filter(|u| u.hw_volume_supported) else {
+        return -1;
+    };
+    let idx = channel_index as usize;
+    if idx >= us.hw_volume_channels.len() || idx >= 3 {
+        return -2;
+    }
+    us.hw_volume_targets[idx].store(value_raw, Ordering::Relaxed);
+    0
+}
+
+/// Read the last observed hardware volume for a single channel by index.
+/// `channel_index` is 0-based into the channel list.
+/// Returns -3 when the value is not yet known.
+#[no_mangle]
+pub extern "C" fn rac_usb_hw_volume_get_ch(
+    ptr: *const Engine,
+    channel_index: c_int,
+    value_out: *mut c_int,
+) -> c_int {
+    let Some(engine) = as_engine(ptr) else {
+        return -1;
+    };
+    let Some(us) = engine.usb_sink.as_ref().filter(|u| u.hw_volume_supported) else {
+        return -1;
+    };
+    let idx = channel_index as usize;
+    if idx >= us.hw_volume_channels.len() || idx >= 3 {
+        return -2;
+    }
+    if value_out.is_null() {
+        return -2;
+    }
+    let v = us.hw_volume_currents[idx].load(Ordering::Relaxed);
     if v == i32::MIN {
         return -3;
     }
