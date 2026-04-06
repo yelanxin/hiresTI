@@ -1436,7 +1436,7 @@ def render_search_tracks_page(app):
 
 def _on_play_album_tracks(app):
     """Play album tracks from the beginning."""
-    tracks = list(getattr(app, "current_track_list", []) or [])
+    tracks = list(app._get_current_track_view_tracks() if hasattr(app, "_get_current_track_view_tracks") else (getattr(app, "current_track_list", []) or []))
     if not tracks:
         return
     app.current_track_list = tracks
@@ -1446,7 +1446,7 @@ def _on_play_album_tracks(app):
 
 def _on_shuffle_album_tracks(app):
     """Shuffle and play album tracks."""
-    tracks = list(getattr(app, "current_track_list", []) or [])
+    tracks = list(app._get_current_track_view_tracks() if hasattr(app, "_get_current_track_view_tracks") else (getattr(app, "current_track_list", []) or []))
     if not tracks:
         return
     # Shuffle only for playback, don't modify display list
@@ -1458,31 +1458,37 @@ def _on_shuffle_album_tracks(app):
 
 
 def _ensure_play_shuffle_btns(app):
-    """Create play/shuffle buttons if needed and add them to album_action_btns_box."""
+    """Create play/shuffle/play-next buttons if needed and add them to album_action_btns_box."""
     if not hasattr(app, "_album_play_btn") or app._album_play_btn is None:
         app._album_play_btn = Gtk.Button(icon_name="media-playback-start-symbolic", css_classes=["flat", "circular", "history-scroll-btn"])
         app._album_play_btn.set_tooltip_text("Play all tracks")
         app._album_play_btn.connect("clicked", lambda _b: _on_play_album_tracks(app))
 
+    if not hasattr(app, "_album_play_next_btn") or app._album_play_next_btn is None:
+        app._album_play_next_btn = Gtk.Button(icon_name="go-next-symbolic", css_classes=["flat", "circular", "history-scroll-btn"])
+        app._album_play_next_btn.connect("clicked", app.on_play_next_current_tracks_clicked)
+
+    if not hasattr(app, "_album_shuffle_btn") or app._album_shuffle_btn is None:
         app._album_shuffle_btn = Gtk.Button(icon_name="media-playlist-shuffle-symbolic", css_classes=["flat", "circular", "history-scroll-btn"])
         app._album_shuffle_btn.set_tooltip_text("Shuffle and play")
         app._album_shuffle_btn.connect("clicked", lambda _b: _on_shuffle_album_tracks(app))
 
+    is_playlist = bool(getattr(app, "current_remote_playlist", None) is not None or getattr(app, "current_playlist_id", None) is not None)
+    app._album_play_next_btn.set_tooltip_text("Play Playlist Next" if is_playlist else "Play Album Next")
+
     action_box = getattr(app, "album_action_btns_box", None)
     if action_box:
-        child = action_box.get_first_child()
-        found = False
-        while child:
-            if child == app._album_play_btn or child == app._album_shuffle_btn:
-                found = True
-                break
-            child = child.get_next_sibling()
-        if not found:
-            action_box.append(app._album_play_btn)
-            action_box.append(app._album_shuffle_btn)
+        for btn in (app._album_play_btn, app._album_play_next_btn, app._album_shuffle_btn):
+            if btn.get_parent() is action_box:
+                action_box.remove(btn)
+        action_box.append(app._album_play_btn)
+        action_box.append(app._album_play_next_btn)
+        action_box.append(app._album_shuffle_btn)
 
     if app._album_play_btn:
         app._album_play_btn.set_visible(True)
+    if app._album_play_next_btn:
+        app._album_play_next_btn.set_visible(True)
     if app._album_shuffle_btn:
         app._album_shuffle_btn.set_visible(True)
 
@@ -1767,6 +1773,10 @@ def populate_tracks(app, tracks):
 
         fav_btn = app.create_track_fav_button(t)
         box.append(fav_btn)
+        next_btn = Gtk.Button(icon_name="go-next-symbolic", css_classes=["flat", "circular", "history-scroll-btn"])
+        next_btn.set_tooltip_text("Play Next")
+        next_btn.connect("clicked", lambda _b, tr=t: app.on_play_next_track_clicked(tr))
+        box.append(next_btn)
         current_remote = getattr(app, "current_remote_playlist", None)
         is_own_remote = getattr(app, "_remote_playlist_is_own", False)
         if current_remote is not None and is_own_remote:
@@ -6506,7 +6516,7 @@ def render_playlist_detail(app, playlist_id):
     if edit_mode:
         append_header_action_spacers(tracks_head, ["fav", "drag", "playlist_remove"])
     else:
-        append_header_action_spacers(tracks_head, ["fav", "add"])
+        append_header_action_spacers(tracks_head, ["fav", "next", "add"])
     title_head = head_btns["title"]
     artist_head = head_btns["artist"]
     album_head = head_btns["album"]
@@ -6578,6 +6588,10 @@ def render_playlist_detail(app, playlist_id):
             rm_btn.connect("clicked", lambda _b, pid=p.get("id"), idx=i: app.on_playlist_remove_track_clicked(pid, idx))
             box.append(rm_btn)
         else:
+            next_btn = Gtk.Button(icon_name="go-next-symbolic", css_classes=["flat", "circular", "history-scroll-btn"])
+            next_btn.set_tooltip_text("Play Next")
+            next_btn.connect("clicked", lambda _b, tr=t: app.on_play_next_track_clicked(tr))
+            box.append(next_btn)
             # Keep identical row height/footprint with album rows by reserving a hidden action button slot.
             ghost_btn = Gtk.Button(icon_name="list-add-symbolic", css_classes=["flat", "circular", "history-scroll-btn", "ghost-row-btn"])
             ghost_btn.set_sensitive(False)

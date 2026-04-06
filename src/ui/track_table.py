@@ -92,6 +92,16 @@ def _build_header_action_spacer(kind):
         w.set_opacity(0.0)
         return w
 
+    if kind == "next":
+        w = Gtk.Button(
+            icon_name="go-next-symbolic",
+            css_classes=["flat", "circular", "history-scroll-btn"],
+        )
+        w.set_sensitive(False)
+        w.set_focusable(False)
+        w.set_opacity(0.0)
+        return w
+
     if kind == "remove":
         w = Gtk.Button(
             icon_name="list-remove-symbolic",

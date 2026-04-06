@@ -341,7 +341,11 @@ def do_activate(self):
     elif saved_drv == "ALSA (mmap)":
         saved_drv = "ALSA（mmap）"
     if is_ex:
-        drivers = [drv for drv in drivers if drv in ("ALSA（auto）", "ALSA（mmap）")]
+        drivers = [
+            drv
+            for drv in drivers
+            if drv in ("ALSA（auto）", "ALSA（mmap）", "USB Rawlink", "USB Rawlink v2")
+        ]
 
     # 如果保存的是 ALSA 或其他驱动，先尝试选中
     if saved_drv in drivers:

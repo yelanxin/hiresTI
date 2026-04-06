@@ -24,6 +24,7 @@ pkg-config = "0.3"
 
 [dependencies]
 gstreamer = "0.23"
+gstreamer-base = "0.23"
 glib = "0.20"
 pipewire = "0.9"
 libpulse-binding = "2"

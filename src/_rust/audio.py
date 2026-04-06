@@ -25,6 +25,7 @@ _LV2_HOST_MANAGED_PORT_SYMBOLS = {"enabled", "enable", "bypass"}
 DRIVER_ALSA_AUTO = "ALSA（auto）"
 DRIVER_ALSA_MMAP = "ALSA（mmap）"
 DRIVER_USB_RAWLINK = "USB Rawlink"
+DRIVER_USB_RAWLINK_V2 = "USB Rawlink v2"
 
 # Matches the fallback label emitted by Rust when device.open() fails (no permission).
 # Format: "USB Audio Device (1fc9:6004)"
@@ -45,9 +46,15 @@ def _driver_key(driver_name):
         return "pipewire"
     if compact in ("auto", "auto(default)"):
         return "auto"
+    if compact in ("usbrawlinkv2", "usb_rawlink_v2"):
+        return "usb_rawlink_v2"
     if compact in ("usbrawlink", "usb_rawlink"):
         return "usb_rawlink"
     return compact
+
+
+def _is_usb_rawlink_family(driver_name):
+    return _driver_key(driver_name) in ("usb_rawlink", "usb_rawlink_v2")
 
 
 class _RustAudioCore:
@@ -3137,7 +3144,14 @@ class RustAudioPlayerAdapter:
             return []
 
     def get_drivers(self):
-        return ["Auto (Default)", "PipeWire", DRIVER_ALSA_AUTO, DRIVER_ALSA_MMAP, DRIVER_USB_RAWLINK]
+        return [
+            "Auto (Default)",
+            "PipeWire",
+            DRIVER_ALSA_AUTO,
+            DRIVER_ALSA_MMAP,
+            DRIVER_USB_RAWLINK,
+            DRIVER_USB_RAWLINK_V2,
+        ]
 
     def _on_rust_event(self, evt, msg):
         if evt == _RustAudioCore.EVENT_EOS:
@@ -3200,7 +3214,17 @@ class RustAudioPlayerAdapter:
                         GLib.idle_add(cb)
                     except Exception:
                         pass
+            if msg and "usb-rawsink opened" in msg:
+                cb = getattr(self, "_on_hw_volume_ready_callback", None)
+                if callable(cb) and self.usb_hw_volume_supported():
+                    try:
+                        GLib.idle_add(cb)
+                    except Exception:
+                        pass
             if msg and "output-switched" in msg:
+                self.output_state = "active"
+                self.output_error = None
+            if msg and "usb-rawsink opened" in msg:
                 self.output_state = "active"
                 self.output_error = None
             if msg and "alsa-mmap device ready" in msg:
@@ -3209,6 +3233,8 @@ class RustAudioPlayerAdapter:
                 # snd-usb-audio has finished re-attaching and the device now
                 # shows up with proper hw: labels in /proc/asound.
                 self._needs_device_list_refresh = True
+            if msg and "usb-rawsink session-drop" in msg:
+                self.output_state = "switching"
             if msg:
                 lmsg = msg.lower()
                 if "container-adapter" in lmsg:
@@ -3228,6 +3254,7 @@ class RustAudioPlayerAdapter:
                     or ("container-adapter" in lmsg)
                     or ("audio-filter rebind" in lmsg)
                     or ("dsp-lv2 " in lmsg)
+                    or ("usb-rawsink" in lmsg)
                     or ("playing" in lmsg)
                     or ("paused" in lmsg)
                     or ("null" == lmsg)
@@ -3890,7 +3917,7 @@ class RustAudioPlayerAdapter:
         if rc == -2:
             logger.debug("RustAdapter.release_output_route: rust release unavailable, falling back to stop()")
             self.stop()
-            if _driver_key(getattr(self, "current_driver", None) or getattr(self, "requested_driver", None)) == "usb_rawlink":
+            if _is_usb_rawlink_family(getattr(self, "current_driver", None) or getattr(self, "requested_driver", None)):
                 time.sleep(0.35)
             return True
         logger.info("RustAdapter.release_output_route: rust release rc=%s", rc)
@@ -4338,7 +4365,7 @@ class RustAudioPlayerAdapter:
         driver_name = str(driver or "")
         devices = self._rust.list_devices(driver)
         if devices is not None:
-            if driver_name == DRIVER_USB_RAWLINK:
+            if _is_usb_rawlink_family(driver_name):
                 devices = self._merge_usb_device_cache(devices)
             try:
                 key = driver_name

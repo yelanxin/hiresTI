@@ -1,6 +1,7 @@
 use gst::glib;
 use gst::prelude::*;
 use gstreamer as gst;
+use glib::translate::ToGlibPtr;
 use libpulse_binding as pulse;
 use pipewire as pw;
 use pulse::callbacks::ListResult;
@@ -38,6 +39,7 @@ use dsp::{
 
 static GST_INIT: Once = Once::new();
 static PW_INIT: Once = Once::new();
+static USB_ALLOCATION_HINT_COUNT: AtomicU64 = AtomicU64::new(0);
 const SPECTRUM_BANDS_MAX: usize = 2048;
 const SPECTRUM_RING_CAP: usize = 512;
 const PIPEWIRE_CARD_PROFILE_TARGET_PREFIX: &str = "pwcardprofile:";
@@ -1212,8 +1214,6 @@ fn usb_audio_pusher_thread(
     let mut hw_volume_worker: Option<UsbHwVolumeWorker> = None;
     let mut dop_enc: Option<usb_audio::DopEncoder> = None;
     let mut last_xruns: u64 = 0;
-    let mut startup_prefill: Vec<u8> = Vec::new();
-    let mut startup_prefill_rate: u32 = 0;
 
     // Throughput diagnostics — measure push rate and drain rate once per second.
     let mut push_bytes_window: u64 = 0;
@@ -1314,12 +1314,6 @@ fn usb_audio_pusher_thread(
         // of the timeout, so the call only wastes CPU.
         let appsink_playing = appsink.current_state() == gst::State::Playing;
         if !appsink_playing {
-            if !startup_prefill.is_empty() {
-                startup_prefill.clear();
-                startup_prefill_rate = 0;
-                dop_enc = None;
-                buf_count = 0;
-            }
             // Accumulate idle time BEFORE doubling so we count what we actually slept.
             if sink.is_some() {
                 idle_with_sink_ms = idle_with_sink_ms.saturating_add(idle_sleep_ms);
@@ -1367,7 +1361,7 @@ fn usb_audio_pusher_thread(
         // still catching genuine decoder stalls (Tidal rebuffering etc.).
         if pull_ms > 150 {
             let q_ms = sink.as_ref().map_or(0, |s| {
-                s.queue.available_read() as u64 * 1000
+                s.queued_bytes() as u64 * 1000
                     / (s.state.rate as u64
                         * s.state.channels as u64
                         * s.state.bytes_per_sample as u64)
@@ -1396,7 +1390,7 @@ fn usb_audio_pusher_thread(
             pull_timeout_count += 1;
             if pull_timeout_count <= 2 || (pull_timeout_count % 32 == 0) {
                 let q_ms = sink.as_ref().map_or(0, |s| {
-                    s.queue.available_read() as u64 * 1000
+                    s.queued_bytes() as u64 * 1000
                         / (s.state.rate as u64
                             * s.state.channels as u64
                             * s.state.bytes_per_sample as u64)
@@ -1431,8 +1425,6 @@ fn usb_audio_pusher_thread(
 
         if sink.is_none() && lazy.reset_pending.load(Ordering::Acquire) {
             lazy.reset_pending.store(false, Ordering::Release);
-            startup_prefill.clear();
-            startup_prefill_rate = 0;
             dop_enc = None;
             buf_count = 0;
         }
@@ -1463,8 +1455,6 @@ fn usb_audio_pusher_thread(
             reset_usb_hw_volume_state(&lazy);
             dop_enc = None;
             buf_count = 0;
-            startup_prefill.clear();
-            startup_prefill_rate = 0;
             click_hist_count = 0;
         }
 
@@ -1487,8 +1477,6 @@ fn usb_audio_pusher_thread(
                 reset_usb_hw_volume_state(&lazy);
                 dop_enc = None;
                 buf_count = 0;
-                startup_prefill.clear();
-                startup_prefill_rate = 0;
             }
         }
 
@@ -1507,7 +1495,7 @@ fn usb_audio_pusher_thread(
                     buf.pts(),
                     buf.size(),
                     sink.as_ref().map_or(0, |s| {
-                        s.queue.available_read() as u64 * 1000
+                        s.queued_bytes() as u64 * 1000
                             / (s.state.rate as u64
                                 * s.state.channels as u64
                                 * s.state.bytes_per_sample as u64)
@@ -1595,39 +1583,29 @@ fn usb_audio_pusher_thread(
                     } else {
                         rate
                     };
-                    if startup_prefill_rate != 0 && startup_prefill_rate != open_rate {
-                        startup_prefill.clear();
-                        buf_count = 0;
-                    }
-                    // Record the PTS of the FIRST prefill buffer.  This is the
-                    // true stream-time start of what the DAC will play, and must
-                    // be used (not query_position at device-open time, which has
-                    // already advanced past the prefill data) so probe_latency
-                    // computes the correct pipeline→DAC gap.
-                    if startup_prefill.is_empty() {
-                        let first_pts_ns = buf.pts().map(|p| p.nseconds()).unwrap_or(0);
-                        lazy.anchor_stream_pos_ns
-                            .store(first_pts_ns, Ordering::Release);
-                    }
-                    startup_prefill_rate = open_rate;
-                    startup_prefill.extend_from_slice(data);
+                    // Record the PTS of the FIRST queue-prefill buffer.  This is
+                    // the true stream-time start of what the DAC will play, and
+                    // must be used (not query_position at device-open time, which
+                    // has already advanced past the queued audio) so
+                    // probe_latency computes the correct pipeline→DAC gap.
+                    let first_pts_ns = buf.pts().map(|p| p.nseconds()).unwrap_or(0);
+                    lazy.anchor_stream_pos_ns
+                        .store(first_pts_ns, Ordering::Release);
                     let prefill_target = usb_audio_startup_prefill_target_bytes(
                         open_rate,
                         lazy.channels,
                         lazy.gst_format.as_str(),
                         lazy.dop_channels,
                     );
-                    if startup_prefill.len() < prefill_target {
-                        continue;
-                    }
 
                     match usb_audio::UsbAudioSink::open_with_feed(
                         &lazy.device_id,
                         open_rate,
                         lazy.bit_depth,
                         Arc::clone(&lazy.feed),
-                        Some(startup_prefill.as_slice()),
+                        None,
                         Some(lazy.alt_profile),
+                        lazy.dop_channels == 0,
                     ) {
                         Ok(s) => {
                             let actual = s.actual_rate;
@@ -1635,7 +1613,6 @@ fn usb_audio_pusher_thread(
                                 let msg = usb_audio_rate_mismatch_error(open_rate, actual);
                                 eprintln!("{msg}");
                                 lazy.feed.invalidate();
-                                startup_prefill.clear();
                                 push_thread_event(&events, EVT_ERROR, msg);
                                 return;
                             }
@@ -1661,18 +1638,21 @@ fn usb_audio_pusher_thread(
                                 buf_ns,
                                 buf_ns / 1_000_000
                             );
+                            eprintln!(
+                                "usb-audio: deferred open complete rate={} target_prefill={} B (~{} ms) mode=direct-to-queue",
+                                actual,
+                                prefill_target,
+                                if actual > 0 {
+                                    prefill_target as u64 * 1000
+                                        / (actual as u64
+                                            * lazy.channels as u64
+                                            * s.state.bytes_per_sample as u64)
+                                            .max(1)
+                                } else {
+                                    0
+                                },
+                            );
                             sink = Some(s);
-                            if let Some(ref mut sn) = sink {
-                                if let Err(e) = sn.ensure_started() {
-                                    startup_prefill.clear();
-                                    push_thread_event(
-                                        &events,
-                                        EVT_ERROR,
-                                        format!("usb-audio: deferred ring start failed: {e}"),
-                                    );
-                                    return;
-                                }
-                            }
                             if let Some(ref sn) = sink {
                                 if sn.has_hw_volume() {
                                     hw_volume_worker = Some(UsbHwVolumeWorker::spawn(
@@ -1693,12 +1673,8 @@ fn usb_audio_pusher_thread(
                                     .store(true, Ordering::Release);
                             }
                             has_opened_once = true;
-                            startup_prefill.clear();
-                            startup_prefill_rate = 0;
-                            continue;
                         }
                         Err(e) => {
-                            startup_prefill.clear();
                             push_thread_event(
                                 &events,
                                 EVT_ERROR,
@@ -1719,45 +1695,105 @@ fn usb_audio_pusher_thread(
                 let s = sink
                     .as_mut()
                     .expect("startup prefill opens sink before push");
-                let mut written = 0;
                 let mut queue_full_retries: u32 = 0;
-                while written < data.len() {
-                    // Recheck disconnect while spinning on a full queue.
-                    if s.state.error.load(Ordering::Acquire) {
-                        push_thread_event(
-                            &events,
-                            EVT_ERROR,
-                            "usb-audio: device disconnected or fatal transfer error",
-                        );
-                        return;
+                if s.supports_borrowed_buffers() && lazy.dop_channels == 0 {
+                    let mut pending = buf.to_owned();
+                    loop {
+                        if s.state.error.load(Ordering::Acquire) {
+                            push_thread_event(
+                                &events,
+                                EVT_ERROR,
+                                "usb-audio: device disconnected or fatal transfer error",
+                            );
+                            return;
+                        }
+                        match s.push_buffer(pending) {
+                            Ok(()) => break,
+                            Err(usb_audio::sink::PushBufferError::Full(buffer)) => {
+                                pending = buffer;
+                            }
+                            Err(usb_audio::sink::PushBufferError::MapFailed(_buffer)) => {
+                                push_thread_event(
+                                    &events,
+                                    EVT_ERROR,
+                                    "usb-audio: borrowed-buffer queue map failed",
+                                );
+                                return;
+                            }
+                        }
+                        queue_full_retries = queue_full_retries.saturating_add(1);
+                        if queue_full_retries <= 4 {
+                            std::hint::spin_loop();
+                        } else if queue_full_retries <= 12 {
+                            std::thread::yield_now();
+                        } else {
+                            std::thread::sleep(Duration::from_micros(250));
+                        }
                     }
-                    let n = s.queue.push(&data[written..]);
-                    written += n;
-                    if n > 0 {
-                        queue_full_retries = 0;
-                        continue;
-                    }
-                    queue_full_retries = queue_full_retries.saturating_add(1);
-                    // Queue full.  Pure yield_now() here turns sustained
-                    // backpressure into a hot busy-loop.  Use a short staged
-                    // back-off: a few spin/yield iterations for ultra-short
-                    // stalls, then sleep briefly once the ring is clearly
-                    // saturated.
-                    if queue_full_retries <= 4 {
-                        std::hint::spin_loop();
-                    } else if queue_full_retries <= 12 {
-                        std::thread::yield_now();
-                    } else {
-                        std::thread::sleep(Duration::from_micros(250));
+                } else {
+                    let mut written = 0;
+                    while written < data.len() {
+                        // Recheck disconnect while spinning on a full queue.
+                        if s.state.error.load(Ordering::Acquire) {
+                            push_thread_event(
+                                &events,
+                                EVT_ERROR,
+                                "usb-audio: device disconnected or fatal transfer error",
+                            );
+                            return;
+                        }
+                        let n = s.push_bytes(&data[written..]);
+                        written += n;
+                        if n > 0 {
+                            queue_full_retries = 0;
+                            continue;
+                        }
+                        queue_full_retries = queue_full_retries.saturating_add(1);
+                        // Queue full.  Pure yield_now() here turns sustained
+                        // backpressure into a hot busy-loop.  Use a short staged
+                        // back-off: a few spin/yield iterations for ultra-short
+                        // stalls, then sleep briefly once the ring is clearly
+                        // saturated.
+                        if queue_full_retries <= 4 {
+                            std::hint::spin_loop();
+                        } else if queue_full_retries <= 12 {
+                            std::thread::yield_now();
+                        } else {
+                            std::thread::sleep(Duration::from_micros(250));
+                        }
                     }
                 }
-                if let Err(e) = s.ensure_started() {
-                    push_thread_event(
-                        &events,
-                        EVT_ERROR,
-                        format!("usb-audio: deferred ring start failed: {e}"),
+                if !s.is_started() {
+                    let prefill_target = usb_audio_startup_prefill_target_bytes(
+                        s.actual_rate,
+                        lazy.channels,
+                        lazy.gst_format.as_str(),
+                        lazy.dop_channels,
                     );
-                    return;
+                    let queue_bytes = s.queued_bytes();
+                    if queue_bytes >= prefill_target {
+                        let queue_ms = if s.actual_rate > 0 {
+                            queue_bytes as u64 * 1000
+                                / (s.actual_rate as u64
+                                    * s.state.channels as u64
+                                    * s.state.bytes_per_sample as u64)
+                                    .max(1)
+                        } else {
+                            0
+                        };
+                        eprintln!(
+                            "usb-audio: direct queue prefill ready queue={} B target={} B (~{} ms); starting ring",
+                            queue_bytes, prefill_target, queue_ms,
+                        );
+                        if let Err(e) = s.ensure_started() {
+                            push_thread_event(
+                                &events,
+                                EVT_ERROR,
+                                format!("usb-audio: deferred ring start failed: {e}"),
+                            );
+                            return;
+                        }
+                    }
                 }
                 push_bytes_window += data.len() as u64;
             }
@@ -1766,7 +1802,7 @@ fn usb_audio_pusher_thread(
         // Sample queue depth for trend tracking (runs every loop iteration).
         if diag_enabled {
             if let Some(ref s) = sink {
-                let qd = s.queue.available_read();
+                let qd = s.queued_bytes();
                 if qd < queue_min {
                     queue_min = qd;
                     queue_min_at_sec = session_start.elapsed().as_secs_f64();
@@ -1792,7 +1828,7 @@ fn usb_audio_pusher_thread(
                 let xrun_total = s.state.xruns.load(Ordering::Relaxed);
                 let xrun_delta = xrun_total.wrapping_sub(last_xrun_snapshot);
                 let usb_errs = s.state.usb_pkt_errors.load(Ordering::Relaxed);
-                let queue_now = s.queue.available_read();
+                let queue_now = s.queued_bytes();
                 let feedback_val = s.state.feedback_ms.lock().ok().and_then(|g| *g);
                 let ignore_feedback = usb_audio_ignore_feedback_enabled();
                 let feedback_tracking = s.state.feedback_in_flight.load(Ordering::Acquire);
@@ -1964,6 +2000,18 @@ fn driver_is_usb_rawlink(driver: &str) -> bool {
         || norm.starts_with("usbrawlink(")
 }
 
+/// Return `true` when `driver` selects the experimental USB Rawlink v2 path.
+fn driver_is_usb_rawlink_v2(driver: &str) -> bool {
+    let norm = normalized_driver_label(driver);
+    matches!(norm.as_str(), "usb_rawlink_v2" | "usbrawlinkv2")
+        || norm.starts_with("usb_rawlink_v2(")
+        || norm.starts_with("usbrawlinkv2(")
+}
+
+fn driver_is_usb_rawlink_family(driver: &str) -> bool {
+    driver_is_usb_rawlink(driver) || driver_is_usb_rawlink_v2(driver)
+}
+
 /// Decode the current shared USB rawlink clock mode.
 ///
 /// Unknown values fall back to Push so a stale/corrupt setting cannot leave the
@@ -1992,6 +2040,126 @@ fn usb_audio_ignore_feedback_enabled() -> bool {
             let text = v.trim().to_ascii_lowercase();
             !text.is_empty() && text != "0" && text != "false" && text != "off"
         })
+        .unwrap_or(false)
+}
+
+fn usb_audio_custom_sink_enabled() -> bool {
+    env::var("HIRESTI_USB_CUSTOM_SINK")
+        .ok()
+        .map(|v| {
+            let text = v.trim().to_ascii_lowercase();
+            !text.is_empty() && text != "0" && text != "false" && text != "off"
+        })
+        .unwrap_or(false)
+}
+
+fn active_usb_raw_sink(engine: &Engine) -> Option<usb_audio::UsbRawSink> {
+    engine.usb_raw_sink.clone().or_else(|| {
+        engine
+            .playbin
+            .property::<Option<gst::Element>>("audio-sink")
+            .and_then(|sink| sink.dynamic_cast::<usb_audio::UsbRawSink>().ok())
+    })
+}
+
+fn active_usb_raw_sink_mut(engine: &mut Engine) -> Option<usb_audio::UsbRawSink> {
+    engine.usb_raw_sink.clone().or_else(|| {
+        engine
+            .playbin
+            .property::<Option<gst::Element>>("audio-sink")
+            .and_then(|sink| sink.dynamic_cast::<usb_audio::UsbRawSink>().ok())
+    })
+}
+
+struct UsbRuntimeInfo {
+    rate: u32,
+    total_frames: u64,
+    anchor_stream_pos_ns: u64,
+    bit_depth: u8,
+    device_name: String,
+}
+
+fn active_usb_runtime_info(engine: &Engine) -> Option<UsbRuntimeInfo> {
+    if let Some(ref us) = engine.usb_sink {
+        return Some(UsbRuntimeInfo {
+            rate: us.feed.rate.load(Ordering::Relaxed),
+            total_frames: us.feed.total_frames.load(Ordering::Relaxed),
+            anchor_stream_pos_ns: us.anchor_stream_pos_ns.load(Ordering::Acquire),
+            bit_depth: us.bit_depth,
+            device_name: us.device_name.clone(),
+        });
+    }
+    active_usb_raw_sink(engine).map(|raw| UsbRuntimeInfo {
+        rate: raw.runtime_rate(),
+        total_frames: raw.runtime_total_frames(),
+        anchor_stream_pos_ns: raw.runtime_anchor_stream_pos_ns(),
+        bit_depth: raw.runtime_bit_depth(),
+        device_name: raw.runtime_device_name(),
+    })
+}
+
+fn active_usb_hw_volume_supported(engine: &Engine) -> bool {
+    if let Some(us) = engine.usb_sink.as_ref() {
+        return us.hw_volume_supported;
+    }
+    active_usb_raw_sink(engine)
+        .map(|raw| raw.hw_volume_supported())
+        .unwrap_or(false)
+}
+
+fn active_usb_hw_volume_range(engine: &Engine) -> Option<(i32, i32, i32)> {
+    if let Some(us) = engine.usb_sink.as_ref().filter(|u| u.hw_volume_supported) {
+        return Some((
+            us.hw_volume_min.load(Ordering::Relaxed),
+            us.hw_volume_max.load(Ordering::Relaxed),
+            us.hw_volume_res.load(Ordering::Relaxed),
+        ));
+    }
+    active_usb_raw_sink(engine).and_then(|raw| raw.hw_volume_get_range())
+}
+
+fn active_usb_hw_volume_channels(engine: &Engine) -> Option<Vec<u8>> {
+    if let Some(us) = engine.usb_sink.as_ref().filter(|u| u.hw_volume_supported) {
+        return Some(us.hw_volume_channels.clone());
+    }
+    active_usb_raw_sink(engine).map(|raw| raw.hw_volume_channels())
+}
+
+fn active_usb_hw_volume_get_ch(engine: &Engine, idx: usize) -> Option<i32> {
+    if let Some(us) = engine.usb_sink.as_ref().filter(|u| u.hw_volume_supported) {
+        if idx < us.hw_volume_channels.len() && idx < 3 {
+            let v = us.hw_volume_currents[idx].load(Ordering::Relaxed);
+            if v != i32::MIN {
+                return Some(v);
+            }
+        }
+        return None;
+    }
+    active_usb_raw_sink(engine).and_then(|raw| raw.hw_volume_get_ch(idx))
+}
+
+fn active_usb_hw_volume_set_all(engine: &mut Engine, value_raw: i32) -> bool {
+    if let Some(us) = engine.usb_sink.as_ref().filter(|u| u.hw_volume_supported) {
+        for t in &us.hw_volume_targets {
+            t.store(value_raw, Ordering::Relaxed);
+        }
+        return true;
+    }
+    active_usb_raw_sink_mut(engine)
+        .map(|raw| raw.hw_volume_set_all(value_raw))
+        .unwrap_or(false)
+}
+
+fn active_usb_hw_volume_set_ch(engine: &mut Engine, idx: usize, value_raw: i32) -> bool {
+    if let Some(us) = engine.usb_sink.as_ref().filter(|u| u.hw_volume_supported) {
+        if idx < us.hw_volume_channels.len() && idx < 3 {
+            us.hw_volume_targets[idx].store(value_raw, Ordering::Relaxed);
+            return true;
+        }
+        return false;
+    }
+    active_usb_raw_sink_mut(engine)
+        .map(|raw| raw.hw_volume_set_ch(idx, value_raw))
         .unwrap_or(false)
 }
 
@@ -2029,6 +2197,111 @@ fn usb_audio_startup_prefill_target_bytes(
     bytes
         .min(usb_audio::FrameQueue::capacity_bytes() as u128)
         .min(usize::MAX as u128) as usize
+}
+
+fn usb_audio_bytes_per_sample_for_format(gst_format: &str, dop_channels: usize) -> usize {
+    if dop_channels > 0 {
+        return 3;
+    }
+    match gst_format {
+        "S16LE" | "S16BE" | "U16LE" | "U16BE" => 2,
+        "S24_3LE" | "S24_3BE" => 3,
+        "S24LE" | "S24BE" | "S32LE" | "S32BE" | "F32LE" | "F32BE" => 4,
+        _ => 4,
+    }
+}
+
+fn usb_audio_proposed_buffer_pool_size(caps: &gst::CapsRef) -> Option<(u32, u32, u32)> {
+    let st = caps.structure(0)?;
+    let media_type = st.name();
+    if media_type != "audio/x-raw" {
+        return None;
+    }
+    let rate = st.get::<i32>("rate").ok()?.max(1) as u32;
+    let channels = st.get::<i32>("channels").ok()?.max(1) as u32;
+    let format = st.get::<&str>("format").ok()?;
+    let bps = usb_audio_bytes_per_sample_for_format(format, 0) as u32;
+    let frame_bytes = channels.saturating_mul(bps).max(1);
+    let bytes_per_ms = rate.saturating_mul(frame_bytes) / 1000;
+    // Aim for ~750 ms chunks, capped so the pool hint stays reasonable even at
+    // high sample rates.  The goal is to reduce GstBuffer boundary crossings in
+    // the borrowed-buffer queue, not to increase user-visible latency.
+    let raw_size = bytes_per_ms.saturating_mul(750);
+    let size = raw_size
+        .clamp(64 * 1024, 256 * 1024)
+        .saturating_div(frame_bytes)
+        .saturating_mul(frame_bytes)
+        .max(frame_bytes);
+    Some((size, 2, 4))
+}
+
+fn try_apply_usb_allocation_hint(query_ref: &mut gst::QueryRef, via: &str) {
+    if query_ref.type_() != gst::QueryType::Allocation {
+        return;
+    }
+
+    let allocation =
+        unsafe { &mut *(query_ref as *mut gst::QueryRef as *mut gst::query::Allocation) };
+    let (caps_opt, need_pool) = allocation.get();
+    let Some(caps) = caps_opt else {
+        return;
+    };
+    let caps_log = format!("{}", caps);
+    let caps_owned = caps.to_owned();
+    let Some((size, min_buffers, max_buffers)) = usb_audio_proposed_buffer_pool_size(caps) else {
+        return;
+    };
+
+    let pool = gst::BufferPool::new();
+    let mut config = pool.config();
+    config.set_params(Some(&caps_owned), size, min_buffers, max_buffers);
+    if pool.set_config(config).is_err() {
+        return;
+    }
+
+    if allocation.allocation_pools().is_empty() {
+        allocation.add_allocation_pool(Some(&pool), size, min_buffers, max_buffers);
+    } else {
+        allocation.set_nth_allocation_pool(0, Some(&pool), size, min_buffers, max_buffers);
+    }
+
+    let count = USB_ALLOCATION_HINT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if count <= 4 || count % 256 == 0 {
+        eprintln!(
+            "usb-audio: allocation-hint #{} via={} need_pool={} caps={} pool_size={} min={} max={}",
+            count,
+            via,
+            need_pool,
+            caps_log,
+            size,
+            min_buffers,
+            max_buffers,
+        );
+    }
+}
+
+fn connect_usb_appsink_allocation_hint(appsink: &gst::Element) {
+    let _ = appsink.connect("propose-allocation", false, move |values| {
+        if values.len() >= 2 {
+            let query_ptr = unsafe {
+                glib::gobject_ffi::g_value_get_boxed(values[1].to_glib_none().0) as *mut gst::ffi::GstQuery
+            };
+            if !query_ptr.is_null() {
+                let query_ref = unsafe { gst::QueryRef::from_mut_ptr(query_ptr) };
+                try_apply_usb_allocation_hint(query_ref, "signal");
+            }
+        }
+        Some(true.to_value())
+    });
+
+    if let Some(pad) = appsink.static_pad("sink") {
+        let _ = pad.add_probe(gst::PadProbeType::QUERY_DOWNSTREAM, move |_pad, info| {
+            if let Some(query) = info.query_mut() {
+                try_apply_usb_allocation_hint(query, "pad-probe");
+            }
+            gst::PadProbeReturn::Ok
+        });
+    }
 }
 
 /// Map a GStreamer format preference string to a bit depth.
@@ -2535,6 +2808,7 @@ pub struct Engine {
     spectrum_active_bands: u32,
     mmap_sink: Option<MmapSink>,
     usb_sink: Option<UsbSinkHandle>,
+    usb_raw_sink: Option<usb_audio::UsbRawSink>,
     /// USB rawlink clock alignment: 0 = push (default), 1 = pull (Level 3).
     usb_clock_mode: u8,
     output_mmap_realtime_priority: i32,
@@ -3130,6 +3404,15 @@ impl Engine {
         let Some(sink) = sink else {
             return (None, None);
         };
+        if let Ok(raw_sink) = sink.clone().dynamic_cast::<usb_audio::UsbRawSink>() {
+            let rate = raw_sink.runtime_rate();
+            let depth = raw_sink.runtime_bit_depth() as i32;
+            let rate = if rate > 0 { Some(rate as i32) } else { None };
+            let depth = if depth > 0 { Some(depth) } else { None };
+            if rate.is_some() || depth.is_some() {
+                return (rate, depth);
+            }
+        }
         let Some(pad) = sink.static_pad("sink") else {
             return (None, None);
         };
@@ -4263,6 +4546,7 @@ impl Engine {
             spectrum_active_bands: SPECTRUM_ACTIVE_BANDS_DEFAULT,
             mmap_sink: None,
             usb_sink: None,
+            usb_raw_sink: None,
             usb_clock_mode: 0,
             output_mmap_realtime_priority: ALSA_MMAP_RT_PRIORITY_DEFAULT,
             output_driver: String::new(),
@@ -4323,30 +4607,39 @@ impl Engine {
     }
 
     fn drain_usb_events(&mut self) {
-        let Some(us) = self.usb_sink.as_ref() else {
-            return;
-        };
-        // Clone what we need before dropping the immutable borrow on self.
-        let spectrum_reset = Arc::clone(&us.spectrum_reset_after_open);
-        let events = us.events.clone();
+        if let Some(us) = self.usb_sink.as_ref() {
+            // Clone what we need before dropping the immutable borrow on self.
+            let spectrum_reset = Arc::clone(&us.spectrum_reset_after_open);
+            let events = us.events.clone();
 
-        // After a track-switch re-open the pusher thread signals that the
-        // device is live again.  Reset the spectrum timeline so stale frames
-        // accumulated during startup prefill are discarded — this keeps the
-        // waveform visualizer in sync with actual audio output.
-        if spectrum_reset.swap(false, Ordering::Acquire) {
-            self.reset_spectrum_timeline();
-        }
-
-        let drained: Vec<(c_int, String)> = match events.lock() {
-            Ok(mut pending) => pending.drain(..).collect(),
-            Err(_) => return,
-        };
-        for (evt, msg) in drained {
-            if evt == EVT_ERROR {
-                self.set_error(msg.clone());
+            // After a track-switch re-open the pusher thread signals that the
+            // device is live again.  Reset the spectrum timeline so stale frames
+            // accumulated during startup prefill are discarded — this keeps the
+            // waveform visualizer in sync with actual audio output.
+            if spectrum_reset.swap(false, Ordering::Acquire) {
+                self.reset_spectrum_timeline();
             }
-            self.emit_event(evt, &msg);
+
+            let drained: Vec<(c_int, String)> = match events.lock() {
+                Ok(mut pending) => pending.drain(..).collect(),
+                Err(_) => return,
+            };
+            for (evt, msg) in drained {
+                if evt == EVT_ERROR {
+                    self.set_error(msg.clone());
+                }
+                self.emit_event(evt, &msg);
+            }
+        } else if let Some(raw) = active_usb_raw_sink(self) {
+            if raw.take_spectrum_reset_after_open() {
+                self.reset_spectrum_timeline();
+            }
+            for (evt, msg) in raw.take_events() {
+                if evt == EVT_ERROR {
+                    self.set_error(msg.clone());
+                }
+                self.emit_event(evt, &msg);
+            }
         }
     }
 
@@ -4467,6 +4760,7 @@ impl Engine {
     }
 
     fn stop_usb_sink(&mut self) {
+        self.usb_raw_sink = None;
         if let Some(mut us) = self.usb_sink.take() {
             us.stop_and_join();
             // The pusher thread dropped its owned UsbAudioSink on exit, which
@@ -4488,11 +4782,21 @@ impl Engine {
     /// Caps are set to the device's native format and channel count but with
     /// an unconstrained rate so GStreamer passes through the source rate.
     ///
-    /// Returns `(appsink_element, UsbSinkHandle, AlsaHwClock)`.
+    /// Returns `(sink_element, configured_msg, usb_handle, hw_clock)`.
     fn build_appsink_usb(
         &self,
         device_id: &str,
-    ) -> Result<(gst::Element, String, UsbSinkHandle, AlsaHwClock), String> {
+        use_custom_sink: bool,
+    ) -> Result<
+        (
+            gst::Element,
+            String,
+            Option<UsbSinkHandle>,
+            Option<usb_audio::UsbRawSink>,
+            Option<AlsaHwClock>,
+        ),
+        String,
+    > {
         // Enumerate to find the device and determine its native format.
         let dev = usb_audio::device::enumerate_usb_audio_devices()
             .into_iter()
@@ -4551,6 +4855,36 @@ impl Engine {
             ("audio/x-raw", fmt)
         };
 
+        let custom_sink_enabled = (use_custom_sink || usb_audio_custom_sink_enabled()) && !is_dop;
+
+        if custom_sink_enabled {
+            let sink = usb_audio::UsbRawSink::new(
+                Some("rust-usb-rawsink"),
+                usb_audio::UsbRawSinkConfig {
+                    device_id: device_id.to_string(),
+                    bit_depth: alt.bit_depth,
+                    alt_profile,
+                    gst_format: gst_format.to_string(),
+                    channels: alt.channels as usize,
+                    clock_mode: self.usb_clock_mode,
+                },
+            );
+            sink.set_property("sync", true);
+            sink.set_property("async", true);
+            let hw_clock = sink.clock();
+            let configured_msg = format!(
+                "usb-rawsink configured device={} format={} channels={} (custom-sink)",
+                device_id, gst_format, alt.channels
+            );
+            return Ok((
+                sink.clone().upcast::<gst::Element>(),
+                configured_msg,
+                None,
+                Some(sink),
+                Some(hw_clock),
+            ));
+        }
+
         // Create the shared clock feed and GStreamer clock NOW — before the
         // device is open.  The clock falls back to CLOCK_MONOTONIC until the
         // feed is anchored by the pusher thread at device-open time.
@@ -4582,10 +4916,13 @@ impl Engine {
         };
         appsink.set_property("caps", &caps);
         appsink.set_property("sync", true);
-        appsink.set_property("emit-signals", false);
+        // Keep appsink pull-mode consumption, but enable GObject signal emission
+        // so the propose-allocation hook can advertise a larger upstream pool.
+        appsink.set_property("emit-signals", true);
         appsink.set_property("max-buffers", 8u32);
         appsink.set_property("drop", false);
         appsink.set_property("wait-on-eos", false);
+        connect_usb_appsink_allocation_hint(&appsink);
 
         let dop_carrier_rate: u32 = if is_dop {
             usb_audio::dop::dop_pcm_rate(max_rate).unwrap_or(max_rate)
@@ -4687,7 +5024,7 @@ impl Engine {
         Ok((
             appsink.clone(),
             configured_msg,
-            UsbSinkHandle {
+            Some(UsbSinkHandle {
                 stop,
                 thread: Some(thread),
                 events,
@@ -4707,8 +5044,9 @@ impl Engine {
                 hw_volume_res,
                 hw_volume_currents,
                 hw_volume_channels: hw_vol_channels,
-            },
-            hw_clock,
+            }),
+            None,
+            Some(hw_clock),
         ))
     }
 
@@ -4881,12 +5219,17 @@ impl Engine {
         latency_us: i32,
         exclusive: bool,
     ) -> c_int {
+        if self.usb_raw_sink.is_some() && driver_is_usb_rawlink_family(driver) {
+            if let Some(raw_sink) = active_usb_raw_sink_mut(self) {
+                raw_sink.prepare_track_switch();
+            }
+        }
         let cur_state = self.playbin.state(gst::ClockTime::from_mseconds(50)).1;
         let _ = self.playbin.set_state(gst::State::Null);
         // Stop any running output sink threads *after* set_state(Null) so the
         // appsink sees EOS and pull-sample unblocks cleanly.
         self.stop_mmap_sink();
-        let had_usb_rawlink = self.usb_sink.is_some();
+        let had_usb_rawlink = self.usb_sink.is_some() || self.usb_raw_sink.is_some();
         self.stop_usb_sink();
 
         // After releasing a USB rawlink session, snd-usb-audio re-attaches
@@ -5091,16 +5434,19 @@ impl Engine {
                     return -15;
                 }
             }
-        } else if driver_is_usb(driver) || driver_is_usb_rawlink(driver) {
+        } else if driver_is_usb(driver) || driver_is_usb_rawlink(driver) || driver_is_usb_rawlink_v2(driver) {
             // Self-hosted USB Audio Class output via libusb isochronous transfers.
             // `device_norm` must be a "usb:VID:PID" or "usb:VID:PID:SERIAL" ID.
             let usb_device_id = device_norm.unwrap_or("");
-            match self.build_appsink_usb(usb_device_id) {
-                Ok((elem, configured_msg, usb_handle, hw_clock)) => {
-                    self.usb_sink = Some(usb_handle);
+            match self.build_appsink_usb(usb_device_id, driver_is_usb_rawlink_v2(driver)) {
+                Ok((elem, configured_msg, usb_handle, usb_raw_sink, hw_clock)) => {
+                    self.usb_raw_sink = usb_raw_sink;
+                    self.usb_sink = usb_handle;
                     self.emit_event(EVT_STATE, &configured_msg);
-                    if let Ok(pipeline) = self.playbin.clone().dynamic_cast::<gst::Pipeline>() {
-                        pipeline.use_clock(Some(hw_clock.upcast_ref::<gst::Clock>()));
+                    if let Some(hw_clock) = hw_clock {
+                        if let Ok(pipeline) = self.playbin.clone().dynamic_cast::<gst::Pipeline>() {
+                            pipeline.use_clock(Some(hw_clock.upcast_ref::<gst::Clock>()));
+                        }
                     }
                     // Caps are already set on the appsink — return None so
                     // wrap_sink_with_caps is not called.
@@ -5128,7 +5474,7 @@ impl Engine {
         // For alsa_mmap and usb, the appsink already has caps set on the element
         // itself; wrapping it inside an audioconvert+capsfilter bin would conflict.
         let is_mmap = driver_is_alsa_mmap(driver);
-        let is_usb = driver_is_usb(driver) || driver_is_usb_rawlink(driver);
+        let is_usb = driver_is_usb(driver) || driver_is_usb_rawlink(driver) || driver_is_usb_rawlink_v2(driver);
         let selected_caps_format = if is_mmap || is_usb {
             None
         } else if !preferred_caps_format.is_empty() {
@@ -6718,7 +7064,7 @@ fn devices_for_driver(driver: &str) -> Vec<(String, Option<String>)> {
     if driver_is_alsa_family(driver) {
         return list_alsa_cards();
     }
-    if driver_is_usb_rawlink(driver) {
+    if driver_is_usb_rawlink(driver) || driver_is_usb_rawlink_v2(driver) {
         return list_usb_rawlink_devices();
     }
     Vec::new()
@@ -6955,6 +7301,16 @@ pub extern "C" fn rac_set_uri(ptr: *mut Engine, uri: *const c_char) -> c_int {
         }
     };
 
+    // For the custom usbrawsink path, explicitly drop the current USB session
+    // before driving the pipeline to NULL on track switches.  This mirrors the
+    // old appsink path's "keep interface claimed across URI changes" behavior
+    // and avoids a needless kernel-driver re-attach between consecutive tracks.
+    if engine.usb_sink.is_none() {
+        if let Some(raw_sink) = active_usb_raw_sink_mut(engine) {
+            raw_sink.prepare_track_switch();
+        }
+    }
+
     if engine.output_driver_is_mmap() {
         let driver = engine.output_driver.clone();
         let device = engine.output_device.clone();
@@ -7087,9 +7443,12 @@ pub extern "C" fn rac_release_output(ptr: *mut Engine) -> c_int {
     let Some(engine) = as_mut_engine(ptr) else {
         return -1;
     };
-    let had_usb_rawlink = engine.usb_sink.is_some();
+    let had_usb_rawlink = engine.usb_sink.is_some() || active_usb_raw_sink(engine).is_some();
     engine.reset_spectrum_timeline();
     let _ = engine.playbin.set_state(gst::State::Null);
+    if let Some(raw_sink) = active_usb_raw_sink_mut(engine) {
+        raw_sink.reset_session("release_output");
+    }
     engine.stop_mmap_sink();
     engine.stop_usb_sink();
     if had_usb_rawlink {
@@ -7149,10 +7508,7 @@ pub extern "C" fn rac_usb_hw_volume_supported(ptr: *const Engine) -> c_int {
     let Some(engine) = as_engine(ptr) else {
         return 0;
     };
-    match engine.usb_sink.as_ref() {
-        Some(us) if us.hw_volume_supported => 1,
-        _ => 0,
-    }
+    if active_usb_hw_volume_supported(engine) { 1 } else { 0 }
 }
 
 /// Query the hardware volume range (1/256 dB units).
@@ -7169,18 +7525,18 @@ pub extern "C" fn rac_usb_hw_volume_get_range(
     let Some(engine) = as_engine(ptr) else {
         return -1;
     };
-    let Some(us) = engine.usb_sink.as_ref().filter(|u| u.hw_volume_supported) else {
-        return -1;
-    };
     if min_out.is_null() || max_out.is_null() || res_out.is_null() {
         return -2;
     }
-    unsafe {
-        *min_out = us.hw_volume_min.load(Ordering::Relaxed);
-        *max_out = us.hw_volume_max.load(Ordering::Relaxed);
-        *res_out = us.hw_volume_res.load(Ordering::Relaxed);
+    if let Some((min, max, res)) = active_usb_hw_volume_range(engine) {
+        unsafe {
+            *min_out = min;
+            *max_out = max;
+            *res_out = res;
+        }
+        return 0;
     }
-    0
+    -1
 }
 
 /// Set the hardware volume on ALL channels.  `value_raw` is in 1/256 dB units.
@@ -7192,13 +7548,7 @@ pub extern "C" fn rac_usb_hw_volume_set(ptr: *mut Engine, value_raw: c_int) -> c
     let Some(engine) = as_mut_engine(ptr) else {
         return -1;
     };
-    let Some(us) = engine.usb_sink.as_ref().filter(|u| u.hw_volume_supported) else {
-        return -1;
-    };
-    for t in &us.hw_volume_targets {
-        t.store(value_raw, Ordering::Relaxed);
-    }
-    0
+    if active_usb_hw_volume_set_all(engine, value_raw) { 0 } else { -1 }
 }
 
 /// Read the last observed hardware volume current value (1/256 dB units).
@@ -7211,20 +7561,16 @@ pub extern "C" fn rac_usb_hw_volume_get(ptr: *const Engine, value_out: *mut c_in
     let Some(engine) = as_engine(ptr) else {
         return -1;
     };
-    let Some(us) = engine.usb_sink.as_ref().filter(|u| u.hw_volume_supported) else {
-        return -1;
-    };
     if value_out.is_null() {
         return -2;
     }
-    let v = us.hw_volume_currents[0].load(Ordering::Relaxed);
-    if v == i32::MIN {
-        return -3;
+    if let Some(v) = active_usb_hw_volume_get_ch(engine, 0) {
+        unsafe {
+            *value_out = v;
+        }
+        return 0;
     }
-    unsafe {
-        *value_out = v;
-    }
-    0
+    if active_usb_hw_volume_supported(engine) { -3 } else { -1 }
 }
 
 /// Query the number of hardware volume channels and their UAC channel indices.
@@ -7242,10 +7588,7 @@ pub extern "C" fn rac_usb_hw_volume_channels(
     let Some(engine) = as_engine(ptr) else {
         return -1;
     };
-    let Some(us) = engine.usb_sink.as_ref().filter(|u| u.hw_volume_supported) else {
-        return -1;
-    };
-    let chs = &us.hw_volume_channels;
+    let Some(chs) = active_usb_hw_volume_channels(engine) else { return -1; };
     if !count_out.is_null() {
         unsafe { *count_out = chs.len() as c_int; }
     }
@@ -7270,15 +7613,12 @@ pub extern "C" fn rac_usb_hw_volume_set_ch(
     let Some(engine) = as_mut_engine(ptr) else {
         return -1;
     };
-    let Some(us) = engine.usb_sink.as_ref().filter(|u| u.hw_volume_supported) else {
-        return -1;
-    };
     let idx = channel_index as usize;
-    if idx >= us.hw_volume_channels.len() || idx >= 3 {
+    let Some(chs) = active_usb_hw_volume_channels(engine) else { return -1; };
+    if idx >= chs.len() || idx >= 3 {
         return -2;
     }
-    us.hw_volume_targets[idx].store(value_raw, Ordering::Relaxed);
-    0
+    if active_usb_hw_volume_set_ch(engine, idx, value_raw) { 0 } else { -2 }
 }
 
 /// Read the last observed hardware volume for a single channel by index.
@@ -7293,24 +7633,21 @@ pub extern "C" fn rac_usb_hw_volume_get_ch(
     let Some(engine) = as_engine(ptr) else {
         return -1;
     };
-    let Some(us) = engine.usb_sink.as_ref().filter(|u| u.hw_volume_supported) else {
-        return -1;
-    };
     let idx = channel_index as usize;
-    if idx >= us.hw_volume_channels.len() || idx >= 3 {
-        return -2;
-    }
     if value_out.is_null() {
         return -2;
     }
-    let v = us.hw_volume_currents[idx].load(Ordering::Relaxed);
-    if v == i32::MIN {
-        return -3;
+    let Some(chs) = active_usb_hw_volume_channels(engine) else { return -1; };
+    if idx >= chs.len() || idx >= 3 {
+        return -2;
     }
-    unsafe {
-        *value_out = v;
+    if let Some(v) = active_usb_hw_volume_get_ch(engine, idx) {
+        unsafe {
+            *value_out = v;
+        }
+        return 0;
     }
-    0
+    -3
 }
 
 #[no_mangle]
@@ -7360,11 +7697,11 @@ fn probe_latency(engine: &Engine) -> (f64, &'static str) {
     // so the pipeline always reports 0.  Instead, measure the real gap between
     // query_position (pipeline decode head) and the DAC play position derived
     // from frame counting: dac_pos = anchor_stream_pos + total_frames / rate.
-    if let Some(ref us) = engine.usb_sink {
-        let rate = us.feed.rate.load(Ordering::Relaxed) as u64;
+    if let Some(info) = active_usb_runtime_info(engine) {
+        let rate = info.rate as u64;
         if rate > 0 {
-            let total_frames = us.feed.total_frames.load(Ordering::Relaxed);
-            let anchor_pos_ns = us.anchor_stream_pos_ns.load(Ordering::Acquire);
+            let total_frames = info.total_frames;
+            let anchor_pos_ns = info.anchor_stream_pos_ns;
             // DAC has played total_frames since anchor — convert to stream ns.
             let dac_played_ns = total_frames.saturating_mul(1_000_000_000) / rate;
             let dac_stream_ns = anchor_pos_ns.saturating_add(dac_played_ns);
@@ -7763,6 +8100,11 @@ pub extern "C" fn rac_set_usb_clock_mode(ptr: *mut Engine, mode: c_int) -> c_int
         sink.clock_mode.store(mode as u8, Ordering::Release);
         sink.feed.set_mode(clock_mode);
         eprintln!("usb-audio: clock mode updated live → {:?}", clock_mode);
+    }
+    if let Some(audio_sink) = engine.playbin.property::<Option<gst::Element>>("audio-sink") {
+        if let Ok(raw_sink) = audio_sink.clone().dynamic_cast::<usb_audio::UsbRawSink>() {
+            raw_sink.set_clock_mode(mode as u8);
+        }
     }
     0
 }
@@ -8522,9 +8864,9 @@ pub extern "C" fn rac_get_runtime_snapshot(ptr: *const Engine) -> *mut c_char {
 
     // USB rawlink runtime info (for signal-path display).
     s.push_str("\"usb_rawlink\":");
-    if let Some(ref us) = engine.usb_sink {
-        let usb_rate = us.feed.rate.load(Ordering::Relaxed);
-        let usb_depth = us.bit_depth as u32;
+    if let Some(info) = active_usb_runtime_info(engine) {
+        let usb_rate = info.rate;
+        let usb_depth = info.bit_depth as u32;
         // ISO ring latency = N_TRANSFERS × N_PACKETS_TARGET_MS.
         // This is the physical write-ahead regardless of clock mode
         // (buffer_depth_ns is 0 in Pull mode for clock math, not latency).
@@ -8535,7 +8877,7 @@ pub extern "C" fn rac_get_runtime_snapshot(ptr: *const Engine) -> *mut c_char {
             usb_rate,
             usb_depth,
             usb_latency_ms,
-            json_escape(&us.device_name),
+            json_escape(&info.device_name),
         ));
     } else {
         s.push_str("null");

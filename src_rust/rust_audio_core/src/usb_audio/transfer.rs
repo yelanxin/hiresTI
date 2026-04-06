@@ -19,6 +19,7 @@
 //! The stop sequence sets `stop = true`, cancels all transfers, then joins the
 //! event thread before dropping the Arc.
 
+use std::collections::BTreeMap;
 use std::os::raw::{c_int, c_uchar, c_uint};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -67,7 +68,7 @@ fn clock_monotonic_ns() -> u64 {
 use crate::alsa_clock::AlsaHwClockFeed;
 
 use super::feedback::{RateAdapter, DRIFT_BUMP_PPB};
-use super::queue::FrameQueue;
+use super::source::TransferSource;
 
 // ---------------------------------------------------------------------------
 // Ring parameters
@@ -79,6 +80,42 @@ pub const N_TRANSFERS: usize = 16;
 /// Each transfer holds `N_PACKETS_TARGET_MS * packets_per_sec / 1000` ISO packets.
 /// 1ms/FS device (1000 pkt/s) → 8 packets; 125µs/HS device (8000 pkt/s) → 64 packets.
 pub const N_PACKETS_TARGET_MS: usize = 8;
+/// Maximum packets a transfer can contain with the current ring parameters.
+const MAX_PACKETS_PER_TRANSFER: usize = N_PACKETS_TARGET_MS * 8_000 / 1_000;
+
+#[derive(Default)]
+struct CompletionTracker {
+    next_submit_seq: u64,
+    next_release_seq: u64,
+    completed: BTreeMap<u64, usize>,
+}
+
+impl CompletionTracker {
+    fn assign_submit_seq(&mut self) -> u64 {
+        let seq = self.next_submit_seq;
+        self.next_submit_seq = self.next_submit_seq.saturating_add(1);
+        seq
+    }
+
+    fn record_completion(&mut self, queue: &dyn TransferSource, seq: u64, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        self.completed.insert(seq, bytes);
+        while let Some(released) = self.completed.remove(&self.next_release_seq) {
+            queue.release_reserved(released);
+            self.next_release_seq = self.next_release_seq.saturating_add(1);
+        }
+    }
+}
+
+struct TransferCtx {
+    state: Arc<RingState>,
+    slot: usize,
+    scratch_ptr: *mut u8,
+    queued_bytes: usize,
+    submit_seq: u64,
+}
 
 // ---------------------------------------------------------------------------
 // Shared state (Arc, accessed from both event thread and main thread)
@@ -100,7 +137,7 @@ fn usb_audio_ignore_feedback_enabled() -> bool {
 }
 
 pub struct RingState {
-    pub queue: Arc<FrameQueue>,
+    pub queue: Arc<dyn TransferSource>,
     pub stop: AtomicBool,
     /// Guards `RateAdapter` — only the event thread calls `samples_this_packet`
     /// in the hot path; main thread resets on format change.
@@ -196,11 +233,20 @@ pub struct RingState {
     /// Set to true once the queue has delivered at least one full packet.
     /// Before this, startup silence is expected and must not count as xrun.
     pub primed: AtomicBool,
+    /// Submit path telemetry: queue-backed direct leases (no queue→transfer copy).
+    pub direct_queue_submits: AtomicU64,
+    /// Fallback count when the queue wrapped and a direct contiguous lease was
+    /// not possible.
+    pub direct_queue_wrap_fallbacks: AtomicU64,
+    /// Fallback count when there was not enough queued audio to lease a full
+    /// transfer directly and scratch-copy + silence padding was required.
+    pub direct_queue_underrun_fallbacks: AtomicU64,
+    completion_tracker: Mutex<CompletionTracker>,
 }
 
 impl RingState {
     pub fn new(
-        queue: Arc<FrameQueue>,
+        queue: Arc<dyn TransferSource>,
         rate: u32,
         bytes_per_sample: usize,
         channels: usize,
@@ -211,8 +257,14 @@ impl RingState {
         clock_feed: Arc<AlsaHwClockFeed>,
     ) -> Arc<Self> {
         eprintln!(
-            "usb-audio: RingState rate={} ch={} bps={} max_packet={} packets_per_sec={} feedback_ep={}",
-            rate, channels, bytes_per_sample, max_packet, packets_per_sec, has_feedback_ep
+            "usb-audio: RingState rate={} ch={} bps={} max_packet={} packets_per_sec={} feedback_ep={} source={}",
+            rate,
+            channels,
+            bytes_per_sample,
+            max_packet,
+            packets_per_sec,
+            has_feedback_ep,
+            queue.kind_name(),
         );
 
         Arc::new(Self {
@@ -244,6 +296,10 @@ impl RingState {
             iso_interval_min_us: AtomicU64::new(u64::MAX),
             callback_max_us: AtomicU64::new(0),
             primed: AtomicBool::new(false),
+            direct_queue_submits: AtomicU64::new(0),
+            direct_queue_wrap_fallbacks: AtomicU64::new(0),
+            direct_queue_underrun_fallbacks: AtomicU64::new(0),
+            completion_tracker: Mutex::new(CompletionTracker::default()),
         })
     }
 }
@@ -320,18 +376,71 @@ fn apply_fadein_frame(
     }
 }
 
-/// Fill the transfer buffer from [`FrameQueue`], setting each ISO packet's
-/// `length` field to the computed sample count for this packet.
+unsafe fn transfer_ctx<'a>(transfer: *mut libusb_transfer) -> &'a mut TransferCtx {
+    &mut *((*transfer).user_data as *mut TransferCtx)
+}
+
+unsafe fn mark_transfer_submitted(ctx: &mut TransferCtx) {
+    if ctx.queued_bytes == 0 {
+        ctx.submit_seq = 0;
+        return;
+    }
+    let mut tracker = ctx
+        .state
+        .completion_tracker
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    ctx.submit_seq = tracker.assign_submit_seq();
+}
+
+fn release_completed_transfer_bytes(ctx: &mut TransferCtx) {
+    if ctx.queued_bytes == 0 {
+        return;
+    }
+    let mut tracker = ctx
+        .state
+        .completion_tracker
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    tracker.record_completion(ctx.state.queue.as_ref(), ctx.submit_seq, ctx.queued_bytes);
+    ctx.queued_bytes = 0;
+}
+
+fn queue_direct_log(count: u64, slot: usize, bytes: usize) {
+    if count <= 4 || count % 4096 == 0 {
+        eprintln!(
+            "usb-audio: direct queue lease #{} slot={} bytes={} (no queue->transfer copy)",
+            count, slot, bytes,
+        );
+    }
+}
+
+fn queue_fallback_log(label: &str, count: u64, slot: usize, total_bytes: usize, assign_avail: usize) {
+    if count <= 4 || count % 1024 == 0 {
+        eprintln!(
+            "usb-audio: direct queue fallback {} #{} slot={} bytes={} assign_avail={}",
+            label, count, slot, total_bytes, assign_avail,
+        );
+    }
+}
+
+/// Prepare the next transfer payload from [`FrameQueue`], setting each ISO
+/// packet's `length` field to the computed sample count for this packet.
 ///
-/// Silence (zeros) is used for any bytes not available in the queue.
+/// Fast path: when enough contiguous queued data is available, libusb points
+/// directly at the queue backing store and no queue→transfer copy occurs.
+/// Wrap-around and underrun cases fall back to the scratch transfer buffer.
 ///
 /// # Safety
 ///
-/// Caller must guarantee `transfer` and `state` are valid and aligned.
-unsafe fn fill_transfer(state: &RingState, transfer: *mut libusb_transfer) {
+/// Caller must guarantee `transfer` is valid and its `user_data` points to a
+/// live [`TransferCtx`].
+unsafe fn fill_transfer(transfer: *mut libusb_transfer) {
+    let ctx = transfer_ctx(transfer);
+    let state = &ctx.state;
     let n_packets = (*transfer).num_iso_packets as usize;
-    let buf_base = (*transfer).buffer as *mut u8;
-    let buf_len = ((*transfer).length) as usize;
+
+    debug_assert!(n_packets <= MAX_PACKETS_PER_TRANSFER);
 
     let mut feedback = *state.feedback_ms.lock().unwrap_or_else(|e| e.into_inner());
     let ignore_feedback = usb_audio_ignore_feedback_enabled();
@@ -358,49 +467,87 @@ unsafe fn fill_transfer(state: &RingState, transfer: *mut libusb_transfer) {
     }
 
     let frame_bytes = state.channels * state.bytes_per_sample;
-
-    // ISO packets must be laid out tightly (no gaps) in the transfer buffer.
-    // libusb/usbfs computes each packet's start offset as the cumulative sum
-    // of the *actual* lengths of all preceding packets — NOT as i * max_packet.
-    // Writing at stride=max_packet but using smaller lengths would cause the
-    // USB host controller to read from the wrong buffer positions for packets
-    // 1..N, producing garbage audio (continuous crackling).
-    let mut offset = 0usize;
+    let mut packet_bytes = [0usize; MAX_PACKETS_PER_TRANSFER];
+    let mut total_bytes = 0usize;
     let mut total_frames: u64 = 0;
-    let mut total_bytes: u64 = 0;
-    let mut xrun_packets: u64 = 0;
-    let mut fadein_rem = state.fadein_remaining.load(Ordering::Relaxed);
-    let mut fadein_armed = false;
     for i in 0..n_packets {
         let samples = adapter.samples_this_packet(feedback) as usize;
-        let packet_bytes = (samples * frame_bytes)
-            .min(state.max_packet)
-            .min(buf_len.saturating_sub(offset));
+        let bytes = (samples * frame_bytes).min(state.max_packet);
+        packet_bytes[i] = bytes;
+        total_bytes += bytes;
+        total_frames += (if frame_bytes > 0 { bytes / frame_bytes } else { samples }) as u64;
+    }
+    drop(adapter);
 
-        // Set actual packet length in the ISO descriptor.
-        let pkt = (*transfer).iso_packet_desc.as_mut_ptr().add(i);
-        (*pkt).length = packet_bytes as c_uint;
+    let assign_avail = state.queue.available_assign();
+    let mut fadein_rem = state.fadein_remaining.load(Ordering::Relaxed);
+    let mut fadein_armed = false;
+    let mut xrun_packets: u64 = 0;
+    let mut queued_bytes = 0usize;
 
-        // Fill from queue; silence-pad anything missing.
-        let pkt_buf = std::slice::from_raw_parts_mut(buf_base.add(offset), packet_bytes);
-        let got = state.queue.pop(pkt_buf);
-        if got < packet_bytes {
-            pkt_buf[got..].fill(0);
-            if state.primed.load(Ordering::Relaxed) {
-                xrun_packets += 1;
-                // Arm fade-in for the recovery after this xrun.
-                fadein_armed = true;
+    let mut active_buf_base = ctx.scratch_ptr;
+    let use_direct = if total_bytes > 0 && assign_avail >= total_bytes {
+        match state.queue.reserve_direct_contiguous(total_bytes) {
+            Some(ptr) => {
+                let count = state.direct_queue_submits.fetch_add(1, Ordering::Relaxed) + 1;
+                queue_direct_log(count, ctx.slot, total_bytes);
+                active_buf_base = ptr;
+                queued_bytes = total_bytes;
+                true
             }
-        } else if packet_bytes > 0 {
+            None => {
+                let count = state
+                    .direct_queue_wrap_fallbacks
+                    .fetch_add(1, Ordering::Relaxed)
+                    + 1;
+                queue_fallback_log("wrap", count, ctx.slot, total_bytes, assign_avail);
+                false
+            }
+        }
+    } else {
+        let count = state
+            .direct_queue_underrun_fallbacks
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        queue_fallback_log("underrun", count, ctx.slot, total_bytes, assign_avail);
+        false
+    };
+
+    (*transfer).buffer = active_buf_base as *mut c_uchar;
+    (*transfer).length = total_bytes as c_int;
+
+    let mut offset = 0usize;
+    for i in 0..n_packets {
+        let bytes = packet_bytes[i];
+        let pkt = (*transfer).iso_packet_desc.as_mut_ptr().add(i);
+        (*pkt).length = bytes as c_uint;
+
+        let pkt_buf = std::slice::from_raw_parts_mut(active_buf_base.add(offset), bytes);
+        let got = if use_direct {
+            bytes
+        } else {
+            let got = state.queue.reserve_copy_into(pkt_buf);
+            queued_bytes = queued_bytes.saturating_add(got);
+            if got < bytes {
+                pkt_buf[got..].fill(0);
+                if state.primed.load(Ordering::Relaxed) {
+                    xrun_packets += 1;
+                    fadein_armed = true;
+                }
+            } else if bytes > 0 {
+                state.primed.store(true, Ordering::Relaxed);
+            }
+            got
+        };
+
+        if use_direct && bytes > 0 {
             state.primed.store(true, Ordering::Relaxed);
         }
 
-        // Apply fade-in ramp if recovering from an xrun.
         if fadein_rem > 0 && got > 0 && frame_bytes > 0 {
             let ramp_total = XRUN_FADEIN_SAMPLES;
             let n_frames = got / frame_bytes;
             for f in 0..n_frames {
-                // Scale: 0 at start of ramp → 1 at end.
                 let pos = ramp_total - fadein_rem;
                 let frame_start = f * frame_bytes;
                 apply_fadein_frame(
@@ -417,72 +564,41 @@ unsafe fn fill_transfer(state: &RingState, transfer: *mut libusb_transfer) {
             }
         }
 
-        total_bytes += packet_bytes as u64;
-
-        let actual_samples = if frame_bytes > 0 {
-            packet_bytes / frame_bytes
-        } else {
-            samples
-        };
-        total_frames += actual_samples as u64;
-
-        // Advance by actual packet bytes so each packet's data immediately
-        // follows the previous one (tight packing required by usbfs).
-        offset += packet_bytes;
+        offset += bytes;
     }
-    drop(adapter);
 
-    // If any packet in this transfer had an xrun, arm the fade-in for
-    // the *next* transfer (current one already has silence in its tail).
     if fadein_armed {
         fadein_rem = XRUN_FADEIN_SAMPLES;
     }
     state.fadein_remaining.store(fadein_rem, Ordering::Relaxed);
 
-    if xrun_packets > 0 {
-        // Xrun logging is intentionally suppressed.  During pause/idle the ISO
-        // ring continues draining the (empty) queue until the pusher thread
-        // closes the sink, producing thousands of harmless xrun packets.
-        // The pusher thread already reports aggregate xrun counts via
-        // EVT_STATE "usb-xruns=N", so per-transfer logging is redundant.
-        // Uncomment the block below only when debugging queue underruns
-        // during active playback.
-        //
-        // let total_xruns_before = state.xruns.load(Ordering::Relaxed);
-        // let bytes_drained = state.bytes_drained_total.load(Ordering::Relaxed);
-        // let bytes_per_ms = state.rate as u64 * frame_bytes as u64 / 1000;
-        // let ms_drained = if bytes_per_ms > 0 { bytes_drained / bytes_per_ms } else { 0 };
-        // let queue_ms    = if bytes_per_ms > 0 { queue_avail_before as u64 / bytes_per_ms } else { 0 };
-        // eprintln!(
-        //     "usb-audio: xrun transfer={}/{} pkt  queue={} B (~{} ms)  missing={} B  \
-        //      feedback={:?} ms  xruns_total={}  playback_ms={}",
-        //     xrun_packets, n_packets, queue_avail_before, queue_ms,
-        //     xrun_bytes_missing, feedback.map(|v| v / 1000),
-        //     total_xruns_before, ms_drained,
-        // );
-    }
-
     if total_bytes > 0 {
         state
             .bytes_drained_total
-            .fetch_add(total_bytes, Ordering::Relaxed);
+            .fetch_add(total_bytes as u64, Ordering::Relaxed);
     }
     if xrun_packets > 0 {
         state.xruns.fetch_add(xrun_packets, Ordering::Relaxed);
     }
-    // Advance the clock once per transfer (batched) instead of once per packet.
-    // 8–64 atomic add calls → 1, cutting hot-path overhead ~8–64×.
     if total_frames > 0 {
         state.clock_feed.advance(total_frames);
     }
+
+    ctx.queued_bytes = queued_bytes;
 }
 
 /// libusb ISO OUT transfer completion callback.
 extern "system" fn iso_out_callback(transfer: *mut libusb_transfer) {
     let cb_entry_ns = clock_monotonic_ns();
 
-    // SAFETY: user_data == Arc::as_ptr(&state); valid while IsoTransferRing alive.
-    let state = unsafe { &*((*transfer).user_data as *const RingState) };
+    // SAFETY: user_data points to a TransferCtx owned by IsoTransferRing.
+    let ctx = unsafe { transfer_ctx(transfer) };
+    let state_arc = Arc::clone(&ctx.state);
+
+    // Release queue-backed bytes from the completed transfer before preparing
+    // the next submission.  Ordered release is handled by CompletionTracker.
+    release_completed_transfer_bytes(ctx);
+    let state = state_arc.as_ref();
 
     state.in_flight.fetch_sub(1, Ordering::AcqRel);
 
@@ -632,7 +748,7 @@ extern "system" fn iso_out_callback(transfer: *mut libusb_transfer) {
     }
 
     // Refill the transfer buffer with fresh audio from the queue and resubmit.
-    unsafe { fill_transfer(state, transfer) };
+    unsafe { fill_transfer(transfer) };
 
     // Record ISO completion timestamp for rate calibration.
     // Called after fill_transfer so total_frames reflects the just-written batch.
@@ -640,11 +756,17 @@ extern "system" fn iso_out_callback(transfer: *mut libusb_transfer) {
 
     let rc = unsafe { libusb_submit_transfer(transfer) };
     if rc == 0 {
+        unsafe { mark_transfer_submitted(ctx) };
         state.in_flight.fetch_add(1, Ordering::AcqRel);
     } else if rc == libusb1_sys::constants::LIBUSB_ERROR_NO_DEVICE {
+        state.queue.cancel_reserved(ctx.queued_bytes);
+        ctx.queued_bytes = 0;
         // Submit failed because device is gone — same as NO_DEVICE above.
         state.error.store(true, Ordering::Release);
         state.stop.store(true, Ordering::Release);
+    } else {
+        state.queue.cancel_reserved(ctx.queued_bytes);
+        ctx.queued_bytes = 0;
     }
     // Other submit failures: in_flight stays decremented; the ring self-heals
     // if other transfers are still running, or stop() will clean up.
@@ -674,6 +796,8 @@ pub struct IsoTransferRing {
     transfers: Vec<*mut libusb_transfer>,
     /// Backing PCM buffers — must stay alive while transfers are in flight.
     _bufs: Vec<Vec<u8>>,
+    /// Per-transfer callback context (slot metadata + completion ordering).
+    _ctxs: Vec<Box<TransferCtx>>,
     pub state: Arc<RingState>,
     /// Raw libusb context pointer (borrowed from the DeviceHandle's context).
     ctx_raw: *mut libusb_context,
@@ -746,8 +870,6 @@ impl IsoTransferRing {
         // regardless of whether the device uses 1ms frames or 125µs microframes.
         let n_packets = (N_PACKETS_TARGET_MS * state.packets_per_sec as usize / 1000).max(8);
         let buf_size = n_packets * state.max_packet;
-        let state_ptr = Arc::as_ptr(&state) as *mut std::ffi::c_void;
-
         eprintln!(
             "usb-audio: IsoTransferRing n_transfers={} n_packets={} buf_size={} bytes ({} ms/transfer)",
             N_TRANSFERS, n_packets, buf_size,
@@ -756,9 +878,11 @@ impl IsoTransferRing {
 
         let mut transfers = Vec::with_capacity(N_TRANSFERS);
         let mut bufs = Vec::with_capacity(N_TRANSFERS);
+        let mut ctxs = Vec::with_capacity(N_TRANSFERS);
 
-        for _ in 0..N_TRANSFERS {
+        for slot in 0..N_TRANSFERS {
             let mut buf: Vec<u8> = vec![0u8; buf_size];
+            let scratch_ptr = buf.as_mut_ptr();
 
             let xfer = unsafe { libusb_alloc_transfer(n_packets as c_int) };
             if xfer.is_null() {
@@ -769,6 +893,15 @@ impl IsoTransferRing {
                 return Err("libusb_alloc_transfer failed (out of memory)".into());
             }
 
+            let ctx = Box::new(TransferCtx {
+                state: Arc::clone(&state),
+                slot,
+                scratch_ptr,
+                queued_bytes: 0,
+                submit_seq: 0,
+            });
+            let ctx_ptr = ctx.as_ref() as *const TransferCtx as *mut std::ffi::c_void;
+
             unsafe {
                 libusb_fill_iso_transfer(
                     xfer,
@@ -778,7 +911,7 @@ impl IsoTransferRing {
                     buf_size as c_int,
                     n_packets as c_int,
                     iso_out_callback,
-                    state_ptr,
+                    ctx_ptr,
                     0, // timeout = 0 (no timeout)
                 );
                 libusb_set_iso_packet_lengths(xfer, state.max_packet as c_uint);
@@ -786,11 +919,13 @@ impl IsoTransferRing {
 
             transfers.push(xfer);
             bufs.push(buf);
+            ctxs.push(ctx);
         }
 
         Ok(Self {
             transfers,
             _bufs: bufs,
+            _ctxs: ctxs,
             state,
             ctx_raw,
             event_thread: None,
@@ -830,7 +965,7 @@ impl IsoTransferRing {
 
         // Fill all transfer buffers before first submission
         for &xfer in &self.transfers {
-            unsafe { fill_transfer(&self.state, xfer) };
+            unsafe { fill_transfer(xfer) };
         }
 
         self.spawn_event_thread()?;
@@ -840,9 +975,13 @@ impl IsoTransferRing {
         for &xfer in &self.transfers {
             let rc = unsafe { libusb_submit_transfer(xfer) };
             if rc == 0 {
+                unsafe { mark_transfer_submitted(transfer_ctx(xfer)) };
                 self.state.in_flight.fetch_add(1, Ordering::AcqRel);
                 submitted += 1;
             } else {
+                let ctx = unsafe { transfer_ctx(xfer) };
+                self.state.queue.cancel_reserved(ctx.queued_bytes);
+                ctx.queued_bytes = 0;
                 submit_err = Some(rc);
                 break;
             }
@@ -910,6 +1049,7 @@ impl IsoTransferRing {
         }
         self.transfers.clear();
         self._bufs.clear();
+        self._ctxs.clear();
     }
 }
 

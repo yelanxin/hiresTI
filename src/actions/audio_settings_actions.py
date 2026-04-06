@@ -24,6 +24,7 @@ _OUTPUT_BIT_DEPTH_GUESS_FORMATS = {
 DRIVER_ALSA_AUTO = "ALSA（auto）"
 DRIVER_ALSA_MMAP = "ALSA（mmap）"
 DRIVER_USB_RAWLINK = "USB Rawlink"
+DRIVER_USB_RAWLINK_V2 = "USB Rawlink v2"
 
 USB_CLOCK_OPTIONS = ["Push", "Pull"]
 USB_CLOCK_DEFAULT = "Push"
@@ -233,6 +234,8 @@ def _driver_key(driver_name):
     text = str(driver_name or "").strip().lower()
     text = text.replace("（", "(").replace("）", ")")
     compact = text.replace(" ", "")
+    if compact in ("usbrawlinkv2", "usb_rawlink_v2"):
+        return "usb_rawlink_v2"
     if compact in ("alsa_mmap", "alsa(mmap)"):
         return "alsa_mmap"
     if compact in ("alsa", "alsa(auto)"):
@@ -248,8 +251,12 @@ def _driver_is_alsa_family(driver_name):
     return _driver_key(driver_name) in ("alsa_auto", "alsa_mmap")
 
 
+def _driver_is_usb_rawlink_family(driver_name):
+    return _driver_key(driver_name) in ("usbrawlink", "usb_rawlink_v2")
+
+
 def _is_usb_rawlink_to_alsa_switch(previous_driver_name, target_driver_name):
-    return _driver_key(previous_driver_name) == "usbrawlink" and _driver_is_alsa_family(target_driver_name)
+    return _driver_is_usb_rawlink_family(previous_driver_name) and _driver_is_alsa_family(target_driver_name)
 
 
 def _release_output_before_driver_enumeration(app, previous_driver_name, target_driver_name):
@@ -304,7 +311,7 @@ def _driver_choices_for_mode(app, exclusive_enabled=None):
         else:
             exclusive_enabled = bool(getattr(app, "settings", {}).get("exclusive_lock", False))
     if exclusive_enabled:
-        drivers = [drv for drv in drivers if _driver_is_alsa_family(drv) or drv == DRIVER_USB_RAWLINK]
+        drivers = [drv for drv in drivers if _driver_is_alsa_family(drv) or _driver_is_usb_rawlink_family(drv)]
     return drivers
 
 
@@ -464,7 +471,7 @@ def _refresh_devices_for_current_driver_ui_only(app, reason="hotplug-watch", pre
             app.ignore_device_change = True
             app.current_device_list = devices
             app.device_dd.set_model(Gtk.StringList.new(new_names))
-            _min_dev = 1 if driver_name == DRIVER_USB_RAWLINK else 2
+            _min_dev = 1 if _driver_is_usb_rawlink_family(driver_name) else 2
             app.device_dd.set_sensitive(len(devices) >= _min_dev)
 
             sel_idx = 0
@@ -717,7 +724,7 @@ def _monitor_selected_device_presence(app):
         device_name = dev_item.get_string()
         if not driver_name or not device_name:
             return
-        if _driver_key(driver_name) not in ("alsa_auto", "alsa_mmap", "pipewire", "usbrawlink"):
+        if _driver_key(driver_name) not in ("alsa_auto", "alsa_mmap", "pipewire", "usbrawlink", "usb_rawlink_v2"):
             return
         if device_name in ("Default Output", "Default System Output", "Unavailable", "Default"):
             return
@@ -740,7 +747,7 @@ def _monitor_selected_device_presence(app):
                     # USB Rawlink: also match by vid:pid prefix — id may have/lack serial
                     # or the cache may have already restored the real name, so a strict
                     # string compare could miss a physically-present device.
-                    if _driver_key(driver_name) == "usbrawlink" and requested_id:
+                    if _driver_is_usb_rawlink_family(driver_name) and requested_id:
                         req_prefix = ":".join(requested_id.split(":")[:3])  # "usb:vid:pid"
                         if any(
                             str(d.get("device_id") or "").startswith(req_prefix)
@@ -793,7 +800,7 @@ def _passive_sync_device_list(app):
         if not drv_item:
             return
         driver_name = drv_item.get_string()
-        if _driver_key(driver_name) not in ("alsa_auto", "alsa_mmap", "pipewire", "usbrawlink"):
+        if _driver_key(driver_name) not in ("alsa_auto", "alsa_mmap", "pipewire", "usbrawlink", "usb_rawlink_v2"):
             return
 
         selected_item = app.device_dd.get_selected_item() if hasattr(app, "device_dd") else None
@@ -816,7 +823,7 @@ def _passive_sync_device_list(app):
                     app.ignore_device_change = True
                     app.current_device_list = devices
                     app.device_dd.set_model(Gtk.StringList.new(new_names))
-                    _min_dev = 1 if driver_name == DRIVER_USB_RAWLINK else 2
+                    _min_dev = 1 if _driver_is_usb_rawlink_family(driver_name) else 2
                     app.device_dd.set_sensitive(len(devices) >= _min_dev)
 
                     sel_idx = 0
@@ -892,7 +899,7 @@ def update_output_status_ui(app):
         state == "error"
         and bool(err)
         and ("Access denied" in err or "Permission denied" in err)
-        and getattr(app.player, "requested_driver", "") == "USB Rawlink"
+        and _driver_is_usb_rawlink_family(getattr(app.player, "requested_driver", ""))
     )
     if hasattr(app, "usb_fix_perm_btn") and app.usb_fix_perm_btn is not None:
         app.usb_fix_perm_btn.set_visible(is_usb_perm_error)
@@ -1301,17 +1308,17 @@ def on_driver_changed(app, dd, p):
     )
     _driver_mark(f"begin driver={driver_name}")
 
-    if app.ex_switch.get_active() and not _driver_is_alsa_family(driver_name) and driver_name != DRIVER_USB_RAWLINK:
+    if app.ex_switch.get_active() and not _driver_is_alsa_family(driver_name) and not _driver_is_usb_rawlink_family(driver_name):
         app._force_driver_selection(DRIVER_ALSA_AUTO)
         if hasattr(app, "show_output_notice"):
             app.show_output_notice(
-                f"Exclusive mode requires {DRIVER_ALSA_AUTO}, {DRIVER_ALSA_MMAP}, or {DRIVER_USB_RAWLINK}.",
+                f"Exclusive mode requires {DRIVER_ALSA_AUTO}, {DRIVER_ALSA_MMAP}, {DRIVER_USB_RAWLINK}, or {DRIVER_USB_RAWLINK_V2}.",
                 "warn",
                 3200,
             )
         return
 
-    if not app.ex_switch.get_active() or _driver_is_alsa_family(driver_name) or driver_name == DRIVER_USB_RAWLINK:
+    if not app.ex_switch.get_active() or _driver_is_alsa_family(driver_name) or _driver_is_usb_rawlink_family(driver_name):
         app.settings["driver"] = driver_name
         app.save_settings()
     _driver_mark("settings-saved")
@@ -1364,14 +1371,14 @@ def on_driver_changed(app, dd, p):
                         break
 
             # USB Rawlink has no "Default" placeholder — enable with ≥1 device.
-            min_count = 1 if driver_name == DRIVER_USB_RAWLINK else 2
+            min_count = 1 if _driver_is_usb_rawlink_family(driver_name) else 2
             app.device_dd.set_sensitive(len(devices) >= min_count)
             if hasattr(app, "mmap_realtime_priority_dd"):
                 app.mmap_realtime_priority_dd.set_sensitive(driver_name == DRIVER_ALSA_MMAP)
             if hasattr(app, "latency_dd"):
                 app.latency_dd.set_sensitive(_driver_is_alsa_family(driver_name))
             if hasattr(app, "usb_clock_mode_dd"):
-                app.usb_clock_mode_dd.set_sensitive(driver_name == DRIVER_USB_RAWLINK)
+                app.usb_clock_mode_dd.set_sensitive(_driver_is_usb_rawlink_family(driver_name))
 
             if sel_idx < len(devices):
                 app.device_dd.set_selected(sel_idx)
@@ -1397,7 +1404,7 @@ def on_driver_changed(app, dd, p):
             app.update_tech_label(app.player.stream_info)
             _driver_mark(f"devices-applied target={target_id or 'default'}")
 
-            if driver_name == DRIVER_USB_RAWLINK:
+            if _driver_is_usb_rawlink_family(driver_name):
                 GLib.idle_add(lambda: _check_and_prompt_usb_permission(app, devices) or False)
 
             def apply_output_async():
@@ -1626,7 +1633,7 @@ def on_output_state_transition(self, prev_state, state, detail=None):
         # USB Rawlink: the USB sink was rebuilt by set_output but the GStreamer
         # pipeline was stopped during the disconnect.  Resume automatically if a
         # track was loaded and the player is not already playing.
-        if getattr(player, "requested_driver", "") == DRIVER_USB_RAWLINK:
+        if _driver_is_usb_rawlink_family(getattr(player, "requested_driver", "")):
             uri = str(getattr(player, "_last_loaded_uri", "") or "")
             if uri and not player.is_playing():
                 pos_s = float(getattr(player, "_cached_pos_s", 0.0) or 0.0)

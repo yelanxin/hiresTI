@@ -772,6 +772,39 @@ impl OpenUsbDevice {
         Ok(())
     }
 
+    pub fn hw_volume_channels(&self) -> Vec<u8> {
+        self.dev
+            .feature_unit
+            .as_ref()
+            .filter(|f| f.has_volume)
+            .map(|f| f.channels.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn get_hw_volume_ch(&self, channel_index: usize) -> Option<i16> {
+        let fu = self.dev.feature_unit.as_ref().filter(|f| f.has_volume)?;
+        let &ch = fu.channels.get(channel_index)?;
+        get_volume_cur(&self.handle, self.dev.ctrl_iface, fu.unit_id, ch)
+    }
+
+    pub fn set_hw_volume_ch(&self, channel_index: usize, value_raw: i16) -> Result<(), String> {
+        let fu = self
+            .dev
+            .feature_unit
+            .as_ref()
+            .filter(|f| f.has_volume)
+            .ok_or_else(|| "device has no volume Feature Unit".to_string())?;
+        let &ch = fu
+            .channels
+            .get(channel_index)
+            .ok_or_else(|| "channel index out of range".to_string())?;
+        set_volume_cur(&self.handle, self.dev.ctrl_iface, fu.unit_id, ch, value_raw)
+    }
+
+    pub fn device_name(&self) -> String {
+        self.dev.name.clone()
+    }
+
     /// Select the best alt-setting for the requested `rate` and `bit_depth`.
     ///
     /// Prefers exact bit-depth match; falls back to the highest available

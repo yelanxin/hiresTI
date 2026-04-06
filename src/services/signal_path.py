@@ -9,6 +9,10 @@ import glob
 
 logger = logging.getLogger("signal_path")
 
+
+def _is_usb_rawlink_driver(driver):
+    return str(driver or "").strip() in ("USB Rawlink", "USB Rawlink v2")
+
 class AudioSignalPathWindow(Adw.Window):
     _PW_RUNTIME_CACHE_TTL_SEC = 1.5
     _TERMINAL_CSS = """
@@ -377,7 +381,7 @@ class AudioSignalPathWindow(Adw.Window):
             "- Source and output sample rates match\n",
             "- Output bit depth is not lower than the source\n",
         ]
-        if driver == "USB Rawlink":
+        if _is_usb_rawlink_driver(driver):
             lines.append(
                 "\nUSB Rawlink bypasses the kernel USB audio driver "
                 "and sends PCM directly to the DAC via libusb — "
@@ -527,7 +531,7 @@ class AudioSignalPathWindow(Adw.Window):
 
     def _display_latency(self, driver_name, is_exclusive, latency_sec, pw_latency_ms, is_playing, usb_latency_ms=None):
         driver = str(driver_name or "").strip()
-        if driver == "USB Rawlink" and usb_latency_ms is not None and usb_latency_ms > 0:
+        if _is_usb_rawlink_driver(driver) and usb_latency_ms is not None and usb_latency_ms > 0:
             return f"{usb_latency_ms:.1f} ms (ISO Ring)", usb_latency_ms
         if driver in ("ALSA", "ALSA（auto）", "ALSA (mmap)", "ALSA（mmap）"):
             try:
@@ -576,12 +580,12 @@ class AudioSignalPathWindow(Adw.Window):
     def _display_output_path(driver_name, is_exclusive, device_id=""):
         if bool(is_exclusive):
             driver = str(driver_name or "").strip()
-            if driver == "USB Rawlink":
+            if _is_usb_rawlink_driver(driver):
                 return "Direct USB Hardware (libusb)"
             return "Direct ALSA Hardware"
         driver = str(driver_name or "").strip()
         dev = str(device_id or "").strip().lower()
-        if driver == "USB Rawlink":
+        if _is_usb_rawlink_driver(driver):
             return "Direct USB Hardware (libusb)"
         if driver == "PipeWire":
             return "PipeWire Shared Graph"
@@ -678,9 +682,10 @@ class AudioSignalPathWindow(Adw.Window):
         pw_runtime = self._merge_pw_runtime_with_fallback(current_driver)
         
         engine_rows = []
-        is_rawlink = current_driver == "USB Rawlink"
+        is_rawlink = _is_usb_rawlink_driver(current_driver)
+        rawlink_mode_label = "USB Rawlink v2 Direct" if current_driver == "USB Rawlink v2" else "USB Rawlink Direct"
         if is_rawlink and is_bp:
-            engine_rows.append(("Mode", "USB Rawlink Direct 🔒", True))
+            engine_rows.append(("Mode", f"{rawlink_mode_label} 🔒", True))
             engine_rows.append(("Software Mixer", "Bypassed (Direct USB)", True))
             engine_rows.append(("Resampler", "Inactive (Bit-Perfect)", True))
         elif is_exclusive:
@@ -695,7 +700,7 @@ class AudioSignalPathWindow(Adw.Window):
             else:
                 engine_rows.append(("Clock Source", "Auto-Adjusted", False))
         elif is_rawlink:
-            engine_rows.append(("Mode", "USB Rawlink Direct", False))
+            engine_rows.append(("Mode", rawlink_mode_label, False))
             engine_rows.append(("Software Mixer", "Bypassed (Direct USB)", True))
         else:
             # [优化] 根据驱动显示不同文案
@@ -736,7 +741,7 @@ class AudioSignalPathWindow(Adw.Window):
 
         # 输出路径描述
         snap_usb = snap.get("usb_rawlink") if isinstance(snap, dict) else None
-        if current_driver == "USB Rawlink" and isinstance(snap_usb, dict):
+        if _is_usb_rawlink_driver(current_driver) and isinstance(snap_usb, dict):
             usb_rate = int(snap_usb.get("rate", 0) or 0)
             usb_depth = int(snap_usb.get("depth", 0) or 0)
             usb_dev_name = str(snap_usb.get("device_name", "") or "")
@@ -863,7 +868,7 @@ class AudioSignalPathWindow(Adw.Window):
         output_rate = "Unknown"
         output_depth = "Unknown"
         snap_usb = snap.get("usb_rawlink") if isinstance(snap, dict) else None
-        if driver == "USB Rawlink" and isinstance(snap_usb, dict):
+        if _is_usb_rawlink_driver(driver) and isinstance(snap_usb, dict):
             usb_rate = int(snap_usb.get("rate", 0) or 0)
             usb_depth = int(snap_usb.get("depth", 0) or 0)
             output_rate = self._format_rate_hz(usb_rate) if usb_rate > 0 else "Unknown"
@@ -927,7 +932,7 @@ class AudioSignalPathWindow(Adw.Window):
         reasons = []
         driver = self._get_current_driver()
         bit_perfect = bool(getattr(self.player, "bit_perfect_mode", False))
-        supported_driver = driver in ("ALSA", "ALSA（auto）", "ALSA (mmap)", "ALSA（mmap）", "PipeWire", "USB Rawlink")
+        supported_driver = driver in ("ALSA", "ALSA（auto）", "ALSA (mmap)", "ALSA（mmap）", "PipeWire", "USB Rawlink", "USB Rawlink v2")
 
         if not bit_perfect:
             reasons.append("Bit-Perfect mode disabled")
@@ -951,7 +956,7 @@ class AudioSignalPathWindow(Adw.Window):
                 reasons.append("Sample-rate mismatch")
             if not depth_match:
                 reasons.append("Output bit depth narrower than source")
-        elif driver == "USB Rawlink":
+        elif _is_usb_rawlink_driver(driver):
             if not rate_match:
                 reasons.append("Sample-rate mismatch")
             if not depth_match:
@@ -1309,7 +1314,7 @@ class AudioSignalPathWindow(Adw.Window):
         output_rate = "Server Controlled"
         output_depth = "16/32 bit (Float)"
         snap_usb = snap.get("usb_rawlink") if isinstance(snap, dict) else None
-        if driver == "USB Rawlink" and isinstance(snap_usb, dict):
+        if _is_usb_rawlink_driver(driver) and isinstance(snap_usb, dict):
             usb_rate = int(snap_usb.get("rate", 0) or 0)
             usb_depth = int(snap_usb.get("depth", 0) or 0)
             output_rate = self._format_rate_hz(usb_rate) if usb_rate > 0 else "Unknown"
@@ -1354,7 +1359,7 @@ class AudioSignalPathWindow(Adw.Window):
             f"Output Format: {output_rate} / {output_depth}",
         ]
         lines.append(f"DSP Master: {dsp_snapshot['master_state']}")
-        if driver == "USB Rawlink" and isinstance(snap_usb, dict):
+        if _is_usb_rawlink_driver(driver) and isinstance(snap_usb, dict):
             usb_dev_name = snap_usb.get("device_name", "")
             if usb_dev_name:
                 lines.append(f"USB Device: {usb_dev_name}")

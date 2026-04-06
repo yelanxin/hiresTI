@@ -36,6 +36,7 @@ from app.app_auth import (
 )
 from app.app_queue import (
     _get_active_queue,
+    _get_current_track_view_tracks,
     _set_play_queue,
     _is_queue_nav_selected,
     _sync_queue_handle_state,
@@ -43,6 +44,11 @@ from app.app_queue import (
     close_queue_drawer,
     on_queue_track_selected,
     _refresh_queue_views,
+    _play_tracks_now,
+    _insert_queue_at,
+    _insert_queue_next,
+    on_play_next_track_clicked,
+    on_play_next_current_tracks_clicked,
     on_queue_remove_track_clicked,
     on_queue_clear_clicked,
 )

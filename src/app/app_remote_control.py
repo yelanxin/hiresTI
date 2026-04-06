@@ -582,42 +582,12 @@ def _remote_move_queue_item(self, from_index, to_index):
 
 
 def _remote_insert_queue_at(self, tracks, index):
-    additions = list(tracks or [])
-    base_queue = list(self._get_active_queue() if hasattr(self, "_get_active_queue") else [])
-    insert_index = max(0, min(int(index), len(base_queue)))
-    new_queue = base_queue[:insert_index] + additions + base_queue[insert_index:]
-    current_index = int(getattr(self, "current_track_index", -1))
-    if current_index >= insert_index:
-        current_index += len(additions)
+    from app.app_queue import _insert_queue_at
 
-    self._remote_queue_event_suppression = int(getattr(self, "_remote_queue_event_suppression", 0) or 0) + 1
-    try:
-        if hasattr(self, "_set_play_queue"):
-            self._set_play_queue(new_queue)
-        else:
-            self.play_queue = new_queue
-    finally:
-        self._remote_queue_event_suppression = max(0, int(getattr(self, "_remote_queue_event_suppression", 1) or 1) - 1)
-
-    self.current_track_index = current_index if 0 <= current_index < len(new_queue) else -1
-    if 0 <= self.current_track_index < len(new_queue):
-        self.playing_track = new_queue[self.current_track_index]
-        self.playing_track_id = getattr(self.playing_track, "id", None)
-    if hasattr(self, "_refresh_queue_views"):
-        GLib.idle_add(self._refresh_queue_views)
-    if hasattr(self, "_mpris_sync_metadata"):
-        self._mpris_sync_metadata()
-    self._remote_publish_queue_event("queue_inserted")
-    return {
-        "queue_size": len(new_queue),
-        "insert_index": insert_index,
-        "inserted": len(additions),
-        "current_index": self.current_track_index,
-    }
+    return _insert_queue_at(self, tracks, index, event_reason="queue_inserted")
 
 
 def _remote_insert_queue_next(self, tracks):
-    current_index = int(getattr(self, "current_track_index", -1))
-    base_queue = list(self._get_active_queue() if hasattr(self, "_get_active_queue") else [])
-    insert_index = current_index + 1 if 0 <= current_index < len(base_queue) else 0
-    return self._remote_insert_queue_at(tracks, insert_index)
+    from app.app_queue import _insert_queue_next
+
+    return _insert_queue_next(self, tracks)

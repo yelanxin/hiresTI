@@ -22,17 +22,23 @@
 //! Later phases add the transfer ring, feedback reader, and Engine integration.
 
 pub mod control;
+pub mod borrowed_queue;
 pub mod descriptor;
 pub mod device;
 pub mod dop;
 pub mod feedback;
 pub mod queue;
+pub mod raw_sink;
 pub mod sink;
+pub mod source;
 pub mod transfer;
 
+pub use borrowed_queue::BorrowedBufferQueue;
 pub use descriptor::{FeatureUnitInfo, UacFormat, UacStreamAlt, UacVersion};
 pub use device::{enumerate_usb_audio_devices, OpenUsbDevice, UacAltProfile, UsbAudioDevice};
 pub use dop::DopEncoder;
 pub use queue::FrameQueue;
+pub use raw_sink::{UsbRawSink, UsbRawSinkConfig};
 pub use sink::UsbAudioSink;
+pub use source::TransferSource;
 pub use transfer::{IsoTransferRing, RingState};
