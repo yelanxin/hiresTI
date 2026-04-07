@@ -3993,6 +3993,13 @@ class RustAudioPlayerAdapter:
             self._refresh_rust_cache(force=True)
     def set_volume(self, vol):
         if bool(getattr(self, "bit_perfect_mode", False)):
+            # In bit-perfect mode, only allow hardware volume (doesn't touch PCM).
+            if self.usb_hw_volume_supported():
+                chs = self.usb_hw_volume_channels()
+                if chs and (len(chs) <= 1 or 0 in chs):
+                    self.usb_hw_volume_set_percent(vol * 100.0)
+                self.output_error = None
+                return
             logger.info("RustAdapter.set_volume ignored while bit-perfect mode is active")
             self.output_error = None
             return

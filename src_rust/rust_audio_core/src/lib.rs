@@ -29,6 +29,8 @@ use std::time::Duration;
 
 mod alsa_clock;
 mod dsp;
+#[allow(dead_code)]
+mod native_transport;
 pub mod usb_audio;
 
 use alsa_clock::{AlsaHwClock, AlsaHwClockFeed};
@@ -2080,6 +2082,15 @@ struct UsbRuntimeInfo {
 }
 
 fn active_usb_runtime_info(engine: &Engine) -> Option<UsbRuntimeInfo> {
+    if let Some(runtime) = engine.native_transport.runtime_info() {
+        return Some(UsbRuntimeInfo {
+            rate: runtime.feed.rate.load(Ordering::Relaxed),
+            total_frames: runtime.feed.total_frames.load(Ordering::Relaxed),
+            anchor_stream_pos_ns: 0,
+            bit_depth: runtime.bit_depth,
+            device_name: runtime.device_name,
+        });
+    }
     if let Some(ref us) = engine.usb_sink {
         return Some(UsbRuntimeInfo {
             rate: us.feed.rate.load(Ordering::Relaxed),
@@ -2099,6 +2110,9 @@ fn active_usb_runtime_info(engine: &Engine) -> Option<UsbRuntimeInfo> {
 }
 
 fn active_usb_hw_volume_supported(engine: &Engine) -> bool {
+    if engine.native_transport.hw_volume_supported() {
+        return true;
+    }
     if let Some(us) = engine.usb_sink.as_ref() {
         return us.hw_volume_supported;
     }
@@ -2108,6 +2122,9 @@ fn active_usb_hw_volume_supported(engine: &Engine) -> bool {
 }
 
 fn active_usb_hw_volume_range(engine: &Engine) -> Option<(i32, i32, i32)> {
+    if let Some(range) = engine.native_transport.hw_volume_range() {
+        return Some(range);
+    }
     if let Some(us) = engine.usb_sink.as_ref().filter(|u| u.hw_volume_supported) {
         return Some((
             us.hw_volume_min.load(Ordering::Relaxed),
@@ -2119,6 +2136,9 @@ fn active_usb_hw_volume_range(engine: &Engine) -> Option<(i32, i32, i32)> {
 }
 
 fn active_usb_hw_volume_channels(engine: &Engine) -> Option<Vec<u8>> {
+    if let Some(chs) = engine.native_transport.hw_volume_channels() {
+        return Some(chs);
+    }
     if let Some(us) = engine.usb_sink.as_ref().filter(|u| u.hw_volume_supported) {
         return Some(us.hw_volume_channels.clone());
     }
@@ -2126,6 +2146,9 @@ fn active_usb_hw_volume_channels(engine: &Engine) -> Option<Vec<u8>> {
 }
 
 fn active_usb_hw_volume_get_ch(engine: &Engine, idx: usize) -> Option<i32> {
+    if let Some(v) = engine.native_transport.hw_volume_get_ch(idx) {
+        return Some(v);
+    }
     if let Some(us) = engine.usb_sink.as_ref().filter(|u| u.hw_volume_supported) {
         if idx < us.hw_volume_channels.len() && idx < 3 {
             let v = us.hw_volume_currents[idx].load(Ordering::Relaxed);
@@ -2139,6 +2162,9 @@ fn active_usb_hw_volume_get_ch(engine: &Engine, idx: usize) -> Option<i32> {
 }
 
 fn active_usb_hw_volume_set_all(engine: &mut Engine, value_raw: i32) -> bool {
+    if engine.native_transport.hw_volume_set_all(value_raw) {
+        return true;
+    }
     if let Some(us) = engine.usb_sink.as_ref().filter(|u| u.hw_volume_supported) {
         for t in &us.hw_volume_targets {
             t.store(value_raw, Ordering::Relaxed);
@@ -2151,6 +2177,9 @@ fn active_usb_hw_volume_set_all(engine: &mut Engine, value_raw: i32) -> bool {
 }
 
 fn active_usb_hw_volume_set_ch(engine: &mut Engine, idx: usize, value_raw: i32) -> bool {
+    if engine.native_transport.hw_volume_set_ch(idx, value_raw) {
+        return true;
+    }
     if let Some(us) = engine.usb_sink.as_ref().filter(|u| u.hw_volume_supported) {
         if idx < us.hw_volume_channels.len() && idx < 3 {
             us.hw_volume_targets[idx].store(value_raw, Ordering::Relaxed);
@@ -2794,6 +2823,10 @@ pub struct Engine {
     /// Positive means spectrum is ahead of the sink's consumption point.
     /// Used by `probe_latency` for USB rawlink delay compensation.
     spectrum_lead_ms: f64,
+    /// Holding queue for native transport spectrum frames.  Frames are held
+    /// until the playback position catches up to the frame's decode-time
+    /// `pos_s`, matching GStreamer's clock-synchronized delivery behaviour.
+    native_spectrum_pending: VecDeque<native_transport::SpectrumFrame>,
     element_msg_seen: u64,
     fmt_probe_tick: u64,
     last_codec: String,
@@ -2809,6 +2842,8 @@ pub struct Engine {
     mmap_sink: Option<MmapSink>,
     usb_sink: Option<UsbSinkHandle>,
     usb_raw_sink: Option<usb_audio::UsbRawSink>,
+    #[allow(dead_code)]
+    native_transport: native_transport::NativeTransportController,
     /// USB rawlink clock alignment: 0 = push (default), 1 = pull (Level 3).
     usb_clock_mode: u8,
     output_mmap_realtime_priority: i32,
@@ -3400,6 +3435,15 @@ impl Engine {
     }
 
     fn query_output_format(&self) -> (Option<i32>, Option<i32>) {
+        if let Some(runtime) = self.native_transport.runtime_info() {
+            let rate = runtime.feed.rate.load(Ordering::Relaxed) as i32;
+            let depth = runtime.bit_depth as i32;
+            let rate = if rate > 0 { Some(rate) } else { None };
+            let depth = if depth > 0 { Some(depth) } else { None };
+            if rate.is_some() || depth.is_some() {
+                return (rate, depth);
+            }
+        }
         let sink: Option<gst::Element> = self.playbin.property("audio-sink");
         let Some(sink) = sink else {
             return (None, None);
@@ -3499,6 +3543,7 @@ impl Engine {
         self.spectrum_pos_s = 0.0;
         self.spectrum_lead_ms = 0.0;
         self.spectrum_len = 0;
+        self.native_spectrum_pending.clear();
         self.spectrum_ring_write = 0;
         self.spectrum_ring_count = 0;
         self.spectrum_vals = [0.0; SPECTRUM_BANDS_MAX];
@@ -3531,6 +3576,7 @@ impl Engine {
 
     fn set_spectrum_active_bands(&mut self, bands: u32) {
         self.spectrum_active_bands = bands.clamp(2, SPECTRUM_BANDS_MAX as u32);
+        self.native_transport.set_spectrum_bands(self.spectrum_active_bands);
         let _ = self.sync_audio_filter_graph();
     }
 
@@ -4532,6 +4578,7 @@ impl Engine {
             spectrum_seen_msgs: 0,
             spectrum_msg_count: 0,
             spectrum_lead_ms: 0.0,
+            native_spectrum_pending: VecDeque::new(),
             element_msg_seen: 0,
             fmt_probe_tick: 0,
             last_codec: String::new(),
@@ -4547,6 +4594,7 @@ impl Engine {
             mmap_sink: None,
             usb_sink: None,
             usb_raw_sink: None,
+            native_transport: native_transport::NativeTransportController::new(),
             usb_clock_mode: 0,
             output_mmap_realtime_priority: ALSA_MMAP_RT_PRIORITY_DEFAULT,
             output_driver: String::new(),
@@ -4587,6 +4635,35 @@ impl Engine {
             } else {
                 cb(evt, ptr::null(), self.event_user_data);
             }
+        }
+    }
+
+    fn maybe_load_native_transport_for_uri(&mut self, uri: &str) {
+        if !driver_is_usb_rawlink_v2(&self.output_driver) {
+            let _ = self.native_transport.stop();
+            return;
+        }
+        let source = match native_transport::NativeTransportSource::from_tidal_uri(uri) {
+            Ok(source) => source,
+            Err(err) => {
+                self.emit_event(EVT_STATE, &format!("native-transport skipped: {err}"));
+                return;
+            }
+        };
+        let summary = format!(
+            "native-transport load source={:?} locator={}",
+            source.kind(),
+            source.locator()
+        );
+        let request = native_transport::NativeTransportLoadRequest {
+            source,
+            target_driver: self.output_driver.clone(),
+            bit_perfect: !self.dsp_config.has_active_processing(),
+            usb_output_config: active_usb_raw_sink(self).and_then(|sink| sink.config()),
+        };
+        match self.native_transport.load(request) {
+            Ok(()) => self.emit_event(EVT_STATE, &summary),
+            Err(err) => self.emit_event(EVT_ERROR, &format!("native-transport load failed: {err}")),
         }
     }
 
@@ -4643,9 +4720,90 @@ impl Engine {
         }
     }
 
+    fn drain_native_transport_events(&mut self) {
+        for (evt, msg) in self.native_transport.take_events() {
+            if evt == EVT_ERROR {
+                self.set_error(msg.clone());
+            }
+            self.emit_event(evt, &msg);
+        }
+        if self.spectrum_enabled {
+            // Enqueue newly arrived frames from the decode thread.
+            for frame in self.native_transport.take_spectrum_frames() {
+                self.native_spectrum_pending.push_back(frame);
+            }
+            // Release frames whose decode-time pos_s has been reached by the
+            // playback clock.  This replicates GStreamer's clock-synchronized
+            // spectrum delivery: frames are held until the audio actually plays.
+            let seek_off = self.native_transport.snapshot().seek_offset_s;
+            let playback_pos_s = self.native_transport.runtime_info()
+                .map(|rt| {
+                    let rate = rt.feed.rate.load(Ordering::Relaxed) as f64;
+                    let frames = rt.feed.total_frames.load(Ordering::Relaxed) as f64;
+                    if rate > 0.0 { seek_off + frames / rate } else { seek_off }
+                })
+                .unwrap_or(seek_off);
+            while let Some(frame) = self.native_spectrum_pending.front() {
+                if frame.pos_s > playback_pos_s + 0.02 {
+                    break; // not yet — hold for next pump cycle
+                }
+                let frame = self.native_spectrum_pending.pop_front().unwrap();
+                let n = (frame.bands as usize).min(SPECTRUM_BANDS_MAX);
+                self.push_spectrum_ring(&*frame.mono, &*frame.left, &*frame.right, n, frame.pos_s);
+            }
+            // Safety valve: cap pending queue to ~2s of frames to prevent
+            // unbounded growth if playback stalls.
+            while self.native_spectrum_pending.len() > 120 {
+                self.native_spectrum_pending.pop_front();
+            }
+        } else {
+            self.native_spectrum_pending.clear();
+        }
+    }
+
+    fn push_spectrum_ring(
+        &mut self,
+        mono: &[f32; SPECTRUM_BANDS_MAX],
+        left: &[f32; SPECTRUM_BANDS_MAX],
+        right: &[f32; SPECTRUM_BANDS_MAX],
+        n: usize,
+        frame_pos_s: f64,
+    ) {
+        if n == 0 {
+            return;
+        }
+        // Backward-seek detection: reset ring if position jumps backward.
+        if self.spectrum_len > 0 && frame_pos_s.is_finite() && frame_pos_s >= 0.0 {
+            let prev_pos_s = self.spectrum_pos_s;
+            if prev_pos_s.is_finite() && frame_pos_s < (prev_pos_s - 0.25) {
+                self.reset_spectrum_timeline();
+            }
+        }
+        self.spectrum_pos_s = frame_pos_s;
+        self.spectrum_vals[..n].copy_from_slice(&mono[..n]);
+        self.spectrum_left_vals[..n].copy_from_slice(&left[..n]);
+        self.spectrum_right_vals[..n].copy_from_slice(&right[..n]);
+        self.spectrum_len = n;
+        self.spectrum_seq = self.spectrum_seq.wrapping_add(1);
+        let ridx = self.spectrum_ring_write;
+        self.spectrum_ring_vals[ridx] = [0.0; SPECTRUM_BANDS_MAX];
+        self.spectrum_ring_left_vals[ridx] = [0.0; SPECTRUM_BANDS_MAX];
+        self.spectrum_ring_right_vals[ridx] = [0.0; SPECTRUM_BANDS_MAX];
+        self.spectrum_ring_vals[ridx][..n].copy_from_slice(&mono[..n]);
+        self.spectrum_ring_left_vals[ridx][..n].copy_from_slice(&left[..n]);
+        self.spectrum_ring_right_vals[ridx][..n].copy_from_slice(&right[..n]);
+        self.spectrum_ring_len[ridx] = n as u16;
+        self.spectrum_ring_pos_s[ridx] = frame_pos_s;
+        self.spectrum_ring_seq[ridx] = self.spectrum_seq;
+        self.spectrum_ring_write = (self.spectrum_ring_write + 1) % SPECTRUM_RING_CAP;
+        self.spectrum_ring_count = (self.spectrum_ring_count + 1).min(SPECTRUM_RING_CAP);
+        self.spectrum_msg_count = self.spectrum_msg_count.wrapping_add(1);
+    }
+
     fn pump_events(&mut self) -> c_int {
         self.drain_mmap_events();
         self.drain_usb_events();
+        self.drain_native_transport_events();
         let Some(bus) = self.playbin.bus() else {
             return 0;
         };
@@ -4982,7 +5140,58 @@ impl Engine {
             "usb-audio: build_appsink hw_volume_supported={} channels={:?} feature_unit={:?}",
             hw_vol_supported, hw_vol_channels, dev.feature_unit
         );
+
+        // Read actual per-channel volume from the DAC so the UI shows correct
+        // values immediately (before the lazy open / UsbHwVolumeWorker start).
+        //
+        // Strategy: try reading via EP0 control transfer WITHOUT claiming
+        // interfaces — this avoids detaching the kernel driver and disturbing
+        // the PLL.  If that fails (some devices require the interface to be
+        // claimed), fall back to the UsbHwVolumeWorker which will emit events
+        // once playback starts.
+        let mut initial_hw_vol_events: Vec<String> = Vec::new();
+        if hw_vol_supported {
+            if let Ok(mut open_dev) = usb_audio::device::OpenUsbDevice::open(&dev) {
+                // Read volume range via GET_RANGE (EP0, no claim needed).
+                let range = open_dev.get_hw_volume_range();
+                if let Some((mn, mx, rs)) = range {
+                    hw_volume_min.store(mn as i32, Ordering::Relaxed);
+                    hw_volume_max.store(mx as i32, Ordering::Relaxed);
+                    hw_volume_res.store(rs as i32, Ordering::Relaxed);
+                }
+                // Read per-channel current values.
+                if let Some(fu) = dev.feature_unit.as_ref().filter(|f| f.has_volume) {
+                    for (idx, &ch) in fu.channels.iter().enumerate() {
+                        let vol = open_dev.get_hw_volume_ch(idx);
+                        eprintln!(
+                            "usb-audio: build_appsink hw-vol idx={} uac_ch={} value={:?}",
+                            idx, ch, vol
+                        );
+                        if let Some(v) = vol {
+                            if idx < 3 {
+                                hw_volume_currents[idx].store(v as i32, Ordering::Relaxed);
+                            }
+                            initial_hw_vol_events.push(
+                                format!("usb-hw-volume-ch{}={}", ch, v),
+                            );
+                        }
+                    }
+                }
+                // We never claimed interfaces, so tell Drop to skip the
+                // release_interface / set_alternate_setting calls.  The handle
+                // just closes via libusb_close — no kernel driver disturbance.
+                open_dev.skip_release_on_drop = true;
+            }
+        }
+
         let events: ThreadEventQueue = Arc::new(Mutex::new(VecDeque::new()));
+        // Enqueue initial per-channel volume events so the UI can display
+        // actual DAC values as soon as _on_hw_volume_ready fires.
+        if let Ok(mut q) = events.lock() {
+            for evt_msg in initial_hw_vol_events {
+                q.push_back((EVT_STATE, evt_msg));
+            }
+        }
         let events_clone = Arc::clone(&events);
         let appsink_clone = appsink.clone();
         let lazy = LazyUsbOpen {
@@ -5219,6 +5428,12 @@ impl Engine {
         latency_us: i32,
         exclusive: bool,
     ) -> c_int {
+        let had_native_transport = driver_is_usb_rawlink_v2(&self.output_driver);
+        if had_native_transport {
+            let _ = self.native_transport.stop_and_release();
+        } else {
+            let _ = self.native_transport.stop();
+        }
         if self.usb_raw_sink.is_some() && driver_is_usb_rawlink_family(driver) {
             if let Some(raw_sink) = active_usb_raw_sink_mut(self) {
                 raw_sink.prepare_track_switch();
@@ -5229,7 +5444,7 @@ impl Engine {
         // Stop any running output sink threads *after* set_state(Null) so the
         // appsink sees EOS and pull-sample unblocks cleanly.
         self.stop_mmap_sink();
-        let had_usb_rawlink = self.usb_sink.is_some() || self.usb_raw_sink.is_some();
+        let had_usb_rawlink = self.usb_sink.is_some() || self.usb_raw_sink.is_some() || had_native_transport;
         self.stop_usb_sink();
 
         // After releasing a USB rawlink session, snd-usb-audio re-attaches
@@ -5523,6 +5738,23 @@ impl Engine {
         self.output_latency_us = latency_us;
         self.output_exclusive = exclusive;
 
+        // Pre-claim the USB device for native transport (v2) so PipeWire
+        // cannot reclaim it before the first track starts playing.
+        if driver_is_usb_rawlink_v2(driver) {
+            if let Some(ref raw_sink) = self.usb_raw_sink {
+                if let Some(cfg) = raw_sink.config() {
+                    let _ = self.native_transport.claim_device(
+                        &cfg.device_id,
+                        cfg.bit_depth,
+                        cfg.alt_profile,
+                    );
+                }
+            }
+        } else {
+            // Already released by stop_and_release() at the top of
+            // set_output_tuned — no extra release_device() needed.
+        }
+
         self.playbin.set_property("audio-sink", &final_sink);
         self.emit_event(
             EVT_STATE,
@@ -5694,11 +5926,15 @@ pub extern "C" fn rac_get_lufs(
     {
         return -2;
     }
-    let vals: LufsValues = engine
-        .audio_filter_graph
-        .as_ref()
-        .map(|g| g.lufs_values())
-        .unwrap_or_default();
+    let vals: LufsValues = if driver_is_usb_rawlink_v2(&engine.output_driver) {
+        engine.native_transport.lufs_values()
+    } else {
+        engine
+            .audio_filter_graph
+            .as_ref()
+            .map(|g| g.lufs_values())
+            .unwrap_or_default()
+    };
     unsafe {
         *out_m = vals.momentary;
         *out_s = vals.short_term;
@@ -7301,6 +7537,22 @@ pub extern "C" fn rac_set_uri(ptr: *mut Engine, uri: *const c_char) -> c_int {
         }
     };
 
+    // For USB Rawlink v2, the GStreamer pipeline is NOT used for audio
+    // playback — native transport handles everything.  Skip all GStreamer
+    // pipeline manipulation; just load via native transport.
+    if driver_is_usb_rawlink_v2(&engine.output_driver) {
+        engine.uri = s.to_string();
+        engine.maybe_load_native_transport_for_uri(s);
+        engine.reset_spectrum_timeline();
+        engine.last_codec.clear();
+        engine.last_bitrate = 0;
+        engine.last_rate = 0;
+        engine.last_depth = 0;
+        engine.source_rate = 0;
+        engine.source_depth = 0;
+        return 0;
+    }
+
     // For the custom usbrawsink path, explicitly drop the current USB session
     // before driving the pipeline to NULL on track switches.  This mirrors the
     // old appsink path's "keep interface claimed across URI changes" behavior
@@ -7377,6 +7629,7 @@ pub extern "C" fn rac_set_uri(ptr: *mut Engine, uri: *const c_char) -> c_int {
     engine.reset_spectrum_timeline();
     engine.playbin.set_property("uri", s);
     engine.uri = s.to_string();
+    engine.maybe_load_native_transport_for_uri(s);
     engine.last_codec.clear();
     engine.last_bitrate = 0;
     engine.last_rate = 0;
@@ -7408,6 +7661,22 @@ pub extern "C" fn rac_play(ptr: *mut Engine) -> c_int {
         engine.emit_event(EVT_ERROR, "rac_play: empty uri");
         return -2;
     }
+    // For USB Rawlink v2, ONLY use native transport — never start the
+    // GStreamer pipeline, which would claim the USB interface via usb-rawsink
+    // and block native transport from accessing the device.
+    if driver_is_usb_rawlink_v2(&engine.output_driver) {
+        match engine.native_transport.play() {
+            Ok(()) => {
+                engine.emit_event(EVT_STATE, "Playing");
+                return 0;
+            }
+            Err(err) => {
+                engine.set_error(format!("native transport play failed: {err}"));
+                engine.emit_event(EVT_ERROR, &format!("native transport play failed: {err}"));
+                return -4;
+            }
+        }
+    }
     let rc = engine.set_state(gst::State::Playing);
     if rc == 0 && (engine.playback_rate - 1.0).abs() > f64::EPSILON {
         let _ = engine.apply_playback_rate();
@@ -7420,6 +7689,19 @@ pub extern "C" fn rac_pause(ptr: *mut Engine) -> c_int {
     let Some(engine) = as_mut_engine(ptr) else {
         return -1;
     };
+    if driver_is_usb_rawlink_v2(&engine.output_driver) {
+        match engine.native_transport.pause() {
+            Ok(()) => {
+                engine.emit_event(EVT_STATE, "Paused");
+                return 0;
+            }
+            Err(err) => {
+                engine.set_error(format!("native transport pause failed: {err}"));
+                engine.emit_event(EVT_ERROR, &format!("native transport pause failed: {err}"));
+                return -4;
+            }
+        }
+    }
     let rc = engine.set_state(gst::State::Paused);
     // Apply any pending DSP structural rebuild now that the pipeline is paused.
     if engine.audio_filter_rebuild_pending {
@@ -7434,6 +7716,19 @@ pub extern "C" fn rac_stop(ptr: *mut Engine) -> c_int {
         return -1;
     };
     engine.reset_spectrum_timeline();
+    if driver_is_usb_rawlink_v2(&engine.output_driver) {
+        match engine.native_transport.stop() {
+            Ok(()) => {
+                engine.emit_event(EVT_STATE, "Null");
+                return 0;
+            }
+            Err(err) => {
+                engine.set_error(format!("native transport stop failed: {err}"));
+                engine.emit_event(EVT_ERROR, &format!("native transport stop failed: {err}"));
+                return -4;
+            }
+        }
+    }
     let rc = engine.set_state(gst::State::Null);
     rc
 }
@@ -7443,8 +7738,14 @@ pub extern "C" fn rac_release_output(ptr: *mut Engine) -> c_int {
     let Some(engine) = as_mut_engine(ptr) else {
         return -1;
     };
-    let had_usb_rawlink = engine.usb_sink.is_some() || active_usb_raw_sink(engine).is_some();
+    let had_native_transport = driver_is_usb_rawlink_v2(&engine.output_driver);
+    let had_usb_rawlink = engine.usb_sink.is_some() || active_usb_raw_sink(engine).is_some() || had_native_transport;
     engine.reset_spectrum_timeline();
+    if had_native_transport {
+        let _ = engine.native_transport.stop_and_release();
+    } else {
+        let _ = engine.native_transport.stop();
+    }
     let _ = engine.playbin.set_state(gst::State::Null);
     if let Some(raw_sink) = active_usb_raw_sink_mut(engine) {
         raw_sink.reset_session("release_output");
@@ -7468,6 +7769,22 @@ pub extern "C" fn rac_seek(ptr: *mut Engine, pos_s: c_double) -> c_int {
     } else {
         0.0
     };
+
+    if driver_is_usb_rawlink_v2(&engine.output_driver) {
+        let ms = (clamped * 1000.0) as u64;
+        match engine.native_transport.seek_ms(ms) {
+            Ok(()) => {
+                engine.reset_spectrum_timeline();
+                return 0;
+            }
+            Err(err) => {
+                engine.set_error(&err);
+                engine.emit_event(EVT_ERROR, &err);
+                return -3;
+            }
+        }
+    }
+
     let rc = engine.playbin.seek_simple(
         // Keep FLUSH for responsiveness/stability across sinks; UI side handles
         // brief position rebound after flush-seek.
@@ -7495,6 +7812,7 @@ pub extern "C" fn rac_set_volume(ptr: *mut Engine, vol: c_double) -> c_int {
         1.0
     };
     engine.playbin.set_property("volume", v);
+    engine.native_transport.set_volume(v as f32);
     0
 }
 
@@ -7659,9 +7977,28 @@ pub extern "C" fn rac_get_position(ptr: *const Engine, pos_out: *mut c_double) -
         return -2;
     }
 
-    let pos = match engine.playbin.query_position::<gst::ClockTime>() {
-        Some(p) => (p.nseconds() as f64) / 1_000_000_000.0,
-        None => 0.0,
+    let pos = if driver_is_usb_rawlink_v2(&engine.output_driver) {
+        let snap = engine.native_transport.snapshot();
+        let seek_offset = snap.seek_offset_s;
+        // Prefer DAC-accurate position from the USB clock feed.
+        if let Some(runtime) = engine.native_transport.runtime_info() {
+            let rate = runtime.feed.rate.load(Ordering::Relaxed) as f64;
+            let frames = runtime.feed.total_frames.load(Ordering::Relaxed) as f64;
+            if rate > 0.0 { seek_offset + frames / rate } else { seek_offset }
+        } else {
+            // Fallback: decoded frame count (ahead of actual playback).
+            let rate = snap.stream_spec.as_ref().map(|s| s.sample_rate as f64).unwrap_or(0.0);
+            if rate > 0.0 {
+                seek_offset + snap.decoded_frame_count as f64 / rate
+            } else {
+                seek_offset
+            }
+        }
+    } else {
+        match engine.playbin.query_position::<gst::ClockTime>() {
+            Some(p) => (p.nseconds() as f64) / 1_000_000_000.0,
+            None => 0.0,
+        }
     };
 
     // SAFETY: pos_out is a valid output pointer from caller.
@@ -7680,9 +8017,13 @@ pub extern "C" fn rac_get_duration(ptr: *const Engine, dur_out: *mut c_double) -
         return -2;
     }
 
-    let dur = match engine.playbin.query_duration::<gst::ClockTime>() {
-        Some(d) => (d.nseconds() as f64) / 1_000_000_000.0,
-        None => 0.0,
+    let dur = if driver_is_usb_rawlink_v2(&engine.output_driver) {
+        engine.native_transport.snapshot().duration_s.unwrap_or(0.0)
+    } else {
+        match engine.playbin.query_duration::<gst::ClockTime>() {
+            Some(d) => (d.nseconds() as f64) / 1_000_000_000.0,
+            None => 0.0,
+        }
     };
 
     // SAFETY: dur_out is a valid output pointer from caller.

@@ -299,7 +299,16 @@ def do_activate(self):
     if is_bp:
         if self.bp_label is not None:
             self.bp_label.set_visible(True)
-        self._lock_volume_controls(True)
+        # Hardware volume (USB Rawlink v2) doesn't touch PCM — keep unlocked.
+        # At startup the USB device may not be claimed yet; _on_hw_volume_ready
+        # will re-check and unlock if hw volume becomes available later.
+        hw_vol = (
+            hasattr(self, "player") and self.player is not None
+            and hasattr(self.player, "usb_hw_volume_supported")
+            and self.player.usb_hw_volume_supported()
+        )
+        if not hw_vol:
+            self._lock_volume_controls(True)
     self.player.toggle_bit_perfect(is_bp, exclusive_lock=is_ex)
     _startup_mark("bit-perfect")
 

@@ -19,7 +19,7 @@ use super::device::UacAltProfile;
 use super::queue::FrameQueue;
 use super::sink::{PushBufferError, UsbAudioSink};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UsbRawSinkConfig {
     pub device_id: String,
     pub bit_depth: u8,
@@ -414,6 +414,14 @@ impl UsbRawSink {
             state.config = Some(config);
         }
         sink
+    }
+
+    pub fn config(&self) -> Option<UsbRawSinkConfig> {
+        self.imp()
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.config.clone())
     }
 
     pub fn reset_session(&self, reason: &str) {

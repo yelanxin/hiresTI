@@ -1892,7 +1892,15 @@ def on_bit_perfect_toggled(self, switch, state):
         self.ex_switch.set_active(False)
     is_ex = self.ex_switch.get_active()
     if state:
-        self._lock_volume_controls(True)
+        # Hardware volume (e.g. USB Rawlink v2) doesn't touch PCM data,
+        # so volume controls stay unlocked in bit-perfect mode.
+        hw_vol = (
+            hasattr(self, "player") and self.player is not None
+            and hasattr(self.player, "usb_hw_volume_supported")
+            and self.player.usb_hw_volume_supported()
+        )
+        if not hw_vol:
+            self._lock_volume_controls(True)
         self.player.toggle_bit_perfect(True, exclusive_lock=is_ex)
     else:
         self.player.toggle_bit_perfect(False, exclusive_lock=is_ex)

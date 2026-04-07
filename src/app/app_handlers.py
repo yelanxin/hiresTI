@@ -103,9 +103,13 @@ def on_volume_changed_ui(self, scale):
         return
     val = scale.get_value()
     if bool(getattr(self, "settings", {}).get("bit_perfect", False)):
-        if hasattr(self, "_sync_volume_ui_state"):
-            self._sync_volume_ui_state(value=100.0, source_scale=scale)
-        return
+        # Hardware volume (USB Rawlink v2) is safe in bit-perfect mode.
+        if hasattr(self.player, "usb_hw_volume_supported") and self.player.usb_hw_volume_supported():
+            pass  # fall through to set_volume below
+        else:
+            if hasattr(self, "_sync_volume_ui_state"):
+                self._sync_volume_ui_state(value=100.0, source_scale=scale)
+            return
     self.player.set_volume(val / 100.0)
     self.settings["volume"] = int(round(val))
     self.schedule_save_settings()

@@ -3004,11 +3004,41 @@ def _on_hw_volume_ready(self):
 
     player = getattr(self, "player", None)
     if player is not None and _hw_volume_main_slider_controls_master(player):
+        # Read the DAC's actual current volume instead of using the saved
+        # settings value — avoids showing 100% when the DAC is actually lower.
+        actual_percent = None
+        try:
+            raw = player.usb_hw_volume_get()
+            if raw is not None:
+                actual_percent = player.usb_hw_volume_raw_to_percent(raw)
+        except Exception:
+            pass
         sync_fn = getattr(self, "_sync_volume_ui_state", None)
         if callable(sync_fn):
-            sync_fn()
+            if actual_percent is not None:
+                actual_percent = max(0.0, min(100.0, float(actual_percent)))
+                settings = getattr(self, "settings", None)
+                if isinstance(settings, dict):
+                    settings["volume"] = int(round(actual_percent))
+                sync_fn(value=actual_percent)
+            else:
+                sync_fn()
+
+    # Sync per-channel slider positions + dB labels now that sliders exist.
+    # The per-channel volume events may have arrived before the sliders were
+    # built, so we need to explicitly sync here.
+    _sync_hw_volume_ch_slider_positions(self)
+    self._hw_vol_ch_initial_synced = True
 
     if not bool(getattr(self, "settings", {}).get("bit_perfect", False)):
+        _update_volume_device_label(self)
+        return False
+    # In bit-perfect mode with hardware volume (e.g. USB Rawlink v2),
+    # unlock volume controls — hw volume doesn't touch PCM data.
+    # At startup the controls were locked because the USB device wasn't
+    # claimed yet; now that hw volume is confirmed, unlock them.
+    if player is not None and hasattr(player, "usb_hw_volume_supported") and player.usb_hw_volume_supported():
+        _lock_volume_controls(self, False)
         _update_volume_device_label(self)
         return False
     _lock_volume_controls(self, True)
@@ -3018,8 +3048,6 @@ def _on_hw_volume_ready(self):
 
 def _on_hw_volume_changed(self, raw_value, uac_ch=None):
     """Sync UI/settings when the DAC reports a new hardware volume value."""
-    if bool(getattr(self, "settings", {}).get("bit_perfect", False)):
-        return False
     player = getattr(self, "player", None)
     if player is None or not hasattr(player, "usb_hw_volume_raw_to_percent"):
         return False
@@ -3238,6 +3266,9 @@ def _rebuild_hw_volume_ch_sliders(self):
     self._hw_vol_ch_scales_all = {}
     self._hw_vol_ch_db_labels_all = {}
 
+    if not hasattr(self, "_hw_vol_ch_linked"):
+        self._hw_vol_ch_linked = True
+
     for attr in ("vol_ch_box", "now_playing_vol_ch_box"):
         ch_box = getattr(self, attr, None)
         if ch_box is None:
@@ -3250,6 +3281,7 @@ def _rebuild_hw_volume_ch_sliders(self):
             ch_box.remove(child)
 
         sliders_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, halign=Gtk.Align.CENTER)
+        columns = []
         for full_idx, uac_ch in extra_entries:
             col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, halign=Gtk.Align.CENTER)
             ch_label = Gtk.Label(label=_UAC_CH_NAMES.get(uac_ch, f"Ch{uac_ch}"))
@@ -3292,15 +3324,93 @@ def _rebuild_hw_volume_ch_sliders(self):
                 text = f"{db:+.1f} dB" if db is not None else ""
                 for lbl in getattr(self, "_hw_vol_ch_db_labels_all", {}).get(u_ch, []):
                     lbl.set_text(text)
+                # When L/R are linked, sync the other channel
+                if getattr(self, "_hw_vol_ch_linked", True):
+                    _sync_linked_ch_volume(self, u_ch, val)
 
             # Connect after set_value to avoid triggering a hw write on init
             ch_scale.connect("value-changed", _on_ch_vol_changed)
             self._hw_vol_ch_scales_all.setdefault(uac_ch, []).append(ch_scale)
             col.append(ch_scale)
-            sliders_row.append(col)
+            columns.append(col)
 
+        for c in columns:
+            sliders_row.append(c)
         ch_box.append(sliders_row)
+
+        # Link button below the sliders
+        if len(columns) >= 2:
+            link_btn = Gtk.ToggleButton()
+            link_btn.set_active(getattr(self, "_hw_vol_ch_linked", True))
+            link_btn.set_icon_name(
+                "changes-prevent-symbolic" if link_btn.get_active() else "changes-allow-symbolic"
+            )
+            link_btn.set_tooltip_text("Link Left/Right channels")
+            link_btn.set_halign(Gtk.Align.CENTER)
+            link_btn.add_css_class("flat")
+            link_btn.add_css_class("circular")
+            link_btn.connect("toggled", lambda b: _on_hw_vol_link_toggled(self, b))
+            ch_box.append(link_btn)
+
         ch_box.set_visible(True)
+
+
+def _on_hw_vol_link_toggled(self, btn):
+    """Toggle linked state for Left/Right channel sliders."""
+    linked = btn.get_active()
+    self._hw_vol_ch_linked = linked
+    btn.set_icon_name(
+        "changes-prevent-symbolic" if linked else "changes-allow-symbolic"
+    )
+    # When linking, sync Right to Left's current value
+    if linked:
+        left_scales = getattr(self, "_hw_vol_ch_scales_all", {}).get(1, [])
+        if left_scales:
+            val = left_scales[0].get_value()
+            _sync_linked_ch_volume(self, 1, val)
+
+
+def _sync_linked_ch_volume(self, source_uac_ch, percent):
+    """When L/R are linked, set the other channel to the same percent."""
+    if source_uac_ch == 1:
+        target_uac_ch = 2
+    elif source_uac_ch == 2:
+        target_uac_ch = 1
+    else:
+        return
+    # Find the target channel's full_idx for the hw volume call
+    player = getattr(self, "player", None)
+    if player is None:
+        return
+    extra_entries = _hw_volume_extra_channel_entries(player)
+    target_idx = None
+    for full_idx, uac_ch in extra_entries:
+        if uac_ch == target_uac_ch:
+            target_idx = full_idx
+            break
+    if target_idx is None:
+        return
+    # Set hw volume on the other channel
+    try:
+        player.usb_hw_volume_set_percent_ch(target_idx, percent)
+    except Exception:
+        logger.debug("linked ch vol set failed", exc_info=True)
+    # Sync the other channel's slider(s) and dB label(s)
+    try:
+        self._hw_vol_ch_programmatic = True
+        for scale in getattr(self, "_hw_vol_ch_scales_all", {}).get(target_uac_ch, []):
+            scale.set_value(percent)
+    finally:
+        self._hw_vol_ch_programmatic = False
+    db = None
+    if hasattr(player, "usb_hw_volume_percent_to_db"):
+        try:
+            db = player.usb_hw_volume_percent_to_db(percent)
+        except Exception:
+            pass
+    text = f"{db:+.1f} dB" if db is not None else ""
+    for lbl in getattr(self, "_hw_vol_ch_db_labels_all", {}).get(target_uac_ch, []):
+        lbl.set_text(text)
 
 
 def _sync_hw_volume_ch_slider_positions(self):

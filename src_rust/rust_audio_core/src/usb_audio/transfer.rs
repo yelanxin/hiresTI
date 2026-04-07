@@ -224,6 +224,8 @@ pub struct RingState {
     /// Minimum observed inter-completion interval (µs) since last diagnostic
     /// snapshot.  Reset to u64::MAX by the pusher thread after each log line.
     pub iso_interval_min_us: AtomicU64,
+    /// Throttle counter for short-packet log messages in the ISO callback.
+    usb_short_pkt_log_count: AtomicU64,
     /// Maximum callback latency (µs) — time spent inside `iso_out_callback`
     /// from entry to post-resubmit.  Reset by the pusher thread after each
     /// diagnostic snapshot.  A high value indicates the event thread was
@@ -294,6 +296,7 @@ impl RingState {
             iso_jitter_events: AtomicU64::new(0),
             iso_interval_max_us: AtomicU64::new(0),
             iso_interval_min_us: AtomicU64::new(u64::MAX),
+            usb_short_pkt_log_count: AtomicU64::new(0),
             callback_max_us: AtomicU64::new(0),
             primed: AtomicBool::new(false),
             direct_queue_submits: AtomicU64::new(0),
@@ -636,12 +639,16 @@ extern "system" fn iso_out_callback(transfer: *mut libusb_transfer) {
         }
     }
     if short_pkts > 0 {
-        eprintln!(
-            "usb-audio: ISO OUT short packets: {}/{} in this transfer (queue={} B)",
-            short_pkts,
-            n_pkt,
-            state.queue.available_read(),
-        );
+        let count = state.usb_short_pkt_log_count.fetch_add(1, Ordering::Relaxed) + 1;
+        if count <= 4 || count % 256 == 0 {
+            eprintln!(
+                "usb-audio: ISO OUT short packets: {}/{} in this transfer (queue={} B, event #{})",
+                short_pkts,
+                n_pkt,
+                state.queue.available_read(),
+                count,
+            );
+        }
     }
     if bad_pkts > 0 {
         let total_errors_before = state.usb_pkt_errors.fetch_add(bad_pkts, Ordering::Relaxed);
@@ -691,15 +698,19 @@ extern "system" fn iso_out_callback(transfer: *mut libusb_transfer) {
                 }
             }
         } else {
-            eprintln!(
-                "usb-audio: ISO OUT packet errors: {}/{} bad in this transfer (total={})  \
-                 queue={} B  feedback={:?}",
-                bad_pkts,
-                n_pkt,
-                total_errors_before + bad_pkts,
-                queue_bytes,
-                feedback.map(|v| v / 1000),
-            );
+            let total = total_errors_before + bad_pkts;
+            // Throttle: log first 4, then every 256th to avoid Mutex contention on stderr.
+            if total <= 4 || total % 256 == 0 {
+                eprintln!(
+                    "usb-audio: ISO OUT packet errors: {}/{} bad in this transfer (total={})  \
+                     queue={} B  feedback={:?}",
+                    bad_pkts,
+                    n_pkt,
+                    total,
+                    queue_bytes,
+                    feedback.map(|v| v / 1000),
+                );
+            }
         }
     }
 

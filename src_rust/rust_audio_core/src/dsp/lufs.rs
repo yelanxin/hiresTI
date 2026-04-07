@@ -152,7 +152,7 @@ const LRA_BLOCKS: usize = 300;
 const GATE_ABS_LUFS: f64 = -70.0;
 
 #[allow(dead_code)]
-struct LufsState {
+pub(crate) struct LufsState {
     sample_rate: u32,
     channels: usize,
 
@@ -191,7 +191,7 @@ struct LufsState {
 }
 
 impl LufsState {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let rate = 48_000u32;
         let channels = 2usize;
         Self {
@@ -218,7 +218,7 @@ impl LufsState {
         }
     }
 
-    fn update_rate_channels(&mut self, rate: u32, channels: usize) {
+    pub(crate) fn update_rate_channels(&mut self, rate: u32, channels: usize) {
         if rate == self.sample_rate && channels == self.channels {
             return;
         }
@@ -237,7 +237,7 @@ impl LufsState {
     }
 
     /// Process a slice of interleaved F64LE samples (read-only tap).
-    fn process(&mut self, samples: &[f64]) {
+    pub(crate) fn process(&mut self, samples: &[f64]) {
         let ch = self.channels.min(MAX_CHANNELS);
         if ch == 0 || samples.is_empty() {
             return;
@@ -333,7 +333,7 @@ impl LufsState {
             compute_dr(self.dr_peak_sq_sum, self.dr_power_sum, self.dr_block_count) as f32;
     }
 
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.filt1 = [BiquadState::default(); MAX_CHANNELS];
         self.filt2 = [BiquadState::default(); MAX_CHANNELS];
         self.block_sum = 0.0;
