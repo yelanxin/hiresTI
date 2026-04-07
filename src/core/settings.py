@@ -406,7 +406,7 @@ def normalize_settings(raw: Optional[dict[str, Any]]) -> dict[str, Any]:
     normalized["viz_profile"] = _as_int(raw_viz_profile, DEFAULT_SETTINGS["viz_profile"], minimum=0, maximum=4)
     # Current effect options after removing Radial, legacy Fall, Pro Bars,
     # and Pro Line, then adding Orbit, Shards, Stereo Mirror, Lissajous,
-    # Stereo Scope, Balance Wave, Center Side, Phase Flower, Stereo Meter,
+    # Stereo Scope, Phase Flower, Stereo Meter,
     # and the appended optional GL Dots slot:
     # 25 entries => 0..24
     raw_viz_effect = raw.get("viz_effect")

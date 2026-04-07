@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.9.0 Beta 1 - 2026-04-07
+
+### Added
+- **USB Rawlink V2 (Native Transport)**: new playback path that bypasses GStreamer entirely — Symphonia FLAC decode → zero-copy PCM → USB ISO OUT → DAC. Delivers bit-perfect output with lower latency and tighter clock control.
+- **Play Next**: added "Play Next" action button to track lists and album headers, allowing users to queue a track or album to play immediately after the current one.
+- **Hardware volume L/R channel link toggle**: a lock button below the hardware volume sliders lets users link or unlink left/right channels for synchronized adjustment.
+
+### Changed
+- **Playback pipeline refactoring**: redesigned the core audio chain with improved jitter suppression, buffer management, and clock synchronization. Introduced a feed-forward hardware clock (`AlsaHwClockFeed`) with push/pull modes and ISO-completion regression calibration for sub-millisecond timing accuracy.
+- **Hardware volume now works in bit-perfect mode**: hardware volume controls operate via USB Feature Unit (EP0 control transfers) and never touch the PCM stream, so they remain fully functional even when bit-perfect is enabled.
+- **Spectrum bands dynamically follow UI selection in V2**: the native transport spectrum processor now reads the active band count from a shared atomic, so switching visualizer resolution takes effect immediately without restarting playback.
+- **Progressive PLL settle retry for DAC compatibility**: USB sample-rate SET_CUR retries now use a 150 → 300 → 500 ms backoff sequence, improving reliability on DACs with slow PLL lock (e.g. Monitor 09).
+- **Improved V1 ↔ V2 driver switching**: synchronous `StopAndRelease` command ensures the USB device is fully released before the other driver claims it, preventing PLL disturbance and app hangs during output driver changes.
+
+### Removed
+- **Balance Wave and Center Side visualizations**: removed from the effect list and rendering pipeline.
+
 ## 1.8.6 - 2026-04-04
 
 ### Changed

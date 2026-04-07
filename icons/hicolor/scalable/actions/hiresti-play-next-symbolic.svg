@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg height="16px" viewBox="0 0 16 16" width="16px" xmlns="http://www.w3.org/2000/svg">
+    <!-- play triangle -->
+    <path d="M 2,3.5 L 11,8 L 2,12.5 Z" fill="currentColor"/>
+    <!-- vertical bar -->
+    <rect x="12" y="3.5" width="2.5" height="9" rx="1" fill="currentColor"/>
+</svg>

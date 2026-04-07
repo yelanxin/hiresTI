@@ -689,7 +689,7 @@ fn transport_worker(
                         None,
                         volume.clone(),
                         spectrum_tx.clone(),
-                        spectrum_bands.load(Ordering::Relaxed),
+                        Arc::clone(&spectrum_bands),
                         Arc::clone(&lufs_values),
                         hw_vol_cache.clone(),
                         claimed_device.take(),
@@ -839,7 +839,7 @@ fn transport_worker(
                             Some(position_ms),
                             volume.clone(),
                             spectrum_tx.clone(),
-                            spectrum_bands.load(Ordering::Relaxed),
+                            Arc::clone(&spectrum_bands),
                             Arc::clone(&lufs_values),
                             hw_vol_cache.clone(),
                             handle_for_worker,
@@ -981,7 +981,7 @@ fn start_direct_flac_decode_worker(
     seek_start_ms: Option<u64>,
     volume: SharedVolume,
     spectrum_tx: crossbeam_channel::Sender<SpectrumFrame>,
-    spectrum_bands: u32,
+    spectrum_bands: Arc<AtomicU32>,
     lufs_values: SharedLufsValues,
     hw_vol_cache: HwVolCache,
     pre_claimed_handle: Option<OpenUsbDevice>,
@@ -1026,7 +1026,7 @@ fn direct_flac_decode_worker(
     seek_start_ms: Option<u64>,
     volume: SharedVolume,
     spectrum_tx: crossbeam_channel::Sender<SpectrumFrame>,
-    spectrum_bands: u32,
+    spectrum_bands: Arc<AtomicU32>,
     lufs_values: SharedLufsValues,
     session_slot: SharedSessionSlot,
     hw_vol_cache: HwVolCache,
@@ -1113,7 +1113,7 @@ fn decode_direct_flac_stream(
     seek_start_ms: Option<u64>,
     volume: SharedVolume,
     spectrum_tx: crossbeam_channel::Sender<SpectrumFrame>,
-    spectrum_bands: u32,
+    spectrum_bands: Arc<AtomicU32>,
     lufs_values: SharedLufsValues,
     session_slot: &SharedSessionSlot,
     hw_vol_cache: &HwVolCache,
@@ -1161,7 +1161,7 @@ fn decode_direct_flac_stream(
 
     let mut processor_chain = PcmProcessorChain::new();
     processor_chain.push(Box::new(VolumePcmProcessor::new(volume)));
-    processor_chain.push(Box::new(SpectrumPcmProcessor::new(spectrum_tx, spectrum_bands as usize)));
+    processor_chain.push(Box::new(SpectrumPcmProcessor::new(spectrum_tx, spectrum_bands)));
     processor_chain.push(Box::new(LufsPcmProcessor::new(lufs_values)));
     let mut chain_configured = false;
     let mut output_session: Option<UsbAudioSink> = None;

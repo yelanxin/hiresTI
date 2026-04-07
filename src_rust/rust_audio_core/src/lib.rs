@@ -2827,6 +2827,8 @@ pub struct Engine {
     /// until the playback position catches up to the frame's decode-time
     /// `pos_s`, matching GStreamer's clock-synchronized delivery behaviour.
     native_spectrum_pending: VecDeque<native_transport::SpectrumFrame>,
+    /// Guards against emitting multiple EOS events for a single native transport track.
+    native_eos_emitted: bool,
     element_msg_seen: u64,
     fmt_probe_tick: u64,
     last_codec: String,
@@ -4579,6 +4581,7 @@ impl Engine {
             spectrum_msg_count: 0,
             spectrum_lead_ms: 0.0,
             native_spectrum_pending: VecDeque::new(),
+            native_eos_emitted: false,
             element_msg_seen: 0,
             fmt_probe_tick: 0,
             last_codec: String::new(),
@@ -4661,6 +4664,7 @@ impl Engine {
             bit_perfect: !self.dsp_config.has_active_processing(),
             usb_output_config: active_usb_raw_sink(self).and_then(|sink| sink.config()),
         };
+        self.native_eos_emitted = false;
         match self.native_transport.load(request) {
             Ok(()) => self.emit_event(EVT_STATE, &summary),
             Err(err) => self.emit_event(EVT_ERROR, &format!("native-transport load failed: {err}")),
@@ -4758,6 +4762,18 @@ impl Engine {
             }
         } else {
             self.native_spectrum_pending.clear();
+        }
+
+        // Detect end-of-stream for native transport: decode worker finished
+        // (decode_completed=true, runtime cleared) → emit EOS so Python
+        // triggers next-track.
+        if !self.native_eos_emitted && driver_is_usb_rawlink_v2(&self.output_driver) {
+            let snap = self.native_transport.snapshot();
+            if snap.decode_completed && snap.decoded_frame_count > 0 {
+                self.native_eos_emitted = true;
+                eprintln!("native-transport EOS: decoded_frames={}", snap.decoded_frame_count);
+                self.emit_event(EVT_EOS, "native-transport-eos");
+            }
         }
     }
 

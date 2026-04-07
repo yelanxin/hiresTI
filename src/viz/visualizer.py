@@ -52,8 +52,6 @@ _STEREO_SPECTRUM_EFFECTS = frozenset({
     "Stereo Mirror",
     "Lissajous",
     "Stereo Scope",
-    "Balance Wave",
-    "Center Side",
     "Phase Flower",
     "Stereo Meter",
 })
@@ -766,8 +764,6 @@ class SpectrumVisualizer(Gtk.DrawingArea):
             "Stereo Mirror",
             "Lissajous",
             "Stereo Scope",
-            "Balance Wave",
-            "Center Side",
             "Phase Flower",
             "Stereo Meter",
         ]
@@ -793,8 +789,6 @@ class SpectrumVisualizer(Gtk.DrawingArea):
             "Stereo Mirror": 19,
             "Lissajous": 20,
             "Stereo Scope": 21,
-            "Balance Wave": 22,
-            "Center Side": 23,
             "Phase Flower": 24,
             "Stereo Meter": 26,
             "Dual Fall": 25,
@@ -1625,10 +1619,6 @@ class SpectrumVisualizer(Gtk.DrawingArea):
                 self._draw_lissajous(cr, width, height, gain, theme["gradient"])
             elif effect == 21:
                 self._draw_stereo_scope(cr, width, height, gain, theme["gradient"])
-            elif effect == 22:
-                self._draw_balance_wave(cr, width, height, gain, theme["gradient"])
-            elif effect == 23:
-                self._draw_center_side(cr, width, height, gain, theme["gradient"])
             elif effect == 24:
                 self._draw_phase_flower(cr, width, height, gain, theme["gradient"])
             elif effect == 26:
@@ -5193,8 +5183,6 @@ _BARS_GL_EFFECT_MODES = {
     "Pulse":         6,
     "Stereo Mirror": 7,
     "Burst":         9,
-    "Balance Wave":  10,
-    "Center Side":   11,
 }
 
 

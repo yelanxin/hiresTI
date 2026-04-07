@@ -1465,7 +1465,7 @@ def _ensure_play_shuffle_btns(app):
         app._album_play_btn.connect("clicked", lambda _b: _on_play_album_tracks(app))
 
     if not hasattr(app, "_album_play_next_btn") or app._album_play_next_btn is None:
-        app._album_play_next_btn = Gtk.Button(icon_name="go-next-symbolic", css_classes=["flat", "circular", "history-scroll-btn"])
+        app._album_play_next_btn = Gtk.Button(icon_name="hiresti-play-next-symbolic", css_classes=["flat", "circular", "history-scroll-btn"])
         app._album_play_next_btn.connect("clicked", app.on_play_next_current_tracks_clicked)
 
     if not hasattr(app, "_album_shuffle_btn") or app._album_shuffle_btn is None:
@@ -1773,7 +1773,7 @@ def populate_tracks(app, tracks):
 
         fav_btn = app.create_track_fav_button(t)
         box.append(fav_btn)
-        next_btn = Gtk.Button(icon_name="go-next-symbolic", css_classes=["flat", "circular", "history-scroll-btn"])
+        next_btn = Gtk.Button(icon_name="hiresti-play-next-symbolic", css_classes=["flat", "circular", "history-scroll-btn"])
         next_btn.set_tooltip_text("Play Next")
         next_btn.connect("clicked", lambda _b, tr=t: app.on_play_next_track_clicked(tr))
         box.append(next_btn)
@@ -6588,7 +6588,7 @@ def render_playlist_detail(app, playlist_id):
             rm_btn.connect("clicked", lambda _b, pid=p.get("id"), idx=i: app.on_playlist_remove_track_clicked(pid, idx))
             box.append(rm_btn)
         else:
-            next_btn = Gtk.Button(icon_name="go-next-symbolic", css_classes=["flat", "circular", "history-scroll-btn"])
+            next_btn = Gtk.Button(icon_name="hiresti-play-next-symbolic", css_classes=["flat", "circular", "history-scroll-btn"])
             next_btn.set_tooltip_text("Play Next")
             next_btn.connect("clicked", lambda _b, tr=t: app.on_play_next_track_clicked(tr))
             box.append(next_btn)

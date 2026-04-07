@@ -245,6 +245,7 @@ pub struct SpectrumFrame {
 pub struct SpectrumPcmProcessor {
     tx: Sender<SpectrumFrame>,
     bands: usize,
+    bands_source: Arc<AtomicU32>,
     threshold_db: f32,
     // Per-channel ring buffers (up to 2 channels for stereo).
     window_left: Vec<f32>,
@@ -263,12 +264,13 @@ pub struct SpectrumPcmProcessor {
 }
 
 impl SpectrumPcmProcessor {
-    pub fn new(tx: Sender<SpectrumFrame>, bands: usize) -> Self {
-        let bands = bands.clamp(2, SPECTRUM_BANDS_MAX);
+    pub fn new(tx: Sender<SpectrumFrame>, bands_source: Arc<AtomicU32>) -> Self {
+        let bands = (bands_source.load(Ordering::Relaxed) as usize).clamp(2, SPECTRUM_BANDS_MAX);
         let window_size = bands * 2; // FFT size
         Self {
             tx,
             bands,
+            bands_source,
             threshold_db: -80.0,
             window_left: vec![0.0; window_size],
             window_right: vec![0.0; window_size],
@@ -280,6 +282,18 @@ impl SpectrumPcmProcessor {
             sample_rate: 0,
             channels: 0,
             configured: false,
+        }
+    }
+
+    /// Check if bands changed from external source and reconfigure if needed.
+    fn sync_bands(&mut self) {
+        let new_bands = (self.bands_source.load(Ordering::Relaxed) as usize).clamp(2, SPECTRUM_BANDS_MAX);
+        if new_bands != self.bands {
+            self.bands = new_bands;
+            self.window_size = new_bands * 2;
+            self.window_left = vec![0.0; self.window_size];
+            self.window_right = vec![0.0; self.window_size];
+            self.window_pos = 0;
         }
     }
 
@@ -355,6 +369,7 @@ impl PcmProcessor for SpectrumPcmProcessor {
         if !self.configured || self.channels == 0 {
             return Ok(slab);
         }
+        self.sync_bands();
         // Extract f32 samples per frame from the slab for spectrum analysis.
         let bytes_per_sample = match slab.spec.format {
             PcmSampleFormat::S16LE => 2,
