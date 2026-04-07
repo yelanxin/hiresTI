@@ -7994,20 +7994,26 @@ pub extern "C" fn rac_get_position(ptr: *const Engine, pos_out: *mut c_double) -
     }
 
     let pos = if driver_is_usb_rawlink_v2(&engine.output_driver) {
-        let snap = engine.native_transport.snapshot();
-        let seek_offset = snap.seek_offset_s;
-        // Prefer DAC-accurate position from the USB clock feed.
-        if let Some(runtime) = engine.native_transport.runtime_info() {
-            let rate = runtime.feed.rate.load(Ordering::Relaxed) as f64;
-            let frames = runtime.feed.total_frames.load(Ordering::Relaxed) as f64;
-            if rate > 0.0 { seek_offset + frames / rate } else { seek_offset }
+        // After EOS but before next track loads, return 0 so the UI doesn't
+        // show stale position from the finished track.
+        if engine.native_eos_emitted {
+            0.0
         } else {
-            // Fallback: decoded frame count (ahead of actual playback).
-            let rate = snap.stream_spec.as_ref().map(|s| s.sample_rate as f64).unwrap_or(0.0);
-            if rate > 0.0 {
-                seek_offset + snap.decoded_frame_count as f64 / rate
+            let snap = engine.native_transport.snapshot();
+            let seek_offset = snap.seek_offset_s;
+            // Prefer DAC-accurate position from the USB clock feed.
+            if let Some(runtime) = engine.native_transport.runtime_info() {
+                let rate = runtime.feed.rate.load(Ordering::Relaxed) as f64;
+                let frames = runtime.feed.total_frames.load(Ordering::Relaxed) as f64;
+                if rate > 0.0 { seek_offset + frames / rate } else { seek_offset }
             } else {
-                seek_offset
+                // Fallback: decoded frame count (ahead of actual playback).
+                let rate = snap.stream_spec.as_ref().map(|s| s.sample_rate as f64).unwrap_or(0.0);
+                if rate > 0.0 {
+                    seek_offset + snap.decoded_frame_count as f64 / rate
+                } else {
+                    seek_offset
+                }
             }
         }
     } else {
@@ -8034,7 +8040,11 @@ pub extern "C" fn rac_get_duration(ptr: *const Engine, dur_out: *mut c_double) -
     }
 
     let dur = if driver_is_usb_rawlink_v2(&engine.output_driver) {
-        engine.native_transport.snapshot().duration_s.unwrap_or(0.0)
+        if engine.native_eos_emitted {
+            0.0
+        } else {
+            engine.native_transport.snapshot().duration_s.unwrap_or(0.0)
+        }
     } else {
         match engine.playbin.query_duration::<gst::ClockTime>() {
             Some(d) => (d.nseconds() as f64) / 1_000_000_000.0,
