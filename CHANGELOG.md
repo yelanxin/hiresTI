@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.9.0 Beta 2 - 2026-04-08
+
+### Added
+- **Mini mode queue drawer**: a toggleable queue list below the mini player bar, opened via a centered arrow button at the bottom edge. Displays two-line rows (title + artist · album) with favorite and remove buttons, scrollable up to 500px height.
+- **Mini mode transparent window background**: the mini player window now has a fully transparent background so rounded corners blend cleanly with the desktop.
+- **DSP processing for native transport**: hot-updatable DSP chain integrated into the USB Rawlink V2 playback path.
+- **Sponsor link in tools menu**: a "Sponsor" entry in the tools/settings dropdown opens the GitHub Sponsors page.
+
+### Changed
+- **Mini mode queue drawer styling**: the drawer uses `@view_bg_color` for the bar and drawer background, with a darker `@headerbar_bg_color`-based list background that follows the system theme.
+- **Playing track icon in mini queue uses track ID matching**: the currently-playing indicator is now determined by `track_id` rather than queue index, fixing incorrect icon display when the queue order differs from the playback position.
+
+### Fixed
+- **Mini mode layout stability on mode switching**: fixed an issue where resizing the queue drawer and then switching between mini and normal mode could corrupt the main window layout.
+
 ## 1.9.0 Beta 1 - 2026-04-07
 
 ### Added
