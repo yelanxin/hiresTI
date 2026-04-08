@@ -22,6 +22,14 @@ pub use tape::{TapeConfig, TapeNode};
 pub use tube::{TubeConfig, TubeNode};
 pub use widener::{WidenerConfig, WidenerNode};
 
+// Pure-Rust DSP states for native transport (no GStreamer dependency).
+pub(crate) use convolver::ConvolverState;
+pub(crate) use limiter::LimiterState;
+pub(crate) use peq::PeqState;
+pub(crate) use tape::TapeState;
+pub(crate) use tube::TubeState;
+pub(crate) use widener::WidenerState;
+
 pub(crate) const SPECTRUM_ACTIVE_BANDS_DEFAULT: u32 = 512;
 pub(crate) const SPECTRUM_ACTIVE_BANDS_MAX: u32 = 2048;
 const SPECTRUM_IDLE_BANDS: u32 = 16;

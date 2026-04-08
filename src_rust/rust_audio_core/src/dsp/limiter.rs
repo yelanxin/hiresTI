@@ -13,7 +13,7 @@ const RELEASE_TIME_S: f64 = 0.100;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
-struct LimiterState {
+pub(crate) struct LimiterState {
     enabled: bool,
     threshold: f64,
     ratio: f64,
@@ -25,7 +25,7 @@ struct LimiterState {
 }
 
 impl LimiterState {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             enabled: false,
             threshold: 0.85,
@@ -36,20 +36,27 @@ impl LimiterState {
         }
     }
 
-    fn release_coeff_for(rate: u32) -> f64 {
+    pub(crate) fn release_coeff_for(rate: u32) -> f64 {
         let r = rate.max(1) as f64;
         (-1.0_f64 / (r * RELEASE_TIME_S)).exp()
     }
 
-    fn update_sample_rate(&mut self, rate: u32) {
+    pub(crate) fn update_sample_rate(&mut self, rate: u32) {
         if rate > 0 && rate != self.sample_rate {
             self.sample_rate = rate;
             self.release_coeff = Self::release_coeff_for(rate);
         }
     }
 
+    pub(crate) fn apply_config(&mut self, config: &LimiterConfig) {
+        self.enabled = config.enabled;
+        self.threshold = config.threshold.clamp(0.0, 1.0);
+        self.ratio = config.ratio.clamp(1.0, 60.0);
+        self.gain = 1.0;
+    }
+
     /// Process interleaved F64LE samples in-place.
-    fn process(&mut self, samples: &mut [f64], channels: usize) {
+    pub(crate) fn process(&mut self, samples: &mut [f64], channels: usize) {
         if !self.enabled || channels == 0 || samples.is_empty() {
             return;
         }

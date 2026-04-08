@@ -50,7 +50,7 @@ impl TapeConfig {
 // ── Biquad (transposed direct form II) ───────────────────────────────────────
 
 #[derive(Debug, Clone)]
-struct Biquad {
+pub(crate) struct Biquad {
     b0: f64,
     b1: f64,
     b2: f64,
@@ -77,7 +77,7 @@ impl Default for Biquad {
 
 impl Biquad {
     #[inline]
-    fn process(&mut self, x: f64) -> f64 {
+    pub(crate) fn process(&mut self, x: f64) -> f64 {
         let y = self.b0 * x + self.z1;
         self.z1 = self.b1 * x - self.a1 * y + self.z2;
         self.z2 = self.b2 * x - self.a2 * y;
@@ -85,7 +85,7 @@ impl Biquad {
     }
 
     /// First-order RC low-pass. `fc` in Hz, `sr` in Hz.
-    fn lowpass_1st(fc: f64, sr: f64) -> Self {
+    pub(crate) fn lowpass_1st(fc: f64, sr: f64) -> Self {
         let a = (-2.0 * PI * fc / sr).exp();
         Self {
             b0: 1.0 - a,
@@ -96,7 +96,7 @@ impl Biquad {
 
     /// Second-order low-shelf (Audio EQ Cookbook, shelf-slope S = 1).
     /// `gain_db` > 0 = boost. Returns identity if gain is negligible.
-    fn low_shelf(fc: f64, gain_db: f64, sr: f64) -> Self {
+    pub(crate) fn low_shelf(fc: f64, gain_db: f64, sr: f64) -> Self {
         if gain_db.abs() < 0.05 {
             return Self::default();
         }
@@ -133,7 +133,7 @@ impl Biquad {
 /// (characteristic of magnetic hysteresis). Naturally compresses transients
 /// more than sustained material (tape-like dynamic behaviour).
 #[inline]
-fn tape_saturate(x: f64, drive: f64) -> f64 {
+pub(crate) fn tape_saturate(x: f64, drive: f64) -> f64 {
     if drive < 1e-6 {
         return x;
     }
@@ -149,7 +149,7 @@ fn tape_saturate(x: f64, drive: f64) -> f64 {
 // ── State (per-stream) ────────────────────────────────────────────────────────
 
 #[derive(Debug)]
-struct TapeState {
+pub(crate) struct TapeState {
     enabled: bool,
     drive: f64,
     tone: f64,
@@ -162,7 +162,7 @@ struct TapeState {
 }
 
 impl TapeState {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let mut s = Self {
             enabled: false,
             drive: 0.30,
@@ -176,7 +176,7 @@ impl TapeState {
         s
     }
 
-    fn rebuild_filters(&mut self) {
+    pub(crate) fn rebuild_filters(&mut self) {
         let sr = self.stream_rate.max(8000) as f64;
         // HF roll-off: tone=0 → 6 kHz, tone=1 → 18 kHz.
         let hf_fc = (6_000.0 + self.tone * 12_000.0).min(sr * 0.45);
@@ -189,7 +189,7 @@ impl TapeState {
         }
     }
 
-    fn update_rate(&mut self, rate: u32) {
+    pub(crate) fn update_rate(&mut self, rate: u32) {
         if rate == 0 || rate == self.stream_rate {
             return;
         }
@@ -197,7 +197,7 @@ impl TapeState {
         self.rebuild_filters();
     }
 
-    fn apply_config(&mut self, config: &TapeConfig) {
+    pub(crate) fn apply_config(&mut self, config: &TapeConfig) {
         self.enabled = config.enabled;
         self.drive = config.drive as f64 / 100.0;
         self.tone = config.tone as f64 / 100.0;
@@ -205,7 +205,7 @@ impl TapeState {
         self.rebuild_filters();
     }
 
-    fn process(&mut self, samples: &mut [f64], channels: usize) {
+    pub(crate) fn process(&mut self, samples: &mut [f64], channels: usize) {
         if !self.enabled || channels == 0 || samples.is_empty() {
             return;
         }

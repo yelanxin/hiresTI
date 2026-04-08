@@ -1,7 +1,10 @@
 pub mod controller;
+pub mod native_dsp;
 pub mod processor;
 pub mod source;
 
+#[allow(unused_imports)]
+pub use native_dsp::DspPcmProcessor;
 #[allow(unused_imports)]
 pub use controller::{
     NativeTransportCommand, NativeTransportController, NativeTransportLoadRequest,

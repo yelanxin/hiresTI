@@ -42,7 +42,7 @@ impl WidenerConfig {
 }
 
 #[derive(Debug)]
-struct WidenerState {
+pub(crate) struct WidenerState {
     enabled: bool,
     width: f64,
     bass_mono_freq: f64,
@@ -53,7 +53,7 @@ struct WidenerState {
 }
 
 impl WidenerState {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             enabled: false,
             width: 1.25,
@@ -72,7 +72,7 @@ impl WidenerState {
         self.side_lp_alpha = 1.0 - a;
     }
 
-    fn update_rate(&mut self, rate: u32) {
+    pub(crate) fn update_rate(&mut self, rate: u32) {
         if rate == 0 || rate == self.stream_rate {
             return;
         }
@@ -80,7 +80,7 @@ impl WidenerState {
         self.rebuild_filters();
     }
 
-    fn apply_config(&mut self, config: &WidenerConfig) {
+    pub(crate) fn apply_config(&mut self, config: &WidenerConfig) {
         self.enabled = config.enabled;
         self.width = (config.width.clamp(0, 200) as f64) / 100.0;
         self.bass_mono_freq = config.bass_mono_freq.clamp(40, 250) as f64;
@@ -88,7 +88,7 @@ impl WidenerState {
         self.rebuild_filters();
     }
 
-    fn process(&mut self, samples: &mut [f64], channels: usize) {
+    pub(crate) fn process(&mut self, samples: &mut [f64], channels: usize) {
         if !self.enabled || channels < 2 || samples.is_empty() {
             return;
         }

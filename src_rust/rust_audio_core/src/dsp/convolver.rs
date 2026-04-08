@@ -308,7 +308,7 @@ impl PartitionedConvolver {
 }
 
 #[derive(Debug)]
-struct ConvolverState {
+pub(crate) struct ConvolverState {
     /// Dry/wet mix gains (ramped per-sample to avoid clicks).
     dry_gain: f64,
     dry_gain_target: f64,
@@ -331,7 +331,7 @@ struct ConvolverState {
 }
 
 impl ConvolverState {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let default_rate = 44100_u32;
         let bs = block_size_for_rate(default_rate);
         Self {
@@ -363,7 +363,7 @@ impl ConvolverState {
     }
 
     /// Load new kernels, resampling to stream rate and applying pre-delay.
-    fn update_kernels(&mut self, kernel_l: Vec<f64>, kernel_r: Vec<f64>, ir_rate: Option<u32>) {
+    pub(crate) fn update_kernels(&mut self, kernel_l: Vec<f64>, kernel_r: Vec<f64>, ir_rate: Option<u32>) {
         self.ir_sample_rate = ir_rate;
         self.raw_kernel_l = kernel_l.clone();
         self.raw_kernel_r = kernel_r.clone();
@@ -384,7 +384,23 @@ impl ConvolverState {
 
     /// Called each buffer from the pad probe with the actual pipeline rate.
     /// Rebuilds the convolver if the rate has changed and IRs need resampling.
-    fn update_stream_rate(&mut self, rate: u32) {
+    pub(crate) fn apply_config(&mut self, config: &ConvolverConfig) {
+        if config.is_active() {
+            self.pre_delay_ms = config.pre_delay_ms;
+            self.update_kernels(
+                config.kernel_l.clone(),
+                config.kernel_r.clone(),
+                config.sample_rate_hz,
+            );
+            self.dry_gain_target = (1.0 - config.mix).clamp(0.0, 1.0);
+            self.wet_gain_target = config.mix.clamp(0.0, 1.0);
+        } else {
+            self.dry_gain_target = 1.0;
+            self.wet_gain_target = 0.0;
+        }
+    }
+
+    pub(crate) fn update_stream_rate(&mut self, rate: u32) {
         if rate == 0 || rate == self.stream_sample_rate {
             return;
         }
@@ -403,7 +419,7 @@ impl ConvolverState {
 
     /// Process interleaved F64LE samples in-place.
     /// Saves the dry copy, convolves, and mixes with per-sample gain ramp.
-    fn process(&mut self, samples: &mut [f64], channels: usize) {
+    pub(crate) fn process(&mut self, samples: &mut [f64], channels: usize) {
         if channels == 0 || samples.is_empty() {
             return;
         }

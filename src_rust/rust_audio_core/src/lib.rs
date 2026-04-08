@@ -3624,6 +3624,8 @@ impl Engine {
             let elem = graph.bin_element();
             self.playbin.set_property("audio-filter", &elem);
         }
+        // Push DSP config to native transport for hot-update during playback.
+        let _ = self.native_transport.update_dsp_config(&self.dsp_config);
         Ok(())
     }
 
@@ -3720,6 +3722,7 @@ impl Engine {
             }
         } else {
             self.audio_filter_rebuild_pending = true;
+            let _ = self.native_transport.update_dsp_config(&self.dsp_config);
             self.emit_event(
                 EVT_STATE,
                 &format!(
@@ -3761,6 +3764,7 @@ impl Engine {
             }
         } else {
             self.audio_filter_rebuild_pending = true;
+            let _ = self.native_transport.update_dsp_config(&self.dsp_config);
             self.emit_event(
                 EVT_STATE,
                 &format!(
@@ -4165,6 +4169,7 @@ impl Engine {
             }
         } else {
             self.audio_filter_rebuild_pending = true;
+            let _ = self.native_transport.update_dsp_config(&self.dsp_config);
             self.emit_event(
                 EVT_STATE,
                 &format!("dsp-lv2 add slot_id={slot_id} uri={uri} rebuild=0 deferred=1"),
@@ -4241,6 +4246,7 @@ impl Engine {
             }
         } else {
             self.audio_filter_rebuild_pending = true;
+            let _ = self.native_transport.update_dsp_config(&self.dsp_config);
             self.emit_event(
                 EVT_STATE,
                 &format!("dsp-lv2 remove slot_id={slot_id} rebuild=0 deferred=1"),
@@ -4277,6 +4283,7 @@ impl Engine {
             }
         } else {
             self.audio_filter_rebuild_pending = true;
+            let _ = self.native_transport.update_dsp_config(&self.dsp_config);
             self.emit_event(
                 EVT_STATE,
                 &format!(
@@ -4658,11 +4665,27 @@ impl Engine {
             source.kind(),
             source.locator()
         );
+        let dsp_active = self.dsp_config.has_active_processing();
+        let usb_cfg = active_usb_raw_sink(self).and_then(|sink| sink.config());
+        eprintln!(
+            "[native-transport] load: dsp_active={} bit_perfect={} usb_output_config={} master={} peq={} conv={} tape={} tube={} wid={} lim={} resamp={} lv2={}",
+            dsp_active, !dsp_active, usb_cfg.is_some(),
+            self.dsp_config.enabled,
+            self.dsp_config.peq.is_active(),
+            self.dsp_config.convolver.is_active(),
+            self.dsp_config.tape.is_active(),
+            self.dsp_config.tube.is_active(),
+            self.dsp_config.widener.is_active(),
+            self.dsp_config.limiter.is_active(),
+            self.dsp_config.resampler.is_active(),
+            self.dsp_config.lv2_slots.iter().any(|s| s.is_active()),
+        );
         let request = native_transport::NativeTransportLoadRequest {
             source,
             target_driver: self.output_driver.clone(),
-            bit_perfect: !self.dsp_config.has_active_processing(),
-            usb_output_config: active_usb_raw_sink(self).and_then(|sink| sink.config()),
+            bit_perfect: !dsp_active,
+            usb_output_config: usb_cfg,
+            dsp_config: if dsp_active { Some(self.dsp_config.clone()) } else { None },
         };
         self.native_eos_emitted = false;
         match self.native_transport.load(request) {

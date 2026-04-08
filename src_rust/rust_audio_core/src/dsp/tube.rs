@@ -92,7 +92,7 @@ impl Biquad {
 }
 
 #[inline]
-fn tube_saturate(x: f64, drive: f64, bias: f64) -> f64 {
+pub(crate) fn tube_saturate(x: f64, drive: f64, bias: f64) -> f64 {
     if drive < 1e-6 {
         return x;
     }
@@ -110,7 +110,7 @@ fn tube_saturate(x: f64, drive: f64, bias: f64) -> f64 {
 }
 
 #[derive(Debug)]
-struct TubeState {
+pub(crate) struct TubeState {
     enabled: bool,
     drive: f64,
     bias: f64,
@@ -122,7 +122,7 @@ struct TubeState {
 }
 
 impl TubeState {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let mut state = Self {
             enabled: false,
             drive: 0.28,
@@ -152,7 +152,7 @@ impl TubeState {
         }
     }
 
-    fn update_rate(&mut self, rate: u32) {
+    pub(crate) fn update_rate(&mut self, rate: u32) {
         if rate == 0 || rate == self.stream_rate {
             return;
         }
@@ -160,7 +160,7 @@ impl TubeState {
         self.rebuild_filters();
     }
 
-    fn apply_config(&mut self, config: &TubeConfig) {
+    pub(crate) fn apply_config(&mut self, config: &TubeConfig) {
         let new_air = config.air as f64 / 100.0;
         let needs_filter_rebuild = (new_air - self.air).abs() > 1e-9;
         self.enabled = config.enabled;
@@ -173,7 +173,7 @@ impl TubeState {
         }
     }
 
-    fn process(&mut self, samples: &mut [f64], channels: usize) {
+    pub(crate) fn process(&mut self, samples: &mut [f64], channels: usize) {
         if !self.enabled || channels == 0 || samples.is_empty() {
             return;
         }

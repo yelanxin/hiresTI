@@ -37,12 +37,13 @@ pub enum NativeTransportState {
     Shutdown,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NativeTransportLoadRequest {
     pub source: NativeTransportSource,
     pub target_driver: String,
     pub bit_perfect: bool,
     pub usb_output_config: Option<UsbRawSinkConfig>,
+    pub dsp_config: Option<crate::dsp::DspGraphConfig>,
 }
 
 #[derive(Debug)]
@@ -64,6 +65,7 @@ pub enum NativeTransportCommand {
     Pause,
     Stop,
     SeekMs(u64),
+    UpdateDspConfig(crate::dsp::DspGraphConfig),
     Shutdown,
 }
 
@@ -279,6 +281,10 @@ impl NativeTransportController {
         self.submit(NativeTransportCommand::SeekMs(position_ms))
     }
 
+    pub fn update_dsp_config(&self, config: &crate::dsp::DspGraphConfig) -> Result<(), String> {
+        self.submit(NativeTransportCommand::UpdateDspConfig(config.clone()))
+    }
+
     pub fn set_volume(&self, gain: f32) {
         self.volume.set(gain);
     }
@@ -473,6 +479,10 @@ fn transport_worker(
     let processor_chain_len = PcmProcessorChain::new().len();
     let mut current_source: Option<NativeTransportSource> = None;
     let mut current_output_config: Option<UsbRawSinkConfig> = None;
+    let mut current_dsp_config: Option<crate::dsp::DspGraphConfig> = None;
+    // Shared slot for hot-updating DSP config in the running decode worker.
+    let dsp_config_slot: super::native_dsp::SharedDspConfig =
+        Arc::new(Mutex::new(None));
     let mut decode_worker: Option<DecodeWorkerHandle> = None;
     // Early-claimed USB device handle.  Keeps the kernel driver detached so
     // PipeWire / PulseAudio cannot reclaim the device between track switches
@@ -651,6 +661,7 @@ fn transport_worker(
 
                 current_source = Some(request.source.clone());
                 current_output_config = request.usb_output_config.clone();
+                current_dsp_config = request.dsp_config.clone();
 
                 // ── Eager decode ─────────────────────────────────────────
                 // Instead of opening a separate HTTP connection just to
@@ -681,6 +692,8 @@ fn transport_worker(
                     claimed_device.take(),
                     auto_start,
                     reuse_session,
+                    current_dsp_config.clone(),
+                    Arc::clone(&dsp_config_slot),
                 ) {
                     Ok(worker) => {
                         decode_worker = Some(worker);
@@ -738,6 +751,8 @@ fn transport_worker(
                             claimed_device.take(),
                             auto_start,
                             None, // no reuse_session for Play
+                            current_dsp_config.clone(),
+                            Arc::clone(&dsp_config_slot),
                         ) {
                             Ok(worker) => {
                                 decode_worker = Some(worker);
@@ -874,6 +889,8 @@ fn transport_worker(
                             handle_for_worker,
                             auto_start,
                             seek_reuse_session,
+                            current_dsp_config.clone(),
+                            Arc::clone(&dsp_config_slot),
                         ) {
                             Ok(worker) => {
                                 decode_worker = Some(worker);
@@ -895,6 +912,17 @@ fn transport_worker(
                             }
                         }
                     }
+                }
+            }
+            NativeTransportCommand::UpdateDspConfig(new_cfg) => {
+                current_dsp_config = if new_cfg.has_active_processing() {
+                    Some(new_cfg.clone())
+                } else {
+                    None
+                };
+                // Push into shared slot so the running decode worker picks it up.
+                if let Ok(mut slot) = dsp_config_slot.lock() {
+                    *slot = Some(new_cfg);
                 }
             }
             NativeTransportCommand::Shutdown => {
@@ -1018,6 +1046,8 @@ fn start_direct_flac_decode_worker(
     pre_claimed_handle: Option<OpenUsbDevice>,
     auto_start: Arc<AtomicBool>,
     reuse_session: Option<UsbAudioSink>,
+    dsp_config: Option<crate::dsp::DspGraphConfig>,
+    dsp_config_slot: super::native_dsp::SharedDspConfig,
 ) -> Result<DecodeWorkerHandle, String> {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_clone = Arc::clone(&stop);
@@ -1045,6 +1075,8 @@ fn start_direct_flac_decode_worker(
                 pre_claimed_handle,
                 auto_start_clone,
                 reuse_session,
+                dsp_config,
+                dsp_config_slot,
             )
         })
         .map_err(|e| format!("native transport: failed to spawn decode worker: {e}"))?;
@@ -1069,6 +1101,8 @@ fn direct_flac_decode_worker(
     pre_claimed_handle: Option<OpenUsbDevice>,
     auto_start: Arc<AtomicBool>,
     reuse_session: Option<UsbAudioSink>,
+    dsp_config: Option<crate::dsp::DspGraphConfig>,
+    dsp_config_slot: super::native_dsp::SharedDspConfig,
 ) {
     queue_native_event(&events, crate::EVT_STATE, "native-transport decode-start");
     let result = decode_direct_flac_stream(
@@ -1089,6 +1123,8 @@ fn direct_flac_decode_worker(
         pre_claimed_handle,
         &auto_start,
         reuse_session,
+        dsp_config,
+        dsp_config_slot,
     );
     if let Ok(mut state) = snapshot.lock() {
         if state.generation != generation {
@@ -1160,6 +1196,8 @@ fn decode_direct_flac_stream(
     pre_claimed_handle: Option<OpenUsbDevice>,
     auto_start: &Arc<AtomicBool>,
     reuse_session: Option<UsbAudioSink>,
+    dsp_config: Option<crate::dsp::DspGraphConfig>,
+    dsp_config_slot: super::native_dsp::SharedDspConfig,
 ) -> Result<(), String> {
     let mss = open_source_as_media_source_stream(source, stop)?;
     let mut hint = Hint::new();
@@ -1265,6 +1303,17 @@ fn decode_direct_flac_stream(
     };
 
     let mut processor_chain = PcmProcessorChain::new();
+    // Always insert DspPcmProcessor so DSP can be hot-enabled/disabled mid-track.
+    {
+        let init_cfg = dsp_config.as_ref().cloned().unwrap_or_default();
+        eprintln!(
+            "[native-transport] inserting DspPcmProcessor (active={})",
+            init_cfg.has_active_processing()
+        );
+        processor_chain.push(Box::new(
+            super::native_dsp::DspPcmProcessor::new(&init_cfg, Some(Arc::clone(&dsp_config_slot))),
+        ));
+    }
     processor_chain.push(Box::new(VolumePcmProcessor::new(volume)));
     processor_chain.push(Box::new(SpectrumPcmProcessor::new(spectrum_tx, spectrum_bands)));
     processor_chain.push(Box::new(LufsPcmProcessor::new(lufs_values)));
@@ -2522,6 +2571,7 @@ mod tests {
             target_driver: "USB Rawlink v2".to_string(),
             bit_perfect: true,
             usb_output_config: None,
+            dsp_config: None,
         };
         controller.load(request).unwrap();
         wait_until(&controller, |snapshot| snapshot.state == NativeTransportState::Ready);
@@ -2553,6 +2603,7 @@ mod tests {
             target_driver: "USB Rawlink v2".to_string(),
             bit_perfect: true,
             usb_output_config: None,
+            dsp_config: None,
         };
         controller.load(request).unwrap();
         wait_until(&controller, |snapshot| snapshot.state == NativeTransportState::Ready);
@@ -2582,6 +2633,7 @@ mod tests {
             target_driver: "USB Rawlink v2".to_string(),
             bit_perfect: true,
             usb_output_config: None,
+            dsp_config: None,
         };
         controller.load(request).unwrap();
         wait_until(&controller, |snapshot| snapshot.state == NativeTransportState::Ready);
@@ -2613,6 +2665,7 @@ mod tests {
             target_driver: "USB Rawlink v2".to_string(),
             bit_perfect: true,
             usb_output_config: None,
+            dsp_config: None,
         };
         controller.load(request).unwrap();
         wait_until(&controller, |snapshot| snapshot.state == NativeTransportState::Ready);
@@ -2647,6 +2700,7 @@ mod tests {
             target_driver: "USB Rawlink v2".to_string(),
             bit_perfect: true,
             usb_output_config: None,
+            dsp_config: None,
         };
         controller.load(request).unwrap();
         wait_until(&controller, |snapshot| snapshot.state == NativeTransportState::Ready);
