@@ -3,7 +3,7 @@ set -euo pipefail
 
 # ================= 配置区域 =================
 APP_NAME="hiresti"
-APP_ID="com.hiresti.player"  # [新增] 必须与 main.py 中的 application_id 一致
+APP_ID="com.hiresti.player"
 DISPLAY_NAME="HiresTI"
 MAINTAINER="Eason <yelanxin@gmail.com>"
 DESCRIPTION="High-Res Tidal Player for Linux with Bit-Perfect support."
@@ -11,38 +11,54 @@ LICENSE="GPL-3.0"
 URL="https://github.com/yourrepo/hiresti"
 # ===========================================
 
+# ---- Supported targets ----
+# Each entry: TARGET_NAME  BASE_IMAGE  DISTRO_FAMILY  PKG_TYPE  SUFFIX
+TARGETS=(
+    "ubuntu2404   ubuntu:24.04          deb   deb   ubuntu2404"
+    "debian12     debian:12             deb   deb   debian12"
+    "debian13     debian:13             deb   deb   debian13"
+    "fedora43     fedora:43             rpm   rpm-fedora   fedora43"
+    "fedora44     fedora:44             rpm   rpm-fedora   fedora44"
+    "archlinux    archlinux:latest      arch  arch  archlinux"
+)
+
 TYPE="${1:-}"
 VERSION="${2:-}"
 USE_PY_BINARY="${HIRESTI_PY_BINARY:-0}"
 
-# Compute DEB architecture string (e.g. amd64, arm64)
+# ---- Usage ----
+print_usage() {
+    echo "Usage: ./package.sh <target> <version>"
+    echo ""
+    echo "Local targets (build on this machine):"
+    echo "  deb             Build .deb using host toolchain"
+    echo "  rpm-fedora      Build Fedora .rpm using host toolchain"
+    echo "  arch            Build Arch .pkg.tar.zst using host toolchain"
+    echo ""
+    echo "Docker targets (build inside container for correct GLIBC):"
+    echo "  ubuntu2404      Ubuntu 24.04 .deb"
+    echo "  debian12        Debian 12 .deb"
+    echo "  debian13        Debian 13 .deb"
+    echo "  fedora43        Fedora 43 .rpm"
+    echo "  fedora44        Fedora 44 .rpm"
+    echo "  archlinux       Arch Linux .pkg.tar.zst"
+    echo "  all             Build all Docker targets"
+    echo ""
+    echo "Example: ./package.sh ubuntu2404 1.9.0beta1"
+    echo "         ./package.sh all 1.9.0beta1"
+}
+
+if [ -z "$TYPE" ] || [ -z "$VERSION" ]; then
+    print_usage
+    exit 1
+fi
+
+# Compute DEB architecture string
 if command -v dpkg-deb &>/dev/null; then
     DEB_ARCH="$(dpkg --print-architecture)"
 else
     DEB_ARCH="$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"
 fi
-
-if [ -z "$TYPE" ] || [ -z "$VERSION" ]; then
-    echo "Usage: ./package.sh [deb|rpm|rpm-fedora|rpm-el9|arch|all] [version]"
-    echo "Example: ./package.sh all 1.0.0"
-    exit 1
-fi
-
-if [[ "$TYPE" == "deb" || "$TYPE" == "all" ]] && ! command -v dpkg-deb &> /dev/null; then
-    echo "Error: 'dpkg-deb' is required."
-    exit 1
-fi
-
-if [[ "$TYPE" == "rpm" || "$TYPE" == "rpm-fedora" || "$TYPE" == "rpm-el9" || "$TYPE" == "all" ]] && ! command -v rpmbuild &> /dev/null; then
-    echo "Error: 'rpmbuild' is required."
-    exit 1
-fi
-
-if [[ "$TYPE" == "arch" || "$TYPE" == "all" ]] && ! command -v zstd &> /dev/null; then
-    echo "Error: 'zstd' is required for Arch package build."
-    exit 1
-fi
-
 
 echo "🚀 Starting build process for $APP_NAME v$VERSION ($TYPE)..."
 if [ "$USE_PY_BINARY" == "1" ]; then
@@ -55,6 +71,99 @@ fi
 echo "$VERSION" > version.txt
 echo "🧾 Version file updated: version.txt -> $VERSION"
 
+
+# ====================================================================
+#  Docker-based builds
+# ====================================================================
+
+find_target() {
+    local name="$1"
+    for t in "${TARGETS[@]}"; do
+        local fields=($t)
+        if [ "${fields[0]}" = "$name" ]; then
+            echo "$t"
+            return 0
+        fi
+    done
+    return 1
+}
+
+docker_build_target() {
+    local target_name="$1"
+    local target_line
+    target_line="$(find_target "$target_name")" || {
+        echo "Error: unknown target '$target_name'"
+        exit 1
+    }
+    local fields=($target_line)
+    local base_image="${fields[1]}"
+    local distro_family="${fields[2]}"
+    local pkg_type="${fields[3]}"
+    local suffix="${fields[4]}"
+    local image_tag="hiresti-builder-${target_name}"
+
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "  Building: $target_name ($base_image)"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    docker build -t "$image_tag" \
+        --build-arg BASE_IMAGE="$base_image" \
+        --build-arg DISTRO_FAMILY="$distro_family" \
+        --build-arg DISTRO_ID="$target_name" \
+        -f Dockerfile.build . || {
+        echo "❌ Docker image build failed for $target_name"
+        return 1
+    }
+
+    mkdir -p dist
+
+    docker run --rm \
+        -v "$(pwd)/dist:/output" \
+        -e VERSION="$VERSION" \
+        -e PKG_TYPE="$pkg_type" \
+        -e PKG_SUFFIX="$suffix" \
+        "$image_tag" || {
+        echo "❌ Package build failed for $target_name"
+        return 1
+    }
+
+    echo "✅ $target_name build complete"
+}
+
+# Handle Docker targets
+case "$TYPE" in
+    ubuntu2404|debian12|debian13|fedora43|fedora44|archlinux)
+        docker_build_target "$TYPE"
+        echo ""
+        echo "🎉 Build Complete! Packages in dist/:"
+        ls -lh dist/ 2>/dev/null
+        exit 0
+        ;;
+    all)
+        failed=()
+        for t in "${TARGETS[@]}"; do
+            local_fields=($t)
+            target_name="${local_fields[0]}"
+            docker_build_target "$target_name" || failed+=("$target_name")
+        done
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        if [ ${#failed[@]} -eq 0 ]; then
+            echo "🎉 All builds complete! Packages in dist/:"
+        else
+            echo "⚠️  Builds complete with failures: ${failed[*]}"
+            echo "Successful packages in dist/:"
+        fi
+        ls -lh dist/ 2>/dev/null
+        exit 0
+        ;;
+esac
+
+
+# ====================================================================
+#  Local builds (deb / rpm-fedora / arch) — no Docker
+# ====================================================================
 
 # Preflight checks
 for required in src/main.py src/ui src/actions src/viz icons/hicolor; do
@@ -81,8 +190,7 @@ mkdir -p "$APP_DIR"
 mkdir -p "$SYSTEM_ICON_DIR"
 mkdir -p "$UDEV_DIR"
 
-# udev rule: grant logged-in user access to USB audio devices (USB Rawlink mode)
-# TAG+="uaccess" only grants access to the current session user (via systemd-logind ACL), not world.
+# udev rule
 cat <<'UDEV_EOF' > "$UDEV_DIR/99-hiresti-usb-audio.rules"
 # HiresTI USB Rawlink - grant logged-in user access to USB audio devices
 SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ENV{ID_USB_INTERFACES}=="*:01????:*", TAG+="uaccess"
@@ -90,9 +198,7 @@ UDEV_EOF
 
 # 2. 复制源文件
 echo "📂 Copying source files..."
-# Copy main.py and new directory structure (src/)
 cp -r src/* "$INSTALL_DIR/"
-# Note: Rust .so files are copied separately below (see sections 2.1 and 2.2)
 if [ -f "version.txt" ]; then cp version.txt "$INSTALL_DIR/"; fi
 cp -r icons "$INSTALL_DIR/"
 if [ -d "css" ]; then cp -r css "$INSTALL_DIR/"; fi
@@ -118,8 +224,15 @@ if [ "$USE_PY_BINARY" == "1" ]; then
     echo "✅ Bundled Python binary: $INSTALL_DIR/hiresti_app/hiresti_app"
 fi
 
-# 2.1 构建并打包 Rust 可视化核心动态库（libviz_core.so）
-if [ -f "src_rust/rust_viz_core/Cargo.toml" ]; then
+# 2.1 构建并打包 Rust 可视化核心动态库
+# Docker builds pre-compile Rust into rust_out/; use those if available.
+PREBUILT_DIR="rust_out"
+RUST_SO="${PREBUILT_DIR}/libviz_core.so"
+if [ -f "$RUST_SO" ]; then
+    echo "✅ Using pre-built Rust visualizer core"
+    mkdir -p "$INSTALL_DIR/src_rust/rust_viz_core/target/release"
+    cp "$RUST_SO" "$INSTALL_DIR/src_rust/rust_viz_core/target/release/"
+elif [ -f "src_rust/rust_viz_core/Cargo.toml" ]; then
     if command -v cargo &> /dev/null; then
         echo "🦀 Building Rust visualizer core..."
         cargo build --manifest-path src_rust/rust_viz_core/Cargo.toml --release
@@ -136,8 +249,13 @@ if [ -f "src_rust/rust_viz_core/Cargo.toml" ]; then
     fi
 fi
 
-# 2.2 构建并打包 Rust 音频核心动态库（librust_audio_core.so）
-if [ -f "src_rust/rust_audio_core/Cargo.toml" ]; then
+# 2.2 构建并打包 Rust 音频核心动态库
+RUST_AUDIO_SO="${PREBUILT_DIR}/librust_audio_core.so"
+if [ -f "$RUST_AUDIO_SO" ]; then
+    echo "✅ Using pre-built Rust audio core"
+    mkdir -p "$INSTALL_DIR/src_rust/rust_audio_core/target/release"
+    cp "$RUST_AUDIO_SO" "$INSTALL_DIR/src_rust/rust_audio_core/target/release/"
+elif [ -f "src_rust/rust_audio_core/Cargo.toml" ]; then
     if command -v cargo &> /dev/null; then
         echo "🦀 Building Rust audio core..."
         cargo build --manifest-path src_rust/rust_audio_core/Cargo.toml --release
@@ -154,10 +272,9 @@ if [ -f "src_rust/rust_audio_core/Cargo.toml" ]; then
     fi
 fi
 
-# 2.3 构建 Rust 启动器（/usr/bin/hiresti）
-# 注意：EL9 和 DEB 使用 shell 脚本，因为 Rust launcher 编译环境 glibc 版本可能与目标系统不兼容
-if [[ "$TYPE" == "rpm-el9" || "$TYPE" == "el9" || "$TYPE" == "deb" || "$TYPE" == "all" ]]; then
-    # For EL9 and DEB, use a shell script wrapper for better compatibility
+# 2.3 构建启动器
+RUST_LAUNCHER="${PREBUILT_DIR}/${APP_NAME}"
+if [[ "$TYPE" == "deb" ]]; then
     cat <<'WRAPPER' > "$BIN_DIR/$APP_NAME"
 #!/bin/bash
 APP_DIR="/usr/share/hiresti"
@@ -166,6 +283,10 @@ PYTHONPATH="$APP_DIR/libs:$APP_DIR" python3 main.py "$@"
 WRAPPER
     chmod +x "$BIN_DIR/$APP_NAME"
     echo "✅ Installed shell launcher: /usr/bin/$APP_NAME"
+elif [ -f "$RUST_LAUNCHER" ]; then
+    echo "✅ Using pre-built Rust launcher"
+    cp "$RUST_LAUNCHER" "$BIN_DIR/$APP_NAME"
+    chmod +x "$BIN_DIR/$APP_NAME"
 elif [ -f "src_rust/rust_launcher/Cargo.toml" ]; then
     if command -v cargo &> /dev/null; then
         echo "🦀 Building Rust launcher..."
@@ -189,7 +310,6 @@ fi
 
 # 3. 处理图标
 echo "🎨 Installing icons..."
-# 这里的逻辑是：把图标名字也统一改为 hiresti，方便 .desktop 引用
 if [ -d "icons/hicolor" ]; then
     cp -r icons/hicolor "$SYSTEM_ICON_DIR/"
 elif [ -f "icon.svg" ]; then
@@ -199,7 +319,6 @@ elif [ -f "icons/icon.png" ]; then
     mkdir -p "$SYSTEM_ICON_DIR/hicolor/256x256/apps"
     cp icons/icon.png "$SYSTEM_ICON_DIR/hicolor/256x256/apps/$APP_NAME.png"
 else
-    # Fallback
     if [ -f "icon.png" ]; then
          mkdir -p "$SYSTEM_ICON_DIR/hicolor/256x256/apps"
          cp icon.png "$SYSTEM_ICON_DIR/hicolor/256x256/apps/$APP_NAME.png"
@@ -209,33 +328,21 @@ fi
 # 4. 捆绑依赖
 echo "📦 Bundling Python dependencies..."
 mkdir -p "$INSTALL_DIR/libs"
-if ! pip3 install tidalapi requests urllib3 PyOpenGL pystray pillow qrcode python-dateutil typing-extensions isodate mpegdash pyaes ratelimit six setproctitle -t "$INSTALL_DIR/libs" --no-cache-dir --upgrade; then
-    echo "⚠️ Online dependency install failed, using local site-packages fallback..."
-    python3 - "$INSTALL_DIR/libs" <<'PY'
+if ! pip3 install tidalapi requests urllib3 PyOpenGL pystray pillow qrcode python-dateutil typing-extensions isodate mpegdash pyaes ratelimit six setproctitle -t "$INSTALL_DIR/libs" --no-cache-dir --upgrade 2>/dev/null; then
+    # Try with --break-system-packages for newer pip
+    if ! pip3 install --break-system-packages tidalapi requests urllib3 PyOpenGL pystray pillow qrcode python-dateutil typing-extensions isodate mpegdash pyaes ratelimit six setproctitle -t "$INSTALL_DIR/libs" --no-cache-dir --upgrade 2>/dev/null; then
+        echo "⚠️ Online dependency install failed, using local site-packages fallback..."
+        python3 - "$INSTALL_DIR/libs" <<'PY'
 import os
 import shutil
 import sys
-import sysconfig
 from importlib.util import find_spec
 
 target = sys.argv[1]
 modules = [
-    "tidalapi",
-    "requests",
-    "urllib3",
-    "OpenGL",
-    "qrcode",
-    "PIL",
-    "certifi",
-    "idna",
-    "charset_normalizer",
-    "dateutil",
-    "typing_extensions",
-    "isodate",
-    "mpegdash",
-    "pyaes",
-    "ratelimit",
-    "six",
+    "tidalapi", "requests", "urllib3", "OpenGL", "qrcode", "PIL",
+    "certifi", "idna", "charset_normalizer", "dateutil",
+    "typing_extensions", "isodate", "mpegdash", "pyaes", "ratelimit", "six",
 ]
 
 def copy_path(src, dst_root):
@@ -262,34 +369,71 @@ for mod in modules:
         src = spec.origin
     if copy_path(src, target):
         copied.append(mod)
-
 print("Copied local modules:", ", ".join(copied) if copied else "(none)")
 PY
+    fi
 fi
 
-# 兼容 RPM shebang 严格检查：避免 /usr/bin/env python 触发 brp-mangle-shebangs 报错
+# 兼容 RPM shebang 严格检查
 while IFS= read -r f; do
     sed -i '1s|^#!/usr/bin/env python$|#!/usr/bin/env python3|' "$f"
 done < <(grep -RIl '^#!/usr/bin/env python$' "$INSTALL_DIR/libs" || true)
 
-# 5. [关键修改] 创建 .desktop 文件
-# 文件名必须是 APP_ID.desktop (com.hiresti.player.desktop)
+# 5. 创建 .desktop 文件
 echo "🖥️ Creating desktop entry..."
 cat <<EOF > "$APP_DIR/$APP_ID.desktop"
 [Desktop Entry]
 Name=$DISPLAY_NAME
 Comment=$DESCRIPTION
 Exec=/usr/bin/$APP_NAME
-# 图标名称对应 /usr/share/icons/.../hiresti.png
 Icon=$APP_NAME
 Terminal=false
 Type=Application
 Categories=AudioVideo;Audio;Player;Music;
-# 这里的 StartupWMClass 用于 X11 兼容，必须匹配 GLib.set_prgname 设置的值
 StartupWMClass=$DISPLAY_NAME
 EOF
 
+
+# ================= 输出包名后缀 =================
+# 容器内构建时，PKG_SUFFIX 从环境变量传入
+PKG_SUFFIX="${PKG_SUFFIX:-}"
+
 # ================= 分支处理 =================
+
+build_deb() {
+    echo "📦 Building .deb package..."
+    mkdir -p "$BUILD_ROOT/DEBIAN"
+    cat <<EOF > "$BUILD_ROOT/DEBIAN/control"
+Package: $APP_NAME
+Version: $VERSION
+Section: sound
+Priority: optional
+Architecture: $DEB_ARCH
+Depends: python3, python3-gi, python3-gi-cairo, python3-cairo, python3-opengl, python3-dateutil, python3-typing-extensions, python3-isodate, python3-setproctitle, gir1.2-gtk-4.0, gir1.2-adw-1, gir1.2-gtksource-4, qrencode, python3-gst-1.0, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-plugins-ugly, libpipewire-0.3-0, libpulse0
+Maintainer: $MAINTAINER
+Description: $DESCRIPTION
+ $DISPLAY_NAME is a desktop client for Tidal focusing on High-Res audio.
+EOF
+    cat <<'POSTINST_EOF' > "$BUILD_ROOT/DEBIAN/postinst"
+#!/bin/sh
+set -e
+if [ "$1" = "configure" ]; then
+    udevadm control --reload-rules 2>/dev/null || true
+    udevadm trigger --subsystem-match=usb 2>/dev/null || true
+fi
+exit 0
+POSTINST_EOF
+    chmod 755 "$BUILD_ROOT/DEBIAN/postinst"
+    mkdir -p dist
+
+    if [ -n "$PKG_SUFFIX" ]; then
+        local deb_name="${APP_NAME}_${VERSION}_${DEB_ARCH}_${PKG_SUFFIX}.deb"
+    else
+        local deb_name="${APP_NAME}_${VERSION}_${DEB_ARCH}.deb"
+    fi
+    dpkg-deb --build "$BUILD_ROOT" "dist/${deb_name}"
+    echo "✅ DEB created: dist/${deb_name}"
+}
 
 build_rpm_variant() {
     local variant="$1"
@@ -343,8 +487,18 @@ EOF
         --define "dist .${dist_tag}"
 
     mkdir -p dist
-    mv "$rpm_build_root"/RPMS/"$arch"/${APP_NAME}-${VERSION}-1*.${arch}.rpm "dist/"
-    echo "✅ RPM created (${variant})."
+    if [ -n "$PKG_SUFFIX" ]; then
+        for rpm_file in "$rpm_build_root"/RPMS/"$arch"/${APP_NAME}-${VERSION}-1*.${arch}.rpm; do
+            local base
+            base="$(basename "$rpm_file")"
+            local newname="${base%.rpm}_${PKG_SUFFIX}.rpm"
+            mv "$rpm_file" "dist/${newname}"
+            echo "✅ RPM created: dist/${newname}"
+        done
+    else
+        mv "$rpm_build_root"/RPMS/"$arch"/${APP_NAME}-${VERSION}-1*.${arch}.rpm "dist/"
+        echo "✅ RPM created (${variant})."
+    fi
 }
 
 build_arch_package() {
@@ -352,7 +506,6 @@ build_arch_package() {
     arch="$(uname -m)"
     pkg_rel="1"
     pkg_ver_rel="${VERSION}-${pkg_rel}"
-    pkg_file="dist/${APP_NAME}-${pkg_ver_rel}-${arch}.pkg.tar.zst"
     pkg_root="$(pwd)/build_archpkg/pkgroot"
 
     rm -rf "$(pwd)/build_archpkg"
@@ -398,94 +551,38 @@ post_upgrade() {
 }
 INSTALL_EOF
 
+    if [ -n "$PKG_SUFFIX" ]; then
+        pkg_file="dist/${APP_NAME}-${pkg_ver_rel}-${arch}_${PKG_SUFFIX}.pkg.tar.zst"
+    else
+        pkg_file="dist/${APP_NAME}-${pkg_ver_rel}-${arch}.pkg.tar.zst"
+    fi
+
     mkdir -p dist
     tar --sort=name --mtime="@$build_ts" --owner=0 --group=0 --numeric-owner \
         -C "$pkg_root" -I 'zstd -19 -T0' -cf "$pkg_file" .PKGINFO .INSTALL usr
-    echo "✅ Arch package created."
+    echo "✅ Arch package created: $pkg_file"
 }
 
 
-if [ "$TYPE" == "deb" ]; then
-    echo "📦 Building .deb package..."
-    mkdir -p "$BUILD_ROOT/DEBIAN"
-    cat <<EOF > "$BUILD_ROOT/DEBIAN/control"
-Package: $APP_NAME
-Version: $VERSION
-Section: sound
-Priority: optional
-Architecture: $DEB_ARCH
-Depends: python3, python3-gi, python3-gi-cairo, python3-cairo, python3-opengl, python3-dateutil, python3-typing-extensions, python3-isodate, python3-setproctitle, gir1.2-gtk-4.0, gir1.2-adw-1, gir1.2-gtksource-4, qrencode, python3-gst-1.0, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-plugins-ugly, libpipewire-0.3-0, libpulse0
-Maintainer: $MAINTAINER
-Description: $DESCRIPTION
- $DISPLAY_NAME is a desktop client for Tidal focusing on High-Res audio.
-EOF
-    cat <<'POSTINST_EOF' > "$BUILD_ROOT/DEBIAN/postinst"
-#!/bin/sh
-set -e
-if [ "$1" = "configure" ]; then
-    udevadm control --reload-rules 2>/dev/null || true
-    udevadm trigger --subsystem-match=usb 2>/dev/null || true
-fi
-exit 0
-POSTINST_EOF
-    chmod 755 "$BUILD_ROOT/DEBIAN/postinst"
-    mkdir -p dist
-    dpkg-deb --build "$BUILD_ROOT" "dist/${APP_NAME}_${VERSION}_${DEB_ARCH}.deb"
-    echo "✅ DEB created."
+# ---- Dispatch local builds ----
+FEDORA_REQUIRES="python3, python3-gobject, python3-cairo, python3-pyopengl, python3-setproctitle, gtk4, libadwaita, gstreamer1-plugins-base, gstreamer1-plugins-good, gstreamer1-plugins-bad-free, gstreamer1-plugins-ugly-free"
 
-elif [ "$TYPE" == "rpm" ]; then
-    echo "📦 Building Fedora + EL9 RPM packages..."
-    build_rpm_variant "fedora" "fedora" "python3, python3-gobject, python3-cairo, python3-pyopengl, python3-setproctitle, gtk4, libadwaita, gstreamer1-plugins-base, gstreamer1-plugins-good, gstreamer1-plugins-bad-free, gstreamer1-plugins-ugly-free"
-    build_rpm_variant "el9" "el9" "python3, python3-gobject, python3-cairo, python3-pyopengl, python3-setproctitle, gtk4, libadwaita, gstreamer1-plugins-base, gstreamer1-plugins-good, gstreamer1-plugins-bad-free, gstreamer1-plugins-ugly-free"
-elif [ "$TYPE" == "rpm-fedora" ]; then
-    echo "📦 Building Fedora RPM package..."
-    build_rpm_variant "fedora" "fedora" "python3, python3-gobject, python3-cairo, python3-pyopengl, python3-setproctitle, gtk4, libadwaita, gstreamer1-plugins-base, gstreamer1-plugins-good, gstreamer1-plugins-bad-free, gstreamer1-plugins-ugly-free"
-elif [ "$TYPE" == "rpm-el9" ]; then
-    echo "📦 Building EL9 RPM package..."
-    build_rpm_variant "el9" "el9" "python3, python3-gobject, python3-cairo, python3-pyopengl, python3-setproctitle, gtk4, libadwaita, gstreamer1-plugins-base, gstreamer1-plugins-good, gstreamer1-plugins-bad-free, gstreamer1-plugins-ugly-free"
-elif [ "$TYPE" == "arch" ]; then
-    echo "📦 Building Arch package..."
-    build_arch_package
-elif [ "$TYPE" == "all" ]; then
-    echo "📦 Building DEB package..."
-    mkdir -p "$BUILD_ROOT/DEBIAN"
-    cat <<EOF > "$BUILD_ROOT/DEBIAN/control"
-Package: $APP_NAME
-Version: $VERSION
-Section: sound
-Priority: optional
-Architecture: $DEB_ARCH
-Depends: python3, python3-gi, python3-gi-cairo, python3-cairo, python3-opengl, python3-dateutil, python3-typing-extensions, python3-isodate, python3-setproctitle, gir1.2-gtk-4.0, gir1.2-adw-1, gir1.2-gtksource-4, qrencode, python3-gst-1.0, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-plugins-ugly, libpipewire-0.3-0, libpulse0
-Maintainer: $MAINTAINER
-Description: $DESCRIPTION
- $DISPLAY_NAME is a desktop client for Tidal focusing on High-Res audio.
-EOF
-    cat <<'POSTINST_EOF' > "$BUILD_ROOT/DEBIAN/postinst"
-#!/bin/sh
-set -e
-if [ "$1" = "configure" ]; then
-    udevadm control --reload-rules 2>/dev/null || true
-    udevadm trigger --subsystem-match=usb 2>/dev/null || true
-fi
-exit 0
-POSTINST_EOF
-    chmod 755 "$BUILD_ROOT/DEBIAN/postinst"
-    mkdir -p dist
-    dpkg-deb --build "$BUILD_ROOT" "dist/${APP_NAME}_${VERSION}_${DEB_ARCH}.deb"
-    echo "✅ DEB created."
-
-    # Remove DEBIAN metadata before RPM build to avoid unpackaged-file errors.
-    rm -rf "$BUILD_ROOT/DEBIAN"
-
-    echo "📦 Building Fedora + EL9 RPM packages..."
-    build_rpm_variant "fedora" "fedora" "python3, python3-gobject, python3-cairo, python3-pyopengl, python3-setproctitle, gtk4, libadwaita, gstreamer1-plugins-base, gstreamer1-plugins-good, gstreamer1-plugins-bad-free, gstreamer1-plugins-ugly-free"
-    build_rpm_variant "el9" "el9" "python3, python3-gobject, python3-cairo, python3-pyopengl, python3-setproctitle, gtk4, libadwaita, gstreamer1-plugins-base, gstreamer1-plugins-good, gstreamer1-plugins-bad-free, gstreamer1-plugins-ugly-free"
-    echo "📦 Building Arch package..."
-    build_arch_package
-else
-    echo "Error: unsupported type '$TYPE'. Use deb | rpm | rpm-fedora | rpm-el9 | arch | all"
-    exit 1
-fi
+case "$TYPE" in
+    deb)
+        build_deb
+        ;;
+    rpm-fedora)
+        build_rpm_variant "fedora" "fedora" "$FEDORA_REQUIRES"
+        ;;
+    arch)
+        build_arch_package
+        ;;
+    *)
+        echo "Error: unsupported local type '$TYPE'. Use deb | rpm-fedora | arch"
+        echo "  Or use a Docker target: ubuntu2204 | ubuntu2404 | debian12 | debian13 | fedora43 | fedora44 | archlinux | all"
+        exit 1
+        ;;
+esac
 
 rm -rf "$BUILD_ROOT"
 echo "🎉 Build Complete!"

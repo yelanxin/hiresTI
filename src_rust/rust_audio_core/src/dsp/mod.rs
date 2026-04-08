@@ -329,7 +329,7 @@ impl DspGraphRuntime {
                 node.apply_config(&config.peq)?;
                 Some(node)
             }
-            Err(err) if !config.has_active_processing() => None,
+            Err(_) if !config.has_active_processing() => None,
             Err(err) => return Err(err),
         };
         let convolver = match ConvolverNode::new() {
@@ -337,7 +337,7 @@ impl DspGraphRuntime {
                 node.apply_config(&config.effective_convolver_config())?;
                 Some(node)
             }
-            Err(err) if !config.convolver.is_active() => None,
+            Err(_) if !config.convolver.is_active() => None,
             Err(err) => return Err(err),
         };
         let tape = match TapeNode::new() {
@@ -345,7 +345,7 @@ impl DspGraphRuntime {
                 node.apply_config(&config.effective_tape_config())?;
                 Some(node)
             }
-            Err(err) if !config.tape.is_active() => None,
+            Err(_) if !config.tape.is_active() => None,
             Err(err) => return Err(err),
         };
         let tube = match TubeNode::new() {
@@ -353,7 +353,7 @@ impl DspGraphRuntime {
                 node.apply_config(&config.effective_tube_config())?;
                 Some(node)
             }
-            Err(err) if !config.tube.is_active() => None,
+            Err(_) if !config.tube.is_active() => None,
             Err(err) => return Err(err),
         };
         let widener = match WidenerNode::new() {
@@ -361,7 +361,7 @@ impl DspGraphRuntime {
                 node.apply_config(&config.effective_widener_config())?;
                 Some(node)
             }
-            Err(err) if !config.widener.is_active() => None,
+            Err(_) if !config.widener.is_active() => None,
             Err(err) => return Err(err),
         };
         let limiter = match LimiterNode::new() {
@@ -369,7 +369,7 @@ impl DspGraphRuntime {
                 node.apply_config(&config.effective_limiter_config())?;
                 Some(node)
             }
-            Err(err) if !config.limiter.is_active() => None,
+            Err(_) if !config.limiter.is_active() => None,
             Err(err) => return Err(err),
         };
         let resampler = match ResamplerNode::new() {
@@ -377,7 +377,7 @@ impl DspGraphRuntime {
                 node.apply_config(&config.effective_resampler_config())?;
                 Some(node)
             }
-            Err(err) if !config.resampler.is_active() => None,
+            Err(_) if !config.resampler.is_active() => None,
             Err(err) => return Err(err),
         };
 

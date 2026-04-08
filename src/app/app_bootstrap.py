@@ -357,12 +357,16 @@ def do_activate(self):
         ]
 
     # 如果保存的是 ALSA 或其他驱动，先尝试选中
+    # Suppress the signal so on_driver_changed doesn't fire now —
+    # it will be called explicitly via GLib.idle_add below.
+    self.ignore_driver_change = True
     if saved_drv in drivers:
         try:
             idx = drivers.index(saved_drv)
             self.driver_dd.set_selected(idx)
         except Exception as e:
             logger.warning("Failed to restore saved driver selection '%s': %s", saved_drv, e)
+    self.ignore_driver_change = False
     _startup_mark("driver-selection-restored")
 
     # Defer heavy output initialization until after first frame is presented.
