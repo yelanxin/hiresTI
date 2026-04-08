@@ -660,6 +660,9 @@ impl UsbAudioSink {
         // 2. Drop feedback reader (frees its libusb_transfer).  Safe now
         //    because the event thread is no longer running.
         self._feedback = None;
+        // Clear the stale pointer so the old ring's Drop doesn't try to
+        // cancel an already-freed transfer (use-after-free).
+        self.ring.feedback_xfer = None;
         // 3. Free ring's libusb transfer objects while the context is
         //    quiescent.  This prevents the later `self.ring = ring` drop
         //    from freeing them while the NEW event thread is running.
@@ -744,6 +747,89 @@ impl UsbAudioSink {
         self.ring = ring;
         self._feedback = feedback;
         self.started = true;
+
+        Ok(())
+    }
+
+    /// Prepare the sink for reuse by a new track **without starting playback**.
+    ///
+    /// Stops the ISO ring, clears the queue, reconfigures alt-setting + rate if
+    /// needed, and creates a fresh transfer ring — but does **not** start it.
+    /// The caller is expected to push audio data and then call `ensure_started()`
+    /// (or let `push_slab_to_usb_output` handle it via the `auto_start` flag).
+    ///
+    /// This keeps the USB handle open continuously, preventing the kernel driver
+    /// (snd-usb-audio) from reattaching and resetting the DAC PLL.
+    pub fn prepare_for_reuse(
+        &mut self,
+        rate: u32,
+        bit_depth: u8,
+    ) -> Result<(), String> {
+        // 1. Stop ring — cancels all ISO transfers, joins event thread.
+        self.ring.stop();
+        // 2. Drop feedback reader (frees its libusb_transfer).
+        self._feedback = None;
+        // Clear the stale pointer so the old ring's Drop doesn't try to
+        // cancel an already-freed transfer (use-after-free).
+        self.ring.feedback_xfer = None;
+        // 3. Free ring's libusb transfer objects while context is quiescent.
+        self.ring.free_transfers();
+
+        // 4. Fresh queue.
+        let queue = ProducerQueue::bytes();
+
+        // 5. Reset alt-setting to 0 — tears down the isochronous endpoint so
+        //    the DAC firmware properly resets its clock domain.  Without this,
+        //    some DACs (NXP/Rawlink v2) reject SET_CUR when switching rates
+        //    while the same alt-setting stays active.
+        {
+            let mut open_dev = self._open_dev.lock().unwrap_or_else(|e| e.into_inner());
+            let si = open_dev.dev.stream_iface;
+            let _ = open_dev.handle.set_alternate_setting(si, 0);
+            open_dev.active_alt = None;
+            open_dev.active_rate = 0;
+            eprintln!("usb-audio: prepare_for_reuse — alt reset to 0 (si={})", si);
+        }
+
+        // 6. Reconfigure device (alt-setting + rate) — reuses claimed interface.
+        let (alt, actual_rate, dev_handle_raw, ctx_raw, is_high_speed) = {
+            let mut open_dev = self._open_dev.lock().unwrap_or_else(|e| e.into_inner());
+            let alt = open_dev
+                .best_alt(rate, bit_depth)
+                .ok_or_else(|| {
+                    format!(
+                        "no alt-setting for rate={} bit_depth={} on prepare_for_reuse",
+                        rate, bit_depth
+                    )
+                })?
+                .clone();
+            open_dev.configure(&alt, rate)?;
+            (
+                alt,
+                open_dev.active_rate,
+                open_dev.handle.as_raw(),
+                open_dev.handle.context().as_raw(),
+                open_dev.dev.is_high_speed,
+            )
+        };
+        eprintln!(
+            "usb-audio: prepare_for_reuse requested_rate={} actual_rate={} bit_depth={} channels={}",
+            rate, actual_rate, bit_depth, alt.channels
+        );
+        let state = Self::build_ring_state(&queue, &self.feed, actual_rate, &alt, is_high_speed);
+        self.feed.invalidate();
+
+        // 7. Create new ring but do NOT start it — deferred start via ensure_started().
+        let ring =
+            IsoTransferRing::new(dev_handle_raw, ctx_raw, alt.out_ep, Arc::clone(&state))?;
+
+        // 8. Swap in new state.
+        self.queue = queue;
+        self.state = state;
+        self.actual_rate = actual_rate;
+        self.ring = ring;
+        self._feedback = None;
+        self.started = false;
 
         Ok(())
     }

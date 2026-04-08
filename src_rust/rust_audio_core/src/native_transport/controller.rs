@@ -14,7 +14,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use symphonia::core::audio::{AudioBuffer, AudioBufferRef, Signal};
-use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
+use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL, CODEC_TYPE_FLAC, CODEC_TYPE_AAC, CODEC_TYPE_ALAC};
 use symphonia::core::conv::IntoSample;
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::{FormatOptions, SeekMode, SeekTo};
@@ -426,6 +426,13 @@ struct DecodeWorkerHandle {
     stop: Arc<AtomicBool>,
     join: thread::JoinHandle<()>,
     session_slot: SharedSessionSlot,
+    /// When `false` the decode worker fills the USB queue but does **not** call
+    /// `ensure_started()`.  The Play command flips this to `true`, which lets
+    /// the next `push_slab_to_usb_output` call arm the ISO ring and begin
+    /// audible playback.  This enables "eager decode": the worker can be
+    /// spawned at Load time so that HTTP, decoding, and USB prefill happen
+    /// *before* the user presses Play, eliminating startup latency.
+    auto_start: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -593,10 +600,23 @@ fn transport_worker(
             }
             NativeTransportCommand::Load(request) => {
                 // Clear runtime FIRST — its control_device Arc keeps the old
-                // OpenUsbDevice alive.  Without this, stop_and_reclaim's
-                // reclaim_device would get BUSY from the lingering handle.
+                // OpenUsbDevice alive.  Without this, stop_decode_worker's
+                // session would keep a lingering Arc preventing extraction.
                 set_native_runtime(&runtime, None);
-                stop_and_reclaim(&mut decode_worker, &mut claimed_device, &claimed_cfg);
+
+                // Stop old worker and harvest its USB session.  We keep the
+                // session alive (not dropped) so the USB handle stays open
+                // and the DAC PLL remains locked — dropping the handle would
+                // trigger libusb_close → kernel driver reattach → PLL reset
+                // → 1-2 seconds of DAC mute on the next track.
+                let reuse_session = stop_decode_worker(&mut decode_worker);
+                if reuse_session.is_some() {
+                    eprintln!("native-transport: load — keeping old USB session for reuse");
+                } else if claimed_device.is_none() {
+                    // No session to reuse and no pre-claimed handle — reclaim.
+                    reclaim_device(&mut claimed_device, &claimed_cfg);
+                }
+
                 let plan = request.source.plan();
                 {
                     let mut state = match snapshot.lock() {
@@ -631,39 +651,59 @@ fn transport_worker(
 
                 current_source = Some(request.source.clone());
                 current_output_config = request.usb_output_config.clone();
-                let probe_result = probe_loaded_source(&request.source);
 
-                let mut state = match snapshot.lock() {
-                    Ok(guard) => guard,
+                // ── Eager decode ─────────────────────────────────────────
+                // Instead of opening a separate HTTP connection just to
+                // probe stream info, start the decode worker immediately
+                // with auto_start=false.  The worker opens HTTP, probes the
+                // format, populates the snapshot, opens the USB device, and
+                // fills the queue — all *before* the user presses Play.
+                // When Play arrives it flips auto_start → true, and the
+                // ring starts on the next push with near-zero latency.
+                let gen = match snapshot.lock() {
+                    Ok(g) => g.generation,
                     Err(_) => break,
                 };
-                match probe_result {
-                    Ok(probe) => {
-                        state.stream_spec = probe.stream_spec;
-                        state.bits_per_sample = probe.bits_per_sample;
-                        state.first_packet_frames = probe.first_packet_frames;
-                        state.duration_s = probe.duration_s;
-                        state.source_summary = probe.source_summary;
-                        state.supports_seek = plan.supports_seek && probe.supports_seek;
-                        state.state = NativeTransportState::Ready;
+                let auto_start = Arc::new(AtomicBool::new(false));
+                match start_direct_flac_decode_worker(
+                    request.source.clone(),
+                    Arc::clone(&snapshot),
+                    Arc::clone(&events),
+                    request.usb_output_config.clone(),
+                    Arc::clone(&runtime),
+                    gen,
+                    None,
+                    volume.clone(),
+                    spectrum_tx.clone(),
+                    Arc::clone(&spectrum_bands),
+                    Arc::clone(&lufs_values),
+                    hw_vol_cache.clone(),
+                    claimed_device.take(),
+                    auto_start,
+                    reuse_session,
+                ) {
+                    Ok(worker) => {
+                        decode_worker = Some(worker);
+                        if let Ok(mut state) = snapshot.lock() {
+                            state.decode_worker_running = true;
+                        }
                         queue_native_event(
                             &events,
                             crate::EVT_STATE,
-                            format!(
-                                "native-transport ready source={:?} summary={}",
-                                state.source_kind.unwrap_or(NativeTransportSourceKind::DirectFlacUrl),
-                                state.source_summary.clone().unwrap_or_default()
-                            ),
+                            "native-transport eager decode started",
                         );
                     }
                     Err(err) => {
+                        reclaim_device(&mut claimed_device, &claimed_cfg);
                         queue_native_event(
                             &events,
                             crate::EVT_ERROR,
-                            format!("native-transport load error: {err}"),
+                            format!("native-transport eager decode failed: {err}"),
                         );
-                        state.last_error = Some(err);
-                        state.state = NativeTransportState::Error;
+                        if let Ok(mut state) = snapshot.lock() {
+                            state.last_error = Some(err);
+                            state.state = NativeTransportState::Error;
+                        }
                     }
                 }
             }
@@ -674,44 +714,50 @@ fn transport_worker(
                 }
                 .generation;
                 if let Some(source) = current_source.clone() {
-                    // Clear runtime FIRST so its control_device Arc releases
-                    // the old OpenUsbDevice, then stop the worker.
-                    set_native_runtime(&runtime, None);
-                    let _old = stop_decode_worker(&mut decode_worker);
-                    drop(_old);
-                    match start_direct_flac_decode_worker(
-                        source,
-                        Arc::clone(&snapshot),
-                        Arc::clone(&events),
-                        current_output_config.clone(),
-                        Arc::clone(&runtime),
-                        generation,
-                        None,
-                        volume.clone(),
-                        spectrum_tx.clone(),
-                        Arc::clone(&spectrum_bands),
-                        Arc::clone(&lufs_values),
-                        hw_vol_cache.clone(),
-                        claimed_device.take(),
-                    ) {
-                        Ok(worker) => {
-                            decode_worker = Some(worker);
-                            if let Ok(mut state) = snapshot.lock() {
-                                state.decode_worker_running = true;
-                                state.decode_completed = false;
-                                state.last_error = None;
+                    if let Some(ref worker) = decode_worker {
+                        // Eager worker from Load is already running — just
+                        // flip auto_start so the ring starts on the next push.
+                        worker.auto_start.store(true, Ordering::Release);
+                    } else {
+                        // No eager worker — start a fresh one with auto_start=true.
+                        set_native_runtime(&runtime, None);
+                        let auto_start = Arc::new(AtomicBool::new(true));
+                        match start_direct_flac_decode_worker(
+                            source,
+                            Arc::clone(&snapshot),
+                            Arc::clone(&events),
+                            current_output_config.clone(),
+                            Arc::clone(&runtime),
+                            generation,
+                            None,
+                            volume.clone(),
+                            spectrum_tx.clone(),
+                            Arc::clone(&spectrum_bands),
+                            Arc::clone(&lufs_values),
+                            hw_vol_cache.clone(),
+                            claimed_device.take(),
+                            auto_start,
+                            None, // no reuse_session for Play
+                        ) {
+                            Ok(worker) => {
+                                decode_worker = Some(worker);
+                                if let Ok(mut state) = snapshot.lock() {
+                                    state.decode_worker_running = true;
+                                    state.decode_completed = false;
+                                    state.last_error = None;
+                                }
                             }
-                        }
-                        Err(err) => {
-                            // Play failed — re-claim so PipeWire can't grab it.
-                            reclaim_device(&mut claimed_device, &claimed_cfg);
-                            queue_native_event(
-                                &events,
-                                crate::EVT_ERROR,
-                                format!("native-transport decode worker start failed: {err}"),
-                            );
-                            if let Ok(mut state) = snapshot.lock() {
-                                state.last_error = Some(err);
+                            Err(err) => {
+                                // Play failed — re-claim so PipeWire can't grab it.
+                                reclaim_device(&mut claimed_device, &claimed_cfg);
+                                queue_native_event(
+                                    &events,
+                                    crate::EVT_ERROR,
+                                    format!("native-transport decode worker start failed: {err}"),
+                                );
+                                if let Ok(mut state) = snapshot.lock() {
+                                    state.last_error = Some(err);
+                                }
                             }
                         }
                     }
@@ -789,36 +835,17 @@ fn transport_worker(
                     }
                 } else if can_seek {
                     if let Some(source) = current_source.clone() {
-                        // Read the current rate before we tear down the session.
-                        let current_rate = snapshot.lock().ok()
-                            .and_then(|s| s.stream_spec.as_ref().map(|spec| spec.sample_rate));
-
                         set_native_runtime(&runtime, None);
-                        let old_sink = stop_decode_worker(&mut decode_worker);
-
-                        // Mark old sink to NOT release USB interfaces on drop.
-                        // This prevents the kernel driver (snd-usb-audio) from
-                        // re-attaching and keeps the DAC PLL stable at the
-                        // current rate — critical for Monitor 09 which fails
-                        // SET_CUR if the PLL hasn't settled after release.
-                        if let Some(mut sink) = old_sink {
-                            sink.set_skip_release_on_drop(true);
-                            drop(sink);
+                        let seek_reuse_session = stop_decode_worker(&mut decode_worker);
+                        if seek_reuse_session.is_none() {
+                            // No session to reuse — reclaim device the normal way.
+                            reclaim_device(&mut claimed_device, &claimed_cfg);
                         }
-
-                        // Immediately re-claim with a fresh handle while the
-                        // interface is still detached from snd-usb-audio.
-                        reclaim_device(&mut claimed_device, &claimed_cfg);
-                        // Tell the new handle to skip SET_CUR — the DAC PLL is
-                        // already locked at the current rate.
-                        if let (Some(ref mut dev), Some(rate)) = (&mut claimed_device, current_rate) {
-                            dev.assumed_rate = Some(rate);
-                            eprintln!(
-                                "native-transport: seek — set assumed_rate={} on re-claimed handle",
-                                rate
-                            );
-                        }
-                        let handle_for_worker = claimed_device.take();
+                        let handle_for_worker = if seek_reuse_session.is_some() {
+                            None // session reuse provides the USB handle
+                        } else {
+                            claimed_device.take()
+                        };
 
                         // Reset decoded counters for the new position.
                         if let Ok(mut state) = snapshot.lock() {
@@ -829,6 +856,8 @@ fn transport_worker(
                             state.last_error = None;
                             state.seek_offset_s = position_ms as f64 / 1000.0;
                         }
+                        // Seek always starts with auto_start=true (we're already playing).
+                        let auto_start = Arc::new(AtomicBool::new(true));
                         match start_direct_flac_decode_worker(
                             source,
                             Arc::clone(&snapshot),
@@ -843,6 +872,8 @@ fn transport_worker(
                             Arc::clone(&lufs_values),
                             hw_vol_cache.clone(),
                             handle_for_worker,
+                            auto_start,
+                            seek_reuse_session,
                         ) {
                             Ok(worker) => {
                                 decode_worker = Some(worker);
@@ -985,11 +1016,14 @@ fn start_direct_flac_decode_worker(
     lufs_values: SharedLufsValues,
     hw_vol_cache: HwVolCache,
     pre_claimed_handle: Option<OpenUsbDevice>,
+    auto_start: Arc<AtomicBool>,
+    reuse_session: Option<UsbAudioSink>,
 ) -> Result<DecodeWorkerHandle, String> {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_clone = Arc::clone(&stop);
     let session_slot: SharedSessionSlot = Arc::new(Mutex::new(None));
     let session_slot_clone = Arc::clone(&session_slot);
+    let auto_start_clone = Arc::clone(&auto_start);
     let join = thread::Builder::new()
         .name("native-transport-direct-flac".to_string())
         .spawn(move || {
@@ -1009,10 +1043,12 @@ fn start_direct_flac_decode_worker(
                 session_slot_clone,
                 hw_vol_cache,
                 pre_claimed_handle,
+                auto_start_clone,
+                reuse_session,
             )
         })
         .map_err(|e| format!("native transport: failed to spawn decode worker: {e}"))?;
-    Ok(DecodeWorkerHandle { stop, join, session_slot })
+    Ok(DecodeWorkerHandle { stop, join, session_slot, auto_start })
 }
 
 fn direct_flac_decode_worker(
@@ -1031,6 +1067,8 @@ fn direct_flac_decode_worker(
     session_slot: SharedSessionSlot,
     hw_vol_cache: HwVolCache,
     pre_claimed_handle: Option<OpenUsbDevice>,
+    auto_start: Arc<AtomicBool>,
+    reuse_session: Option<UsbAudioSink>,
 ) {
     queue_native_event(&events, crate::EVT_STATE, "native-transport decode-start");
     let result = decode_direct_flac_stream(
@@ -1049,6 +1087,8 @@ fn direct_flac_decode_worker(
         &session_slot,
         &hw_vol_cache,
         pre_claimed_handle,
+        &auto_start,
+        reuse_session,
     );
     if let Ok(mut state) = snapshot.lock() {
         if state.generation != generation {
@@ -1118,6 +1158,8 @@ fn decode_direct_flac_stream(
     session_slot: &SharedSessionSlot,
     hw_vol_cache: &HwVolCache,
     pre_claimed_handle: Option<OpenUsbDevice>,
+    auto_start: &Arc<AtomicBool>,
+    reuse_session: Option<UsbAudioSink>,
 ) -> Result<(), String> {
     let mss = open_source_as_media_source_stream(source, stop)?;
     let mut hint = Hint::new();
@@ -1142,6 +1184,69 @@ fn decode_direct_flac_stream(
     let mut decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &DecoderOptions::default())
         .map_err(|e| format!("native transport: decoder init failed: {e}"))?;
+
+    // Populate snapshot with stream info discovered from the Symphonia probe.
+    // This is especially important for eager-decode (Load-time) workers so the
+    // UI gets duration/spec before Play is pressed, replacing the old separate
+    // HTTP probe connection.
+    {
+        if let Ok(mut state) = snapshot.lock() {
+            if state.generation == generation {
+                state.stream_spec = track.codec_params.channels.map(|ch| PcmStreamSpec {
+                    sample_rate: track.codec_params.sample_rate.unwrap_or(0),
+                    channels: ch.count(),
+                    format: bits_per_sample_to_pcm_format(
+                        track.codec_params.bits_per_sample.unwrap_or(32),
+                    ),
+                });
+                state.bits_per_sample = track.codec_params.bits_per_sample;
+                state.duration_s = track.codec_params.n_frames.and_then(|n| {
+                    let rate = track.codec_params.sample_rate.unwrap_or(0) as f64;
+                    if rate > 0.0 { Some(n as f64 / rate) } else { None }
+                });
+                let plan_supports_seek = state.supports_seek;
+                state.supports_seek = plan_supports_seek;
+                if state.state == NativeTransportState::Loading {
+                    state.state = NativeTransportState::Ready;
+                    queue_native_event(
+                        events,
+                        crate::EVT_STATE,
+                        format!(
+                            "native-transport ready (from decode worker) rate={} ch={} bits={}",
+                            track.codec_params.sample_rate.unwrap_or(0),
+                            track.codec_params.channels.map(|c| c.count()).unwrap_or(0),
+                            track.codec_params.bits_per_sample.unwrap_or(0),
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    // Emit a TAG event so the Python UI can display tech info (codec,
+    // sample rate, bit depth) in the playback bar.
+    {
+        let codec_name = match track.codec_params.codec {
+            CODEC_TYPE_FLAC => "FLAC",
+            CODEC_TYPE_AAC => "AAC",
+            CODEC_TYPE_ALAC => "ALAC",
+            _ => "PCM",
+        };
+        let sr = track.codec_params.sample_rate.unwrap_or(0);
+        let bps = track.codec_params.bits_per_sample.unwrap_or(0);
+        let mut tag_parts: Vec<String> = Vec::new();
+        tag_parts.push(format!("codec={codec_name}"));
+        if sr > 0 {
+            tag_parts.push(format!("source_rate={sr}"));
+            tag_parts.push(format!("rate={sr}"));
+        }
+        if bps > 0 {
+            tag_parts.push(format!("source_depth={bps}"));
+            tag_parts.push(format!("depth={bps}"));
+        }
+        queue_native_event(events, crate::EVT_TAG, tag_parts.join(";"));
+    }
+
     // Seek to the requested position.
     // Try Symphonia seek first (works for seekable sources like local files).
     // Fall back to packet-skip for non-seekable sources (HTTP streams).
@@ -1165,9 +1270,18 @@ fn decode_direct_flac_stream(
     processor_chain.push(Box::new(LufsPcmProcessor::new(lufs_values)));
     let mut chain_configured = false;
     let mut output_session: Option<UsbAudioSink> = None;
+    let mut reuse_sess = reuse_session;
     let mut pre_handle = pre_claimed_handle;
     let mut reuse_buf: Vec<u8> = Vec::new();
     let mut seeking = skip_until_ts.is_some();
+    // Bitrate estimation: accumulate compressed bytes and sample count.
+    // First two emissions happen quickly (~0.25s apart) so the Python
+    // stabilization logic (needs 2 consecutive ±40% readings) can display
+    // the value within ~0.5s.  After that, emit every ~2s.
+    let stream_rate = track.codec_params.sample_rate.unwrap_or(44100) as u64;
+    let mut src_bytes_accum: u64 = 0;
+    let mut src_samples_accum: u64 = 0;
+    let mut bitrate_emissions: u32 = 0;
 
     let result = (|| -> Result<(), String> {
         loop {
@@ -1197,9 +1311,31 @@ fn decode_direct_flac_stream(
                 seeking = false;
                 decoder.reset();
             }
+            // Track compressed packet size for bitrate estimation.
+            let pkt_compressed_bytes = packet.buf().len() as u64;
+            let pkt_dur_samples = packet.dur();
             let decoded = decoder
                 .decode(&packet)
                 .map_err(|e| format!("native transport: decode failed: {e}"))?;
+            src_bytes_accum += pkt_compressed_bytes;
+            src_samples_accum += pkt_dur_samples;
+            // First 2 emissions at ~0.25s for fast UI display, then every ~2s.
+            let interval = if bitrate_emissions < 2 {
+                stream_rate / 4
+            } else {
+                stream_rate * 2
+            };
+            if src_samples_accum >= interval {
+                let bitrate_bps = src_bytes_accum * 8 * stream_rate / src_samples_accum;
+                queue_native_event(
+                    events,
+                    crate::EVT_TAG,
+                    format!("bitrate={bitrate_bps}"),
+                );
+                src_bytes_accum = 0;
+                src_samples_accum = 0;
+                bitrate_emissions += 1;
+            }
             let target_format = output_config
                 .as_ref()
                 .map(|cfg| pcm_format_from_gst_format(cfg.gst_format.as_str()))
@@ -1219,11 +1355,67 @@ fn decode_direct_flac_stream(
                     ));
                 }
                 if output_session.is_none() {
-                    let (session, runtime_info) = open_native_usb_output(
-                        cfg, &slab.spec, events, pre_handle.take(),
-                    )?;
-                    // Restore cached hardware volume values after opening.
+                    // Try to reuse the old USB session if the rate matches.
+                    // Rate changes require a full interface release cycle on
+                    // some DACs (NXP/Rawlink v2) — the PLL won't accept
+                    // SET_CUR at a new rate without a kernel-driver reset.
+                    let can_reuse = reuse_sess.as_ref()
+                        .map(|old| old.actual_rate == slab.spec.sample_rate)
+                        .unwrap_or(false);
+                    let session = if can_reuse {
+                        let mut old = reuse_sess.take().unwrap();
+                        eprintln!(
+                            "native-transport: reusing USB session (same rate={})",
+                            old.actual_rate
+                        );
+                        old.prepare_for_reuse(slab.spec.sample_rate, cfg.bit_depth)?;
+                        // Set up clock feed parameters.
+                        let pps = old.state.packets_per_sec as usize;
+                        let n_pkts = (usb_audio::transfer::N_PACKETS_TARGET_MS * pps / 1000).max(8);
+                        let ring_buf_ns =
+                            (usb_audio::transfer::N_TRANSFERS * n_pkts) as u64 * 1_000_000_000 / pps as u64;
+                        let clock_mode = match cfg.clock_mode {
+                            1 => ClockMode::Pull,
+                            _ => ClockMode::Push,
+                        };
+                        let buf_ns = if clock_mode == ClockMode::Pull { 0 } else { ring_buf_ns };
+                        old.feed.set_buffer_depth_ns(buf_ns);
+                        old.feed.set_mode(clock_mode);
+                        queue_native_event(
+                            events,
+                            crate::EVT_STATE,
+                            format!(
+                                "native-transport usb-reused rate={} device={} clock_mode={:?}",
+                                old.actual_rate, cfg.device_id, clock_mode
+                            ),
+                        );
+                        old
+                    } else {
+                        // Rate mismatch or no session — drop old session and
+                        // open from scratch.
+                        if let Some(old) = reuse_sess.take() {
+                            eprintln!(
+                                "native-transport: rate change {}→{}, dropping old session",
+                                old.actual_rate, slab.spec.sample_rate
+                            );
+                            drop(old);
+                        }
+                        let (s, _runtime_info) = open_native_usb_output(
+                            cfg, &slab.spec, events, pre_handle.take(),
+                        )?;
+                        s
+                    };
+                    // Restore cached hardware volume values.
                     restore_hw_vol_cache(&session, hw_vol_cache);
+                    // Build runtime info for the (possibly reused) session.
+                    let runtime_info = NativeUsbRuntime {
+                        feed: Arc::clone(&session.feed),
+                        bit_depth: cfg.bit_depth,
+                        device_name: session.device_name(),
+                        hw_volume_supported: session.has_hw_volume(),
+                        hw_volume_channels: session.hw_volume_channels(),
+                        control_device: session.control_device(),
+                    };
                     set_native_runtime(runtime, Some(runtime_info));
                     output_session = Some(session);
                     // Notify Python layer that USB audio is configured so
@@ -1240,6 +1432,7 @@ fn decode_direct_flac_stream(
                     slab.spec.sample_rate,
                     &slab,
                     events,
+                    auto_start,
                 )?;
             }
             // Reclaim the data buffer for reuse in next iteration.
@@ -1249,7 +1442,10 @@ fn decode_direct_flac_stream(
 
     // Park the USB session in the shared slot so the transport_worker can
     // keep the interface claimed between track switches.
-    if let Some(session) = output_session.take() {
+    // Prefer the active output_session; fall back to the unused reuse_sess
+    // (happens when decode fails before the first slab opens a session).
+    let session_to_park = output_session.take().or(reuse_sess.take());
+    if let Some(session) = session_to_park {
         if let Ok(mut slot) = session_slot.lock() {
             *slot = Some(session);
         }
@@ -1427,6 +1623,7 @@ fn push_slab_to_usb_output(
     sample_rate: u32,
     slab: &PcmSlab,
     events: &Arc<Mutex<VecDeque<(i32, String)>>>,
+    auto_start: &AtomicBool,
 ) -> Result<(), String> {
     let data = &slab.data;
     let mut offset = 0usize;
@@ -1435,6 +1632,20 @@ fn push_slab_to_usb_output(
         if written > 0 {
             offset += written;
         } else {
+            // Queue full and ring not started — if auto_start was just enabled
+            // (by a Play command), start the ring so it drains the queue.
+            if !session.is_started() && auto_start.load(Ordering::Acquire) {
+                queue_native_event(
+                    events,
+                    crate::EVT_STATE,
+                    format!(
+                        "native-transport usb-prefill (queue-full fast-start) queued={}",
+                        session.queued_bytes(),
+                    ),
+                );
+                session.ensure_started()?;
+                continue; // retry push now that ring is draining
+            }
             std::thread::yield_now();
             std::thread::sleep(std::time::Duration::from_micros(250));
         }
@@ -1453,7 +1664,10 @@ fn push_slab_to_usb_output(
         / 1000)
         .min(usb_audio::FrameQueue::capacity_bytes() as u128) as usize;
 
-    if !session.is_started() && session.queued_bytes() >= target_prefill {
+    if !session.is_started()
+        && session.queued_bytes() >= target_prefill
+        && auto_start.load(Ordering::Acquire)
+    {
         queue_native_event(
             events,
             crate::EVT_STATE,
