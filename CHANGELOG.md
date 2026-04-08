@@ -13,6 +13,11 @@
 - **Spectrum bands dynamically follow UI selection in V2**: the native transport spectrum processor now reads the active band count from a shared atomic, so switching visualizer resolution takes effect immediately without restarting playback.
 - **Progressive PLL settle retry for DAC compatibility**: USB sample-rate SET_CUR retries now use a 150 → 300 → 500 ms backoff sequence, improving reliability on DACs with slow PLL lock (e.g. Monitor 09).
 - **Improved V1 ↔ V2 driver switching**: synchronous `StopAndRelease` command ensures the USB device is fully released before the other driver claims it, preventing PLL disturbance and app hangs during output driver changes.
+- **USB session reuse across same-rate track switches**: the native transport now keeps the USB handle open between consecutive tracks at the same sample rate, eliminating the 1–2 second DAC mute previously caused by `libusb_close` → kernel driver reattach → PLL reset. Rate changes still perform a full interface release cycle for DAC compatibility.
+- **Playback bar now shows tech info for USB Rawlink V2**: codec, sample rate, bit depth, and bitrate are displayed in the playback bar during native transport playback (e.g. `BP/EX • 24-bit/96kHz • FLAC • 2400kbps`).
+
+### Fixed
+- **Fixed use-after-free crash on track switch**: the ISO transfer ring's `feedback_xfer` pointer was not cleared after the `FeedbackReader` was dropped, causing `libusb_cancel_transfer` to operate on freed memory when the old ring was dropped during `reconfigure()` or session reuse.
 
 ### Removed
 - **Balance Wave and Center Side visualizations**: removed from the effect list and rendering pipeline.
