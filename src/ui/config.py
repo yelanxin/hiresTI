@@ -44,11 +44,15 @@ button.circular {
 }
 
 .card-bar.mini-state {
-    margin: 0;       
+    margin: 0;
     padding: 20px 0px 20px 20px;
-    border-radius: 0;
-    border: none;    
+    border-radius: 12px;
+    border: 1px solid alpha(black, 0.3);
     background-color: @headerbar_bg_color;
+}
+.card-bar.mini-state.mini-queue-open {
+    border-radius: 12px 12px 0 0;
+    border-bottom: none;
 }
 
 /* 波形面板黑框 */
@@ -900,14 +904,57 @@ button.circular {
         margin-bottom: 24px; margin-top: 8px; text-shadow: 0 0 15px rgba(255, 255, 255, 0.2);
     }
 
-window.undecorated { background-color: transparent; }
 .player-overlay-container { background-color: transparent; }
+window.mini-mode,
+window.mini-mode.background,
+window.mini-mode.csd,
+window.mini-mode.background.csd {
+    background-color: transparent;
+    background: none;
+    box-shadow: none;
+    border: none;
+    margin: 0;
+    padding: 0;
+}
+window.mini-mode dialog-host,
+window.mini-mode widget,
+window.mini-mode windowhandle,
+window.mini-mode overlay,
+window.mini-mode box,
+window.mini-mode centerbox,
+window.mini-mode .player-overlay-container {
+    background-color: transparent;
+    background: none;
+}
+window.mini-mode .card-bar.mini-state {
+    background-color: @view_bg_color;
+}
+window.mini-mode .mini-queue-drawer {
+    background-color: @view_bg_color;
+}
 .card-bar.mini-state .player-ctrls-box { margin-top: 12px; margin-right: 20px; border-spacing: 15px; }
 .card-bar.mini-state .player-ctrls-box button.flat { min-height: 28px; min-width: 28px; padding: 0; color: alpha(currentColor, 0.7); background: transparent; }
 .card-bar.mini-state .player-ctrls-box .pill { min-height: 42px; min-width: 42px; padding: 0; background-color: @accent_color; color: white; border-radius: 99px; box-shadow: 0 2px 5px alpha(black, 0.2); }
 .card-bar.mini-state .player-ctrls-box .pill:hover { filter: brightness(1.1); transform: scale(1.05); }
 .card-bar.mini-state .player-ctrls-box button image { -gtk-icon-size: 16px; }
 .card-bar.mini-state .player-ctrls-box .pill image { -gtk-icon-size: 20px; }
+.mini-queue-drawer {
+    background-color: @headerbar_bg_color;
+    border-radius: 0 0 12px 12px;
+    border: 1px solid alpha(black, 0.3);
+    border-top: none;
+    box-shadow: 0 4px 12px alpha(black, 0.3);
+    padding-top: 0;
+    margin-top: 0;
+}
+.mini-queue-drawer list.mini-queue-list { background-color: color-mix(in srgb, @headerbar_bg_color 85%, black); border-radius: 8px; padding: 4px; }
+.mini-queue-list row { padding: 2px 4px; border-radius: 6px; }
+.mini-queue-list row:hover { background: alpha(currentColor, 0.08); }
+.mini-queue-list row:selected { background: alpha(@accent_color, 0.15); }
+.mini-queue-title { font-size: 1em; }
+.mini-queue-subtitle { font-size: 0.88em; }
+.mini-queue-arrow { min-width: 24px; min-height: 24px; padding: 0; opacity: 0.6; }
+.mini-queue-arrow:hover { opacity: 1.0; }
 .eq-btn image { -gtk-icon-size: 20px; }
 .eq-btn { min-width: 36px; min-height: 36px; padding: 0; }
 .card-bar scale.horizontal { margin: 0; padding: 0; }

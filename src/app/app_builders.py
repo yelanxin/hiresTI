@@ -3507,6 +3507,7 @@ def toggle_mini_mode(self, btn):
     if hasattr(self, "hide_now_playing_overlay"):
         self.hide_now_playing_overlay()
     self.close_queue_drawer()
+    self.close_mini_queue()
     _reset_search_focus_after_layout_change(self)
 
     self.is_mini_mode = not self.is_mini_mode
@@ -3520,6 +3521,8 @@ def toggle_mini_mode(self, btn):
 
         self.bottom_bar.add_css_class("mini-state")
         self.mini_controls.set_visible(True)
+        if getattr(self, "mini_queue_arrow", None) is not None:
+            self.mini_queue_arrow.set_visible(True)
 
         if self.timeline_box is not None: self.timeline_box.set_visible(False)
         if self.vol_box is not None: self.vol_box.set_visible(False)
@@ -3536,13 +3539,20 @@ def toggle_mini_mode(self, btn):
             self.art_img.set_size_request(56, 56)
 
         self.win.set_decorated(False)
+        self.win.add_css_class("mini-mode")
         self.win.set_resizable(False)
         self.win.set_size_request(390, 85)
         self.win.set_default_size(390, 85)
     else:
+        self.close_mini_queue()
         self.header.set_visible(True)
         self.paned.set_visible(True)
         self.mini_controls.set_visible(False)
+        if getattr(self, "mini_queue_arrow", None) is not None:
+            self.mini_queue_arrow.set_visible(False)
+        if getattr(self, "mini_queue_revealer", None) is not None:
+            self.mini_queue_revealer.set_visible(False)
+            self.mini_queue_revealer.set_reveal_child(False)
 
         if self.timeline_box is not None: self.timeline_box.set_visible(True)
         if self.vol_box is not None: self.vol_box.set_visible(True)
@@ -3561,6 +3571,8 @@ def toggle_mini_mode(self, btn):
         self._player_bar_layout_tier = "full"
 
         self.bottom_bar.remove_css_class("mini-state")
+        # Reset scroll height that may have been changed by drawer resize.
+        self.win.remove_css_class("mini-mode")
         self.win.set_decorated(True)
         self.win.set_resizable(True)
         self.win.set_size_request(-1, -1)

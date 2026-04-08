@@ -148,6 +148,8 @@ def _update_track_list_icon(self, target_list=None):
             targets.append(self.now_playing_queue_list)
         if getattr(self, "now_playing_track_list", None) is not None:
             targets.append(self.now_playing_track_list)
+        if getattr(self, "mini_queue_list", None) is not None:
+            targets.append(self.mini_queue_list)
         if not targets:
             return
 

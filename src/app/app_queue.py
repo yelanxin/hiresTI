@@ -2,7 +2,7 @@
 
 import logging
 
-from gi.repository import GLib
+from gi.repository import GLib, Gtk
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +83,178 @@ def close_queue_drawer(self):
     _sync_queue_handle_state(self, False)
 
 
+_MINI_QUEUE_HEIGHT = 500
+_MINI_BAR_HEIGHT = 85
+_MINI_WIDTH = 390
+_MINI_QUEUE_HEAD = 30   # header area
+
+
+def toggle_mini_queue(self, _btn=None):
+    """Toggle the mini-mode queue drawer open/closed."""
+    revealer = getattr(self, "mini_queue_revealer", None)
+    arrow = getattr(self, "mini_queue_arrow", None)
+    if revealer is None:
+        return
+    opening = not revealer.get_reveal_child()
+    if arrow is not None:
+        arrow.set_icon_name("pan-up-symbolic" if opening else "pan-down-symbolic")
+    if opening:
+        self.render_mini_queue()
+        self.bottom_bar.add_css_class("mini-queue-open")
+        revealer.set_visible(True)
+        revealer.set_reveal_child(True)
+        self.win.set_size_request(_MINI_WIDTH, _MINI_BAR_HEIGHT + _MINI_QUEUE_HEIGHT + _MINI_QUEUE_HEAD)
+    else:
+        self.bottom_bar.remove_css_class("mini-queue-open")
+        revealer.set_reveal_child(False)
+        revealer.set_visible(False)
+        self.win.set_size_request(_MINI_WIDTH, _MINI_BAR_HEIGHT)
+
+
+def close_mini_queue(self):
+    """Close the mini queue drawer if open."""
+    revealer = getattr(self, "mini_queue_revealer", None)
+    if revealer is not None and revealer.get_reveal_child():
+        if getattr(self, "bottom_bar", None) is not None:
+            self.bottom_bar.remove_css_class("mini-queue-open")
+        revealer.set_reveal_child(False)
+        revealer.set_visible(False)
+        # Reset scroll height to default so it doesn't affect main mode layout.
+        scroll = getattr(self, "mini_queue_scroll", None)
+        if scroll is not None:
+            scroll.set_size_request(-1, _MINI_QUEUE_HEIGHT)
+        self.win.set_size_request(_MINI_WIDTH, _MINI_BAR_HEIGHT)
+    arrow = getattr(self, "mini_queue_arrow", None)
+    if arrow is not None:
+        arrow.set_icon_name("pan-down-symbolic")
+
+
+def _build_mini_queue_row(app, track, i, current_idx):
+    """Build a two-line queue row: title on top, artist · album below."""
+    row = Gtk.ListBoxRow(css_classes=["track-row"])
+    row.queue_track_index = i
+    row.track_id = getattr(track, "id", None)
+
+    box = Gtk.Box(spacing=6, margin_top=2, margin_bottom=2)
+
+    # Index / play icon stack
+    stack = Gtk.Stack()
+    stack.set_size_request(16, -1)
+    stack.add_css_class("track-index-stack")
+    num_lbl = Gtk.Label(label=str(i + 1), css_classes=["dim-label"])
+    stack.add_named(num_lbl, "num")
+    play_icon = Gtk.Image(icon_name="media-playback-start-symbolic")
+    play_icon.add_css_class("accent")
+    stack.add_named(play_icon, "icon")
+    # Default to number; _update_track_list_icon will set the play icon by track_id.
+    stack.set_visible_child_name("num")
+    box.append(stack)
+
+    # Title + subtitle (artist · album)
+    info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1,
+                   hexpand=True, valign=Gtk.Align.CENTER)
+    title = getattr(track, "name", "Unknown Track")
+    title_lbl = Gtk.Label(label=title, xalign=0, ellipsize=3,
+                          css_classes=["track-title", "mini-queue-title"])
+    title_lbl.set_tooltip_text(title)
+    info.append(title_lbl)
+
+    artist_name = getattr(getattr(track, "artist", None), "name", None) or ""
+    album_name = getattr(getattr(track, "album", None), "name", None) or ""
+    parts = [p for p in (artist_name, album_name) if p]
+    if parts:
+        sub_text = " · ".join(parts)
+        sub_lbl = Gtk.Label(label=sub_text, xalign=0, ellipsize=3,
+                            css_classes=["dim-label", "mini-queue-subtitle"])
+        sub_lbl.set_tooltip_text(sub_text)
+        info.append(sub_lbl)
+    box.append(info)
+
+    # Favorite button
+    if hasattr(app, "create_track_fav_button"):
+        fav_btn = app.create_track_fav_button(track)
+        fav_btn.set_margin_start(2)
+        fav_btn.set_margin_end(0)
+        box.append(fav_btn)
+
+    # Remove from queue button
+    rm_btn = Gtk.Button(icon_name="list-remove-symbolic",
+                        css_classes=["flat", "playlist-tool-btn", "queue-remove-btn"])
+    rm_btn.set_tooltip_text("Remove from Queue")
+    rm_btn.set_margin_start(0)
+    rm_btn.set_margin_end(0)
+    rm_btn.connect("clicked", lambda _b, idx=i: app.on_queue_remove_track_clicked(idx))
+    box.append(rm_btn)
+
+    row.set_child(box)
+    return row
+
+
+def render_mini_queue(self):
+    """Populate the mini-mode queue drawer with compact track rows."""
+    list_box = getattr(self, "mini_queue_list", None)
+    if list_box is None:
+        return
+    tracks = self._get_active_queue()
+    current_idx = int(getattr(self, "current_track_index", -1) or -1)
+
+    count_lbl = getattr(self, "mini_queue_count_label", None)
+    if count_lbl is not None:
+        count_lbl.set_text(f"{len(tracks)} tracks")
+
+    # Signature-based skip to avoid rebuilding unchanged queue.
+    sig = (len(tracks), current_idx,
+           tuple(str(getattr(t, "id", id(t))) for t in tracks[:200]))
+    if getattr(self, "_mini_queue_sig", None) == sig and list_box.get_first_child() is not None:
+        return
+
+    # Clear existing rows.
+    while True:
+        child = list_box.get_first_child()
+        if child is None:
+            break
+        list_box.remove(child)
+
+    if not tracks:
+        row = Gtk.ListBoxRow()
+        row.set_selectable(False)
+        row.set_activatable(False)
+        hint = Gtk.Label(
+            label="Queue is empty.",
+            xalign=0,
+            css_classes=["dim-label"],
+            margin_start=10, margin_end=10, margin_top=12, margin_bottom=12,
+        )
+        row.set_child(hint)
+        list_box.append(row)
+        self._mini_queue_sig = sig
+        return
+
+    # Show a window around the current track (max ~80 rows for performance).
+    window_before, window_after = 20, 60
+    total = len(tracks)
+    anchor = max(0, min(current_idx, total - 1)) if total > 0 else 0
+    start = max(0, anchor - window_before)
+    end = min(total, anchor + window_after + 1)
+
+    for i in range(start, end):
+        row = _build_mini_queue_row(self, tracks[i], i, current_idx)
+        list_box.append(row)
+
+    # Scroll the current track into view after layout.
+    if 0 <= current_idx < total:
+        def _scroll_to_current():
+            target_row = list_box.get_row_at_index(current_idx - start)
+            if target_row is not None:
+                target_row.grab_focus()
+            return False
+        GLib.timeout_add(80, _scroll_to_current)
+
+    self._mini_queue_sig = sig
+    if hasattr(self, "_update_track_list_icon"):
+        self._update_track_list_icon(target_list=list_box)
+
+
 def on_queue_track_selected(self, box, row):
     if not row:
         return
@@ -101,6 +273,11 @@ def _refresh_queue_views(self):
         self.render_queue_drawer()
     if hasattr(self, "_render_now_playing_queue"):
         self._render_now_playing_queue(self._get_active_queue())
+    # Refresh the mini-mode queue drawer if it is currently open.
+    rev = getattr(self, "mini_queue_revealer", None)
+    if rev is not None and rev.get_reveal_child():
+        self._mini_queue_sig = None  # force rebuild
+        self.render_mini_queue()
 
 
 def _play_tracks_now(self, tracks):

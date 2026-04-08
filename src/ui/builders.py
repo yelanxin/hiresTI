@@ -637,6 +637,7 @@ def build_header(app, container):
     tools_box.append(_tool_row("hiresti-shortcuts-symbolic", "Keyboard Shortcuts", _on_shortcuts_clicked))
     tools_box.append(_tool_row("hiresti-tech-symbolic", "Signal Path / Tech Info", _on_signal_path_clicked))
     tools_box.append(_tool_row("hiresti-gear-symbolic", "Settings", _on_settings_clicked))
+    tools_box.append(_tool_row("emblem-favorite-symbolic", "Sponsor", lambda _b: __import__("subprocess").Popen(["xdg-open", "https://github.com/sponsors/yelanxin"])))
     tools_box.append(_tool_row("help-about-symbolic", "About", _on_about_clicked))
     app.tools_pop.set_child(tools_box)
     app.tools_btn.connect("clicked", lambda _b: app.tools_pop.popup())
@@ -1056,9 +1057,14 @@ def build_body(app, container):
 
 
 def build_player_bar(app, container):
+    # Shell: bar overlay + revealer stacked vertically.
+    # The overlay wraps only the bar so overlaid buttons stay pinned to the bar.
+    app._player_bar_shell = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+    app._player_bar_shell.add_css_class("player-overlay-container")
+    container.append(app._player_bar_shell)
+
     app.player_overlay = Gtk.Overlay()
-    app.player_overlay.add_css_class("player-overlay-container")
-    container.append(app.player_overlay)
+    app._player_bar_shell.append(app.player_overlay)
 
     app.bottom_bar = Gtk.CenterBox(css_classes=["card-bar"])
     app.player_overlay.set_child(app.bottom_bar)
@@ -1082,6 +1088,52 @@ def build_player_bar(app, container):
     app.mini_controls.append(m_restore)
     app.mini_controls.append(m_close)
     app.player_overlay.add_overlay(app.mini_controls)
+
+    # ── Mini-mode queue arrow (overlaid on bar, bottom-center) ────
+    app.mini_queue_arrow = Gtk.Button(
+        icon_name="pan-down-symbolic",
+        css_classes=["flat", "circular", "mini-queue-arrow"],
+    )
+    app.mini_queue_arrow.set_tooltip_text("Queue")
+    app.mini_queue_arrow.set_visible(False)
+    app.mini_queue_arrow.connect("clicked", app.toggle_mini_queue)
+    app.mini_queue_arrow.set_valign(Gtk.Align.END)
+    app.mini_queue_arrow.set_halign(Gtk.Align.CENTER)
+    app.mini_queue_arrow.set_margin_bottom(0)
+    app.player_overlay.add_overlay(app.mini_queue_arrow)
+
+    # ── Mini-mode queue drawer (revealer below the bar overlay) ────
+    app.mini_queue_revealer = Gtk.Revealer(
+        transition_type=Gtk.RevealerTransitionType.NONE,
+    )
+    app.mini_queue_revealer.set_transition_duration(0)
+    app.mini_queue_revealer.set_reveal_child(False)
+    app.mini_queue_revealer.set_visible(False)
+
+    mini_q_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0,
+                         css_classes=["mini-queue-drawer"],
+                         halign=Gtk.Align.FILL,
+                         hexpand=True)
+    mini_q_head = Gtk.Box(spacing=8, margin_start=10, margin_end=10, margin_top=0, margin_bottom=4)
+    mini_q_head.append(Gtk.Label(label="Queue", xalign=0, hexpand=True,
+                                 css_classes=["heading"]))
+    app.mini_queue_count_label = Gtk.Label(label="", css_classes=["dim-label"])
+    mini_q_head.append(app.mini_queue_count_label)
+    mini_q_box.append(mini_q_head)
+
+    app.mini_queue_list = Gtk.ListBox(css_classes=["tracks-list", "mini-queue-list"])
+    app.mini_queue_list.connect("row-activated", app.on_queue_track_selected)
+    app.mini_queue_scroll = Gtk.ScrolledWindow(vexpand=True, hexpand=False)
+    app.mini_queue_scroll.set_size_request(-1, 500)
+    app.mini_queue_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+    app.mini_queue_scroll.set_margin_start(10)
+    app.mini_queue_scroll.set_margin_end(10)
+    app.mini_queue_scroll.set_margin_bottom(10)
+    app.mini_queue_scroll.set_child(app.mini_queue_list)
+    mini_q_box.append(app.mini_queue_scroll)
+
+    app.mini_queue_revealer.set_child(mini_q_box)
+    app._player_bar_shell.append(app.mini_queue_revealer)
 
     side_panel_width = 340
     app.player_side_panel_width = side_panel_width
