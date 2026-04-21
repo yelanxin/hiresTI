@@ -25,6 +25,10 @@ TARGETS=(
 TYPE="${1:-}"
 VERSION="${2:-}"
 USE_PY_BINARY="${HIRESTI_PY_BINARY:-0}"
+PKG_JOBS="${HIRESTI_PKG_JOBS:-1}"
+if ! [[ "$PKG_JOBS" =~ ^[0-9]+$ ]] || [ "$PKG_JOBS" -lt 1 ]; then
+    PKG_JOBS=1
+fi
 
 # ---- Usage ----
 print_usage() {
@@ -46,6 +50,10 @@ print_usage() {
     echo ""
     echo "Example: ./package.sh ubuntu2404 1.9.0beta1"
     echo "         ./package.sh all 1.9.0beta1"
+    echo ""
+    echo "Env:"
+    echo "  HIRESTI_PKG_JOBS=N   parallel 'all' builds (default 1)"
+    echo "  HIRESTI_PY_BINARY=1  bundle Python via PyInstaller"
 }
 
 if [ -z "$TYPE" ] || [ -z "$VERSION" ]; then
@@ -149,12 +157,42 @@ case "$TYPE" in
         exit 0
         ;;
     all)
+        mkdir -p dist
         failed=()
-        for t in "${TARGETS[@]}"; do
-            local_fields=($t)
-            target_name="${local_fields[0]}"
-            docker_build_target "$target_name" || failed+=("$target_name")
-        done
+        if [ "$PKG_JOBS" -le 1 ]; then
+            for t in "${TARGETS[@]}"; do
+                local_fields=($t)
+                target_name="${local_fields[0]}"
+                docker_build_target "$target_name" || failed+=("$target_name")
+            done
+        else
+            echo "🔀 Parallel multi-target build (HIRESTI_PKG_JOBS=$PKG_JOBS)"
+            echo "   Per-target output streamed to dist/build-<target>.log"
+            faildir="$(mktemp -d)"
+            trap 'rm -rf "$faildir"' EXIT
+            for t in "${TARGETS[@]}"; do
+                local_fields=($t)
+                target_name="${local_fields[0]}"
+                while [ "$(jobs -rp | wc -l)" -ge "$PKG_JOBS" ]; do
+                    wait -n 2>/dev/null || true
+                done
+                (
+                    log="dist/build-${target_name}.log"
+                    echo "[start] ${target_name}  → ${log}"
+                    if docker_build_target "${target_name}" >"$log" 2>&1; then
+                        echo "[ok]    ${target_name}"
+                    else
+                        echo "[FAIL]  ${target_name}  → ${log}"
+                        touch "$faildir/${target_name}"
+                    fi
+                ) &
+            done
+            wait
+            for f in "$faildir"/*; do
+                [ -e "$f" ] || continue
+                failed+=("$(basename "$f")")
+            done
+        fi
         echo ""
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         if [ ${#failed[@]} -eq 0 ]; then
