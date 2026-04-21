@@ -1048,6 +1048,12 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
     color: alpha(currentColor, 0.92);
     background-color: alpha(currentColor, 0.62);
 }
+.tools-update-dot {
+    min-width: 9px;
+    min-height: 9px;
+    border-radius: 999px;
+    background-color: #ff6b57;
+}
 .history-scroll-btn {
     min-width: 28px;
     min-height: 28px;

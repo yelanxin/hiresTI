@@ -101,6 +101,18 @@ def on_settings_clicked(self, btn):
         self.right_stack.set_visible_child_name("settings")
 
 
+def on_check_for_updates_clicked(self, _btn=None):
+    from services.update_check import check_for_updates_async
+
+    check_for_updates_async(self, user_initiated=True, force=True, present_result=True)
+
+
+def _schedule_startup_update_check(self, delay_ms=4200):
+    from services.update_check import schedule_startup_update_check
+
+    schedule_startup_update_check(self, delay_ms=int(delay_ms or 4200))
+
+
 def on_volume_changed_ui(self, scale):
     if getattr(self, "_volume_ui_syncing", False):
         return

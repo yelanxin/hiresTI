@@ -13,6 +13,7 @@ from models import HistoryManager, PlaylistManager
 from services.dsp_presets import DspPresetManager
 from services.lyrics import LyricsManager
 from services.scrobbler import ScrobblerService
+from services.update_check import init_update_check_state
 from ui import config as ui_config
 from utils.paths import get_cache_dir, get_config_dir
 
@@ -347,5 +348,6 @@ def init_runtime(self):
     _init_paths_and_settings(self)
     _init_audio_and_data_services(self)
     _init_runtime_state(self)
+    init_update_check_state(self)
     if hasattr(self, "_init_remote_control_state"):
         self._init_remote_control_state()

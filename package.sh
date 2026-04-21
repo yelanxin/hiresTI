@@ -71,6 +71,14 @@ fi
 echo "$VERSION" > version.txt
 echo "🧾 Version file updated: version.txt -> $VERSION"
 
+# Package version must not contain '-' (pacman parses '-' as pkgver/pkgrel
+# boundary; rpm disallows it in Version; historic deb releases used the
+# stripped form too). Keep $VERSION as-is for the in-app version string.
+PKG_VERSION="${VERSION//-/}"
+if [ "$PKG_VERSION" != "$VERSION" ]; then
+    echo "🧾 Packaging version normalized: $VERSION -> $PKG_VERSION"
+fi
+
 
 # ====================================================================
 #  Docker-based builds
@@ -405,11 +413,11 @@ build_deb() {
     mkdir -p "$BUILD_ROOT/DEBIAN"
     cat <<EOF > "$BUILD_ROOT/DEBIAN/control"
 Package: $APP_NAME
-Version: $VERSION
+Version: $PKG_VERSION
 Section: sound
 Priority: optional
 Architecture: $DEB_ARCH
-Depends: python3, python3-gi, python3-gi-cairo, python3-cairo, python3-opengl, python3-dateutil, python3-typing-extensions, python3-isodate, python3-setproctitle, gir1.2-gtk-4.0, gir1.2-adw-1, gir1.2-gtksource-4, qrencode, python3-gst-1.0, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-plugins-ugly, libpipewire-0.3-0, libpulse0
+Depends: python3, python3-gi, python3-gi-cairo, python3-cairo, python3-opengl, python3-dateutil, python3-typing-extensions, python3-isodate, python3-setproctitle, gir1.2-gtk-4.0, gir1.2-adw-1, gir1.2-gtksource-4, qrencode, python3-gst-1.0, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-plugins-ugly, gstreamer1.0-pipewire, libpipewire-0.3-0, libpulse0, libasound2, libusb-1.0-0, libgl1, libegl1, libgl1-mesa-dri
 Maintainer: $MAINTAINER
 Description: $DESCRIPTION
  $DISPLAY_NAME is a desktop client for Tidal focusing on High-Res audio.
@@ -427,9 +435,9 @@ POSTINST_EOF
     mkdir -p dist
 
     if [ -n "$PKG_SUFFIX" ]; then
-        local deb_name="${APP_NAME}_${VERSION}_${DEB_ARCH}_${PKG_SUFFIX}.deb"
+        local deb_name="${APP_NAME}_${PKG_VERSION}_${DEB_ARCH}_${PKG_SUFFIX}.deb"
     else
-        local deb_name="${APP_NAME}_${VERSION}_${DEB_ARCH}.deb"
+        local deb_name="${APP_NAME}_${PKG_VERSION}_${DEB_ARCH}.deb"
     fi
     dpkg-deb --build "$BUILD_ROOT" "dist/${deb_name}"
     echo "✅ DEB created: dist/${deb_name}"
@@ -449,7 +457,7 @@ build_rpm_variant() {
 
     cat <<EOF > "$spec_file"
 Name:           $APP_NAME
-Version:        $VERSION
+Version:        $PKG_VERSION
 Release:        1%{?dist}
 Summary:        $DESCRIPTION (${variant})
 License:        $LICENSE
@@ -478,7 +486,7 @@ udevadm trigger --subsystem-match=usb 2>/dev/null || true
 /usr/lib/udev/rules.d/99-hiresti-usb-audio.rules
 
 %changelog
-* $(date "+%a %b %d %Y") $MAINTAINER - $VERSION-1
+* $(date "+%a %b %d %Y") $MAINTAINER - $PKG_VERSION-1
 - Automated ${variant} build
 EOF
 
@@ -488,7 +496,7 @@ EOF
 
     mkdir -p dist
     if [ -n "$PKG_SUFFIX" ]; then
-        for rpm_file in "$rpm_build_root"/RPMS/"$arch"/${APP_NAME}-${VERSION}-1*.${arch}.rpm; do
+        for rpm_file in "$rpm_build_root"/RPMS/"$arch"/${APP_NAME}-${PKG_VERSION}-1*.${arch}.rpm; do
             local base
             base="$(basename "$rpm_file")"
             local newname="${base%.rpm}_${PKG_SUFFIX}.rpm"
@@ -496,7 +504,7 @@ EOF
             echo "✅ RPM created: dist/${newname}"
         done
     else
-        mv "$rpm_build_root"/RPMS/"$arch"/${APP_NAME}-${VERSION}-1*.${arch}.rpm "dist/"
+        mv "$rpm_build_root"/RPMS/"$arch"/${APP_NAME}-${PKG_VERSION}-1*.${arch}.rpm "dist/"
         echo "✅ RPM created (${variant})."
     fi
 }
@@ -505,7 +513,7 @@ build_arch_package() {
     local arch pkg_rel pkg_ver_rel pkg_file pkg_root pkg_size build_ts
     arch="$(uname -m)"
     pkg_rel="1"
-    pkg_ver_rel="${VERSION}-${pkg_rel}"
+    pkg_ver_rel="${PKG_VERSION}-${pkg_rel}"
     pkg_root="$(pwd)/build_archpkg/pkgroot"
 
     rm -rf "$(pwd)/build_archpkg"
@@ -534,11 +542,17 @@ depend = gst-plugins-good
 depend = gst-plugins-bad
 depend = gst-plugins-ugly
 depend = gst-python
+depend = gst-plugin-pipewire
 depend = python-gobject
 depend = python-cairo
 depend = python-opengl
+depend = python-setproctitle
 depend = pipewire
 depend = libpulse
+depend = alsa-lib
+depend = libusb
+depend = mesa
+depend = libglvnd
 EOF
 
     cat <<'INSTALL_EOF' > "$pkg_root/.INSTALL"
@@ -565,7 +579,7 @@ INSTALL_EOF
 
 
 # ---- Dispatch local builds ----
-FEDORA_REQUIRES="python3, python3-gobject, python3-cairo, python3-pyopengl, python3-setproctitle, gtk4, libadwaita, gstreamer1-plugins-base, gstreamer1-plugins-good, gstreamer1-plugins-bad-free, gstreamer1-plugins-ugly-free"
+FEDORA_REQUIRES="python3, python3-gobject, python3-cairo, python3-pyopengl, python3-setproctitle, gtk4, libadwaita, gstreamer1-plugins-base, gstreamer1-plugins-good, gstreamer1-plugins-bad-free, gstreamer1-plugins-ugly-free, pipewire, pipewire-gstreamer, pulseaudio-libs, alsa-lib, libusb1, mesa-libGL, mesa-libEGL, mesa-dri-drivers, libglvnd-glx, libglvnd-egl"
 
 case "$TYPE" in
     deb)

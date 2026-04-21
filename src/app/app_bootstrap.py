@@ -136,6 +136,10 @@ def do_shutdown(self):
         self._seek_commit_source = 0
     if hasattr(self, "_remember_current_window_size"):
         self._remember_current_window_size(persist=False)
+    update_check = getattr(self, "_update_check_source", 0)
+    if update_check:
+        GLib.source_remove(update_check)
+        self._update_check_source = 0
     self.save_settings()
     if self.player is not None:
         self.player.cleanup()
@@ -187,6 +191,8 @@ def _run_post_activate_tasks(app):
     if hasattr(app, "_prewarm_visualizer_cold_start"):
         app._viz_cold_prewarm_source = GLib.timeout_add(140, app._prewarm_visualizer_cold_start)
     GLib.timeout_add(220, lambda: (app._init_tray_icon(), False)[1])
+    if hasattr(app, "_schedule_startup_update_check"):
+        app._schedule_startup_update_check(4200)
     GLib.timeout_add(0, app._ensure_overlay_handles_visible)
     return False
 

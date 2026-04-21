@@ -228,6 +228,146 @@ def _present_community_window(app):
     win.present()
 
 
+def _build_update_meta_row(title: str, value: str):
+    row = Adw.ActionRow(title=title, subtitle=value or "—")
+    row.set_activatable(False)
+    return row
+
+
+def present_update_window(app):
+    state = dict(getattr(app, "_update_check_state", {}) or {})
+    current_version = str(state.get("current_version") or getattr(app, "app_version", "dev") or "dev").strip()
+    latest_version = str(state.get("latest_version") or "").strip()
+    latest_name = str(state.get("latest_name") or latest_version or "").strip()
+    latest_url = str(state.get("latest_url") or "https://github.com/yelanxin/hiresTI/releases").strip()
+    published_at = str(state.get("latest_published_at") or "").strip()
+    latest_notes = str(state.get("latest_notes") or "").strip()
+    error_text = str(state.get("error") or "").strip()
+    available = bool(state.get("update_available"))
+
+    win = Adw.Window(transient_for=getattr(app, "win", None), modal=True)
+    win.set_title("Software Update")
+    win.set_default_size(520, 440)
+
+    content = Adw.ToolbarView()
+    win.set_content(content)
+
+    header = Adw.HeaderBar()
+    content.add_top_bar(header)
+
+    scroll = Gtk.ScrolledWindow()
+    scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+    content.set_content(scroll)
+
+    clamp = Adw.Clamp(maximum_size=520, tightening_threshold=480, margin_top=24, margin_bottom=24, margin_start=16, margin_end=16)
+    scroll.set_child(clamp)
+
+    root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+    clamp.set_child(root)
+
+    title_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    title_icon = Gtk.Image.new_from_icon_name("view-refresh-symbolic")
+    title_icon.set_halign(Gtk.Align.START)
+    title_icon.set_pixel_size(24)
+    title_box.append(title_icon)
+
+    if error_text:
+        heading = "Update Check Failed"
+        subtitle = "GitHub releases could not be reached just now. You can still open the releases page manually."
+    elif available:
+        heading = "Update Available"
+        subtitle = f"{latest_name or latest_version} is newer than your current build."
+    else:
+        heading = "Up to Date"
+        subtitle = "No newer GitHub release was found for this build."
+
+    title_label = Gtk.Label(label=heading, xalign=0, css_classes=["album-title-large"])
+    subtitle_label = Gtk.Label(
+        label=subtitle,
+        xalign=0,
+        wrap=True,
+        wrap_mode=Pango.WrapMode.WORD_CHAR,
+    )
+    subtitle_label.add_css_class("dim-label")
+    title_box.append(title_label)
+    title_box.append(subtitle_label)
+    root.append(title_box)
+
+    meta_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, css_classes=["boxed-list"])
+    meta_list.append(_build_update_meta_row("Current Version", current_version))
+    meta_list.append(_build_update_meta_row("Latest Release", latest_name or latest_version or "No newer release"))
+    meta_list.append(_build_update_meta_row("Published", published_at or "Unknown"))
+    if error_text:
+        meta_list.append(_build_update_meta_row("Status", error_text))
+    root.append(meta_list)
+
+    if latest_notes:
+        notes_title = Gtk.Label(label="Release Notes", xalign=0)
+        notes_title.add_css_class("caption")
+        notes_title.add_css_class("dim-label")
+        root.append(notes_title)
+
+        notes_label = Gtk.Label(
+            label=latest_notes,
+            xalign=0,
+            wrap=True,
+            selectable=True,
+            wrap_mode=Pango.WrapMode.WORD_CHAR,
+        )
+        notes_label.add_css_class("dim-label")
+        root.append(notes_label)
+
+    actions = Gtk.Box(spacing=10)
+    open_release_btn = Gtk.Button(label="Open Release Page")
+    open_release_btn.connect("clicked", lambda _btn: _open_external_url(latest_url))
+    actions.append(open_release_btn)
+
+    close_btn = Gtk.Button(label="Close")
+    close_btn.connect("clicked", lambda _btn: win.close())
+    actions.append(close_btn)
+    root.append(actions)
+
+    win.present()
+
+
+def refresh_update_widgets(app):
+    state = dict(getattr(app, "_update_check_state", {}) or {})
+    available = bool(state.get("update_available"))
+    inflight = bool(getattr(app, "_update_check_inflight", False))
+    latest_version = str(state.get("latest_version") or "").strip()
+
+    tools_btn = getattr(app, "tools_btn", None)
+    if tools_btn is not None:
+        tooltip = "Tools & Settings"
+        if inflight:
+            tooltip = "Tools & Settings • Checking GitHub releases"
+        elif available and latest_version:
+            tooltip = f"Tools & Settings • Update available: {latest_version}"
+        tools_btn.set_tooltip_text(tooltip)
+
+    tools_update_badge = getattr(app, "tools_update_badge", None)
+    if tools_update_badge is not None:
+        tools_update_badge.set_visible(bool(available and not inflight))
+
+    row_btn = getattr(app, "tools_update_row_btn", None)
+    row_label = getattr(app, "tools_update_row_label", None)
+    row_badge = getattr(app, "tools_update_row_badge", None)
+    if row_label is not None:
+        if inflight:
+            row_label.set_text("Checking for Updates...")
+        elif available:
+            row_label.set_text("Update Available")
+        else:
+            row_label.set_text("Check for Updates")
+    if row_btn is not None:
+        row_btn.set_sensitive(not inflight)
+        row_btn.set_tooltip_text(
+            f"Latest release: {latest_version}" if available and latest_version else "Check GitHub releases for a newer version"
+        )
+    if row_badge is not None:
+        row_badge.set_visible(bool(available and not inflight))
+
+
 def _popover_is_visible(pop):
     if pop is None:
         return False
@@ -690,7 +830,20 @@ def build_header(app, container):
     app.mini_btn.set_tooltip_text("Mini Player Mode")
     app.mini_btn.connect("clicked", app.toggle_mini_mode)
 
-    app.tools_btn = Gtk.Button(icon_name="hiresti-gear-symbolic", css_classes=["flat"])
+    app.tools_btn = Gtk.Button(css_classes=["flat"])
+    gear_image = Gtk.Image.new_from_icon_name("hiresti-gear-symbolic")
+    gear_image.set_pixel_size(18)
+    gear_overlay = Gtk.Overlay()
+    gear_overlay.set_child(gear_image)
+    app.tools_update_badge = Gtk.Box(css_classes=["tools-update-dot"])
+    app.tools_update_badge.set_size_request(9, 9)
+    app.tools_update_badge.set_halign(Gtk.Align.END)
+    app.tools_update_badge.set_valign(Gtk.Align.START)
+    app.tools_update_badge.set_margin_top(1)
+    app.tools_update_badge.set_margin_start(12)
+    app.tools_update_badge.set_visible(False)
+    gear_overlay.add_overlay(app.tools_update_badge)
+    app.tools_btn.set_child(gear_overlay)
     app.tools_btn.set_tooltip_text("Tools & Settings")
     app.tools_pop = Gtk.Popover()
     app.tools_pop.set_parent(app.tools_btn)
@@ -703,14 +856,22 @@ def build_header(app, container):
         margin_end=8,
     )
 
-    def _tool_row(icon_name, label, callback):
+    def _tool_row(icon_name, label, callback, with_badge=False):
         btn = Gtk.Button(css_classes=["flat"])
-        row = Gtk.Box(spacing=8)
+        row = Gtk.Box(spacing=8, hexpand=True)
         row.append(Gtk.Image.new_from_icon_name(icon_name))
-        row.append(Gtk.Label(label=label, xalign=0))
+        text = Gtk.Label(label=label, xalign=0, hexpand=True)
+        row.append(text)
+        badge = None
+        if with_badge:
+            badge = Gtk.Box(css_classes=["tools-update-dot"])
+            badge.set_size_request(9, 9)
+            badge.set_valign(Gtk.Align.CENTER)
+            badge.set_visible(False)
+            row.append(badge)
         btn.set_child(row)
         btn.connect("clicked", callback)
-        return btn
+        return btn, text, badge
 
     def _on_shortcuts_clicked(_btn):
         app.tools_pop.popdown()
@@ -733,12 +894,27 @@ def build_header(app, container):
         app.tools_pop.popdown()
         _present_community_window(app)
 
-    tools_box.append(_tool_row("hiresti-shortcuts-symbolic", "Keyboard Shortcuts", _on_shortcuts_clicked))
-    tools_box.append(_tool_row("hiresti-tech-symbolic", "Signal Path / Tech Info", _on_signal_path_clicked))
-    tools_box.append(_tool_row("hiresti-gear-symbolic", "Settings", _on_settings_clicked))
-    tools_box.append(_tool_row("network-workgroup-symbolic", "Community", _on_community_clicked))
-    tools_box.append(_tool_row("help-about-symbolic", "About", _on_about_clicked))
+    def _on_update_clicked(_btn):
+        app.tools_pop.popdown()
+        app.on_check_for_updates_clicked(_btn)
+
+    row_btn, _row_label, _row_badge = _tool_row("hiresti-shortcuts-symbolic", "Keyboard Shortcuts", _on_shortcuts_clicked)
+    tools_box.append(row_btn)
+    row_btn, _row_label, _row_badge = _tool_row("hiresti-tech-symbolic", "Signal Path / Tech Info", _on_signal_path_clicked)
+    tools_box.append(row_btn)
+    row_btn, _row_label, _row_badge = _tool_row("hiresti-gear-symbolic", "Settings", _on_settings_clicked)
+    tools_box.append(row_btn)
+    row_btn, _row_label, _row_badge = _tool_row("view-refresh-symbolic", "Check for Updates", _on_update_clicked, with_badge=True)
+    app.tools_update_row_btn = row_btn
+    app.tools_update_row_label = _row_label
+    app.tools_update_row_badge = _row_badge
+    tools_box.append(row_btn)
+    row_btn, _row_label, _row_badge = _tool_row("network-workgroup-symbolic", "Community", _on_community_clicked)
+    tools_box.append(row_btn)
+    row_btn, _row_label, _row_badge = _tool_row("help-about-symbolic", "About", _on_about_clicked)
+    tools_box.append(row_btn)
     app.tools_pop.set_child(tools_box)
+    refresh_update_widgets(app)
     app.tools_btn.connect("clicked", lambda _b: app.tools_pop.popup())
 
     box_right.append(app.login_btn)

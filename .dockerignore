@@ -1,0 +1,11 @@
+.git
+src_rust/rust_audio_core/target
+src_rust/rust_viz_core/target
+src_rust/rust_launcher/target
+build_tmp
+dist
+build_rpmbuild_*
+build_archpkg
+__pycache__
+*.pyc
+.claude

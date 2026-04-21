@@ -4,11 +4,13 @@
 
 ### Added
 - **Community hub in the tools menu**: the old Sponsor / Discord entries are now merged into a single `Community` dialog with direct actions for `Join Discord`, `Sponsor HiresTI`, and `Star on GitHub`.
+- **In-app update check against GitHub Releases**: a new `Check for Updates` entry in the tools menu queries the GitHub Releases API, compares against the running build, and opens a release-notes window with a direct link to the release page. A silent background check also runs shortly after launch, with results cached for 12 hours and persisted across restarts. Stable builds only surface stable releases, while prerelease builds (alpha / beta / rc) also receive newer prereleases, so users on each channel are notified about upgrades relevant to them. A small red dot appears on the tools button and the `Check for Updates` row whenever a newer release is available.
 
 ### Changed
 - **Community dialog presentation**: the new community window uses a dedicated layout and a taller default height so all actions and support prompts are visible without awkward clipping.
 
 ### Fixed
+- **Packaged builds now declare full GL / ALSA / PipeWire runtime dependencies across Arch, Fedora and Debian/Ubuntu**: `mesa` / `libglvnd` (Arch), `mesa-libGL`, `mesa-libEGL`, `mesa-dri-drivers`, `libglvnd-glx`, `libglvnd-egl` (Fedora), and `libgl1`, `libegl1`, `libgl1-mesa-dri` (Debian/Ubuntu) are now explicitly required, so `GtkGLArea` / PyOpenGL no longer fail on minimal systems that previously lacked a libGL loader and caused the spectrum visualizer to stay blank. The same pass also pulls in `alsa-lib`, `libusb` and the distro's PipeWire-GStreamer bridge (`gst-plugin-pipewire` / `pipewire-gstreamer` / `gstreamer1.0-pipewire`), matching what USB Rawlink native and PipeWire playback actually need at runtime.
 - **Native transport duration / progress for DASH streams**: USB Rawlink V2 now derives total duration for MPD/DASH FLAC streams from the manifest and reports it to the UI, so `24-bit/96kHz` tracks no longer get stuck with a frozen progress bar.
 - **Waveform-to-audio alignment in USB Rawlink V2**: the visualizer now releases waveform frames against the DAC play-head while transport progress continues to follow the write-head, removing the visible lead/lag mismatch.
 - **USB Rawlink V1 high-rate startup reliability**: `96 kHz` playback is now more compatible on sensitive DACs thanks to UAC2 rate-before-alt-setting ordering, larger startup buffer pools for borrowed-buffer prefill, and a stalled-prefill force-start fallback.

@@ -1,0 +1,107 @@
+ARG BASE_IMAGE=ubuntu:24.04
+
+FROM ${BASE_IMAGE} AS builder
+
+ARG DISTRO_FAMILY
+ARG DISTRO_ID
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ---- Install build dependencies (cached per base image) ----
+RUN if [ "$DISTRO_FAMILY" = "deb" ]; then \
+        apt-get update && apt-get install -y --no-install-recommends \
+            build-essential pkg-config curl ca-certificates \
+            python3 python3-pip python3-venv \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libpulse-dev libpipewire-0.3-dev libusb-1.0-0-dev \
+            libasound2-dev liblilv-dev libclang-dev clang dpkg-dev \
+        && rm -rf /var/lib/apt/lists/*; \
+    elif [ "$DISTRO_FAMILY" = "rpm" ]; then \
+        dnf install -y --setopt=install_weak_deps=False \
+            gcc gcc-c++ make pkg-config curl ca-certificates \
+            python3 python3-pip \
+            gstreamer1-devel gstreamer1-plugins-base-devel \
+            pulseaudio-libs-devel pipewire-devel libusb1-devel \
+            alsa-lib-devel lilv-devel clang-devel clang rpm-build \
+        && dnf clean all; \
+    elif [ "$DISTRO_FAMILY" = "suse" ]; then \
+        zypper --non-interactive refresh && \
+        zypper --non-interactive install --no-recommends \
+            gcc gcc-c++ make pkg-config curl ca-certificates \
+            python3 python3-devel python3-pip \
+            gstreamer-devel gstreamer-plugins-base-devel \
+            libpulse-devel pipewire-devel libusb-1_0-devel \
+            alsa-devel liblilv-0-devel clang-devel clang rpm-build \
+        && zypper clean --all; \
+    elif [ "$DISTRO_FAMILY" = "arch" ]; then \
+        pacman -Syu --noconfirm \
+            base-devel pkg-config curl ca-certificates \
+            python python-pip \
+            gstreamer gst-plugins-base \
+            libpulse pipewire libusb \
+            alsa-lib lilv clang \
+            zstd \
+        && pacman -Scc --noconfirm; \
+    fi
+
+# ---- Install Rust (cached per base image) ----
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# ---- Step 1: Copy only Cargo manifests + vendor for dependency caching ----
+COPY src_rust/rust_audio_core/Cargo.toml src_rust/rust_audio_core/Cargo.lock* src_rust/rust_audio_core/
+COPY src_rust/rust_audio_core/.cargo src_rust/rust_audio_core/.cargo/
+COPY src_rust/rust_audio_core/vendor src_rust/rust_audio_core/vendor/
+COPY src_rust/rust_viz_core/Cargo.toml src_rust/rust_viz_core/
+COPY src_rust/rust_launcher/Cargo.toml src_rust/rust_launcher/
+
+# Vendor if not already present
+RUN cd src_rust/rust_audio_core && \
+    ([ -d vendor ] || cargo vendor 2>/dev/null || true)
+
+# ---- Step 2: Build Rust dependencies with dummy source (cached unless Cargo.toml changes) ----
+WORKDIR /build
+
+# Create minimal dummy sources so cargo can compile all *dependencies*
+RUN mkdir -p src_rust/rust_audio_core/src/bin && \
+    echo "pub fn dummy(){}" > src_rust/rust_audio_core/src/lib.rs && \
+    echo "fn main(){}" > src_rust/rust_audio_core/src/bin/usb_enum.rs && \
+    mkdir -p src_rust/rust_viz_core/src && \
+    echo "#[no_mangle] pub extern fn dummy(){}" > src_rust/rust_viz_core/src/lib.rs && \
+    mkdir -p src_rust/rust_launcher/src && \
+    echo "fn main(){}" > src_rust/rust_launcher/src/main.rs
+
+# Pre-build dependencies (this layer is cached as long as Cargo.toml/vendor don't change)
+RUN --mount=type=cache,target=/build/src_rust/rust_audio_core/target,id=rust-audio-${DISTRO_ID} \
+    --mount=type=cache,target=/build/src_rust/rust_viz_core/target,id=rust-viz-${DISTRO_ID} \
+    --mount=type=cache,target=/build/src_rust/rust_launcher/target,id=rust-launcher-${DISTRO_ID} \
+    cargo build --manifest-path src_rust/rust_audio_core/Cargo.toml --release 2>&1 || true && \
+    cargo build --manifest-path src_rust/rust_viz_core/Cargo.toml --release 2>&1 || true && \
+    cargo build --manifest-path src_rust/rust_launcher/Cargo.toml --release 2>&1 || true
+
+# ---- Step 3: Copy real source and rebuild (only recompiles changed crates) ----
+COPY . /build
+
+# Touch source files to ensure cargo sees them as newer than the dummy
+RUN find src_rust/rust_audio_core/src -name '*.rs' -exec touch {} + && \
+    find src_rust/rust_viz_core/src -name '*.rs' -exec touch {} + && \
+    find src_rust/rust_launcher/src -name '*.rs' -exec touch {} +
+
+# Re-vendor in case COPY overwrote the vendor dir
+RUN cd src_rust/rust_audio_core && \
+    ([ -d vendor ] || cargo vendor 2>/dev/null || true)
+
+# Final build uses cache mount — only recompiles the project crates, not all deps
+RUN --mount=type=cache,target=/build/src_rust/rust_audio_core/target,id=rust-audio-${DISTRO_ID} \
+    --mount=type=cache,target=/build/src_rust/rust_viz_core/target,id=rust-viz-${DISTRO_ID} \
+    --mount=type=cache,target=/build/src_rust/rust_launcher/target,id=rust-launcher-${DISTRO_ID} \
+    cargo build --manifest-path src_rust/rust_audio_core/Cargo.toml --release && \
+    cargo build --manifest-path src_rust/rust_viz_core/Cargo.toml --release && \
+    cargo build --manifest-path src_rust/rust_launcher/Cargo.toml --release && \
+    mkdir -p /build/rust_out && \
+    cp src_rust/rust_audio_core/target/release/librust_audio_core.so /build/rust_out/ && \
+    cp src_rust/rust_viz_core/target/release/libviz_core.so /build/rust_out/ && \
+    cp src_rust/rust_launcher/target/release/hiresti /build/rust_out/
+
+# Package — package.sh detects pre-built .so and skips cargo
+CMD ["bash", "-c", "./package.sh ${PKG_TYPE} ${VERSION} && cp dist/* /output/"]

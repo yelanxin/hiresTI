@@ -111,6 +111,12 @@ def _init_widget_refs(self):
     self.search_content_box = None
     self.search_suggest_popover = None
     self.global_share_popover = None
+    self.tools_btn = None
+    self.tools_pop = None
+    self.tools_update_badge = None
+    self.tools_update_row_btn = None
+    self.tools_update_row_label = None
+    self.tools_update_row_badge = None
     self.content_window_handle = None
     self.content_overlay = None
     self.content_vbox = None
@@ -338,6 +344,9 @@ def _init_runtime_refs(self):
     self.remote_api_last_error = ""
     self._remote_api_service = None
     self._remote_ui_syncing = False
+    self._update_check_state = {}
+    self._update_check_inflight = False
+    self._update_check_source = 0
 
 
 def init_ui_refs(self):

@@ -6,6 +6,7 @@ from app.wiring_utils import bind_map
 def bind_handlers_core(TidalApp, seen=None):
     from app.app_handlers import (
         on_about_clicked,
+        on_check_for_updates_clicked,
         on_login_clicked,
         on_logout_clicked,
         on_settings_clicked,
@@ -39,10 +40,12 @@ def bind_handlers_core(TidalApp, seen=None):
         _on_login_success_for_attempt,
         _on_login_failed,
         _on_login_failed_for_attempt,
+        _schedule_startup_update_check,
     )
 
     bind_map(TidalApp, [
         ("on_about_clicked", on_about_clicked),
+        ("on_check_for_updates_clicked", on_check_for_updates_clicked),
         ("on_login_clicked", on_login_clicked),
         ("on_logout_clicked", on_logout_clicked),
         ("on_settings_clicked", on_settings_clicked),
@@ -76,6 +79,7 @@ def bind_handlers_core(TidalApp, seen=None):
         ("_on_login_success_for_attempt", _on_login_success_for_attempt),
         ("_on_login_failed", _on_login_failed),
         ("_on_login_failed_for_attempt", _on_login_failed_for_attempt),
+        ("_schedule_startup_update_check", _schedule_startup_update_check),
     ], seen=seen)
 
 
