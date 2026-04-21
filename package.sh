@@ -14,12 +14,13 @@ URL="https://github.com/yourrepo/hiresti"
 # ---- Supported targets ----
 # Each entry: TARGET_NAME  BASE_IMAGE  DISTRO_FAMILY  PKG_TYPE  SUFFIX
 TARGETS=(
-    "ubuntu2404   ubuntu:24.04          deb   deb   ubuntu2404"
-    "debian12     debian:12             deb   deb   debian12"
-    "debian13     debian:13             deb   deb   debian13"
-    "fedora43     fedora:43             rpm   rpm-fedora   fedora43"
-    "fedora44     fedora:44             rpm   rpm-fedora   fedora44"
-    "archlinux    archlinux:latest      arch  arch  archlinux"
+    "ubuntu2404             ubuntu:24.04                deb   deb          ubuntu2404"
+    "debian12               debian:12                   deb   deb          debian12"
+    "debian13               debian:13                   deb   deb          debian13"
+    "fedora43               fedora:43                   rpm   rpm-fedora   fedora43"
+    "fedora44               fedora:44                   rpm   rpm-fedora   fedora44"
+    "archlinux              archlinux:latest            arch  arch         archlinux"
+    "opensuse-tumbleweed    opensuse/tumbleweed:latest  suse  rpm-opensuse opensuse_tumbleweed"
 )
 
 TYPE="${1:-}"
@@ -45,8 +46,9 @@ print_usage() {
     echo "  debian13        Debian 13 .deb"
     echo "  fedora43        Fedora 43 .rpm"
     echo "  fedora44        Fedora 44 .rpm"
-    echo "  archlinux       Arch Linux .pkg.tar.zst"
-    echo "  all             Build all Docker targets"
+    echo "  archlinux              Arch Linux .pkg.tar.zst"
+    echo "  opensuse-tumbleweed    openSUSE Tumbleweed .rpm"
+    echo "  all                    Build all Docker targets"
     echo ""
     echo "Example: ./package.sh ubuntu2404 1.9.0beta1"
     echo "         ./package.sh all 1.9.0beta1"
@@ -149,7 +151,7 @@ docker_build_target() {
 
 # Handle Docker targets
 case "$TYPE" in
-    ubuntu2404|debian12|debian13|fedora43|fedora44|archlinux)
+    ubuntu2404|debian12|debian13|fedora43|fedora44|archlinux|opensuse-tumbleweed)
         docker_build_target "$TYPE"
         echo ""
         echo "🎉 Build Complete! Packages in dist/:"
@@ -619,6 +621,8 @@ INSTALL_EOF
 # ---- Dispatch local builds ----
 FEDORA_REQUIRES="python3, python3-gobject, python3-cairo, python3-pyopengl, python3-setproctitle, gtk4, libadwaita, gstreamer1-plugins-base, gstreamer1-plugins-good, gstreamer1-plugins-bad-free, gstreamer1-plugins-ugly-free, pipewire, pipewire-gstreamer, pulseaudio-libs, alsa-lib, libusb1, mesa-libGL, mesa-libEGL, mesa-dri-drivers, libglvnd-glx, libglvnd-egl"
 
+OPENSUSE_REQUIRES="python3, python3-gobject, python3-gobject-Gdk, python3-gobject-cairo, python3-cairo, python3-opengl, python3-setproctitle, python3-python-dateutil, python3-typing_extensions, python3-isodate, typelib-1_0-Gtk-4_0, typelib-1_0-Adw-1, typelib-1_0-GtkSource-5, gstreamer, gstreamer-plugins-base, gstreamer-plugins-good, gstreamer-plugins-bad, gstreamer-plugins-ugly, gstreamer-plugin-pipewire, pipewire, libpulse0, alsa, libasound2, libusb-1_0-0, Mesa-libGL1, Mesa-libEGL1, Mesa-dri, libglvnd"
+
 case "$TYPE" in
     deb)
         build_deb
@@ -626,12 +630,15 @@ case "$TYPE" in
     rpm-fedora)
         build_rpm_variant "fedora" "fedora" "$FEDORA_REQUIRES"
         ;;
+    rpm-opensuse)
+        build_rpm_variant "opensuse" "opensuse" "$OPENSUSE_REQUIRES"
+        ;;
     arch)
         build_arch_package
         ;;
     *)
-        echo "Error: unsupported local type '$TYPE'. Use deb | rpm-fedora | arch"
-        echo "  Or use a Docker target: ubuntu2204 | ubuntu2404 | debian12 | debian13 | fedora43 | fedora44 | archlinux | all"
+        echo "Error: unsupported local type '$TYPE'. Use deb | rpm-fedora | rpm-opensuse | arch"
+        echo "  Or use a Docker target: ubuntu2204 | ubuntu2404 | debian12 | debian13 | fedora43 | fedora44 | archlinux | opensuse-tumbleweed | all"
         exit 1
         ;;
 esac
