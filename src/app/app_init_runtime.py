@@ -8,6 +8,8 @@ from gi.repository import GLib
 from _rust.audio import create_audio_engine
 from backend import TidalBackend
 from core.constants import CacheSettings
+from sources import MediaRegistry
+from sources.tidal_resolver import TidalResolver
 from core.settings import load_settings
 from models import HistoryManager, PlaylistManager
 from services.dsp_presets import DspPresetManager
@@ -22,6 +24,8 @@ logger = logging.getLogger(__name__)
 
 def _init_paths_and_settings(self):
     self.backend = TidalBackend()
+    self.media_registry = MediaRegistry()
+    self.media_registry.register("tidal", TidalResolver(self.backend))
     self._cache_root = get_cache_dir()
     self._config_root = get_config_dir()
     os.makedirs(self._cache_root, exist_ok=True)

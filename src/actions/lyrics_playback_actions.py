@@ -361,10 +361,11 @@ def play_track(app, index):
                 cache.pop(track.id, None)
                 logger.debug("Using prefetched stream url for track: %s (age %.0fs)", track.id, url_age)
             else:
-                url = app.backend.get_stream_url(track)
+                info = app.media_registry.resolve(track)
+                url = info.url
                 _apply_track_redirect(app, track)
-                bit_depth = int(getattr(app.backend, "_last_stream_bit_depth", 0) or 0)
-                sample_rate = int(getattr(app.backend, "_last_stream_sample_rate", 0) or 0)
+                bit_depth = int(info.bit_depth or 0)
+                sample_rate = int(info.sample_rate or 0)
 
             if url and max_tracks > 0 and str(url).startswith("http"):
                 Thread(

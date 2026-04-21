@@ -19,7 +19,7 @@ def on_quality_changed(app, dd, p):
         track = app.current_track_list[app.current_index]
 
         def refresh():
-            new_url = app.backend.get_stream_url(track)
+            new_url = app.media_registry.resolve(track).url
             GLib.idle_add(lambda: app._restart_player_with_url(new_url, pos))
 
         Thread(target=refresh, daemon=True).start()
