@@ -1292,7 +1292,9 @@ def _on_dsp_master_toggled(self, switch, state):
         "DSP master toggle rebind hook available=%s",
         hasattr(self, "_lv2_restart_playback_for_graph_rebind"),
     )
-    if hasattr(self, "_lv2_restart_playback_for_graph_rebind"):
+    if _player_uses_usb_rawlink_family(player):
+        logger.info("DSP master toggle playback rebind skipped: rawlink-native")
+    elif hasattr(self, "_lv2_restart_playback_for_graph_rebind"):
         try:
             logger.info("DSP master toggle invoking playback rebind")
             self._lv2_restart_playback_for_graph_rebind(reason="dsp-master-toggle")
@@ -3793,10 +3795,22 @@ def _lv2_install_help_text():
     return _LV2_INSTALL_HELP_TEXT
 
 
+def _player_uses_usb_rawlink_family(player):
+    driver = (
+        getattr(player, "current_driver", None)
+        or getattr(player, "requested_driver", None)
+        or ""
+    )
+    return str(driver or "") in ("USB Rawlink", "USB Rawlink v2")
+
+
 def _lv2_restart_playback_for_graph_rebind(self, reason="unspecified"):
     player = getattr(self, "player", None)
     if player is None:
         logger.info("LV2 playback rebind skipped: reason=%s cause=no-player", reason)
+        return False
+    if _player_uses_usb_rawlink_family(player):
+        logger.info("LV2 playback rebind skipped: reason=%s cause=rawlink-native", reason)
         return False
     if bool(getattr(self, "_playback_rebind_inflight", False)):
         self._playback_rebind_pending = True

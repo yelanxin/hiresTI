@@ -124,6 +124,13 @@ pub struct MpdManifestInfo {
     pub first_start_number: Option<u64>,
     pub first_timescale: Option<u64>,
     pub first_segment_count: Option<u64>,
+    /// Total duration in milliseconds, sourced from `<MPD mediaPresentationDuration>`
+    /// or `<Period duration>` (ISO 8601 durations).
+    pub total_duration_ms: Option<u64>,
+    /// `<SegmentTemplate duration>` in `timescale` units.
+    pub segment_template_duration: Option<u64>,
+    /// Summed `<S d="...">` duration in `timescale` units.
+    pub segment_timeline_total: Option<u64>,
 }
 
 pub fn inspect_mpd_manifest(xml: &str) -> Result<MpdManifestInfo, String> {
@@ -154,6 +161,24 @@ fn parse_mpd_node<'a>(
     info: &mut MpdManifestInfo,
 ) -> Result<(), String> {
     match name {
+        b"MPD" => {
+            for attr in attributes.flatten() {
+                if attr.key.as_ref() == b"mediaPresentationDuration"
+                    && info.total_duration_ms.is_none()
+                {
+                    let raw = decode_attr_value(reader, attr.value.as_ref())?;
+                    info.total_duration_ms = parse_iso8601_duration_ms(&raw);
+                }
+            }
+        }
+        b"Period" => {
+            for attr in attributes.flatten() {
+                if attr.key.as_ref() == b"duration" && info.total_duration_ms.is_none() {
+                    let raw = decode_attr_value(reader, attr.value.as_ref())?;
+                    info.total_duration_ms = parse_iso8601_duration_ms(&raw);
+                }
+            }
+        }
         b"Representation" => {
             info.representation_count += 1;
             for attr in attributes.flatten() {
@@ -195,24 +220,46 @@ fn parse_mpd_node<'a>(
                             .parse::<u64>()
                             .ok();
                     }
+                    b"duration" if info.segment_template_duration.is_none() => {
+                        info.segment_template_duration = decode_attr_value(reader, attr.value.as_ref())?
+                            .parse::<u64>()
+                            .ok();
+                    }
                     _ => {}
                 }
             }
         }
         b"S" => {
             let mut count = 1u64;
+            let mut seg_d = 0u64;
             for attr in attributes.flatten() {
-                if attr.key.as_ref() == b"r" {
-                    let repeat = decode_attr_value(reader, attr.value.as_ref())?
-                        .parse::<i64>()
-                        .unwrap_or(0);
-                    if repeat >= 0 {
-                        count = count.saturating_add(repeat as u64);
+                match attr.key.as_ref() {
+                    b"r" => {
+                        let repeat = decode_attr_value(reader, attr.value.as_ref())?
+                            .parse::<i64>()
+                            .unwrap_or(0);
+                        if repeat >= 0 {
+                            count = count.saturating_add(repeat as u64);
+                        }
                     }
+                    b"d" => {
+                        seg_d = decode_attr_value(reader, attr.value.as_ref())?
+                            .parse::<u64>()
+                            .unwrap_or(0);
+                    }
+                    _ => {}
                 }
             }
             info.first_segment_count =
                 Some(info.first_segment_count.unwrap_or(0).saturating_add(count));
+            if seg_d > 0 {
+                let total = seg_d.saturating_mul(count);
+                info.segment_timeline_total = Some(
+                    info.segment_timeline_total
+                        .unwrap_or(0)
+                        .saturating_add(total),
+                );
+            }
         }
         _ => {}
     }
@@ -254,6 +301,78 @@ fn infer_quality_label(locator: &str) -> String {
     } else {
         "LOSSLESS".to_string()
     }
+}
+
+impl MpdManifestInfo {
+    pub fn total_duration_s(&self) -> Option<f64> {
+        if let Some(ms) = self.total_duration_ms {
+            return Some(ms as f64 / 1000.0);
+        }
+        let ts = self.first_timescale.filter(|t| *t > 0)? as f64;
+        if let (Some(count), Some(seg_d)) =
+            (self.first_segment_count, self.segment_template_duration)
+        {
+            if count > 0 && seg_d > 0 {
+                return Some((count as f64 * seg_d as f64) / ts);
+            }
+        }
+        if let Some(total) = self.segment_timeline_total {
+            if total > 0 {
+                return Some(total as f64 / ts);
+            }
+        }
+        None
+    }
+}
+
+fn parse_iso8601_duration_ms(raw: &str) -> Option<u64> {
+    let s = raw.trim();
+    let rest = s.strip_prefix('P').or_else(|| s.strip_prefix('p'))?;
+    let rest = rest.strip_prefix('T').or_else(|| rest.strip_prefix('t')).unwrap_or(rest);
+    if rest.is_empty() {
+        return None;
+    }
+
+    let mut total_ms: u64 = 0;
+    let mut num_start = 0usize;
+    let bytes = rest.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if c.is_ascii_digit() || c == '.' {
+            i += 1;
+            continue;
+        }
+        let token = &rest[num_start..i];
+        if token.is_empty() {
+            return None;
+        }
+        match c {
+            'H' | 'h' => {
+                let h: u64 = token.parse().ok()?;
+                total_ms = total_ms.checked_add(h.checked_mul(3_600_000)?)?;
+            }
+            'M' | 'm' => {
+                let m: u64 = token.parse().ok()?;
+                total_ms = total_ms.checked_add(m.checked_mul(60_000)?)?;
+            }
+            'S' | 's' => {
+                let sec: f64 = token.parse().ok()?;
+                let ms = (sec * 1000.0).round();
+                if !ms.is_finite() || ms < 0.0 {
+                    return None;
+                }
+                total_ms = total_ms.checked_add(ms as u64)?;
+            }
+            _ => return None,
+        }
+        i += 1;
+        num_start = i;
+    }
+    if num_start != bytes.len() {
+        return None;
+    }
+    Some(total_ms)
 }
 
 fn decode_attr_value(reader: &Reader<&[u8]>, raw: &[u8]) -> Result<String, String> {
@@ -316,5 +435,56 @@ mod tests {
             info.first_segment_count,
             Some(1)
         );
+    }
+
+    #[test]
+    fn inspect_mpd_extracts_total_duration_from_manifest() {
+        let xml = r#"
+            <MPD mediaPresentationDuration="PT4M12.5S">
+              <Period>
+                <AdaptationSet mimeType="audio/mp4">
+                  <Representation id="1" codecs="flac" audioSamplingRate="96000">
+                    <SegmentTemplate initialization="init.m4s"
+                                     media="chunk-$Number$.m4s"
+                                     startNumber="1"
+                                     timescale="48000">
+                      <SegmentTimeline>
+                        <S t="0" d="96000" r="125" />
+                      </SegmentTimeline>
+                    </SegmentTemplate>
+                  </Representation>
+                </AdaptationSet>
+              </Period>
+            </MPD>
+        "#;
+        let info = inspect_mpd_manifest(xml).unwrap();
+        assert_eq!(info.total_duration_ms, Some(252_500));
+        assert_eq!(info.total_duration_s(), Some(252.5));
+    }
+
+    #[test]
+    fn inspect_mpd_falls_back_to_segment_timeline_duration() {
+        let xml = r#"
+            <MPD>
+              <Period>
+                <AdaptationSet mimeType="audio/mp4">
+                  <Representation id="1" codecs="flac" audioSamplingRate="96000">
+                    <SegmentTemplate initialization="init.m4s"
+                                     media="chunk-$Number$.m4s"
+                                     startNumber="1"
+                                     timescale="48000">
+                      <SegmentTimeline>
+                        <S t="0" d="96000" r="2" />
+                      </SegmentTimeline>
+                    </SegmentTemplate>
+                  </Representation>
+                </AdaptationSet>
+              </Period>
+            </MPD>
+        "#;
+        let info = inspect_mpd_manifest(xml).unwrap();
+        assert_eq!(info.first_segment_count, Some(3));
+        assert_eq!(info.segment_timeline_total, Some(288000));
+        assert_eq!(info.total_duration_s(), Some(6.0));
     }
 }

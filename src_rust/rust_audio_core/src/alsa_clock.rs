@@ -426,6 +426,59 @@ impl AlsaHwClockFeed {
 
     // ── Shared read path ─────────────────────────────────────────────────────
 
+    /// Estimated stream time already audible at the device, in nanoseconds.
+    ///
+    /// `total_frames` tracks the USB write-head because frames are counted when an
+    /// ISO transfer is filled. The device hears those frames after the in-flight
+    /// ring drains, so UI/spectrum alignment must subtract `buffer_depth_ns`.
+    pub fn playback_elapsed_ns(&self) -> Option<u64> {
+        let write_elapsed = self.write_elapsed_ns()?;
+        let buffer_depth = self.buffer_depth_ns.load(Ordering::Relaxed);
+        Some(write_elapsed.saturating_sub(buffer_depth))
+    }
+
+    pub fn playback_elapsed_s(&self) -> Option<f64> {
+        self.playback_elapsed_ns()
+            .map(|ns| ns as f64 / 1_000_000_000.0)
+    }
+
+    /// Estimated stream time queued/written to the USB ring, in seconds.
+    ///
+    /// This intentionally does not subtract `buffer_depth_ns`; it is useful for
+    /// UI transport progress, which should keep moving even while the stricter
+    /// play-head estimate is waiting for the in-flight ring to drain.
+    pub fn write_elapsed_s(&self) -> Option<f64> {
+        self.write_elapsed_ns()
+            .map(|ns| ns as f64 / 1_000_000_000.0)
+    }
+
+    fn write_elapsed_ns(&self) -> Option<u64> {
+        if !self.valid.load(Ordering::Acquire) {
+            return None;
+        }
+        let rate = self.rate.load(Ordering::Relaxed) as u64;
+        if rate == 0 {
+            return None;
+        }
+
+        let total_frames = self.total_frames.load(Ordering::Relaxed);
+        if self.mode.load(Ordering::Relaxed) == ClockMode::Pull as u8
+            && self.pull_ready.load(Ordering::Acquire)
+        {
+            let anchor_frames = self.pull_anchor_frames.load(Ordering::Relaxed);
+            let ns_per_fp32 = self.pull_ns_per_frame_fp32.load(Ordering::Relaxed);
+            if ns_per_fp32 > 0 {
+                let pre_anchor_ns = anchor_frames.saturating_mul(1_000_000_000) / rate;
+                let post_anchor_frames = total_frames.saturating_sub(anchor_frames);
+                let post_anchor_ns =
+                    ((post_anchor_frames as u128 * ns_per_fp32 as u128) >> 32) as u64;
+                return Some(pre_anchor_ns.saturating_add(post_anchor_ns));
+            }
+        }
+
+        Some(total_frames.saturating_mul(1_000_000_000) / rate)
+    }
+
     /// Estimate of the hardware playback position as `CLOCK_MONOTONIC` ns.
     ///
     /// Returns `None` if the feed has not been anchored yet.

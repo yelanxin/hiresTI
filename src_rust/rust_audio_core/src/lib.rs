@@ -1276,6 +1276,8 @@ fn usb_audio_pusher_thread(
     // (track switch) we signal the engine to reset the spectrum timeline so
     // stale frames accumulated during startup prefill are discarded.
     let mut has_opened_once = false;
+    // Timestamp of device open — used to detect stalled prefill.
+    let mut device_open_at: Option<std::time::Instant> = None;
 
     // Exponential back-off sleep duration for the idle (no-sample) path.
     // Resets to MIN_IDLE_MS on each real sample; caps at MAX_IDLE_MS.
@@ -1337,6 +1339,7 @@ fn usb_audio_pusher_thread(
                         s.set_skip_release_on_drop(true);
                     }
                     sink = None;
+                    device_open_at = None;
                     reset_usb_hw_volume_state(&lazy);
                     dop_enc = None;
                     buf_count = 0;
@@ -1404,6 +1407,47 @@ fn usb_audio_pusher_thread(
                     pull_timeout_count, pull_ms, q_ms, state,
                 );
             }
+            // If the ring has not started yet but we already have at least 1×
+            // the ring size buffered, force-start instead of waiting forever
+            // for upstream delivery to reach the full 2× prefill target.
+            if let Some(ref mut s) = sink {
+                if !s.is_started() {
+                    let stall_ms = device_open_at
+                        .map(|t| t.elapsed().as_millis() as u64)
+                        .unwrap_or(0);
+                    let min_prefill = usb_audio_startup_prefill_target_bytes(
+                        s.actual_rate,
+                        lazy.channels,
+                        lazy.gst_format.as_str(),
+                        lazy.dop_channels,
+                    ) / 2;
+                    let queue_bytes = s.queued_bytes();
+                    if stall_ms >= 500 && queue_bytes >= min_prefill {
+                        let queue_ms = if s.actual_rate > 0 {
+                            queue_bytes as u64 * 1000
+                                / (s.actual_rate as u64
+                                    * s.state.channels as u64
+                                    * s.state.bytes_per_sample as u64)
+                                    .max(1)
+                        } else {
+                            0
+                        };
+                        eprintln!(
+                            "usb-audio: prefill stalled {}ms — force-starting ring with queue={} B target_min={} B (~{} ms)",
+                            stall_ms, queue_bytes, min_prefill, queue_ms,
+                        );
+                        if let Err(e) = s.ensure_started() {
+                            push_thread_event(
+                                &events,
+                                EVT_ERROR,
+                                format!("usb-audio: deferred ring start failed: {e}"),
+                            );
+                            return;
+                        }
+                        appsink.set_property("sync", true);
+                    }
+                }
+            }
             // `try-pull-sample` has already blocked for 100 ms.  Sleeping again
             // here only extends producer starvation while the USB ring keeps
             // draining the queued audio, increasing the chance of an avoidable
@@ -1454,6 +1498,7 @@ fn usb_audio_pusher_thread(
                 s.set_skip_release_on_drop(true);
             }
             sink = None;
+            device_open_at = None;
             reset_usb_hw_volume_state(&lazy);
             dop_enc = None;
             buf_count = 0;
@@ -1476,6 +1521,7 @@ fn usb_audio_pusher_thread(
                     s.set_skip_release_on_drop(true);
                 }
                 sink = None;
+                device_open_at = None;
                 reset_usb_hw_volume_state(&lazy);
                 dop_enc = None;
                 buf_count = 0;
@@ -1655,6 +1701,7 @@ fn usb_audio_pusher_thread(
                                 },
                             );
                             sink = Some(s);
+                            device_open_at = Some(std::time::Instant::now());
                             if let Some(ref sn) = sink {
                                 if sn.has_hw_volume() {
                                     hw_volume_worker = Some(UsbHwVolumeWorker::spawn(
@@ -1795,6 +1842,7 @@ fn usb_audio_pusher_thread(
                             );
                             return;
                         }
+                        appsink.set_property("sync", true);
                     }
                 }
                 push_bytes_window += data.len() as u64;
@@ -2261,7 +2309,13 @@ fn usb_audio_proposed_buffer_pool_size(caps: &gst::CapsRef) -> Option<(u32, u32,
         .saturating_div(frame_bytes)
         .saturating_mul(frame_bytes)
         .max(frame_bytes);
-    Some((size, 2, 4))
+    // Size the pool so the borrowed-buffer startup prefill can accumulate the
+    // full 2× ring target without exhausting upstream buffers at 96 kHz+.
+    let prefill_bytes =
+        usb_audio_startup_prefill_target_bytes(rate, channels as usize, format, 0);
+    let buffers_for_prefill = (prefill_bytes as u32 + size - 1) / size;
+    let max_buffers = buffers_for_prefill.max(4) + 4;
+    Some((size, 2, max_buffers))
 }
 
 fn try_apply_usb_allocation_hint(query_ref: &mut gst::QueryRef, via: &str) {
@@ -4665,7 +4719,24 @@ impl Engine {
             source.kind(),
             source.locator()
         );
-        let dsp_active = self.dsp_config.has_active_processing();
+        let dsp_active = self.dsp_config.has_native_transport_processing();
+        let unsupported = if self
+            .dsp_config
+            .has_native_transport_unsupported_processing()
+        {
+            self.dsp_config.native_transport_unsupported_modules()
+        } else {
+            Vec::new()
+        };
+        if !unsupported.is_empty() {
+            self.emit_event(
+                EVT_STATE,
+                &format!(
+                    "native-transport dsp unsupported skipped modules={}",
+                    unsupported.join(",")
+                ),
+            );
+        }
         let usb_cfg = active_usb_raw_sink(self).and_then(|sink| sink.config());
         eprintln!(
             "[native-transport] load: dsp_active={} bit_perfect={} usb_output_config={} master={} peq={} conv={} tape={} tube={} wid={} lim={} resamp={} lv2={}",
@@ -4763,12 +4834,10 @@ impl Engine {
             // playback clock.  This replicates GStreamer's clock-synchronized
             // spectrum delivery: frames are held until the audio actually plays.
             let seek_off = self.native_transport.snapshot().seek_offset_s;
-            let playback_pos_s = self.native_transport.runtime_info()
-                .map(|rt| {
-                    let rate = rt.feed.rate.load(Ordering::Relaxed) as f64;
-                    let frames = rt.feed.total_frames.load(Ordering::Relaxed) as f64;
-                    if rate > 0.0 { seek_off + frames / rate } else { seek_off }
-                })
+            let playback_pos_s = self
+                .native_transport
+                .runtime_info()
+                .map(|rt| seek_off + rt.feed.playback_elapsed_s().unwrap_or(0.0))
                 .unwrap_or(seek_off);
             while let Some(frame) = self.native_spectrum_pending.front() {
                 if frame.pos_s > playback_pos_s + 0.02 {
@@ -5088,8 +5157,9 @@ impl Engine {
         let feed = Arc::new(AlsaHwClockFeed::default());
         let hw_clock = AlsaHwClock::new(Arc::clone(&feed));
 
-        // Build appsink.  `sync=true` lets the AlsaHwClock gate buffer
-        // release against the USB frame counter once the device is open.
+        // Build appsink.  Start with `sync=false` so upstream can prefill the
+        // queue at full speed; the pusher thread enables sync once the USB
+        // ring has started and the hardware-backed clock is live.
         let appsink = gst::ElementFactory::make("appsink")
             .name("rust-usb-appsink")
             .build()
@@ -5112,7 +5182,9 @@ impl Engine {
                 .build()
         };
         appsink.set_property("caps", &caps);
-        appsink.set_property("sync", true);
+        // Start unsynchronised so upstream can fill the queue as fast as
+        // possible; the pusher thread re-enables sync once the ring is active.
+        appsink.set_property("sync", false);
         // Keep appsink pull-mode consumption, but enable GObject signal emission
         // so the propose-allocation hook can advertise a larger upstream pool.
         appsink.set_property("emit-signals", true);
@@ -8024,11 +8096,27 @@ pub extern "C" fn rac_get_position(ptr: *const Engine, pos_out: *mut c_double) -
         } else {
             let snap = engine.native_transport.snapshot();
             let seek_offset = snap.seek_offset_s;
-            // Prefer DAC-accurate position from the USB clock feed.
+            // Use the USB write-head for transport progress so the UI keeps
+            // moving even while the stricter play-head estimate is waiting for
+            // the in-flight ISO ring to drain. Spectrum release uses
+            // playback_elapsed_s() above for DAC-aligned visuals.
             if let Some(runtime) = engine.native_transport.runtime_info() {
-                let rate = runtime.feed.rate.load(Ordering::Relaxed) as f64;
-                let frames = runtime.feed.total_frames.load(Ordering::Relaxed) as f64;
-                if rate > 0.0 { seek_offset + frames / rate } else { seek_offset }
+                let write_pos = runtime.feed.write_elapsed_s().unwrap_or(0.0);
+                if write_pos > 0.0 || snap.state != native_transport::NativeTransportState::Playing
+                {
+                    seek_offset + write_pos
+                } else {
+                    let rate = snap
+                        .stream_spec
+                        .as_ref()
+                        .map(|s| s.sample_rate as f64)
+                        .unwrap_or(0.0);
+                    if rate > 0.0 && snap.decoded_frame_count > 0 {
+                        seek_offset + snap.decoded_frame_count as f64 / rate
+                    } else {
+                        seek_offset
+                    }
+                }
             } else {
                 // Fallback: decoded frame count (ahead of actual playback).
                 let rate = snap.stream_spec.as_ref().map(|s| s.sample_rate as f64).unwrap_or(0.0);

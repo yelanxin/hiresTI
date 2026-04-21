@@ -915,14 +915,168 @@ fn transport_worker(
                 }
             }
             NativeTransportCommand::UpdateDspConfig(new_cfg) => {
-                current_dsp_config = if new_cfg.has_active_processing() {
+                let previous_native_active = current_dsp_config
+                    .as_ref()
+                    .map(|cfg| cfg.has_native_transport_processing())
+                    .unwrap_or(false);
+                let new_native_active = new_cfg.has_native_transport_processing();
+                let target_bit_perfect = !new_native_active;
+                let unsupported = new_cfg.native_transport_unsupported_modules();
+                if !unsupported.is_empty() {
+                    queue_native_event(
+                        &events,
+                        crate::EVT_STATE,
+                        format!(
+                            "native-transport dsp unsupported skipped modules={}",
+                            unsupported.join(",")
+                        ),
+                    );
+                }
+
+                current_dsp_config = if new_native_active {
                     Some(new_cfg.clone())
                 } else {
                     None
                 };
-                // Push into shared slot so the running decode worker picks it up.
+
+                let (generation, cur_state, has_track) = match snapshot.lock() {
+                    Ok(mut state) => {
+                        state.bit_perfect = target_bit_perfect;
+                        (
+                            state.generation,
+                            state.state,
+                            state.current_track_id.is_some(),
+                        )
+                    }
+                    Err(_) => break,
+                };
+
+                if previous_native_active == new_native_active {
+                    if let Ok(mut slot) = dsp_config_slot.lock() {
+                        *slot = if new_native_active { Some(new_cfg) } else { None };
+                    }
+                    continue;
+                }
+
+                if !has_track || current_source.is_none() {
+                    if let Ok(mut slot) = dsp_config_slot.lock() {
+                        *slot = None;
+                    }
+                    continue;
+                }
+
+                let should_restart = decode_worker.is_some()
+                    && matches!(
+                        cur_state,
+                        NativeTransportState::Loading
+                            | NativeTransportState::Ready
+                            | NativeTransportState::Playing
+                    );
+                if !should_restart {
+                    if let Ok(mut slot) = dsp_config_slot.lock() {
+                        *slot = None;
+                    }
+                    continue;
+                }
+
+                let restart_pos_ms = if cur_state == NativeTransportState::Playing {
+                    Some(current_native_playback_position_ms(&snapshot, &runtime))
+                } else {
+                    None
+                };
+                queue_native_event(
+                    &events,
+                    crate::EVT_STATE,
+                    format!(
+                        "native-transport dsp-mode-switch native_active={} bit_perfect={} pos_ms={} state={:?}",
+                        new_native_active,
+                        target_bit_perfect,
+                        restart_pos_ms.unwrap_or(0),
+                        cur_state,
+                    ),
+                );
+                eprintln!(
+                    "native-transport: dsp mode switch native_active={} bit_perfect={} pos_ms={} state={:?}",
+                    new_native_active,
+                    target_bit_perfect,
+                    restart_pos_ms.unwrap_or(0),
+                    cur_state,
+                );
+
+                set_native_runtime(&runtime, None);
+                let restart_reuse_session = stop_decode_worker(&mut decode_worker);
+                if restart_reuse_session.is_none() {
+                    reclaim_device(&mut claimed_device, &claimed_cfg);
+                }
+                let handle_for_worker = if restart_reuse_session.is_some() {
+                    None
+                } else {
+                    claimed_device.take()
+                };
+
+                if let Ok(mut state) = snapshot.lock() {
+                    state.bit_perfect = target_bit_perfect;
+                    state.decoded_slab_count = 0;
+                    state.decoded_frame_count = 0;
+                    state.decoded_byte_count = 0;
+                    state.decode_worker_running = false;
+                    state.decode_completed = false;
+                    state.last_error = None;
+                    if let Some(pos_ms) = restart_pos_ms {
+                        state.seek_offset_s = pos_ms as f64 / 1000.0;
+                    } else {
+                        state.seek_offset_s = 0.0;
+                        if cur_state != NativeTransportState::Playing {
+                            state.state = NativeTransportState::Loading;
+                        }
+                    }
+                }
                 if let Ok(mut slot) = dsp_config_slot.lock() {
-                    *slot = Some(new_cfg);
+                    *slot = None;
+                }
+
+                let Some(source) = current_source.clone() else {
+                    continue;
+                };
+                let auto_start =
+                    Arc::new(AtomicBool::new(cur_state == NativeTransportState::Playing));
+                match start_direct_flac_decode_worker(
+                    source,
+                    Arc::clone(&snapshot),
+                    Arc::clone(&events),
+                    current_output_config.clone(),
+                    Arc::clone(&runtime),
+                    generation,
+                    restart_pos_ms,
+                    volume.clone(),
+                    spectrum_tx.clone(),
+                    Arc::clone(&spectrum_bands),
+                    Arc::clone(&lufs_values),
+                    hw_vol_cache.clone(),
+                    handle_for_worker,
+                    auto_start,
+                    restart_reuse_session,
+                    current_dsp_config.clone(),
+                    Arc::clone(&dsp_config_slot),
+                ) {
+                    Ok(worker) => {
+                        decode_worker = Some(worker);
+                        if let Ok(mut state) = snapshot.lock() {
+                            state.decode_worker_running = true;
+                        }
+                    }
+                    Err(err) => {
+                        reclaim_device(&mut claimed_device, &claimed_cfg);
+                        queue_native_event(
+                            &events,
+                            crate::EVT_ERROR,
+                            format!("native-transport dsp mode restart failed: {err}"),
+                        );
+                        if let Ok(mut state) = snapshot.lock() {
+                            state.last_error = Some(err);
+                            state.state = NativeTransportState::Error;
+                        }
+                    }
                 }
             }
             NativeTransportCommand::Shutdown => {
@@ -1028,6 +1182,40 @@ fn set_native_runtime(runtime: &Arc<Mutex<Option<NativeUsbRuntime>>>, value: Opt
     if let Ok(mut slot) = runtime.lock() {
         *slot = value;
     }
+}
+
+fn current_native_playback_position_ms(
+    snapshot: &Arc<Mutex<NativeTransportSnapshot>>,
+    runtime: &Arc<Mutex<Option<NativeUsbRuntime>>>,
+) -> u64 {
+    let (seek_offset_s, decoded_frame_count, fallback_rate) = match snapshot.lock() {
+        Ok(state) => (
+            state.seek_offset_s,
+            state.decoded_frame_count,
+            state
+                .stream_spec
+                .as_ref()
+                .map(|spec| spec.sample_rate)
+                .unwrap_or(0),
+        ),
+        Err(_) => (0.0, 0, 0),
+    };
+
+    let pos_s = match runtime.lock() {
+        Ok(slot) => slot
+            .as_ref()
+            .and_then(|info| info.feed.write_elapsed_s().map(|elapsed| seek_offset_s + elapsed))
+            .unwrap_or_else(|| {
+                if fallback_rate > 0 {
+                    seek_offset_s + (decoded_frame_count as f64 / fallback_rate as f64)
+                } else {
+                    seek_offset_s
+                }
+            }),
+        Err(_) => seek_offset_s,
+    };
+
+    (pos_s.max(0.0) * 1000.0).round() as u64
 }
 
 fn start_direct_flac_decode_worker(
@@ -1238,10 +1426,22 @@ fn decode_direct_flac_stream(
                     ),
                 });
                 state.bits_per_sample = track.codec_params.bits_per_sample;
-                state.duration_s = track.codec_params.n_frames.and_then(|n| {
-                    let rate = track.codec_params.sample_rate.unwrap_or(0) as f64;
-                    if rate > 0.0 { Some(n as f64 / rate) } else { None }
-                });
+                state.duration_s = track.codec_params.n_frames
+                    .filter(|n| *n > 0)
+                    .and_then(|n| {
+                        let rate = track.codec_params.sample_rate.unwrap_or(0) as f64;
+                        if rate > 0.0 { Some(n as f64 / rate) } else { None }
+                    })
+                    .or_else(|| {
+                        if let NativeTransportSource::TidalMpd { manifest_uri, .. } = source {
+                            read_locator_to_string(manifest_uri)
+                                .ok()
+                                .and_then(|xml| inspect_mpd_manifest(&xml).ok())
+                                .and_then(|info| info.total_duration_s())
+                        } else {
+                            None
+                        }
+                    });
                 let plan_supports_seek = state.supports_seek;
                 state.supports_seek = plan_supports_seek;
                 if state.state == NativeTransportState::Loading {
@@ -1787,23 +1987,28 @@ fn inspect_mpd_source(locator: &str) -> Result<SourceProbeResult, String> {
     let xml = read_locator_to_string(locator)?;
     let info = inspect_mpd_manifest(&xml)?;
     let mut parts = vec![format!("mpd representations={}", info.representation_count)];
+    let duration_s = info.total_duration_s();
     if let Some(rate) = info.first_audio_sampling_rate {
         parts.push(format!("rate={rate}"));
     }
-    if let Some(codecs) = info.first_codecs {
+    if let Some(codecs) = info.first_codecs.as_ref() {
         parts.push(format!("codecs={codecs}"));
     }
-    if let Some(init) = info.first_initialization {
+    if let Some(init) = info.first_initialization.as_ref() {
         parts.push(format!("init={init}"));
     }
-    if let Some(media) = info.first_media_template {
+    if let Some(media) = info.first_media_template.as_ref() {
         parts.push(format!("media={media}"));
     }
     if let Some(count) = info.first_segment_count {
         parts.push(format!("segments={count}"));
     }
+    if let Some(d) = duration_s {
+        parts.push(format!("duration_s={d:.3}"));
+    }
     Ok(SourceProbeResult {
         source_summary: Some(parts.join(" ")),
+        duration_s,
         supports_seek: false,
         ..Default::default()
     })

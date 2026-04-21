@@ -248,6 +248,35 @@ impl DspGraphConfig {
                 || self.lv2_slots.iter().any(Lv2SlotConfig::is_active))
     }
 
+    pub fn has_native_transport_processing(&self) -> bool {
+        self.enabled
+            && (self.peq.is_active()
+                || self.convolver.is_active()
+                || self.tape.is_active()
+                || self.tube.is_active()
+                || self.widener.is_active()
+                || self.limiter.is_active())
+    }
+
+    pub fn has_native_transport_unsupported_processing(&self) -> bool {
+        self.enabled
+            && (self.resampler.is_active() || self.lv2_slots.iter().any(Lv2SlotConfig::is_active))
+    }
+
+    pub fn native_transport_unsupported_modules(&self) -> Vec<&'static str> {
+        if !self.enabled {
+            return Vec::new();
+        }
+        let mut modules = Vec::new();
+        if self.resampler.is_active() {
+            modules.push("resampler");
+        }
+        if self.lv2_slots.iter().any(Lv2SlotConfig::is_active) {
+            modules.push("lv2");
+        }
+        modules
+    }
+
     pub fn effective_lv2_slots(&self) -> Vec<Lv2SlotConfig> {
         self.lv2_slots
             .iter()

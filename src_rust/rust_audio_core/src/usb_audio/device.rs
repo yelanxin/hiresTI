@@ -586,7 +586,15 @@ impl OpenUsbDevice {
         // Claim the Audio Control interface first so class-specific control
         // transfers (sample-rate / hardware volume) have the kernel detached.
         if ci != si {
-            let _ = self.handle.claim_interface(ci);
+            match self.handle.claim_interface(ci) {
+                Ok(()) => eprintln!("usb-audio: claimed ctrl interface {} OK", ci),
+                Err(e) => {
+                    eprintln!(
+                        "usb-audio: WARN claim ctrl interface {} failed: {} — proceeding",
+                        ci, e
+                    )
+                }
+            }
         }
 
         // claim_interface may return BUSY if already claimed (e.g. reconfigure
@@ -616,11 +624,21 @@ impl OpenUsbDevice {
             })
             .unwrap_or_default();
 
-        self.handle
-            .set_alternate_setting(si, alt.alt_setting)
-            .map_err(|e| format!("set alt-setting {}: {}", alt.alt_setting, e))?;
+        eprintln!(
+            "usb-audio: configure alt={} rate={} ci={} si={} device={:04x}:{:04x} clock_id={:?}",
+            alt.alt_setting,
+            rate,
+            ci,
+            si,
+            self.dev.vendor_id,
+            self.dev.product_id,
+            self.dev.clock_id
+        );
 
         if skip_rate_setting {
+            self.handle
+                .set_alternate_setting(si, alt.alt_setting)
+                .map_err(|e| format!("set alt-setting {}: {}", alt.alt_setting, e))?;
             // DAC PLL is still locked at assumed_rate — skip SET_CUR.
             // Just record the active state and restore volumes.
             self.active_alt = Some(alt.clone());
@@ -633,6 +651,9 @@ impl OpenUsbDevice {
         // Set sample rate
         match self.dev.uac_version {
             UacVersion::V1 => {
+                self.handle
+                    .set_alternate_setting(si, alt.alt_setting)
+                    .map_err(|e| format!("set alt-setting {}: {}", alt.alt_setting, e))?;
                 eprintln!(
                     "usb-audio: UAC1 SET_CUR rate={} ep=0x{:02x}",
                     rate, alt.out_ep
@@ -645,19 +666,12 @@ impl OpenUsbDevice {
                     "UAC 2.0 device has no clock_id — descriptor parse failed".to_string()
                 })?;
 
-                // Query supported rates via GET_RANGE so we pick a rate the
-                // device actually supports before issuing SET_CUR.
                 let supported = query_sample_rates_uac2(&self.handle, ci, clock_id);
                 eprintln!(
                     "usb-audio: UAC2 GET_RANGE clock_id={} supported={:?}",
                     clock_id, supported
                 );
 
-                // Choose the best rate: exact match first, then the highest
-                // supported rate that does not exceed the requested rate.
-                // Avoid jumping to a higher rate than requested — some devices
-                // accept SET_CUR at any value but their DAC runs at a fixed
-                // lower rate, causing fast playback.
                 let chosen_rate = if supported.contains(&rate) {
                     rate
                 } else if !supported.is_empty() {
@@ -668,7 +682,6 @@ impl OpenUsbDevice {
                         .max()
                         .unwrap_or_else(|| *supported.iter().min().unwrap())
                 } else {
-                    // No GET_RANGE data — try the requested rate as-is.
                     rate
                 };
                 eprintln!(
@@ -676,132 +689,115 @@ impl OpenUsbDevice {
                     chosen_rate, rate, clock_id, ci
                 );
 
-                match set_sample_rate_uac2(&self.handle, ci, clock_id, chosen_rate) {
-                    Ok(_) => {
-                        // Verify via GET_CUR: some devices silently ignore
-                        // SET_CUR and keep their hardware clock at a fixed rate.
-                        let verified = get_cur_sample_rate_uac2(&self.handle, ci, clock_id)
+                let old_family = if self.active_rate > 0 {
+                    self.active_rate % 44_100 == 0
+                } else {
+                    false
+                };
+                let new_family = chosen_rate % 44_100 == 0;
+                let is_family_switch = self.active_rate > 0 && old_family != new_family;
+
+                let achieved_rate: Result<u32, String> = (|| {
+                    if set_sample_rate_uac2(&self.handle, ci, clock_id, chosen_rate).is_ok() {
+                        let v = get_cur_sample_rate_uac2(&self.handle, ci, clock_id)
                             .filter(|&r| r >= 8_000 && r <= 768_000)
                             .unwrap_or(chosen_rate);
                         eprintln!(
                             "usb-audio: UAC2 SET_CUR OK → chosen={} verified={}",
-                            chosen_rate, verified
+                            chosen_rate, v
                         );
-                        self.active_alt = Some(alt.clone());
-                        self.active_rate = verified;
-                        self.restore_saved_volumes(ci, &saved_volumes);
-                        return Ok(());
+                        return Ok(v);
                     }
-                    Err(warn) => {
-                        eprintln!("usb-audio: UAC2 SET_CUR failed ({})", warn);
 
-                        // Some devices STALL the very first SET_CUR issued after
-                        // the kernel driver (snd-usb-audio) has just been detached
-                        // from the interface — the device's clock control path needs
-                        // a brief settling period before it becomes responsive.
-                        // Retry once after 20 ms; this is enough for the MUSILAND
-                        // Monitor 09 (and similar UAC 2.0 devices) to start
-                        // accepting frequency commands without falling through to
-                        // the rate-probe path.
-                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    eprintln!("usb-audio: UAC2 SET_CUR failed, retrying…");
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    if set_sample_rate_uac2(&self.handle, ci, clock_id, chosen_rate).is_ok() {
+                        let v = get_cur_sample_rate_uac2(&self.handle, ci, clock_id)
+                            .filter(|&r| r >= 8_000 && r <= 768_000)
+                            .unwrap_or(chosen_rate);
+                        eprintln!("usb-audio: UAC2 SET_CUR retry OK → verified={}", v);
+                        return Ok(v);
+                    }
+
+                    for (retry_i, delay_ms) in [150u64, 300, 500].iter().enumerate() {
+                        eprintln!(
+                            "usb-audio: UAC2 long-delay retry #{} for rate={} ({}ms)",
+                            retry_i + 1,
+                            chosen_rate,
+                            delay_ms
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(*delay_ms));
                         if set_sample_rate_uac2(&self.handle, ci, clock_id, chosen_rate).is_ok() {
-                            let verified = get_cur_sample_rate_uac2(&self.handle, ci, clock_id)
+                            let v = get_cur_sample_rate_uac2(&self.handle, ci, clock_id)
                                 .filter(|&r| r >= 8_000 && r <= 768_000)
                                 .unwrap_or(chosen_rate);
                             eprintln!(
-                                "usb-audio: UAC2 SET_CUR retry OK → chosen={} verified={}",
-                                chosen_rate, verified
+                                "usb-audio: UAC2 long-delay retry #{} OK → verified={}",
+                                retry_i + 1,
+                                v
                             );
-                            self.active_alt = Some(alt.clone());
-                            self.active_rate = verified;
-                            self.restore_saved_volumes(ci, &saved_volumes);
-                            return Ok(());
+                            return Ok(v);
                         }
-
-                        // PLL clock-domain switch can take 50–500+ ms on some DACs
-                        // (e.g. NXP/Freescale-class USB audio, Monitor 09).  After
-                        // tearing down an ISO transfer ring (native transport v2),
-                        // the PLL needs extra time to re-lock.  Retry with
-                        // progressive backoff before falling through.
-                        for (retry_i, delay_ms) in [150u64, 300, 500].iter().enumerate() {
-                            eprintln!(
-                                "usb-audio: UAC2 long-delay retry #{} for rate={} (PLL settle, {}ms)",
-                                retry_i + 1, chosen_rate, delay_ms
-                            );
-                            std::thread::sleep(std::time::Duration::from_millis(*delay_ms));
-                            if set_sample_rate_uac2(&self.handle, ci, clock_id, chosen_rate).is_ok() {
-                                let verified = get_cur_sample_rate_uac2(&self.handle, ci, clock_id)
-                                    .filter(|&r| r >= 8_000 && r <= 768_000)
-                                    .unwrap_or(chosen_rate);
-                                eprintln!(
-                                    "usb-audio: UAC2 long-delay retry #{} OK → verified={}",
-                                    retry_i + 1, verified
-                                );
-                                self.active_alt = Some(alt.clone());
-                                self.active_rate = verified;
-                                self.restore_saved_volumes(ci, &saved_volumes);
-                                return Ok(());
-                            }
-                        }
-
-                        // GET_CUR — device may have a fixed clock.
-                        let cur = get_cur_sample_rate_uac2(&self.handle, ci, clock_id);
-                        eprintln!("usb-audio: UAC2 GET_CUR={:?}", cur);
-                        if let Some(r) = cur.filter(|&r| r >= 8_000 && r <= 768_000) {
-                            eprintln!("usb-audio: using fixed clock rate={} Hz", r);
-                            self.active_alt = Some(alt.clone());
-                            self.active_rate = r;
-                            self.restore_saved_volumes(ci, &saved_volumes);
-                            return Ok(());
-                        }
-
-                        // GET_RANGE was empty and GET_CUR failed — device may
-                        // accept SET_CUR only at specific rates.  Probe common
-                        // audio rates (STALL responses are immediate, ~0 ms).
-                        const PROBE: &[u32] = &[44_100, 48_000, 88_200, 96_000, 176_400, 192_000];
-                        if supported.is_empty() {
-                            for &r in PROBE {
-                                if r == chosen_rate {
-                                    continue;
-                                }
-                                eprintln!("usb-audio: UAC2 probing rate={}", r);
-                                if set_sample_rate_uac2(&self.handle, ci, clock_id, r).is_ok() {
-                                    eprintln!("usb-audio: UAC2 probe OK → rate={}", r);
-                                    self.active_alt = Some(alt.clone());
-                                    self.active_rate = r;
-                                    self.restore_saved_volumes(ci, &saved_volumes);
-                                    return Ok(());
-                                }
-                            }
-                        }
-
-                        // All UAC 2.0 clock control attempts failed.  Some
-                        // devices report UAC 2.0 descriptors but implement rate
-                        // control via the UAC 1.0 mechanism (SET_CUR to the ISO
-                        // OUT endpoint).  Try that as a last resort.
-                        eprintln!(
-                            "usb-audio: UAC2 clock control failed, trying UAC1 endpoint fallback"
-                        );
-                        for &r in PROBE {
-                            eprintln!(
-                                "usb-audio: UAC1-fallback probing rate={} ep=0x{:02x}",
-                                r, alt.out_ep
-                            );
-                            if set_sample_rate_uac1(&self.handle, alt.out_ep, r).is_ok() {
-                                eprintln!("usb-audio: UAC1-fallback OK → rate={}", r);
-                                self.active_alt = Some(alt.clone());
-                                self.active_rate = r;
-                                self.restore_saved_volumes(ci, &saved_volumes);
-                                return Ok(());
-                            }
-                        }
-
-                        return Err(format!(
-                            "usb-audio: all rate-setting methods failed for rate={} on clock_id={}",
-                            chosen_rate, clock_id
-                        ));
                     }
+
+                    let cur = get_cur_sample_rate_uac2(&self.handle, ci, clock_id);
+                    eprintln!("usb-audio: UAC2 GET_CUR={:?}", cur);
+                    if let Some(r) = cur.filter(|&r| r >= 8_000 && r <= 768_000) {
+                        eprintln!("usb-audio: using fixed clock rate={} Hz", r);
+                        return Ok(r);
+                    }
+
+                    const PROBE: &[u32] = &[44_100, 48_000, 88_200, 96_000, 176_400, 192_000];
+                    if supported.is_empty() {
+                        for &r in PROBE {
+                            if r == chosen_rate {
+                                continue;
+                            }
+                            eprintln!("usb-audio: UAC2 probing rate={}", r);
+                            if set_sample_rate_uac2(&self.handle, ci, clock_id, r).is_ok() {
+                                eprintln!("usb-audio: UAC2 probe OK → rate={}", r);
+                                return Ok(r);
+                            }
+                        }
+                    }
+
+                    eprintln!("usb-audio: UAC2 clock control failed, trying UAC1 endpoint fallback");
+                    let _ = self.handle.set_alternate_setting(si, alt.alt_setting);
+                    for &r in PROBE {
+                        eprintln!(
+                            "usb-audio: UAC1-fallback probing rate={} ep=0x{:02x}",
+                            r, alt.out_ep
+                        );
+                        if set_sample_rate_uac1(&self.handle, alt.out_ep, r).is_ok() {
+                            eprintln!("usb-audio: UAC1-fallback OK → rate={}", r);
+                            return Ok(r);
+                        }
+                    }
+
+                    Err(format!(
+                        "usb-audio: all rate-setting methods failed for rate={} on clock_id={}",
+                        chosen_rate, clock_id
+                    ))
+                })();
+
+                let verified = achieved_rate?;
+
+                if is_family_switch {
+                    eprintln!(
+                        "usb-audio: clock family switch {}→{} Hz — PLL settle 20 ms",
+                        self.active_rate, verified
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(20));
                 }
+
+                self.handle
+                    .set_alternate_setting(si, alt.alt_setting)
+                    .map_err(|e| format!("set alt-setting {}: {}", alt.alt_setting, e))?;
+
+                self.active_alt = Some(alt.clone());
+                self.active_rate = verified;
+                self.restore_saved_volumes(ci, &saved_volumes);
+                return Ok(());
             }
         }
 

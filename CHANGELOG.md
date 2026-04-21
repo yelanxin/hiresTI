@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.9.0 Beta 4 - 2026-04-20
+
+### Added
+- **Community hub in the tools menu**: the old Sponsor / Discord entries are now merged into a single `Community` dialog with direct actions for `Join Discord`, `Sponsor HiresTI`, and `Star on GitHub`.
+
+### Changed
+- **Community dialog presentation**: the new community window uses a dedicated layout and a taller default height so all actions and support prompts are visible without awkward clipping.
+
+### Fixed
+- **Native transport duration / progress for DASH streams**: USB Rawlink V2 now derives total duration for MPD/DASH FLAC streams from the manifest and reports it to the UI, so `24-bit/96kHz` tracks no longer get stuck with a frozen progress bar.
+- **Waveform-to-audio alignment in USB Rawlink V2**: the visualizer now releases waveform frames against the DAC play-head while transport progress continues to follow the write-head, removing the visible lead/lag mismatch.
+- **USB Rawlink V1 high-rate startup reliability**: `96 kHz` playback is now more compatible on sensitive DACs thanks to UAC2 rate-before-alt-setting ordering, larger startup buffer pools for borrowed-buffer prefill, and a stalled-prefill force-start fallback.
+- **USB Rawlink V2 DSP mode switching**: enabling or disabling DSP now restarts the native transport worker when required, switches bit-perfect/native-DSP mode correctly, and preserves playback position instead of leaving playback stuck.
+- **Unsupported native DSP modules are now reported and skipped cleanly**: when `LV2` or `resampler` processing is enabled, the native transport emits an explicit `unsupported skipped modules=...` state message instead of silently trying to run unsupported processing in the Rawlink V2 path.
+- **Rawlink DSP toggles no longer trigger the wrong UI rebind path**: USB Rawlink / V2 now skip the GTK-side playback rebind used by the GStreamer graph, and programmatic exclusive-toggle updates no longer re-enter the bit-perfect path while DSP is taking over.
+
 ## 1.9.0 Beta 2 - 2026-04-08
 
 ### Added

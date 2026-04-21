@@ -130,7 +130,7 @@ impl PcmProcessor for DspPcmProcessor {
         eprintln!(
             "[native-dsp] configure: rate={} ch={} fmt={:?} active={}",
             spec.sample_rate, spec.channels, spec.format,
-            self.config.has_active_processing()
+            self.config.has_native_transport_processing()
         );
         Ok(())
     }
@@ -141,11 +141,14 @@ impl PcmProcessor for DspPcmProcessor {
             p.try_lock().ok().and_then(|mut slot| slot.take())
         });
         if let Some(new_cfg) = pending_cfg {
-            eprintln!("[native-dsp] hot-update config: active={}", new_cfg.has_active_processing());
+            eprintln!(
+                "[native-dsp] hot-update config: active={}",
+                new_cfg.has_native_transport_processing()
+            );
             self.update_config(&new_cfg);
         }
 
-        if !self.config.has_active_processing() {
+        if !self.config.has_native_transport_processing() {
             return Ok(slab);
         }
 

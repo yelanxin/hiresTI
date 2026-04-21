@@ -1,6 +1,7 @@
 import gi
 import logging
 import os
+import subprocess
 import sys
 import time
 
@@ -131,6 +132,100 @@ def _on_global_close_clicked(app):
             win.close()
         except Exception:
             pass
+
+
+def _open_external_url(url: str):
+    subprocess.Popen(["xdg-open", url])
+
+
+def _build_community_action_row(icon_name: str, title: str, subtitle: str, button_label: str, url: str):
+    row = Adw.ActionRow(title=title, subtitle=subtitle)
+    row.add_prefix(Gtk.Image.new_from_icon_name(icon_name))
+    button = Gtk.Button(label=button_label, valign=Gtk.Align.CENTER)
+    button.connect("clicked", lambda _btn: _open_external_url(url))
+    row.add_suffix(button)
+    row.set_activatable_widget(button)
+    return row
+
+
+def _present_community_window(app):
+    win = Adw.Window(transient_for=getattr(app, "win", None), modal=True)
+    win.set_title("Community")
+    win.set_default_size(520, 520)
+
+    content = Adw.ToolbarView()
+    win.set_content(content)
+
+    header = Adw.HeaderBar()
+    content.add_top_bar(header)
+
+    scroll = Gtk.ScrolledWindow()
+    scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+    content.set_content(scroll)
+
+    clamp = Adw.Clamp(maximum_size=520, tightening_threshold=480, margin_top=24, margin_bottom=24, margin_start=16, margin_end=16)
+    scroll.set_child(clamp)
+
+    root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+    clamp.set_child(root)
+
+    title_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    title_icon = Gtk.Image.new_from_icon_name("network-workgroup-symbolic")
+    title_icon.set_halign(Gtk.Align.START)
+    title_icon.set_pixel_size(24)
+    title_box.append(title_icon)
+    title_label = Gtk.Label(label="Community", xalign=0, css_classes=["album-title-large"])
+    subtitle_label = Gtk.Label(
+        label="Join the Discord server, support development, and help more listeners discover HiresTI.",
+        xalign=0,
+        wrap=True,
+        wrap_mode=Pango.WrapMode.WORD_CHAR,
+    )
+    subtitle_label.add_css_class("dim-label")
+    title_box.append(title_label)
+    title_box.append(subtitle_label)
+    root.append(title_box)
+
+    links_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, css_classes=["boxed-list"])
+    links_list.append(
+        _build_community_action_row(
+            "network-workgroup-symbolic",
+            "Join Discord",
+            "Talk with other users, share device setups, and send feedback directly.",
+            "Join",
+            "https://discord.gg/t9wm2q2H",
+        )
+    )
+    links_list.append(
+        _build_community_action_row(
+            "emblem-favorite-symbolic",
+            "Sponsor HiresTI",
+            "Support development and help fund more time on playback quality and UI polish.",
+            "Sponsor",
+            "https://github.com/sponsors/yelanxin",
+        )
+    )
+    links_list.append(
+        _build_community_action_row(
+            "starred-symbolic",
+            "Star on GitHub",
+            "If HiresTI is useful to you, a GitHub star helps more people discover the project.",
+            "Star",
+            "https://github.com/yelanxin/hiresTI",
+        )
+    )
+    root.append(links_list)
+
+    note_label = Gtk.Label(
+        label="A GitHub star is the simplest way to help the project grow, even if you are not ready to sponsor yet.",
+        xalign=0,
+        wrap=True,
+        wrap_mode=Pango.WrapMode.WORD_CHAR,
+    )
+    note_label.add_css_class("dim-label")
+    root.append(note_label)
+
+    win.present()
 
 
 def _popover_is_visible(pop):
@@ -634,10 +729,14 @@ def build_header(app, container):
         app.tools_pop.popdown()
         app.on_about_clicked(_btn)
 
+    def _on_community_clicked(_btn):
+        app.tools_pop.popdown()
+        _present_community_window(app)
+
     tools_box.append(_tool_row("hiresti-shortcuts-symbolic", "Keyboard Shortcuts", _on_shortcuts_clicked))
     tools_box.append(_tool_row("hiresti-tech-symbolic", "Signal Path / Tech Info", _on_signal_path_clicked))
     tools_box.append(_tool_row("hiresti-gear-symbolic", "Settings", _on_settings_clicked))
-    tools_box.append(_tool_row("emblem-favorite-symbolic", "Sponsor", lambda _b: __import__("subprocess").Popen(["xdg-open", "https://github.com/sponsors/yelanxin"])))
+    tools_box.append(_tool_row("network-workgroup-symbolic", "Community", _on_community_clicked))
     tools_box.append(_tool_row("help-about-symbolic", "About", _on_about_clicked))
     app.tools_pop.set_child(tools_box)
     app.tools_btn.connect("clicked", lambda _b: app.tools_pop.popup())

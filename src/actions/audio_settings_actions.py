@@ -1889,7 +1889,11 @@ def on_bit_perfect_toggled(self, switch, state):
                 logger.debug("bit-perfect lv2 rebind failed", exc_info=True)
     self.ex_switch.set_sensitive(state)
     if not state:
-        self.ex_switch.set_active(False)
+        setattr(self, "_exclusive_ui_syncing", True)
+        try:
+            self.ex_switch.set_active(False)
+        finally:
+            setattr(self, "_exclusive_ui_syncing", False)
     is_ex = self.ex_switch.get_active()
     if state:
         # Hardware volume (e.g. USB Rawlink v2) doesn't touch PCM data,
@@ -1973,6 +1977,9 @@ def on_bit_perfect_toggled(self, switch, state):
 
 
 def on_exclusive_toggled(self, switch, state):
+    if bool(getattr(self, "_exclusive_ui_syncing", False)):
+        return False
+
     self.settings["exclusive_lock"] = state
     self.save_settings()
 
