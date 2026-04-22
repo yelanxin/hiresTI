@@ -1,50 +1,16 @@
 # Changelog
 
-## 1.9.0 Beta 4.1 - 2026-04-21
-
-### Fixed
-- **USB Rawlink V2 pause/play toggle**: playback state detection now follows the native transport state instead of GStreamer's `playbin` state, so the main play button, now-playing controls, MPRIS, and remote pause actions no longer mis-detect an active V2 stream as idle and fail to pause.
-
-## 1.9.0 Beta 4 - 2026-04-20
-
-### Added
-- **Community hub in the tools menu**: the old Sponsor / Discord entries are now merged into a single `Community` dialog with direct actions for `Join Discord`, `Sponsor HiresTI`, and `Star on GitHub`.
-- **In-app update check against GitHub Releases**: a new `Check for Updates` entry in the tools menu queries the GitHub Releases API, compares against the running build, and opens a release-notes window with a direct link to the release page. A silent background check also runs shortly after launch, with results cached for 12 hours and persisted across restarts. Stable builds only surface stable releases, while prerelease builds (alpha / beta / rc) also receive newer prereleases, so users on each channel are notified about upgrades relevant to them. A small red dot appears on the tools button and the `Check for Updates` row whenever a newer release is available.
-- **openSUSE Tumbleweed packaging target**: `./package.sh opensuse-tumbleweed` now builds a native `.rpm` against `opensuse/tumbleweed:latest` with Tumbleweed-correct dependency names (`typelib-1_0-Gtk-4_0`, `typelib-1_0-Adw-1`, `typelib-1_0-GtkSource-5`, `Mesa-libGL1`, `Mesa-libEGL1`, `Mesa-dri`, `libglvnd`, `gstreamer-plugin-pipewire`, and the `python3-*` capability aliases provided by the versioned `python313-*` packages). Dry-run install inside a clean Tumbleweed container resolves all transitive deps without missing-package errors.
-
-### Changed
-- **Community dialog presentation**: the new community window uses a dedicated layout and a taller default height so all actions and support prompts are visible without awkward clipping.
-
-### Fixed
-- **Packaged builds now declare full GL / ALSA / PipeWire runtime dependencies across Arch, Fedora and Debian/Ubuntu**: `mesa` / `libglvnd` (Arch), `mesa-libGL`, `mesa-libEGL`, `mesa-dri-drivers`, `libglvnd-glx`, `libglvnd-egl` (Fedora), and `libgl1`, `libegl1`, `libgl1-mesa-dri` (Debian/Ubuntu) are now explicitly required, so `GtkGLArea` / PyOpenGL no longer fail on minimal systems that previously lacked a libGL loader and caused the spectrum visualizer to stay blank. The same pass also pulls in `alsa-lib`, `libusb` and the distro's PipeWire-GStreamer bridge (`gst-plugin-pipewire` / `pipewire-gstreamer` / `gstreamer1.0-pipewire`), matching what USB Rawlink native and PipeWire playback actually need at runtime.
-- **Native transport duration / progress for DASH streams**: USB Rawlink V2 now derives total duration for MPD/DASH FLAC streams from the manifest and reports it to the UI, so `24-bit/96kHz` tracks no longer get stuck with a frozen progress bar.
-- **Waveform-to-audio alignment in USB Rawlink V2**: the visualizer now releases waveform frames against the DAC play-head while transport progress continues to follow the write-head, removing the visible lead/lag mismatch.
-- **USB Rawlink V1 high-rate startup reliability**: `96 kHz` playback is now more compatible on sensitive DACs thanks to UAC2 rate-before-alt-setting ordering, larger startup buffer pools for borrowed-buffer prefill, and a stalled-prefill force-start fallback.
-- **USB Rawlink V2 DSP mode switching**: enabling or disabling DSP now restarts the native transport worker when required, switches bit-perfect/native-DSP mode correctly, and preserves playback position instead of leaving playback stuck.
-- **Unsupported native DSP modules are now reported and skipped cleanly**: when `LV2` or `resampler` processing is enabled, the native transport emits an explicit `unsupported skipped modules=...` state message instead of silently trying to run unsupported processing in the Rawlink V2 path.
-- **Rawlink DSP toggles no longer trigger the wrong UI rebind path**: USB Rawlink / V2 now skip the GTK-side playback rebind used by the GStreamer graph, and programmatic exclusive-toggle updates no longer re-enter the bit-perfect path while DSP is taking over.
-
-## 1.9.0 Beta 2 - 2026-04-08
-
-### Added
-- **Mini mode queue drawer**: a toggleable queue list below the mini player bar, opened via a centered arrow button at the bottom edge. Displays two-line rows (title + artist · album) with favorite and remove buttons, scrollable up to 500px height.
-- **Mini mode transparent window background**: the mini player window now has a fully transparent background so rounded corners blend cleanly with the desktop.
-- **DSP processing for native transport**: hot-updatable DSP chain integrated into the USB Rawlink V2 playback path.
-- **Sponsor link in tools menu**: a "Sponsor" entry in the tools/settings dropdown opens the GitHub Sponsors page.
-
-### Changed
-- **Mini mode queue drawer styling**: the drawer uses `@view_bg_color` for the bar and drawer background, with a darker `@headerbar_bg_color`-based list background that follows the system theme.
-- **Playing track icon in mini queue uses track ID matching**: the currently-playing indicator is now determined by `track_id` rather than queue index, fixing incorrect icon display when the queue order differs from the playback position.
-
-### Fixed
-- **Mini mode layout stability on mode switching**: fixed an issue where resizing the queue drawer and then switching between mini and normal mode could corrupt the main window layout.
-
-## 1.9.0 Beta 1 - 2026-04-07
+## 1.9.1 - 2026-04-21
 
 ### Added
 - **USB Rawlink V2 (Native Transport)**: new playback path that bypasses GStreamer entirely — Symphonia FLAC decode → zero-copy PCM → USB ISO OUT → DAC. Delivers bit-perfect output with lower latency and tighter clock control.
 - **Play Next**: added "Play Next" action button to track lists and album headers, allowing users to queue a track or album to play immediately after the current one.
 - **Hardware volume L/R channel link toggle**: a lock button below the hardware volume sliders lets users link or unlink left/right channels for synchronized adjustment.
+- **Mini mode queue drawer**: a toggleable queue list below the mini player bar, opened via a centered arrow button at the bottom edge. Displays two-line rows (title + artist · album) with favorite and remove buttons, scrollable up to 500px height.
+- **Mini mode transparent window background**: the mini player window now has a fully transparent background so rounded corners blend cleanly with the desktop.
+- **Native DSP processing in USB Rawlink V2**: the native transport now supports a hot-updatable DSP chain in the V2 playback path.
+- **Community hub and in-app update check**: the tools menu now includes a consolidated `Community` dialog plus a `Check for Updates` flow that reads GitHub Releases, surfaces release notes, shows a red-dot badge when something newer is available, and runs a cached startup check in the background.
+- **openSUSE Tumbleweed packaging target**: `./package.sh opensuse-tumbleweed` now builds a native `.rpm` with the correct Tumbleweed dependency set.
 
 ### Changed
 - **Playback pipeline refactoring**: redesigned the core audio chain with improved jitter suppression, buffer management, and clock synchronization. Introduced a feed-forward hardware clock (`AlsaHwClockFeed`) with push/pull modes and ISO-completion regression calibration for sub-millisecond timing accuracy.
@@ -54,9 +20,21 @@
 - **Improved V1 ↔ V2 driver switching**: synchronous `StopAndRelease` command ensures the USB device is fully released before the other driver claims it, preventing PLL disturbance and app hangs during output driver changes.
 - **USB session reuse across same-rate track switches**: the native transport now keeps the USB handle open between consecutive tracks at the same sample rate, eliminating the 1–2 second DAC mute previously caused by `libusb_close` → kernel driver reattach → PLL reset. Rate changes still perform a full interface release cycle for DAC compatibility.
 - **Playback bar now shows tech info for USB Rawlink V2**: codec, sample rate, bit depth, and bitrate are displayed in the playback bar during native transport playback (e.g. `BP/EX • 24-bit/96kHz • FLAC • 2400kbps`).
+- **Mini mode queue presentation**: the drawer uses `@view_bg_color` for the bar and drawer background, with a darker `@headerbar_bg_color` list background that follows the system theme. The currently-playing marker now follows `track_id` instead of queue index.
+- **Community dialog presentation**: the new community window uses a dedicated layout and a taller default height so all actions and support prompts are visible without awkward clipping.
 
 ### Fixed
 - **Fixed use-after-free crash on track switch**: the ISO transfer ring's `feedback_xfer` pointer was not cleared after the `FeedbackReader` was dropped, causing `libusb_cancel_transfer` to operate on freed memory when the old ring was dropped during `reconfigure()` or session reuse.
+- **Mini mode layout stability on mode switching**: resizing the queue drawer and switching between mini and normal mode no longer corrupts the main window layout.
+- **Packaged builds now declare full GL / ALSA / PipeWire runtime dependencies across Arch, Fedora and Debian/Ubuntu**: `mesa` / `libglvnd` (Arch), `mesa-libGL`, `mesa-libEGL`, `mesa-dri-drivers`, `libglvnd-glx`, `libglvnd-egl` (Fedora), and `libgl1`, `libegl1`, `libgl1-mesa-dri` (Debian/Ubuntu) are now explicitly required, so `GtkGLArea` / PyOpenGL no longer fail on minimal systems. The same pass also pulls in `alsa-lib`, `libusb` and the distro's PipeWire-GStreamer bridge (`gst-plugin-pipewire` / `pipewire-gstreamer` / `gstreamer1.0-pipewire`) to match real runtime requirements.
+- **Native transport duration / progress for DASH streams**: USB Rawlink V2 now derives total duration for MPD/DASH FLAC streams from the manifest and reports it to the UI, so `24-bit/96kHz` tracks no longer get stuck with a frozen progress bar.
+- **Waveform-to-audio alignment in USB Rawlink V2**: the visualizer now releases waveform frames against the DAC play-head while transport progress continues to follow the write-head, removing the visible lead/lag mismatch.
+- **USB Rawlink V1 high-rate startup reliability**: `96 kHz` playback is now more compatible on sensitive DACs thanks to UAC2 rate-before-alt-setting ordering, larger startup buffer pools for borrowed-buffer prefill, and a stalled-prefill force-start fallback.
+- **USB Rawlink V2 DSP mode switching**: enabling or disabling DSP now restarts the native transport worker when required, switches bit-perfect/native-DSP mode correctly, and preserves playback position instead of leaving playback stuck.
+- **Unsupported native DSP modules are now reported and skipped cleanly**: when `LV2` or `resampler` processing is enabled, the native transport emits an explicit `unsupported skipped modules=...` state message instead of silently trying to run unsupported processing in the Rawlink V2 path.
+- **Rawlink DSP toggles no longer trigger the wrong UI rebind path**: USB Rawlink / V2 now skip the GTK-side playback rebind used by the GStreamer graph, and programmatic exclusive-toggle updates no longer re-enter the bit-perfect path while DSP is taking over.
+- **USB Rawlink V2 pause/play toggle**: playback state detection now follows the native transport state instead of GStreamer's `playbin` state, so the main play button, now-playing controls, MPRIS, and remote pause actions no longer mis-detect an active V2 stream as idle and fail to pause.
+- **Prerelease point-version update detection**: version parsing now understands prerelease point versions such as `beta4.1` and `beta1.2`, so the updater can correctly surface newer prerelease patch builds instead of treating them as identical to their base beta tag.
 
 ### Removed
 - **Balance Wave and Center Side visualizations**: removed from the effect list and rendering pipeline.
