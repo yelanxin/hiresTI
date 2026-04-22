@@ -2062,6 +2062,18 @@ fn driver_is_usb_rawlink_family(driver: &str) -> bool {
     driver_is_usb_rawlink(driver) || driver_is_usb_rawlink_v2(driver)
 }
 
+fn transport_reports_playing(
+    output_driver: &str,
+    native_state: native_transport::NativeTransportState,
+    gst_state: gst::State,
+) -> bool {
+    if driver_is_usb_rawlink_v2(output_driver) {
+        native_state == native_transport::NativeTransportState::Playing
+    } else {
+        gst_state == gst::State::Playing
+    }
+}
+
 /// Decode the current shared USB rawlink clock mode.
 ///
 /// Unknown values fall back to Push so a stale/corrupt setting cannot leave the
@@ -8286,8 +8298,9 @@ pub extern "C" fn rac_is_playing(ptr: *const Engine) -> c_int {
     let Some(engine) = as_engine(ptr) else {
         return 0;
     };
+    let native_state = engine.native_transport.snapshot().state;
     let (_, state, _) = engine.playbin.state(gst::ClockTime::from_mseconds(50));
-    if state == gst::State::Playing {
+    if transport_reports_playing(&engine.output_driver, native_state, state) {
         1
     } else {
         0
@@ -9850,5 +9863,33 @@ Playback:
         assert!(msg.contains("48000 Hz"));
         assert!(msg.contains("96000 Hz"));
         assert!(msg.contains("no-SRC"));
+    }
+
+    #[test]
+    fn transport_reports_playing_prefers_native_state_for_usb_rawlink_v2() {
+        assert!(transport_reports_playing(
+            "USB Rawlink v2",
+            native_transport::NativeTransportState::Playing,
+            gst::State::Paused,
+        ));
+        assert!(!transport_reports_playing(
+            "USB Rawlink v2",
+            native_transport::NativeTransportState::Paused,
+            gst::State::Playing,
+        ));
+    }
+
+    #[test]
+    fn transport_reports_playing_uses_gst_state_for_non_native_drivers() {
+        assert!(transport_reports_playing(
+            "ALSA（auto）",
+            native_transport::NativeTransportState::Paused,
+            gst::State::Playing,
+        ));
+        assert!(!transport_reports_playing(
+            "ALSA（auto）",
+            native_transport::NativeTransportState::Playing,
+            gst::State::Paused,
+        ));
     }
 }
