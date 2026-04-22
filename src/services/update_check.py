@@ -90,7 +90,8 @@ def parse_version(value: Any) -> dict[str, Any] | None:
     remainder = compact[match.end():]
     stage = "stable"
     stage_num = 0
-    stage_match = re.search(r"(alpha|a|beta|b|rc|pre|preview)[.\-]?(\d+)?", remainder)
+    stage_parts: tuple[int, ...] = ()
+    stage_match = re.search(r"(alpha|a|beta|b|rc|pre|preview)(?:[.\-]?(\d+(?:[.\-]\d+)*))?", remainder)
     if stage_match:
         raw_stage = stage_match.group(1)
         if raw_stage in ("a", "alpha"):
@@ -99,10 +100,23 @@ def parse_version(value: Any) -> dict[str, Any] | None:
             stage = "beta"
         elif raw_stage in ("pre", "preview", "rc"):
             stage = "rc"
-        stage_num = int(stage_match.group(2) or 0)
+        raw_parts = str(stage_match.group(2) or "").strip()
+        if raw_parts:
+            try:
+                stage_parts = tuple(
+                    int(part)
+                    for part in re.split(r"[.\-]", raw_parts)
+                    if str(part).strip()
+                )
+            except Exception:
+                stage_parts = ()
+        if stage != "stable" and not stage_parts:
+            stage_parts = (0,)
+        stage_num = int(stage_parts[0] if stage_parts else 0)
     normalized = f"{major}.{minor}.{patch}"
     if stage != "stable":
-        normalized = f"{normalized}-{stage}{stage_num or 0}"
+        stage_suffix = ".".join(str(part) for part in stage_parts) if stage_parts else "0"
+        normalized = f"{normalized}-{stage}{stage_suffix}"
     return {
         "text": text,
         "normalized": normalized,
@@ -111,8 +125,9 @@ def parse_version(value: Any) -> dict[str, Any] | None:
         "patch": patch,
         "stage": stage,
         "stage_num": stage_num,
+        "stage_parts": stage_parts,
         "is_prerelease": stage != "stable",
-        "sort_key": (major, minor, patch, _STAGE_RANK[stage], stage_num),
+        "sort_key": (major, minor, patch, _STAGE_RANK[stage], stage_parts),
     }
 
 

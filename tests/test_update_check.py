@@ -21,6 +21,17 @@ def test_parse_version_supports_beta_and_stable_formats():
     assert parsed_stable["is_prerelease"] is False
     assert parsed_legacy["stage"] == "beta"
     assert parsed_legacy["stage_num"] == 1
+    assert parsed_legacy["stage_parts"] == (1, 1)
+    assert parsed_legacy["normalized"] == "1.9.0-beta1.1"
+
+
+def test_compute_update_available_supports_prerelease_point_releases():
+    pytest.importorskip("gi")
+    from services import update_check as mod
+
+    assert mod._compute_update_available("1.9.0 Beta 4", "v1.9.0-beta4.1") is True
+    assert mod._compute_update_available("1.9.0beta1.1", "1.9.0beta1.2") is True
+    assert mod._compute_update_available("1.9.0beta4.1", "v1.9.0-beta4") is False
 
 
 def test_fetch_update_state_ignores_prerelease_for_stable_build(monkeypatch):
