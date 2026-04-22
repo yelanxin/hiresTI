@@ -19,7 +19,16 @@ def _restore_session_async(self):
         if ok:
             GLib.idle_add(self.on_login_success)
         else:
-            GLib.idle_add(self._toggle_login_view, False)
+            def not_logged_in():
+                self._toggle_login_view(False)
+                # Ensure the sidebar has a row selected and the grid area
+                # renders content for that row, instead of a blank canvas.
+                try:
+                    self._restore_last_view()
+                except Exception:
+                    logger.debug("restore_last_view failed (pre-login)", exc_info=True)
+                return False
+            GLib.idle_add(not_logged_in)
 
     submit_daemon(task)
 
@@ -65,6 +74,17 @@ def _restore_last_view(self):
     if view == "search_view":
         view = "grid_view"
         nav_id = "home"
+
+    # Pre-login, Tidal-only sections render an empty canvas. Fall back to
+    # the local-library Tracks view so the user lands on something
+    # meaningful.
+    logged_in = bool(getattr(getattr(self, "backend", None), "user", None))
+    tidal_only_nav_ids = {
+        "home", "new", "top", "hires", "genres", "decades", "moods",
+        "collection", "liked_songs", "artists", "playlists", "history",
+    }
+    if not logged_in and nav_id in tidal_only_nav_ids:
+        nav_id = "local_tracks"
 
     target = None
     child = self.nav_list.get_first_child()

@@ -2053,7 +2053,14 @@ def _load_now_playing_album_tracks_async(self, album):
     def task():
         result_tracks = []
         try:
-            result_tracks = list(self.backend.get_tracks(album) or [])
+            if str(getattr(album, "_source_type", "") or "") == "local" and getattr(self, "local_library", None) is not None:
+                local_album = self.local_library.find_album_by_id(album_id) if album_id else None
+                albumartist = getattr(local_album, "_albumartist", "") if local_album is not None else ""
+                album_name = getattr(local_album, "name", "") if local_album is not None else getattr(album, "name", "")
+                if albumartist and album_name:
+                    result_tracks = list(self.local_library.get_album_tracks(albumartist, album_name) or [])
+            else:
+                result_tracks = list(self.backend.get_tracks(album) or [])
         except Exception as exc:
             logger.debug("Now playing album track load failed: %s", exc)
         if not result_tracks and track is not None:

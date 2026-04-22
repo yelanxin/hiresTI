@@ -4,6 +4,7 @@ import time
 
 from gi.repository import GLib, Gtk
 from actions import ui_actions
+from actions import local_nav
 
 logger = logging.getLogger(__name__)
 
@@ -184,6 +185,10 @@ def on_nav_selected(app, box, row):
         app.collection_content_box.remove(c)
     app.queue_track_list = None
     app.liked_track_list = None
+
+    if local_nav.is_local_nav_id(row.nav_id):
+        if local_nav.dispatch_local_nav(app, row.nav_id):
+            return
 
     if row.nav_id == "home":
         app.grid_title_label.set_text("Home")

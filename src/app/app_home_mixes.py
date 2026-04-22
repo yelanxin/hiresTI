@@ -152,6 +152,8 @@ def build_daily_mixes(self, days=7, per_day=8):
         entries = self.history_mgr.get_recent_track_entries(limit=400)
         if not entries and getattr(self.backend, "user", None):
             for alb in self.history_mgr.get_albums()[:24]:
+                if str(getattr(alb, "_source_type", "") or "") == "local":
+                    continue
                 tracks = self.backend.get_tracks(alb) or []
                 for t in tracks[:10]:
                     entries.append(

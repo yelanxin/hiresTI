@@ -30,6 +30,20 @@ def _hide_dr_meter_debug() -> bool:
 def _sidebar_nav_sections():
     return [
         (
+            "LIBRARY",
+            [
+                ("local_folders", "folder-music-symbolic", "Local Folders"),
+            ],
+        ),
+        (
+            "MUSIC",
+            [
+                ("local_tracks", "audio-x-generic-symbolic", "Tracks"),
+                ("local_albums", "hiresti-albums-symbolic", "Albums"),
+                ("local_artists", "hiresti-artists-symbolic", "Artists"),
+            ],
+        ),
+        (
             "DISCOVER",
             [
                 ("home", "hiresti-home-symbolic", "Home"),
@@ -42,7 +56,7 @@ def _sidebar_nav_sections():
             ],
         ),
         (
-            "YOUR LIBRARY",
+            "FAVORITES",
             [
                 ("collection", "hiresti-albums-symbolic", "Albums"),
                 ("liked_songs", "hiresti-favorite-symbolic", "Tracks"),
@@ -898,11 +912,17 @@ def build_header(app, container):
         app.tools_pop.popdown()
         app.on_check_for_updates_clicked(_btn)
 
+    def _on_open_local_clicked(_btn):
+        app.tools_pop.popdown()
+        app.on_open_local_file_clicked(_btn)
+
     row_btn, _row_label, _row_badge = _tool_row("hiresti-shortcuts-symbolic", "Keyboard Shortcuts", _on_shortcuts_clicked)
     tools_box.append(row_btn)
     row_btn, _row_label, _row_badge = _tool_row("hiresti-tech-symbolic", "Signal Path / Tech Info", _on_signal_path_clicked)
     tools_box.append(row_btn)
     row_btn, _row_label, _row_badge = _tool_row("hiresti-gear-symbolic", "Settings", _on_settings_clicked)
+    tools_box.append(row_btn)
+    row_btn, _row_label, _row_badge = _tool_row("folder-music-symbolic", "Open Local File…", _on_open_local_clicked)
     tools_box.append(row_btn)
     row_btn, _row_label, _row_badge = _tool_row("view-refresh-symbolic", "Check for Updates", _on_update_clicked, with_badge=True)
     app.tools_update_row_btn = row_btn
@@ -1294,6 +1314,7 @@ def build_body(app, container):
     for header, nav_items in _sidebar_nav_sections():
         header_row = Gtk.ListBoxRow()
         header_row.nav_id = ""
+        header_row.sidebar_section = header
         header_row.add_css_class("sidebar-group-row")
         if hasattr(header_row, "set_activatable"):
             header_row.set_activatable(False)
@@ -1305,6 +1326,7 @@ def build_body(app, container):
         for nid, icon, txt in nav_items:
             row = Gtk.ListBoxRow()
             row.nav_id = nid
+            row.sidebar_section = header
             box = Gtk.Box(spacing=12, margin_start=12, margin_top=8, margin_bottom=8)
             box.append(Gtk.Image.new_from_icon_name(icon))
             box.append(Gtk.Label(label=txt))

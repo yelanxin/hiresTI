@@ -125,3 +125,15 @@ def bind_handlers_extra(TidalApp, seen=None):
         ("on_daily_mix_track_selected", on_daily_mix_track_selected),
         ("on_daily_mix_item_activated", on_daily_mix_item_activated),
     ], seen=seen)
+
+
+def bind_handlers_local_playback(TidalApp, seen=None):
+    from app.app_handlers import (
+        on_open_local_file_clicked,
+        _on_local_file_selected,
+    )
+
+    bind_map(TidalApp, [
+        ("on_open_local_file_clicked", on_open_local_file_clicked),
+        ("_on_local_file_selected", _on_local_file_selected),
+    ], seen=seen)

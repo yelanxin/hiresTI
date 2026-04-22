@@ -86,23 +86,20 @@ def _toggle_login_view(self, logged_in):
             artist_fav_btn.set_visible(False)
     paned = getattr(self, "paned", None)
     if paned is not None:
-        if not logged_in:
-            paned.set_position(0)
-        else:
-            win_w = (self.win.get_width() if self.win else 0) or ui_config.WINDOW_WIDTH
-            sidebar_px = int(max(120, win_w * float(ui_config.SIDEBAR_RATIO)))
-            paned.set_position(min(sidebar_px, max(0, win_w - 320)))
+        # Sidebar is always shown now — keep the same proportion pre- and post-login.
+        win_w = (self.win.get_width() if self.win else 0) or ui_config.WINDOW_WIDTH
+        sidebar_px = int(max(120, win_w * float(ui_config.SIDEBAR_RATIO)))
+        paned.set_position(min(sidebar_px, max(0, win_w - 320)))
     ui_views_builders.toggle_login_view(self, logged_in)
     if paned is not None:
-        if logged_in:
-            GLib.idle_add(self._restore_paned_position_after_layout)
+        GLib.idle_add(self._restore_paned_position_after_layout)
         paned.set_visible(True)
     mini_btn = getattr(self, "mini_btn", None)
     if mini_btn is not None:
         mini_btn.set_visible(bool(logged_in))
     tools_btn = getattr(self, "tools_btn", None)
     if tools_btn is not None:
-        tools_btn.set_visible(bool(logged_in))
+        tools_btn.set_visible(True)
     player_overlay = getattr(self, "player_overlay", None)
     if player_overlay is not None:
         player_overlay.set_visible(bool(logged_in))
@@ -117,23 +114,31 @@ def _toggle_login_view(self, logged_in):
 
 def _set_login_view_pending(self):
     self._session_restore_pending = True
+    # Sidebar + library view stay visible even while the Tidal session is
+    # being restored. Only hide the login prompt card and playback chrome
+    # that don't make sense before any playback is set up.
     paned = getattr(self, "paned", None)
     if paned is not None:
-        paned.set_visible(False)
+        paned.set_visible(True)
     if hasattr(self, "login_prompt_box") and self.login_prompt_box is not None:
         self.login_prompt_box.set_visible(False)
     if hasattr(self, "alb_scroll") and self.alb_scroll is not None:
-        self.alb_scroll.set_visible(False)
+        self.alb_scroll.set_visible(True)
     if hasattr(self, "sidebar_box") and self.sidebar_box is not None:
-        self.sidebar_box.set_visible(False)
+        self.sidebar_box.set_visible(True)
+    try:
+        from ui.views_builders import _apply_sidebar_login_filter
+        _apply_sidebar_login_filter(self, False)
+    except Exception:
+        pass
     if hasattr(self, "search_entry") and self.search_entry is not None:
-        self.search_entry.set_visible(False)
+        self.search_entry.set_visible(True)
     mini_btn = getattr(self, "mini_btn", None)
     if mini_btn is not None:
         mini_btn.set_visible(False)
     tools_btn = getattr(self, "tools_btn", None)
     if tools_btn is not None:
-        tools_btn.set_visible(False)
+        tools_btn.set_visible(True)
     player_overlay = getattr(self, "player_overlay", None)
     if player_overlay is not None:
         player_overlay.set_visible(False)

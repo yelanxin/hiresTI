@@ -101,6 +101,9 @@ def _prefetch_next_track(app, current_index):
         if track_id is None:
             return
 
+        if str(getattr(next_track, "_source_type", "") or "") == "local":
+            return
+
         quality_key = str(getattr(app.backend, "quality", "unknown"))
         cache = getattr(app, "stream_prefetch_cache", {})
         cached = cache.get(track_id)
@@ -483,6 +486,15 @@ def play_track(app, index):
                 return False
 
             GLib.idle_add(apply_loading_lyrics)
+
+            if str(getattr(track, "_source_type", "") or "") == "local":
+                def apply_no_lyrics_local():
+                    if request_id != getattr(app, "_play_request_id", 0):
+                        return False
+                    app.render_lyrics_list(None, NO_LYRICS_BOTTOM_HINT)
+                    return False
+                GLib.idle_add(apply_no_lyrics_local)
+                return
 
             raw_lyrics = app.backend.get_lyrics(track.id)
 

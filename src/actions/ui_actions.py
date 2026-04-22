@@ -1660,6 +1660,7 @@ def show_album_details(app, alb):
     app.header_artist.set_tooltip_text(artist_name)
 
     utils.load_img(app.header_art, lambda: app.backend.get_artwork_url(alb, 640), app.cache_dir, utils.COVER_SIZE)
+    _album_is_local = str(getattr(alb, "_source_type", "") or "") == "local"
     is_fav = app.backend.is_favorite(getattr(alb, "id", ""))
     app._update_fav_icon(app.fav_btn, is_fav)
     if app.remote_playlist_edit_btn is not None:
@@ -1669,9 +1670,9 @@ def show_album_details(app, alb):
     if app.remote_playlist_more_btn is not None:
         app.remote_playlist_more_btn.set_visible(False)
     if app.fav_btn is not None:
-        app.fav_btn.set_visible(True)
+        app.fav_btn.set_visible(not _album_is_local)
     if app.add_playlist_btn is not None:
-        app.add_playlist_btn.set_visible(True)
+        app.add_playlist_btn.set_visible(not _album_is_local)
 
     _ensure_play_shuffle_btns(app)
 
@@ -1684,8 +1685,16 @@ def show_album_details(app, alb):
     if hasattr(app, "similar_albums_box"):
         app.similar_albums_box.set_visible(False)
 
+    is_local_album = str(getattr(alb, "_source_type", "") or "") == "local"
+
     def detail_task():
-        ts = app.backend.get_tracks(alb)
+        if is_local_album and getattr(app, "local_library", None) is not None:
+            ts = app.local_library.get_album_tracks(
+                getattr(alb, "_albumartist", "") or getattr(getattr(alb, "artist", None), "name", ""),
+                getattr(alb, "name", ""),
+            )
+        else:
+            ts = app.backend.get_tracks(alb)
         desc = ""
         year = _album_release_year_text(alb)
         if year:
@@ -1697,7 +1706,13 @@ def show_album_details(app, alb):
             desc += f"  •  {count} Tracks"
         GLib.idle_add(lambda: app.header_meta.set_text(desc.strip(" • ")))
         GLib.idle_add(app.load_album_tracks, ts)
-        _load_similar_albums(app, alb)
+        if not is_local_album:
+            _load_similar_albums(app, alb)
+        else:
+            GLib.idle_add(
+                lambda: getattr(app, "similar_albums_box", None)
+                and app.similar_albums_box.set_visible(False)
+            )
 
     Thread(target=detail_task, daemon=True).start()
 

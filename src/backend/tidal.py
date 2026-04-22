@@ -2881,6 +2881,17 @@ class TidalBackend:
         if isinstance(obj, dict) and 'obj' in obj: obj = obj['obj']
         if not obj: return None
 
+        # Local-library objects: cover is a plain filesystem path (or
+        # file:// URI). Short-circuit so we don't try to build a Tidal URL.
+        if str(getattr(obj, "_source_type", "") or "") == "local":
+            for attr in ("cover", "picture", "album_cover"):
+                val = getattr(obj, attr, None)
+                if isinstance(val, str) and val:
+                    return val
+            album_ref = getattr(obj, "album", None)
+            album_cover = getattr(album_ref, "cover", "") if album_ref is not None else ""
+            return album_cover or None
+
         # Playlist artwork is often exposed via object methods/typed fields;
         # UUID-to-resources URL synthesis can fail with 403 on some objects.
         if "Playlist" in type(obj).__name__:

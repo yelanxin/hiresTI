@@ -9,6 +9,7 @@ from _rust.audio import create_audio_engine
 from backend import TidalBackend
 from core.constants import CacheSettings
 from sources import MediaRegistry
+from sources.local import LocalFileResolver, LocalLibrarySource
 from sources.tidal_resolver import TidalResolver
 from core.settings import load_settings
 from models import HistoryManager, PlaylistManager
@@ -17,7 +18,7 @@ from services.lyrics import LyricsManager
 from services.scrobbler import ScrobblerService
 from services.update_check import init_update_check_state
 from ui import config as ui_config
-from utils.paths import get_cache_dir, get_config_dir
+from utils.paths import get_cache_dir, get_config_dir, get_data_dir
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,7 @@ def _init_paths_and_settings(self):
     self.backend = TidalBackend()
     self.media_registry = MediaRegistry()
     self.media_registry.register("tidal", TidalResolver(self.backend))
+    self.media_registry.register("local", LocalFileResolver())
     self._cache_root = get_cache_dir()
     self._config_root = get_config_dir()
     os.makedirs(self._cache_root, exist_ok=True)
@@ -140,6 +142,19 @@ def _init_audio_and_data_services(self):
     os.makedirs(self.cache_dir, exist_ok=True)
     self.audio_cache_dir = os.path.join(self._cache_root, "audio")
     os.makedirs(self.audio_cache_dir, exist_ok=True)
+
+    self._data_root = get_data_dir()
+    os.makedirs(self._data_root, exist_ok=True)
+    self.local_library_db_path = os.path.join(self._data_root, "library.db")
+    try:
+        self.local_library = LocalLibrarySource(
+            self.local_library_db_path,
+            self._cache_root,
+        )
+        logger.info("LocalLibrarySource initialized (db=%s)", self.local_library_db_path)
+    except Exception:
+        self.local_library = None
+        logger.exception("LocalLibrarySource initialization failed")
     self.audio_cache_tracks = int(
         self.settings.get("audio_cache_tracks", CacheSettings.DEFAULT_AUDIO_TRACKS) or 0
     )

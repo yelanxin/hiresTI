@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.9.0 Beta 4.1 - 2026-04-21
+
+### Fixed
+- **USB Rawlink V2 pause/play toggle**: playback state detection now follows the native transport state instead of GStreamer's `playbin` state, so the main play button, now-playing controls, MPRIS, and remote pause actions no longer mis-detect an active V2 stream as idle and fail to pause.
+
 ## 1.9.0 Beta 4 - 2026-04-20
 
 ### Added

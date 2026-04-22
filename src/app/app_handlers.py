@@ -65,6 +65,10 @@ from app.app_home_mixes import (
     on_daily_mix_track_selected,
     on_daily_mix_item_activated,
 )
+from app.app_local_playback import (
+    on_open_local_file_clicked,
+    _on_local_file_selected,
+)
 
 logger = logging.getLogger(__name__)
 

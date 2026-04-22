@@ -2547,8 +2547,41 @@ fn read_locator_to_string(locator: &str) -> Result<String, String> {
     Ok(text)
 }
 
-fn file_uri_to_path(locator: &str) -> Option<&str> {
-    locator.strip_prefix("file://")
+fn file_uri_to_path(locator: &str) -> Option<String> {
+    let rest = locator.strip_prefix("file://")?;
+    // Allow an optional empty authority ("file:///path") and percent-decode
+    // so paths with spaces or non-ASCII characters resolve correctly.
+    Some(percent_decode(rest))
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2])) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|e| {
+        // Fall back to the original string if decoded bytes aren't valid UTF-8.
+        String::from_utf8_lossy(e.as_bytes()).into_owned()
+    })
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn build_mpd_segment_sequence(
@@ -2583,7 +2616,7 @@ fn resolve_locator(base: &str, value: &str) -> String {
         return value.to_string();
     }
     if let Some(path) = file_uri_to_path(base) {
-        let base_path = std::path::Path::new(path);
+        let base_path = std::path::Path::new(&path);
         let dir = base_path.parent().unwrap_or_else(|| std::path::Path::new("/"));
         return format!("file://{}", dir.join(value).display());
     }

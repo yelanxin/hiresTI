@@ -11,6 +11,7 @@ from ui.track_table import build_tracks_header, append_header_action_spacers
 
 def build_grid_view(app):
     grid_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["home-view"])
+    app.grid_outer_vbox = grid_vbox
     title_box = Gtk.Box(
         orientation=Gtk.Orientation.VERTICAL,
         spacing=4,
@@ -119,18 +120,36 @@ def build_grid_view(app):
     app.right_stack.add_named(grid_vbox, "grid_view")
 
 
+TIDAL_ONLY_SIDEBAR_SECTIONS = ("DISCOVER", "FAVORITES", "RECENT")
+
+
+def _apply_sidebar_login_filter(app, logged_in):
+    nav_list = getattr(app, "nav_list", None)
+    if nav_list is None:
+        return
+    row = nav_list.get_first_child()
+    while row is not None:
+        section = getattr(row, "sidebar_section", "") or ""
+        if section in TIDAL_ONLY_SIDEBAR_SECTIONS:
+            row.set_visible(bool(logged_in))
+        row = row.get_next_sibling()
+
+
 def toggle_login_view(app, logged_in):
-    app.login_prompt_box.set_visible(not logged_in)
-    app.alb_scroll.set_visible(logged_in)
+    # Login prompt card is no longer gating the UI — the sidebar + library view
+    # are always shown. Users can reach Tidal auth via the header Login button.
+    app.login_prompt_box.set_visible(False)
+    app.alb_scroll.set_visible(True)
     if hasattr(app, "search_entry") and app.search_entry is not None:
-        app.search_entry.set_visible(logged_in)
+        app.search_entry.set_visible(True)
     if hasattr(app, "sidebar_box") and app.sidebar_box is not None:
-        app.sidebar_box.set_visible(logged_in)
+        app.sidebar_box.set_visible(True)
+    _apply_sidebar_login_filter(app, logged_in)
     if not logged_in:
         app.login_btn.set_label("Login")
-        app.grid_title_label.set_text("Welcome")
+        app.grid_title_label.set_text("Library")
         if hasattr(app, "grid_subtitle_label") and app.grid_subtitle_label is not None:
-            app.grid_subtitle_label.set_text("Sign in to load your personalized mixes and library picks")
+            app.grid_subtitle_label.set_text("Local files and, once signed in, your TIDAL collection")
         return
 
     display_name = "User"

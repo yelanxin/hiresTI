@@ -246,11 +246,16 @@ def on_player_album_clicked(self):
     if not album_id:
         return
 
+    is_local = str(getattr(album_obj, "_source_type", "") or "") == "local"
+
     def _resolve():
-        try:
-            alb = self.backend.session.album(album_id)
-        except Exception:
-            alb = album_obj
+        if is_local and getattr(self, "local_library", None) is not None:
+            alb = self.local_library.find_album_by_id(str(album_id)) or album_obj
+        else:
+            try:
+                alb = self.backend.session.album(album_id)
+            except Exception:
+                alb = album_obj
         GLib.idle_add(self.show_album_details, alb)
 
     submit_daemon(_resolve)
@@ -300,6 +305,8 @@ def _get_tidal_image_url(self, uuid, width=320, height=320):
     if not uuid:
         return None
     if isinstance(uuid, str) and ("http" in uuid or "file://" in uuid):
+        return uuid
+    if isinstance(uuid, str) and uuid.startswith("/"):
         return uuid
     try:
         path = uuid.replace("-", "/")
