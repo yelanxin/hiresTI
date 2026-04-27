@@ -1697,57 +1697,48 @@ fn decode_direct_audio_stream(
                     ));
                 }
                 if output_session.is_none() {
-                    // Try to reuse the old USB session if the rate matches.
-                    // Rate changes require a full interface release cycle on
-                    // some DACs (NXP/Rawlink v2) — the PLL won't accept
-                    // SET_CUR at a new rate without a kernel-driver reset.
-                    let can_reuse = reuse_sess
-                        .as_ref()
-                        .map(|old| old.actual_rate == slab.spec.sample_rate)
-                        .unwrap_or(false);
-                    let session = if can_reuse {
-                        let mut old = reuse_sess.take().unwrap();
-                        eprintln!(
-                            "native-transport: reusing USB session (same rate={})",
-                            old.actual_rate
-                        );
-                        old.prepare_for_reuse(slab.spec.sample_rate, cfg.bit_depth)?;
-                        // Set up clock feed parameters.
-                        let pps = old.state.packets_per_sec as usize;
-                        let n_pkts = (usb_audio::transfer::N_PACKETS_TARGET_MS * pps / 1000).max(8);
-                        let ring_buf_ns = (usb_audio::transfer::N_TRANSFERS * n_pkts) as u64
-                            * 1_000_000_000
-                            / pps as u64;
-                        let clock_mode = match cfg.clock_mode {
-                            1 => ClockMode::Pull,
-                            _ => ClockMode::Push,
-                        };
-                        let buf_ns = if clock_mode == ClockMode::Pull {
-                            0
-                        } else {
-                            ring_buf_ns
-                        };
-                        old.feed.set_buffer_depth_ns(buf_ns);
-                        old.feed.set_mode(clock_mode);
-                        queue_native_event(
-                            events,
-                            crate::EVT_STATE,
-                            format!(
-                                "native-transport usb-reused rate={} device={} clock_mode={:?}",
-                                old.actual_rate, cfg.device_id, clock_mode
-                            ),
-                        );
-                        old
-                    } else {
-                        // Rate mismatch or no session — drop old session and
-                        // open from scratch.
-                        if let Some(old) = reuse_sess.take() {
+                    let session = if let Some(mut old) = reuse_sess.take() {
+                        let old_rate = old.actual_rate;
+                        if old_rate == slab.spec.sample_rate {
                             eprintln!(
-                                "native-transport: rate change {}→{}, dropping old session",
-                                old.actual_rate, slab.spec.sample_rate
+                                "native-transport: reusing USB session (same rate={})",
+                                old_rate
                             );
-                            drop(old);
+                        } else {
+                            eprintln!(
+                                "native-transport: rate change {}→{}, reconfiguring live USB session",
+                                old_rate, slab.spec.sample_rate
+                            );
                         }
+                        match old.prepare_for_reuse(slab.spec.sample_rate, cfg.bit_depth) {
+                            Ok(()) => {
+                                let clock_mode = configure_session_feed(&old, cfg);
+                                queue_native_event(
+                                    events,
+                                    crate::EVT_STATE,
+                                    format!(
+                                        "native-transport usb-reused rate={} previous_rate={} device={} clock_mode={:?}",
+                                        old.actual_rate, old_rate, cfg.device_id, clock_mode
+                                    ),
+                                );
+                                old
+                            }
+                            Err(err) => {
+                                eprintln!(
+                                    "native-transport: live USB reconfigure {}→{} failed: {}; reopening",
+                                    old_rate, slab.spec.sample_rate, err
+                                );
+                                drop(old);
+                                let (s, _runtime_info) = open_native_usb_output(
+                                    cfg,
+                                    &slab.spec,
+                                    events,
+                                    pre_handle.take(),
+                                )?;
+                                s
+                            }
+                        }
+                    } else {
                         let (s, _runtime_info) =
                             open_native_usb_output(cfg, &slab.spec, events, pre_handle.take())?;
                         s
@@ -1974,6 +1965,25 @@ fn open_native_usb_output(
         control_device: session.control_device(),
     };
     Ok((session, runtime))
+}
+
+fn configure_session_feed(session: &UsbAudioSink, cfg: &UsbRawSinkConfig) -> ClockMode {
+    let pps = session.state.packets_per_sec as usize;
+    let n_pkts = (usb_audio::transfer::N_PACKETS_TARGET_MS * pps / 1000).max(8);
+    let ring_buf_ns =
+        (usb_audio::transfer::N_TRANSFERS * n_pkts) as u64 * 1_000_000_000 / pps as u64;
+    let clock_mode = match cfg.clock_mode {
+        1 => ClockMode::Pull,
+        _ => ClockMode::Push,
+    };
+    let buf_ns = if clock_mode == ClockMode::Pull {
+        0
+    } else {
+        ring_buf_ns
+    };
+    session.feed.set_buffer_depth_ns(buf_ns);
+    session.feed.set_mode(clock_mode);
+    clock_mode
 }
 
 fn push_slab_to_usb_output(

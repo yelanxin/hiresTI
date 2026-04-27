@@ -35,7 +35,8 @@ use std::sync::{Arc, Mutex};
 use gstreamer as gst;
 use libusb1_sys::{
     libusb_alloc_transfer, libusb_cancel_transfer, libusb_device_handle, libusb_fill_iso_transfer,
-    libusb_free_transfer, libusb_set_iso_packet_lengths, libusb_submit_transfer, libusb_transfer,
+    libusb_free_transfer, libusb_handle_events_timeout, libusb_set_iso_packet_lengths,
+    libusb_submit_transfer, libusb_transfer,
 };
 
 use rusb::UsbContext as _;
@@ -385,7 +386,14 @@ impl UsbAudioSink {
         rate: u32,
         bit_depth: u8,
         preferred_profile: Option<UacAltProfile>,
-    ) -> Result<(UsbAudioDevice, OpenUsbDevice, super::descriptor::UacStreamAlt), String> {
+    ) -> Result<
+        (
+            UsbAudioDevice,
+            OpenUsbDevice,
+            super::descriptor::UacStreamAlt,
+        ),
+        String,
+    > {
         let dev = find_device_by_id(device_id)
             .ok_or_else(|| format!("USB audio device '{}' not found", device_id))?;
         let mut open_dev = OpenUsbDevice::open(&dev)?;
@@ -624,7 +632,8 @@ impl UsbAudioSink {
 
         let dev_handle_raw = open_dev.handle.as_raw();
         let ctx_raw = open_dev.handle.context().as_raw();
-        let state = Self::build_ring_state(&queue, &feed, actual_rate, &alt, open_dev.dev.is_high_speed);
+        let state =
+            Self::build_ring_state(&queue, &feed, actual_rate, &alt, open_dev.dev.is_high_speed);
         feed.invalidate();
 
         let ring = IsoTransferRing::new(dev_handle_raw, ctx_raw, alt.out_ep, Arc::clone(&state))?;
@@ -760,11 +769,7 @@ impl UsbAudioSink {
     ///
     /// This keeps the USB handle open continuously, preventing the kernel driver
     /// (snd-usb-audio) from reattaching and resetting the DAC PLL.
-    pub fn prepare_for_reuse(
-        &mut self,
-        rate: u32,
-        bit_depth: u8,
-    ) -> Result<(), String> {
+    pub fn prepare_for_reuse(&mut self, rate: u32, bit_depth: u8) -> Result<(), String> {
         // 1. Stop ring — cancels all ISO transfers, joins event thread.
         self.ring.stop();
         // 2. Drop feedback reader (frees its libusb_transfer).
@@ -778,38 +783,65 @@ impl UsbAudioSink {
         // 4. Fresh queue.
         let queue = ProducerQueue::bytes();
 
-        // 5. Reset alt-setting to 0 — tears down the isochronous endpoint so
-        //    the DAC firmware properly resets its clock domain.  Without this,
-        //    some DACs (NXP/Rawlink v2) reject SET_CUR when switching rates
-        //    while the same alt-setting stays active.
-        {
+        // 5. Reuse the current alt/rate when possible. Re-issuing SET_CUR or
+        // toggling alt=0 on a same-rate track switch can make some DACs mute
+        // one channel while their output stage recovers.
+        let (alt, actual_rate, dev_handle_raw, ctx_raw, uac_version, is_high_speed, rate_changed) = {
             let mut open_dev = self._open_dev.lock().unwrap_or_else(|e| e.into_inner());
-            let si = open_dev.dev.stream_iface;
-            let _ = open_dev.handle.set_alternate_setting(si, 0);
-            open_dev.active_alt = None;
-            open_dev.active_rate = 0;
-            eprintln!("usb-audio: prepare_for_reuse — alt reset to 0 (si={})", si);
-        }
+            let reusable_active = open_dev
+                .active_alt
+                .as_ref()
+                .filter(|alt| open_dev.active_rate == rate && alt.bit_depth == bit_depth)
+                .cloned();
 
-        // 6. Reconfigure device (alt-setting + rate) — reuses claimed interface.
-        let (alt, actual_rate, dev_handle_raw, ctx_raw, is_high_speed) = {
-            let mut open_dev = self._open_dev.lock().unwrap_or_else(|e| e.into_inner());
-            let alt = open_dev
-                .best_alt(rate, bit_depth)
-                .ok_or_else(|| {
-                    format!(
-                        "no alt-setting for rate={} bit_depth={} on prepare_for_reuse",
-                        rate, bit_depth
-                    )
-                })?
-                .clone();
-            open_dev.configure(&alt, rate)?;
+            let alt = if let Some(alt) = reusable_active {
+                eprintln!(
+                    "usb-audio: prepare_for_reuse — keeping active alt={} rate={}",
+                    alt.alt_setting, rate
+                );
+                alt
+            } else {
+                let previous_rate = open_dev.active_rate;
+                let rate_change = previous_rate > 0 && previous_rate != rate;
+
+                // For a real rate change, tear down the isochronous endpoint
+                // before SET_CUR. This keeps rate switching reliable without
+                // closing the libusb handle or letting the kernel reattach.
+                if rate_change {
+                    let si = open_dev.dev.stream_iface;
+                    let _ = open_dev.handle.set_alternate_setting(si, 0);
+                    open_dev.active_alt = None;
+                    open_dev.active_rate = 0;
+                    eprintln!(
+                        "usb-audio: prepare_for_reuse — rate change {}→{}, alt reset to 0 (si={})",
+                        previous_rate, rate, si
+                    );
+                }
+
+                let alt = open_dev
+                    .best_alt(rate, bit_depth)
+                    .ok_or_else(|| {
+                        format!(
+                            "no alt-setting for rate={} bit_depth={} on prepare_for_reuse",
+                            rate, bit_depth
+                        )
+                    })?
+                    .clone();
+                open_dev.configure(&alt, rate)?;
+                alt
+            };
+
+            let actual_rate = open_dev.active_rate;
+            let rate_changed =
+                actual_rate == rate && self.actual_rate > 0 && self.actual_rate != actual_rate;
             (
                 alt,
-                open_dev.active_rate,
+                actual_rate,
                 open_dev.handle.as_raw(),
                 open_dev.handle.context().as_raw(),
+                open_dev.dev.uac_version,
                 open_dev.dev.is_high_speed,
+                rate_changed,
             )
         };
         eprintln!(
@@ -819,11 +851,22 @@ impl UsbAudioSink {
         let state = Self::build_ring_state(&queue, &self.feed, actual_rate, &alt, is_high_speed);
         self.feed.invalidate();
 
-        // 7. Create new ring but do NOT start it — deferred start via ensure_started().
-        let ring =
-            IsoTransferRing::new(dev_handle_raw, ctx_raw, alt.out_ep, Arc::clone(&state))?;
+        if rate_changed {
+            wait_for_rate_change_settle(
+                dev_handle_raw,
+                ctx_raw,
+                alt.feedback_ep,
+                uac_version,
+                is_high_speed,
+                state.packets_per_sec,
+                actual_rate,
+            )?;
+        }
 
-        // 8. Swap in new state.
+        // 6. Create new ring but do NOT start it — deferred start via ensure_started().
+        let ring = IsoTransferRing::new(dev_handle_raw, ctx_raw, alt.out_ep, Arc::clone(&state))?;
+
+        // 7. Swap in new state.
         self.queue = queue;
         self.state = state;
         self.actual_rate = actual_rate;
@@ -974,6 +1017,285 @@ fn format_feedback_bytes(buf: &[u8]) -> String {
 
 fn feedback_rate_hz(ms: i64, packets_per_sec: u32) -> f64 {
     ms as f64 / 1_000_000.0 * packets_per_sec as f64
+}
+
+struct RateChangeSettleCtx {
+    uac_version: UacVersion,
+    is_high_speed: bool,
+    packets_per_sec: u32,
+    ep: u8,
+    target_rate: u32,
+    target_ms: i64,
+    tolerance_ms: i64,
+    stable_needed: u32,
+    stable_count: u32,
+    callbacks: u64,
+    parse_failures: u64,
+    last_rate_hz: Option<f64>,
+    done: bool,
+    in_flight: bool,
+    submit_error: Option<c_int>,
+}
+
+const RATE_CHANGE_SETTLE_MIN_MS_DEFAULT: u64 = 120;
+const RATE_CHANGE_SETTLE_MAX_MS_DEFAULT: u64 = 300;
+const RATE_CHANGE_SETTLE_LIMIT_MS: u64 = 1_500;
+const RATE_CHANGE_SETTLE_TOLERANCE_PPM: i64 = 1_000;
+const RATE_CHANGE_SETTLE_STABLE_COUNT: u32 = 2;
+
+fn env_ms(name: &str, default_ms: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|ms| ms.min(RATE_CHANGE_SETTLE_LIMIT_MS))
+        .unwrap_or(default_ms)
+}
+
+fn rate_change_settle_min_ms() -> u64 {
+    env_ms(
+        "HIRESTI_USB_RATE_CHANGE_SETTLE_MIN_MS",
+        RATE_CHANGE_SETTLE_MIN_MS_DEFAULT,
+    )
+}
+
+fn rate_change_settle_max_ms() -> u64 {
+    env_ms(
+        "HIRESTI_USB_RATE_CHANGE_SETTLE_MAX_MS",
+        RATE_CHANGE_SETTLE_MAX_MS_DEFAULT,
+    )
+}
+
+extern "system" fn rate_change_settle_feedback_callback(transfer: *mut libusb_transfer) {
+    // SAFETY: user_data points to RateChangeSettleCtx owned by
+    // wait_for_rate_change_settle(), which drains/cancels the transfer before
+    // freeing the context.
+    let ctx = unsafe { &mut *((*transfer).user_data as *mut RateChangeSettleCtx) };
+    ctx.callbacks = ctx.callbacks.saturating_add(1);
+    ctx.in_flight = false;
+
+    let status = unsafe { (*transfer).status };
+    if status != libusb1_sys::constants::LIBUSB_TRANSFER_COMPLETED {
+        ctx.done = true;
+        return;
+    }
+
+    let transfer_len = unsafe { (*transfer).actual_length } as usize;
+    let pkt_desc = unsafe { &*(*transfer).iso_packet_desc.as_ptr() };
+    let pkt_actual_len = pkt_desc.actual_length as usize;
+    let pkt_configured_len = pkt_desc.length as usize;
+    let raw_storage = unsafe {
+        std::slice::from_raw_parts((*transfer).buffer as *const u8, pkt_configured_len.min(16))
+    };
+    let payload_len = if pkt_actual_len > 0 {
+        pkt_actual_len.min(pkt_configured_len)
+    } else {
+        transfer_len.min(pkt_configured_len)
+    };
+    let buf = unsafe { std::slice::from_raw_parts((*transfer).buffer as *const u8, payload_len) };
+    let ms = match ctx.uac_version {
+        UacVersion::V2 => parse_feedback_uac2(buf, ctx.packets_per_sec),
+        UacVersion::V1 => parse_feedback_uac1(buf, ctx.is_high_speed),
+    };
+
+    if let Some(raw) = ms {
+        let rate_hz = feedback_rate_hz(raw, ctx.packets_per_sec);
+        ctx.last_rate_hz = Some(rate_hz);
+        if (raw - ctx.target_ms).abs() <= ctx.tolerance_ms {
+            ctx.stable_count = ctx.stable_count.saturating_add(1);
+        } else {
+            ctx.stable_count = 0;
+        }
+        if ctx.callbacks <= 4 || ctx.stable_count >= ctx.stable_needed {
+            eprintln!(
+                "usb-audio: rate-change settle feedback cb#{} ep=0x{:02x} raw=[{}] rate={:.3}Hz target={}Hz stable={}/{}",
+                ctx.callbacks,
+                ctx.ep,
+                format_feedback_bytes(raw_storage),
+                rate_hz,
+                ctx.target_rate,
+                ctx.stable_count,
+                ctx.stable_needed,
+            );
+        }
+        if ctx.stable_count >= ctx.stable_needed {
+            ctx.done = true;
+            return;
+        }
+    } else {
+        ctx.parse_failures = ctx.parse_failures.saturating_add(1);
+        if ctx.parse_failures <= 2 {
+            eprintln!(
+                "usb-audio: rate-change settle feedback parse failed ep=0x{:02x} cb#{} raw=[{}]",
+                ctx.ep,
+                ctx.callbacks,
+                format_feedback_bytes(raw_storage),
+            );
+        }
+    }
+
+    let rc = unsafe { libusb_submit_transfer(transfer) };
+    if rc == 0 {
+        ctx.in_flight = true;
+    } else {
+        ctx.submit_error = Some(rc);
+        ctx.done = true;
+    }
+}
+
+fn wait_for_rate_change_settle(
+    dev_handle_raw: *mut libusb_device_handle,
+    ctx_raw: *mut libusb1_sys::libusb_context,
+    feedback_ep: Option<u8>,
+    uac_version: UacVersion,
+    is_high_speed: bool,
+    packets_per_sec: u32,
+    target_rate: u32,
+) -> Result<(), String> {
+    let max_ms = rate_change_settle_max_ms();
+    if max_ms == 0 {
+        eprintln!("usb-audio: rate-change settle disabled");
+        return Ok(());
+    }
+    let min_ms = rate_change_settle_min_ms().min(max_ms);
+    let Some(ep) = feedback_ep else {
+        eprintln!(
+            "usb-audio: rate-change settle no feedback ep — fixed {} ms",
+            min_ms
+        );
+        if min_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(min_ms));
+        }
+        return Ok(());
+    };
+
+    let buf_len: usize = match uac_version {
+        UacVersion::V2 => 4,
+        UacVersion::V1 if is_high_speed => 4,
+        UacVersion::V1 => 3,
+    };
+    let mut buf = vec![0u8; buf_len];
+    let target_ms = target_rate as i64 * 1_000_000 / packets_per_sec as i64;
+    let tolerance_ms = (target_ms * RATE_CHANGE_SETTLE_TOLERANCE_PPM / 1_000_000).max(1);
+    let ctx_ptr = Box::into_raw(Box::new(RateChangeSettleCtx {
+        uac_version,
+        is_high_speed,
+        packets_per_sec,
+        ep,
+        target_rate,
+        target_ms,
+        tolerance_ms,
+        stable_needed: RATE_CHANGE_SETTLE_STABLE_COUNT,
+        stable_count: 0,
+        callbacks: 0,
+        parse_failures: 0,
+        last_rate_hz: None,
+        done: false,
+        in_flight: false,
+        submit_error: None,
+    }));
+
+    let xfer = unsafe { libusb_alloc_transfer(1) };
+    if xfer.is_null() {
+        unsafe {
+            drop(Box::from_raw(ctx_ptr));
+        }
+        return Err("libusb_alloc_transfer failed for rate-change settle feedback".into());
+    }
+
+    unsafe {
+        libusb_fill_iso_transfer(
+            xfer,
+            dev_handle_raw,
+            ep as c_uchar,
+            buf.as_mut_ptr() as *mut c_uchar,
+            buf_len as c_int,
+            1,
+            rate_change_settle_feedback_callback,
+            ctx_ptr as *mut c_void,
+            0,
+        );
+        libusb_set_iso_packet_lengths(xfer, buf_len as c_uint);
+    }
+
+    eprintln!(
+        "usb-audio: rate-change settle waiting for feedback target={}Hz min={}ms max={}ms",
+        target_rate, min_ms, max_ms,
+    );
+    unsafe {
+        (*ctx_ptr).in_flight = true;
+    }
+    let submit_rc = unsafe { libusb_submit_transfer(xfer) };
+    if submit_rc != 0 {
+        unsafe {
+            libusb_free_transfer(xfer);
+            drop(Box::from_raw(ctx_ptr));
+        }
+        return Err(format!(
+            "submit rate-change settle feedback transfer: rc={}",
+            submit_rc
+        ));
+    }
+
+    let start_ns = clock_monotonic_ns();
+    let deadline_ns = start_ns.saturating_add(max_ms.saturating_mul(1_000_000));
+    let event_timeout = libc::timeval {
+        tv_sec: 0,
+        tv_usec: 5_000,
+    };
+    while clock_monotonic_ns() < deadline_ns {
+        unsafe {
+            if (*ctx_ptr).done {
+                break;
+            }
+            libusb_handle_events_timeout(ctx_raw, &event_timeout);
+        }
+    }
+
+    let elapsed_ms = clock_monotonic_ns().saturating_sub(start_ns) / 1_000_000;
+    let settled = unsafe { (*ctx_ptr).stable_count >= (*ctx_ptr).stable_needed };
+    if settled && elapsed_ms < min_ms {
+        std::thread::sleep(std::time::Duration::from_millis(min_ms - elapsed_ms));
+    }
+
+    unsafe {
+        if (*ctx_ptr).in_flight {
+            libusb_cancel_transfer(xfer);
+            let cancel_deadline_ns = clock_monotonic_ns().saturating_add(200_000_000);
+            while (*ctx_ptr).in_flight && clock_monotonic_ns() < cancel_deadline_ns {
+                libusb_handle_events_timeout(ctx_raw, &event_timeout);
+            }
+        }
+    }
+
+    let total_ms = clock_monotonic_ns().saturating_sub(start_ns) / 1_000_000;
+    let still_in_flight = unsafe { (*ctx_ptr).in_flight };
+    let ctx = unsafe { Box::from_raw(ctx_ptr) };
+    if still_in_flight {
+        eprintln!(
+            "usb-audio: rate-change settle cancel did not drain after {} ms (callbacks={}); leaking settle transfer",
+            total_ms, ctx.callbacks,
+        );
+        std::mem::forget(ctx);
+        std::mem::forget(buf);
+        return Ok(());
+    }
+    if settled {
+        eprintln!(
+            "usb-audio: rate-change settle ready in {} ms (held {} ms, callbacks={})",
+            elapsed_ms, total_ms, ctx.callbacks,
+        );
+    } else {
+        eprintln!(
+            "usb-audio: rate-change settle timeout after {} ms (callbacks={} last_rate={:?} submit_error={:?})",
+            total_ms, ctx.callbacks, ctx.last_rate_hz, ctx.submit_error,
+        );
+    }
+    unsafe {
+        libusb_free_transfer(xfer);
+    }
+    drop(ctx);
+    drop(buf);
+    Ok(())
 }
 
 /// libusb ISO IN completion callback for the feedback endpoint.
