@@ -242,6 +242,14 @@ class TidalBackend:
         """
         Keep user-selected quality as first choice, then fallback to broadly
         supported tiers when stream URL endpoint rejects higher tier.
+
+        For LOSSLESS-tier users, HI_RES_LOSSLESS is prepended to the chain
+        because Tidal currently silently downgrades many LOSSLESS-tier
+        requests to AAC 320 even when the catalog flags FLAC availability;
+        the HI_RES_LOSSLESS tier still serves FLAC in that case (24-bit
+        when a hi-res master exists, otherwise the same AAC fallback that
+        LOSSLESS would yield).  Caller must validate the returned codec to
+        treat the AAC outcome as a last-resort fallback.
         """
         primary = self.quality
         primary_str = str(primary or "").upper()
@@ -251,6 +259,12 @@ class TidalBackend:
             chain.append(self._resolve_quality(["high_lossless", "LOSSLESS"], fallback="LOSSLESS"))
             chain.append(self._resolve_quality(["low_320k", "HIGH"], fallback="HIGH"))
         elif "LOSSLESS" in primary_str:
+            chain.insert(
+                0,
+                self._resolve_quality(
+                    ["hi_res_lossless", "HI_RES_LOSSLESS"], fallback="HI_RES_LOSSLESS"
+                ),
+            )
             chain.append(self._resolve_quality(["low_320k", "HIGH"], fallback="HIGH"))
 
         # Dedupe by string representation while preserving order.
@@ -3237,6 +3251,13 @@ class TidalBackend:
         preferred = self.quality
         qualities = self._get_stream_quality_fallback_chain()
         last_exc = None
+        # When the chain prepends HI_RES_LOSSLESS as a workaround, Tidal may
+        # silently downgrade to AAC for tracks without a hi-res master.  We
+        # treat that as a soft failure and try the next chain entry, keeping
+        # the AAC URL as a last-resort fallback if every entry returns AAC.
+        downgrade_url = None
+        downgrade_info = None
+        downgrade_q = None
         try:
             for idx, q in enumerate(qualities):
                 try:
@@ -3266,6 +3287,28 @@ class TidalBackend:
                     self._last_stream_sample_rate = int(
                         getattr(stream_info, "sample_rate", 0) or 0
                     )
+
+                    # Codec validation: when we asked for a LOSSLESS-tier stream
+                    # but Tidal returned a non-LOSSLESS audio_quality (HIGH/LOW
+                    # = AAC), save it as a fallback and try the next chain entry.
+                    # Recovers FLAC for tracks that have a hi-res master in the
+                    # catalog but whose LOSSLESS tier is being downgraded.
+                    asked_lossless = "LOSSLESS" in str(q or "").upper()
+                    returned_q_str = str(getattr(stream_info, "audio_quality", "") or "").upper()
+                    got_lossless = "LOSSLESS" in returned_q_str
+                    if asked_lossless and stream_info is not None and not got_lossless:
+                        if downgrade_url is None:
+                            downgrade_url = url
+                            downgrade_info = stream_info
+                            downgrade_q = q
+                        if idx < len(qualities) - 1:
+                            logger.warning(
+                                "Tidal downgraded '%s' to %s on q=%s; trying next fallback...",
+                                getattr(track, "name", "?"),
+                                returned_q_str or "?",
+                                q,
+                            )
+                            continue
 
                     if idx == 0:
                         if stream_info is not None:
@@ -3305,6 +3348,23 @@ class TidalBackend:
                         continue
                     if idx < len(qualities) - 1:
                         continue
+            # Every chain entry that succeeded returned a downgraded AAC stream
+            # (track has no FLAC master in Tidal's catalog).  Use the first
+            # such URL as last-resort output rather than failing the call.
+            if downgrade_url is not None:
+                self._last_stream_bit_depth = int(
+                    getattr(downgrade_info, "bit_depth", 0) or 0
+                )
+                self._last_stream_sample_rate = int(
+                    getattr(downgrade_info, "sample_rate", 0) or 0
+                )
+                logger.warning(
+                    "Stream lossless unavailable for '%s'; using downgraded %s (q=%s)",
+                    getattr(track, "name", "?"),
+                    getattr(downgrade_info, "audio_quality", "?"),
+                    downgrade_q,
+                )
+                return downgrade_url
             if last_exc is not None:
                 logger.warning("Stream URL error [%s]: %s", classify_exception(last_exc), last_exc)
                 # When a track ID is dead (404/not_found) — common for liked songs that
