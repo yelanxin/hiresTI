@@ -767,7 +767,18 @@ fn transport_worker(
                         worker.auto_start.store(true, Ordering::Release);
                     } else {
                         // No eager worker — start a fresh one with auto_start=true.
+                        // If we're resuming from Pause, the snapshot still holds
+                        // the paused position; pass it as seek_start_ms so the
+                        // new decode worker resumes instead of restarting from 0.
+                        let resume_pos_ms = current_native_playback_position_ms(&snapshot, &runtime);
                         set_native_runtime(&runtime, None);
+                        if resume_pos_ms > 0 {
+                            if let Ok(mut state) = snapshot.lock() {
+                                state.seek_offset_s = resume_pos_ms as f64 / 1000.0;
+                                state.decoded_frame_count = 0;
+                            }
+                        }
+                        let seek_start_ms = if resume_pos_ms > 0 { Some(resume_pos_ms) } else { None };
                         let auto_start = Arc::new(AtomicBool::new(true));
                         match start_direct_audio_decode_worker(
                             source,
@@ -776,7 +787,7 @@ fn transport_worker(
                             current_output_config.clone(),
                             Arc::clone(&runtime),
                             generation,
-                            None,
+                            seek_start_ms,
                             volume.clone(),
                             spectrum_tx.clone(),
                             Arc::clone(&spectrum_bands),
