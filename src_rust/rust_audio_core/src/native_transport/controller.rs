@@ -1,29 +1,35 @@
 use super::processor::{
-    LufsPcmProcessor, PcmProcessorChain, PcmSampleFormat, PcmSlab, PcmStreamSpec,
-    SharedLufsValues, SharedVolume, SpectrumFrame, SpectrumPcmProcessor, VolumePcmProcessor,
+    LufsPcmProcessor, PcmProcessorChain, PcmSampleFormat, PcmSlab, PcmStreamSpec, SharedLufsValues,
+    SharedVolume, SpectrumFrame, SpectrumPcmProcessor, VolumePcmProcessor,
 };
 use super::source::{
     inspect_mpd_manifest, MpdManifestInfo, NativeDecoderKind, NativeTransportSource,
     NativeTransportSourceKind,
 };
+use crate::alsa_clock::{AlsaHwClockFeed, ClockMode};
+use crate::usb_audio::{
+    self, OpenUsbDevice, QueueMode, UacAltProfile, UsbAudioSink, UsbRawSinkConfig,
+};
 use crossbeam_channel::{unbounded, Receiver, Sender};
+use std::collections::VecDeque;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
-use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use symphonia::core::audio::{AudioBuffer, AudioBufferRef, Signal};
-use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL, CODEC_TYPE_FLAC, CODEC_TYPE_AAC, CODEC_TYPE_ALAC};
+use symphonia::core::codecs::{
+    CodecType, DecoderOptions, CODEC_TYPE_AAC, CODEC_TYPE_ALAC, CODEC_TYPE_FLAC, CODEC_TYPE_NULL,
+};
 use symphonia::core::conv::IntoSample;
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::{FormatOptions, SeekMode, SeekTo};
-use symphonia::core::io::{MediaSource, MediaSourceStream, MediaSourceStreamOptions, ReadOnlySource};
+use symphonia::core::io::{
+    MediaSource, MediaSourceStream, MediaSourceStreamOptions, ReadOnlySource,
+};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 use symphonia::core::sample::Sample;
-use crate::alsa_clock::{AlsaHwClockFeed, ClockMode};
-use crate::usb_audio::{self, OpenUsbDevice, QueueMode, UacAltProfile, UsbAudioSink, UsbRawSinkConfig};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeTransportState {
@@ -177,7 +183,9 @@ impl NativeTransportController {
         let volume = SharedVolume::default();
         let (spectrum_tx, spectrum_rx) = crossbeam_channel::bounded(64);
         let spectrum_bands = Arc::new(AtomicU32::new(512));
-        let lufs_values: SharedLufsValues = Arc::new(std::sync::Mutex::new(crate::dsp::lufs::LufsValues::default()));
+        let lufs_values: SharedLufsValues = Arc::new(std::sync::Mutex::new(
+            crate::dsp::lufs::LufsValues::default(),
+        ));
         let hw_vol_cache: HwVolCache = [
             Arc::new(AtomicI32::new(i32::MIN)),
             Arc::new(AtomicI32::new(i32::MIN)),
@@ -199,10 +207,16 @@ impl NativeTransportController {
         ];
         let join = thread::spawn(move || {
             transport_worker(
-                rx, snapshot_clone, events_clone, runtime_clone,
+                rx,
+                snapshot_clone,
+                events_clone,
+                runtime_clone,
                 hw_vol_info_clone,
-                volume_clone, spectrum_tx_clone, spectrum_bands_clone,
-                lufs_clone, hw_vol_cache_clone,
+                volume_clone,
+                spectrum_tx_clone,
+                spectrum_bands_clone,
+                lufs_clone,
+                hw_vol_cache_clone,
             )
         });
         Self {
@@ -227,7 +241,12 @@ impl NativeTransportController {
             .map_err(|e| format!("native transport command send failed: {e}"))
     }
 
-    pub fn claim_device(&self, device_id: &str, bit_depth: u8, alt_profile: UacAltProfile) -> Result<(), String> {
+    pub fn claim_device(
+        &self,
+        device_id: &str,
+        bit_depth: u8,
+        alt_profile: UacAltProfile,
+    ) -> Result<(), String> {
         self.submit(NativeTransportCommand::ClaimDevice {
             device_id: device_id.to_string(),
             bit_depth,
@@ -260,7 +279,8 @@ impl NativeTransportController {
     pub fn stop_and_release(&self) -> Result<(), String> {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         self.submit(NativeTransportCommand::StopAndRelease(tx))?;
-        rx.recv().map_err(|e| format!("stop_and_release: recv failed: {e}"))
+        rx.recv()
+            .map_err(|e| format!("stop_and_release: recv failed: {e}"))
     }
 
     pub fn seek_ms(&self, position_ms: u64) -> Result<(), String> {
@@ -323,10 +343,7 @@ impl NativeTransportController {
     }
 
     pub fn runtime_info(&self) -> Option<NativeUsbRuntime> {
-        self.runtime
-            .lock()
-            .ok()
-            .and_then(|runtime| runtime.clone())
+        self.runtime.lock().ok().and_then(|runtime| runtime.clone())
     }
 
     pub fn hw_volume_supported(&self) -> bool {
@@ -334,7 +351,11 @@ impl NativeTransportController {
             return runtime.hw_volume_supported;
         }
         // Fallback: check cached info from pre-claim.
-        self.hw_vol_info.lock().ok().map(|i| i.supported).unwrap_or(false)
+        self.hw_vol_info
+            .lock()
+            .ok()
+            .map(|i| i.supported)
+            .unwrap_or(false)
     }
 
     pub fn hw_volume_range(&self) -> Option<(i32, i32, i32)> {
@@ -388,8 +409,12 @@ impl NativeTransportController {
         for c in &self.hw_vol_cache {
             c.store(value_raw, Ordering::Relaxed);
         }
-        let Some(runtime) = self.runtime_info() else { return false; };
-        let Ok(device) = runtime.control_device.lock() else { return false; };
+        let Some(runtime) = self.runtime_info() else {
+            return false;
+        };
+        let Ok(device) = runtime.control_device.lock() else {
+            return false;
+        };
         device.set_hw_volume(value_raw as i16).is_ok()
     }
 
@@ -397,8 +422,12 @@ impl NativeTransportController {
         if idx < 3 {
             self.hw_vol_cache[idx].store(value_raw, Ordering::Relaxed);
         }
-        let Some(runtime) = self.runtime_info() else { return false; };
-        let Ok(device) = runtime.control_device.lock() else { return false; };
+        let Some(runtime) = self.runtime_info() else {
+            return false;
+        };
+        let Ok(device) = runtime.control_device.lock() else {
+            return false;
+        };
         device.set_hw_volume_ch(idx, value_raw as i16).is_ok()
     }
 }
@@ -481,8 +510,7 @@ fn transport_worker(
     let mut current_output_config: Option<UsbRawSinkConfig> = None;
     let mut current_dsp_config: Option<crate::dsp::DspGraphConfig> = None;
     // Shared slot for hot-updating DSP config in the running decode worker.
-    let dsp_config_slot: super::native_dsp::SharedDspConfig =
-        Arc::new(Mutex::new(None));
+    let dsp_config_slot: super::native_dsp::SharedDspConfig = Arc::new(Mutex::new(None));
     let mut decode_worker: Option<DecodeWorkerHandle> = None;
     // Early-claimed USB device handle.  Keeps the kernel driver detached so
     // PipeWire / PulseAudio cannot reclaim the device between track switches
@@ -491,7 +519,11 @@ fn transport_worker(
     let mut claimed_cfg: Option<ClaimedDeviceCfg> = None;
     while let Ok(cmd) = rx.recv() {
         match cmd {
-            NativeTransportCommand::ClaimDevice { device_id, bit_depth, alt_profile } => {
+            NativeTransportCommand::ClaimDevice {
+                device_id,
+                bit_depth,
+                alt_profile,
+            } => {
                 // Release any previous claim.
                 claimed_device = None;
                 claimed_cfg = Some(ClaimedDeviceCfg {
@@ -539,7 +571,8 @@ fn transport_worker(
                                                 );
                                                 if let Some(v) = vol {
                                                     if idx < 3 {
-                                                        hw_vol_cache[idx].store(v as i32, Ordering::Relaxed);
+                                                        hw_vol_cache[idx]
+                                                            .store(v as i32, Ordering::Relaxed);
                                                     }
                                                     queue_native_event(
                                                         &events,
@@ -551,7 +584,8 @@ fn transport_worker(
                                         }
                                     }
                                     queue_native_event(
-                                        &events, crate::EVT_STATE,
+                                        &events,
+                                        crate::EVT_STATE,
                                         format!("native-transport device-claimed {}", device_id),
                                     );
                                     // Signal hw-volume readiness so the UI can
@@ -564,10 +598,7 @@ fn transport_worker(
                                     claimed_device = Some(open_dev);
                                 }
                                 Err(e) => {
-                                    eprintln!(
-                                        "native-transport: pre-claim failed: {}",
-                                        e
-                                    );
+                                    eprintln!("native-transport: pre-claim failed: {}", e);
                                 }
                             }
                         }
@@ -576,7 +607,10 @@ fn transport_worker(
                         }
                     }
                 } else {
-                    eprintln!("native-transport: pre-claim device '{}' not found", device_id);
+                    eprintln!(
+                        "native-transport: pre-claim device '{}' not found",
+                        device_id
+                    );
                 }
             }
             NativeTransportCommand::ReleaseDevice => {
@@ -676,7 +710,7 @@ fn transport_worker(
                     Err(_) => break,
                 };
                 let auto_start = Arc::new(AtomicBool::new(false));
-                match start_direct_flac_decode_worker(
+                match start_direct_audio_decode_worker(
                     request.source.clone(),
                     Arc::clone(&snapshot),
                     Arc::clone(&events),
@@ -735,7 +769,7 @@ fn transport_worker(
                         // No eager worker — start a fresh one with auto_start=true.
                         set_native_runtime(&runtime, None);
                         let auto_start = Arc::new(AtomicBool::new(true));
-                        match start_direct_flac_decode_worker(
+                        match start_direct_audio_decode_worker(
                             source,
                             Arc::clone(&snapshot),
                             Arc::clone(&events),
@@ -798,8 +832,10 @@ fn transport_worker(
                     Err(_) => break,
                 };
                 state.decode_worker_running = false;
-                if matches!(state.state, NativeTransportState::Playing | NativeTransportState::Ready)
-                {
+                if matches!(
+                    state.state,
+                    NativeTransportState::Playing | NativeTransportState::Ready
+                ) {
                     state.state = NativeTransportState::Paused;
                     queue_native_event(&events, crate::EVT_STATE, "native-transport Paused");
                 }
@@ -829,11 +865,7 @@ fn transport_worker(
             }
             NativeTransportCommand::SeekMs(position_ms) => {
                 let (generation, supports_seek, cur_state) = match snapshot.lock() {
-                    Ok(state) => (
-                        state.generation,
-                        state.supports_seek,
-                        state.state,
-                    ),
+                    Ok(state) => (state.generation, state.supports_seek, state.state),
                     Err(_) => break,
                 };
                 let can_seek = supports_seek
@@ -846,7 +878,9 @@ fn transport_worker(
                         "native-transport seek unsupported for current source",
                     );
                     if let Ok(mut state) = snapshot.lock() {
-                        state.last_error = Some("native transport seek unsupported for current source".to_string());
+                        state.last_error = Some(
+                            "native transport seek unsupported for current source".to_string(),
+                        );
                     }
                 } else if can_seek {
                     if let Some(source) = current_source.clone() {
@@ -873,7 +907,7 @@ fn transport_worker(
                         }
                         // Seek always starts with auto_start=true (we're already playing).
                         let auto_start = Arc::new(AtomicBool::new(true));
-                        match start_direct_flac_decode_worker(
+                        match start_direct_audio_decode_worker(
                             source,
                             Arc::clone(&snapshot),
                             Arc::clone(&events),
@@ -953,7 +987,11 @@ fn transport_worker(
 
                 if previous_native_active == new_native_active {
                     if let Ok(mut slot) = dsp_config_slot.lock() {
-                        *slot = if new_native_active { Some(new_cfg) } else { None };
+                        *slot = if new_native_active {
+                            Some(new_cfg)
+                        } else {
+                            None
+                        };
                     }
                     continue;
                 }
@@ -1040,7 +1078,7 @@ fn transport_worker(
                 };
                 let auto_start =
                     Arc::new(AtomicBool::new(cur_state == NativeTransportState::Playing));
-                match start_direct_flac_decode_worker(
+                match start_direct_audio_decode_worker(
                     source,
                     Arc::clone(&snapshot),
                     Arc::clone(&events),
@@ -1129,10 +1167,7 @@ fn stop_and_reclaim(
 
 /// Open a fresh USB handle and claim_only() to keep the kernel driver detached.
 /// Retries a few times if BUSY (lingering Arc from runtime / other handles).
-fn reclaim_device(
-    claimed_device: &mut Option<OpenUsbDevice>,
-    cfg: &Option<ClaimedDeviceCfg>,
-) {
+fn reclaim_device(claimed_device: &mut Option<OpenUsbDevice>, cfg: &Option<ClaimedDeviceCfg>) {
     *claimed_device = None;
     let cfg = match cfg {
         Some(c) => c,
@@ -1144,7 +1179,10 @@ fn reclaim_device(
     let dev = match dev {
         Some(d) => d,
         None => {
-            eprintln!("native-transport: re-claim device '{}' not found", cfg.device_id);
+            eprintln!(
+                "native-transport: re-claim device '{}' not found",
+                cfg.device_id
+            );
             return;
         }
     };
@@ -1155,30 +1193,36 @@ fn reclaim_device(
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         match OpenUsbDevice::open(&dev) {
-            Ok(mut open_dev) => {
-                match open_dev.claim_only() {
-                    Ok(()) => {
-                        eprintln!("native-transport: re-claimed USB device {}", cfg.device_id);
-                        *claimed_device = Some(open_dev);
-                        return;
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "native-transport: re-claim attempt {} failed: {}",
-                            attempt + 1, e
-                        );
-                    }
+            Ok(mut open_dev) => match open_dev.claim_only() {
+                Ok(()) => {
+                    eprintln!("native-transport: re-claimed USB device {}", cfg.device_id);
+                    *claimed_device = Some(open_dev);
+                    return;
                 }
-            }
+                Err(e) => {
+                    eprintln!(
+                        "native-transport: re-claim attempt {} failed: {}",
+                        attempt + 1,
+                        e
+                    );
+                }
+            },
             Err(e) => {
-                eprintln!("native-transport: re-claim open attempt {} failed: {}", attempt + 1, e);
+                eprintln!(
+                    "native-transport: re-claim open attempt {} failed: {}",
+                    attempt + 1,
+                    e
+                );
             }
         }
     }
     eprintln!("native-transport: re-claim gave up after 3 attempts");
 }
 
-fn set_native_runtime(runtime: &Arc<Mutex<Option<NativeUsbRuntime>>>, value: Option<NativeUsbRuntime>) {
+fn set_native_runtime(
+    runtime: &Arc<Mutex<Option<NativeUsbRuntime>>>,
+    value: Option<NativeUsbRuntime>,
+) {
     if let Ok(mut slot) = runtime.lock() {
         *slot = value;
     }
@@ -1204,7 +1248,11 @@ fn current_native_playback_position_ms(
     let pos_s = match runtime.lock() {
         Ok(slot) => slot
             .as_ref()
-            .and_then(|info| info.feed.write_elapsed_s().map(|elapsed| seek_offset_s + elapsed))
+            .and_then(|info| {
+                info.feed
+                    .write_elapsed_s()
+                    .map(|elapsed| seek_offset_s + elapsed)
+            })
             .unwrap_or_else(|| {
                 if fallback_rate > 0 {
                     seek_offset_s + (decoded_frame_count as f64 / fallback_rate as f64)
@@ -1218,7 +1266,7 @@ fn current_native_playback_position_ms(
     (pos_s.max(0.0) * 1000.0).round() as u64
 }
 
-fn start_direct_flac_decode_worker(
+fn start_direct_audio_decode_worker(
     source: NativeTransportSource,
     snapshot: Arc<Mutex<NativeTransportSnapshot>>,
     events: Arc<Mutex<VecDeque<(i32, String)>>>,
@@ -1243,9 +1291,9 @@ fn start_direct_flac_decode_worker(
     let session_slot_clone = Arc::clone(&session_slot);
     let auto_start_clone = Arc::clone(&auto_start);
     let join = thread::Builder::new()
-        .name("native-transport-direct-flac".to_string())
+        .name("native-transport-direct-audio".to_string())
         .spawn(move || {
-            direct_flac_decode_worker(
+            direct_audio_decode_worker(
                 stop_clone,
                 source,
                 snapshot,
@@ -1268,10 +1316,15 @@ fn start_direct_flac_decode_worker(
             )
         })
         .map_err(|e| format!("native transport: failed to spawn decode worker: {e}"))?;
-    Ok(DecodeWorkerHandle { stop, join, session_slot, auto_start })
+    Ok(DecodeWorkerHandle {
+        stop,
+        join,
+        session_slot,
+        auto_start,
+    })
 }
 
-fn direct_flac_decode_worker(
+fn direct_audio_decode_worker(
     stop: Arc<AtomicBool>,
     source: NativeTransportSource,
     snapshot: Arc<Mutex<NativeTransportSnapshot>>,
@@ -1293,7 +1346,7 @@ fn direct_flac_decode_worker(
     dsp_config_slot: super::native_dsp::SharedDspConfig,
 ) {
     queue_native_event(&events, crate::EVT_STATE, "native-transport decode-start");
-    let result = decode_direct_flac_stream(
+    let result = decode_direct_audio_stream(
         &stop,
         &source,
         &snapshot,
@@ -1361,12 +1414,39 @@ struct SourceProbeResult {
 
 fn probe_loaded_source(source: &NativeTransportSource) -> Result<SourceProbeResult, String> {
     match source {
-        NativeTransportSource::TidalDirectFlac { url, .. } => probe_direct_flac_source(url),
+        NativeTransportSource::TidalDirectMedia { url, .. } => probe_direct_media_source(url),
         NativeTransportSource::TidalMpd { manifest_uri, .. } => inspect_mpd_source(manifest_uri),
     }
 }
 
-fn decode_direct_flac_stream(
+fn source_probe_hint(source: &NativeTransportSource) -> Option<&'static str> {
+    match source {
+        NativeTransportSource::TidalDirectMedia { url, .. } => direct_locator_probe_hint(url),
+        NativeTransportSource::TidalMpd { .. } => Some("mp4"),
+    }
+}
+
+fn direct_locator_probe_hint(locator: &str) -> Option<&'static str> {
+    let name = locator
+        .split('?')
+        .next()
+        .unwrap_or(locator)
+        .rsplit('/')
+        .next()
+        .unwrap_or(locator)
+        .to_ascii_lowercase();
+    if name.ends_with(".flac") {
+        Some("flac")
+    } else if name.ends_with(".m4a") || name.ends_with(".mp4") || name.ends_with(".m4s") {
+        Some("mp4")
+    } else if name.ends_with(".aac") {
+        Some("aac")
+    } else {
+        None
+    }
+}
+
+fn decode_direct_audio_stream(
     stop: &Arc<AtomicBool>,
     source: &NativeTransportSource,
     snapshot: &Arc<Mutex<NativeTransportSnapshot>>,
@@ -1389,27 +1469,34 @@ fn decode_direct_flac_stream(
 ) -> Result<(), String> {
     let mss = open_source_as_media_source_stream(source, stop)?;
     let mut hint = Hint::new();
-    match source {
-        NativeTransportSource::TidalDirectFlac { .. } => {
-            hint.with_extension("flac");
-        }
-        NativeTransportSource::TidalMpd { .. } => {
-            hint.with_extension("mp4");
-        }
+    if let Some(extension) = source_probe_hint(source) {
+        hint.with_extension(extension);
     }
     let probe = symphonia::default::get_probe()
-        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
         .map_err(|e| format!("native transport: decode open failed: {e}"))?;
     let mut format = probe.format;
     let track = format
         .default_track()
         .filter(|track| track.codec_params.codec != CODEC_TYPE_NULL)
         .cloned()
-        .ok_or_else(|| "native transport: no decodable FLAC track found".to_string())?;
+        .ok_or_else(|| "native transport: no decodable audio track found".to_string())?;
     let track_id = track.id;
     let mut decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &DecoderOptions::default())
         .map_err(|e| format!("native transport: decoder init failed: {e}"))?;
+    let mpd_probe_info = if let NativeTransportSource::TidalMpd { manifest_uri, .. } = source {
+        read_locator_to_string(manifest_uri)
+            .ok()
+            .and_then(|xml| inspect_mpd_manifest(&xml).ok())
+    } else {
+        None
+    };
 
     // Populate snapshot with stream info discovered from the Symphonia probe.
     // This is especially important for eager-decode (Load-time) workers so the
@@ -1418,30 +1505,39 @@ fn decode_direct_flac_stream(
     {
         if let Ok(mut state) = snapshot.lock() {
             if state.generation == generation {
-                state.stream_spec = track.codec_params.channels.map(|ch| PcmStreamSpec {
-                    sample_rate: track.codec_params.sample_rate.unwrap_or(0),
-                    channels: ch.count(),
-                    format: bits_per_sample_to_pcm_format(
-                        track.codec_params.bits_per_sample.unwrap_or(32),
-                    ),
+                state.stream_spec = track.codec_params.channels.map(|ch| {
+                    let format = track
+                        .codec_params
+                        .bits_per_sample
+                        .map(bits_per_sample_to_pcm_format)
+                        .unwrap_or(PcmSampleFormat::F32LE);
+                    PcmStreamSpec {
+                        sample_rate: track.codec_params.sample_rate.unwrap_or(0),
+                        channels: ch.count(),
+                        format,
+                    }
                 });
                 state.bits_per_sample = track.codec_params.bits_per_sample;
-                state.duration_s = track.codec_params.n_frames
+                state.duration_s = track
+                    .codec_params
+                    .n_frames
                     .filter(|n| *n > 0)
                     .and_then(|n| {
                         let rate = track.codec_params.sample_rate.unwrap_or(0) as f64;
-                        if rate > 0.0 { Some(n as f64 / rate) } else { None }
-                    })
-                    .or_else(|| {
-                        if let NativeTransportSource::TidalMpd { manifest_uri, .. } = source {
-                            read_locator_to_string(manifest_uri)
-                                .ok()
-                                .and_then(|xml| inspect_mpd_manifest(&xml).ok())
-                                .and_then(|info| info.total_duration_s())
+                        if rate > 0.0 {
+                            Some(n as f64 / rate)
                         } else {
                             None
                         }
+                    })
+                    .or_else(|| {
+                        mpd_probe_info
+                            .as_ref()
+                            .and_then(|info| info.total_duration_s())
                     });
+                if let Some(info) = mpd_probe_info.as_ref() {
+                    state.source_summary = Some(format_mpd_source_summary(info));
+                }
                 let plan_supports_seek = state.supports_seek;
                 state.supports_seek = plan_supports_seek;
                 if state.state == NativeTransportState::Loading {
@@ -1464,12 +1560,7 @@ fn decode_direct_flac_stream(
     // Emit a TAG event so the Python UI can display tech info (codec,
     // sample rate, bit depth) in the playback bar.
     {
-        let codec_name = match track.codec_params.codec {
-            CODEC_TYPE_FLAC => "FLAC",
-            CODEC_TYPE_AAC => "AAC",
-            CODEC_TYPE_ALAC => "ALAC",
-            _ => "PCM",
-        };
+        let codec_name = codec_label(track.codec_params.codec);
         let sr = track.codec_params.sample_rate.unwrap_or(0);
         let bps = track.codec_params.bits_per_sample.unwrap_or(0);
         let mut tag_parts: Vec<String> = Vec::new();
@@ -1510,12 +1601,16 @@ fn decode_direct_flac_stream(
             "[native-transport] inserting DspPcmProcessor (active={})",
             init_cfg.has_active_processing()
         );
-        processor_chain.push(Box::new(
-            super::native_dsp::DspPcmProcessor::new(&init_cfg, Some(Arc::clone(&dsp_config_slot))),
-        ));
+        processor_chain.push(Box::new(super::native_dsp::DspPcmProcessor::new(
+            &init_cfg,
+            Some(Arc::clone(&dsp_config_slot)),
+        )));
     }
     processor_chain.push(Box::new(VolumePcmProcessor::new(volume)));
-    processor_chain.push(Box::new(SpectrumPcmProcessor::new(spectrum_tx, spectrum_bands)));
+    processor_chain.push(Box::new(SpectrumPcmProcessor::new(
+        spectrum_tx,
+        spectrum_bands,
+    )));
     processor_chain.push(Box::new(LufsPcmProcessor::new(lufs_values)));
     let mut chain_configured = false;
     let mut output_session: Option<UsbAudioSink> = None;
@@ -1539,7 +1634,9 @@ fn decode_direct_flac_stream(
             }
             let packet = match format.next_packet() {
                 Ok(packet) => packet,
-                Err(SymphoniaError::IoError(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                Err(SymphoniaError::IoError(err))
+                    if err.kind() == std::io::ErrorKind::UnexpectedEof =>
+                {
                     return Ok(());
                 }
                 Err(err) => return Err(format!("native transport: packet read failed: {err}")),
@@ -1576,11 +1673,7 @@ fn decode_direct_flac_stream(
             };
             if src_samples_accum >= interval {
                 let bitrate_bps = src_bytes_accum * 8 * stream_rate / src_samples_accum;
-                queue_native_event(
-                    events,
-                    crate::EVT_TAG,
-                    format!("bitrate={bitrate_bps}"),
-                );
+                queue_native_event(events, crate::EVT_TAG, format!("bitrate={bitrate_bps}"));
                 src_bytes_accum = 0;
                 src_samples_accum = 0;
                 bitrate_emissions += 1;
@@ -1608,7 +1701,8 @@ fn decode_direct_flac_stream(
                     // Rate changes require a full interface release cycle on
                     // some DACs (NXP/Rawlink v2) — the PLL won't accept
                     // SET_CUR at a new rate without a kernel-driver reset.
-                    let can_reuse = reuse_sess.as_ref()
+                    let can_reuse = reuse_sess
+                        .as_ref()
                         .map(|old| old.actual_rate == slab.spec.sample_rate)
                         .unwrap_or(false);
                     let session = if can_reuse {
@@ -1621,13 +1715,18 @@ fn decode_direct_flac_stream(
                         // Set up clock feed parameters.
                         let pps = old.state.packets_per_sec as usize;
                         let n_pkts = (usb_audio::transfer::N_PACKETS_TARGET_MS * pps / 1000).max(8);
-                        let ring_buf_ns =
-                            (usb_audio::transfer::N_TRANSFERS * n_pkts) as u64 * 1_000_000_000 / pps as u64;
+                        let ring_buf_ns = (usb_audio::transfer::N_TRANSFERS * n_pkts) as u64
+                            * 1_000_000_000
+                            / pps as u64;
                         let clock_mode = match cfg.clock_mode {
                             1 => ClockMode::Pull,
                             _ => ClockMode::Push,
                         };
-                        let buf_ns = if clock_mode == ClockMode::Pull { 0 } else { ring_buf_ns };
+                        let buf_ns = if clock_mode == ClockMode::Pull {
+                            0
+                        } else {
+                            ring_buf_ns
+                        };
                         old.feed.set_buffer_depth_ns(buf_ns);
                         old.feed.set_mode(clock_mode);
                         queue_native_event(
@@ -1649,9 +1748,8 @@ fn decode_direct_flac_stream(
                             );
                             drop(old);
                         }
-                        let (s, _runtime_info) = open_native_usb_output(
-                            cfg, &slab.spec, events, pre_handle.take(),
-                        )?;
+                        let (s, _runtime_info) =
+                            open_native_usb_output(cfg, &slab.spec, events, pre_handle.take())?;
                         s
                     };
                     // Restore cached hardware volume values.
@@ -1669,14 +1767,12 @@ fn decode_direct_flac_stream(
                     output_session = Some(session);
                     // Notify Python layer that USB audio is configured so
                     // the hw-volume UI can sync with the actual DAC state.
-                    queue_native_event(
-                        events,
-                        crate::EVT_STATE,
-                        "usb-audio configured",
-                    );
+                    queue_native_event(events, crate::EVT_STATE, "usb-audio configured");
                 }
                 push_slab_to_usb_output(
-                    output_session.as_mut().expect("output session just created"),
+                    output_session
+                        .as_mut()
+                        .expect("output session just created"),
                     cfg,
                     slab.spec.sample_rate,
                     &slab,
@@ -1758,7 +1854,11 @@ fn open_native_usb_output(
             1 => ClockMode::Pull,
             _ => ClockMode::Push,
         };
-        let buf_ns = if clock_mode == ClockMode::Pull { 0 } else { ring_buf_ns };
+        let buf_ns = if clock_mode == ClockMode::Pull {
+            0
+        } else {
+            ring_buf_ns
+        };
         session.feed.set_buffer_depth_ns(buf_ns);
         session.feed.set_mode(clock_mode);
         queue_native_event(
@@ -1799,10 +1899,7 @@ fn open_native_usb_output(
         ) {
             Ok(s) => {
                 if attempt > 0 {
-                    eprintln!(
-                        "native-transport: USB open succeeded on retry #{}",
-                        attempt
-                    );
+                    eprintln!("native-transport: USB open succeeded on retry #{}", attempt);
                 }
                 session_result = Some(s);
                 break;
@@ -1813,14 +1910,17 @@ fn open_native_usb_output(
                     let delay = RETRY_DELAYS_MS[attempt as usize];
                     eprintln!(
                         "native-transport: USB open failed (attempt {}), retrying in {}ms: {}",
-                        attempt + 1, delay, last_err
+                        attempt + 1,
+                        delay,
+                        last_err
                     );
                     queue_native_event(
                         events,
                         crate::EVT_STATE,
                         format!(
                             "native-transport rate-setting failed, retrying ({}/{})",
-                            attempt + 1, MAX_RETRIES
+                            attempt + 1,
+                            MAX_RETRIES
                         ),
                     );
                     std::thread::sleep(std::time::Duration::from_millis(delay));
@@ -1832,9 +1932,15 @@ fn open_native_usb_output(
         queue_native_event(
             events,
             crate::EVT_ERROR,
-            format!("native-transport USB rate-setting failed after {} retries: {}", MAX_RETRIES, last_err),
+            format!(
+                "native-transport USB rate-setting failed after {} retries: {}",
+                MAX_RETRIES, last_err
+            ),
         );
-        format!("native-transport: USB open failed after {} retries: {}", MAX_RETRIES, last_err)
+        format!(
+            "native-transport: USB open failed after {} retries: {}",
+            MAX_RETRIES, last_err
+        )
     })?;
     let pps = session.state.packets_per_sec as usize;
     let n_pkts = (usb_audio::transfer::N_PACKETS_TARGET_MS * pps / 1000).max(8);
@@ -1844,7 +1950,11 @@ fn open_native_usb_output(
         1 => ClockMode::Pull,
         _ => ClockMode::Push,
     };
-    let buf_ns = if clock_mode == ClockMode::Pull { 0 } else { ring_buf_ns };
+    let buf_ns = if clock_mode == ClockMode::Pull {
+        0
+    } else {
+        ring_buf_ns
+    };
     session.feed.set_buffer_depth_ns(buf_ns);
     session.feed.set_mode(clock_mode);
     queue_native_event(
@@ -1908,8 +2018,7 @@ fn push_slab_to_usb_output(
     let target_prefill = (sample_rate as u128
         * cfg.channels as u128
         * bytes_per_sample as u128
-        * (usb_audio::transfer::N_TRANSFERS * usb_audio::transfer::N_PACKETS_TARGET_MS * 2)
-            as u128
+        * (usb_audio::transfer::N_TRANSFERS * usb_audio::transfer::N_PACKETS_TARGET_MS * 2) as u128
         / 1000)
         .min(usb_audio::FrameQueue::capacity_bytes() as u128) as usize;
 
@@ -1929,11 +2038,8 @@ fn push_slab_to_usb_output(
         session.ensure_started()?;
     } else if session.is_started() {
         // Low watermark monitoring: warn when queue drops below 50ms of audio.
-        let low_watermark = (sample_rate as usize
-            * cfg.channels as usize
-            * bytes_per_sample
-            * 50)
-            / 1000;
+        let low_watermark =
+            (sample_rate as usize * cfg.channels as usize * bytes_per_sample * 50) / 1000;
         let queued = session.queued_bytes();
         if queued < low_watermark && queued > 0 {
             queue_native_event(
@@ -1963,9 +2069,7 @@ fn record_decoded_slab(
             return;
         }
         state.decoded_slab_count = state.decoded_slab_count.saturating_add(1);
-        state.decoded_frame_count = state
-            .decoded_frame_count
-            .saturating_add(slab.frames as u64);
+        state.decoded_frame_count = state.decoded_frame_count.saturating_add(slab.frames as u64);
         state.decoded_byte_count = state
             .decoded_byte_count
             .saturating_add(slab.data.len() as u64);
@@ -1986,10 +2090,23 @@ fn snapshot_generation_matches(
 fn inspect_mpd_source(locator: &str) -> Result<SourceProbeResult, String> {
     let xml = read_locator_to_string(locator)?;
     let info = inspect_mpd_manifest(&xml)?;
+    let duration_s = info.total_duration_s();
+    Ok(SourceProbeResult {
+        source_summary: Some(format_mpd_source_summary(&info)),
+        duration_s,
+        supports_seek: false,
+        ..Default::default()
+    })
+}
+
+fn format_mpd_source_summary(info: &MpdManifestInfo) -> String {
     let mut parts = vec![format!("mpd representations={}", info.representation_count)];
     let duration_s = info.total_duration_s();
     if let Some(rate) = info.first_audio_sampling_rate {
         parts.push(format!("rate={rate}"));
+    }
+    if let Some(mime) = info.first_mime_type.as_ref() {
+        parts.push(format!("mime={mime}"));
     }
     if let Some(codecs) = info.first_codecs.as_ref() {
         parts.push(format!("codecs={codecs}"));
@@ -2000,33 +2117,38 @@ fn inspect_mpd_source(locator: &str) -> Result<SourceProbeResult, String> {
     if let Some(media) = info.first_media_template.as_ref() {
         parts.push(format!("media={media}"));
     }
+    if let Some(base_url) = info.first_base_url.as_ref() {
+        parts.push(format!("base={base_url}"));
+    }
     if let Some(count) = info.first_segment_count {
         parts.push(format!("segments={count}"));
     }
     if let Some(d) = duration_s {
         parts.push(format!("duration_s={d:.3}"));
     }
-    Ok(SourceProbeResult {
-        source_summary: Some(parts.join(" ")),
-        duration_s,
-        supports_seek: false,
-        ..Default::default()
-    })
+    parts.join(" ")
 }
 
-fn probe_direct_flac_source(locator: &str) -> Result<SourceProbeResult, String> {
+fn probe_direct_media_source(locator: &str) -> Result<SourceProbeResult, String> {
     let mss = open_locator_as_probe_stream(locator)?;
     let mut hint = Hint::new();
-    hint.with_extension("flac");
+    if let Some(extension) = direct_locator_probe_hint(locator) {
+        hint.with_extension(extension);
+    }
     let probe = symphonia::default::get_probe()
-        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
-        .map_err(|e| format!("native transport: FLAC probe failed: {e}"))?;
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .map_err(|e| format!("native transport: audio probe failed: {e}"))?;
     let mut format = probe.format;
     let track = format
         .default_track()
         .filter(|track| track.codec_params.codec != CODEC_TYPE_NULL)
         .cloned()
-        .ok_or_else(|| "native transport: no decodable FLAC track found".to_string())?;
+        .ok_or_else(|| "native transport: no decodable audio track found".to_string())?;
     let track_id = track.id;
     let mut decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &DecoderOptions::default())
@@ -2047,7 +2169,7 @@ fn probe_direct_flac_source(locator: &str) -> Result<SourceProbeResult, String> 
                 }
                 let decoded = decoder
                     .decode(&packet)
-                    .map_err(|e| format!("native transport: FLAC decode probe failed: {e}"))?;
+                    .map_err(|e| format!("native transport: audio decode probe failed: {e}"))?;
                 first_packet_frames = Some(decoded.frames());
                 let decoded_spec = decoded.spec();
                 stream_spec = Some(PcmStreamSpec {
@@ -2057,7 +2179,9 @@ fn probe_direct_flac_source(locator: &str) -> Result<SourceProbeResult, String> 
                 });
                 break;
             }
-            Err(SymphoniaError::IoError(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+            Err(SymphoniaError::IoError(err))
+                if err.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
                 break;
             }
             Err(err) => return Err(format!("native transport: packet read failed: {err}")),
@@ -2065,16 +2189,18 @@ fn probe_direct_flac_source(locator: &str) -> Result<SourceProbeResult, String> 
     }
 
     let bits_per_sample = track.codec_params.bits_per_sample;
-    let duration_s = track
-        .codec_params
-        .n_frames
-        .and_then(|n| {
-            let rate = track.codec_params.sample_rate.unwrap_or(0) as f64;
-            if rate > 0.0 { Some(n as f64 / rate) } else { None }
-        });
+    let duration_s = track.codec_params.n_frames.and_then(|n| {
+        let rate = track.codec_params.sample_rate.unwrap_or(0) as f64;
+        if rate > 0.0 {
+            Some(n as f64 / rate)
+        } else {
+            None
+        }
+    });
     let summary = stream_spec.as_ref().map(|spec| {
         format!(
-            "direct-flac rate={} channels={} format={:?} bits={}",
+            "direct-audio codec={} rate={} channels={} format={:?} bits={}",
+            codec_label(track.codec_params.codec),
             spec.sample_rate,
             spec.channels,
             spec.format,
@@ -2090,6 +2216,15 @@ fn probe_direct_flac_source(locator: &str) -> Result<SourceProbeResult, String> 
         source_summary: summary,
         supports_seek: true,
     })
+}
+
+fn codec_label(codec: CodecType) -> &'static str {
+    match codec {
+        CODEC_TYPE_FLAC => "FLAC",
+        CODEC_TYPE_AAC => "AAC",
+        CODEC_TYPE_ALAC => "ALAC",
+        _ => "PCM",
+    }
 }
 
 fn bits_per_sample_to_pcm_format(bits: u32) -> PcmSampleFormat {
@@ -2123,7 +2258,9 @@ fn pcm_format_from_gst_format(format: &str) -> Result<PcmSampleFormat, String> {
         "S32LE" | "S32BE" => Ok(PcmSampleFormat::S32LE),
         "F32LE" | "F32BE" => Ok(PcmSampleFormat::F32LE),
         "F64LE" | "F64BE" => Ok(PcmSampleFormat::F64LE),
-        other => Err(format!("native transport: unsupported target gst format '{other}'")),
+        other => Err(format!(
+            "native transport: unsupported target gst format '{other}'"
+        )),
     }
 }
 
@@ -2357,8 +2494,7 @@ fn interleave_into<T, F>(
     bytes_per_sample: usize,
     out: &mut Vec<u8>,
     mut write_sample: F,
-)
-where
+) where
     T: Copy + Sample,
     F: FnMut(T, &mut Vec<u8>),
 {
@@ -2468,7 +2604,9 @@ fn spawn_download_thread(
 /// Open a stream for short-lived probing (no download thread).
 fn open_locator_as_probe_stream(locator: &str) -> Result<MediaSourceStream, String> {
     let source: Box<dyn MediaSource> = if let Some(path) = file_uri_to_path(locator) {
-        Box::new(fs::File::open(path).map_err(|e| format!("native transport: file open failed: {e}"))?)
+        Box::new(
+            fs::File::open(path).map_err(|e| format!("native transport: file open failed: {e}"))?,
+        )
     } else if locator.starts_with("http://") || locator.starts_with("https://") {
         let response = ureq::get(locator)
             .call()
@@ -2489,7 +2627,9 @@ fn open_locator_as_media_source_stream(
 ) -> Result<MediaSourceStream, String> {
     let source: Box<dyn MediaSource> = if let Some(path) = file_uri_to_path(locator) {
         // Local files: no I/O thread needed, direct read is fine.
-        Box::new(fs::File::open(path).map_err(|e| format!("native transport: file open failed: {e}"))?)
+        Box::new(
+            fs::File::open(path).map_err(|e| format!("native transport: file open failed: {e}"))?,
+        )
     } else if locator.starts_with("http://") || locator.starts_with("https://") {
         let response = ureq::get(locator)
             .call()
@@ -2510,7 +2650,7 @@ fn open_source_as_media_source_stream(
     stop: &Arc<AtomicBool>,
 ) -> Result<MediaSourceStream, String> {
     match source {
-        NativeTransportSource::TidalDirectFlac { url, .. } => {
+        NativeTransportSource::TidalDirectMedia { url, .. } => {
             open_locator_as_media_source_stream(url, stop)
         }
         NativeTransportSource::TidalMpd { manifest_uri, .. } => {
@@ -2542,7 +2682,9 @@ fn read_locator_to_string(locator: &str) -> Result<String, String> {
             .read_to_string(&mut text)
             .map_err(|e| format!("native transport: manifest body read failed: {e}"))?;
     } else {
-        return Err(format!("native transport: unsupported manifest locator '{locator}'"));
+        return Err(format!(
+            "native transport: unsupported manifest locator '{locator}'"
+        ));
     }
     Ok(text)
 }
@@ -2555,24 +2697,36 @@ fn build_mpd_segment_sequence(
     manifest_locator: &str,
     info: &MpdManifestInfo,
 ) -> Result<Vec<String>, String> {
-    let init = info
-        .first_initialization
-        .as_deref()
-        .ok_or_else(|| "native transport: MPD missing initialization template".to_string())?;
-    let media = info
-        .first_media_template
-        .as_deref()
-        .ok_or_else(|| "native transport: MPD missing media template".to_string())?;
+    let Some(init) = info.first_initialization.as_deref() else {
+        if let Some(base_url) = info.first_base_url.as_deref() {
+            return Ok(vec![resolve_locator(manifest_locator, base_url)]);
+        }
+        return Err("native transport: MPD missing initialization template".to_string());
+    };
+    let Some(media) = info.first_media_template.as_deref() else {
+        if let Some(base_url) = info.first_base_url.as_deref() {
+            return Ok(vec![resolve_locator(manifest_locator, base_url)]);
+        }
+        return Err("native transport: MPD missing media template".to_string());
+    };
     let rep = info.first_representation_id.as_deref().unwrap_or("0");
     let start_number = info.first_start_number.unwrap_or(1);
     let segment_count = info.first_segment_count.unwrap_or(0);
+    let segment_base = info
+        .first_base_url
+        .as_deref()
+        .map(|base| resolve_locator(manifest_locator, base))
+        .unwrap_or_else(|| manifest_locator.to_string());
     let mut out = Vec::with_capacity(segment_count.saturating_add(1) as usize);
-    out.push(resolve_locator(manifest_locator, &replace_representation_id(init, rep)));
+    out.push(resolve_locator(
+        &segment_base,
+        &replace_representation_id(init, rep),
+    ));
     for idx in 0..segment_count {
         let number = start_number.saturating_add(idx);
         let media_name = replace_representation_id(media, rep);
         let media_name = replace_number_token(&media_name, number)?;
-        out.push(resolve_locator(manifest_locator, &media_name));
+        out.push(resolve_locator(&segment_base, &media_name));
     }
     Ok(out)
 }
@@ -2584,7 +2738,9 @@ fn resolve_locator(base: &str, value: &str) -> String {
     }
     if let Some(path) = file_uri_to_path(base) {
         let base_path = std::path::Path::new(path);
-        let dir = base_path.parent().unwrap_or_else(|| std::path::Path::new("/"));
+        let dir = base_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("/"));
         return format!("file://{}", dir.join(value).display());
     }
     if let Some((prefix, _)) = base.rsplit_once('/') {
@@ -2604,13 +2760,17 @@ fn replace_number_token(template: &str, number: u64) -> Result<String, String> {
             let token = &rest[..end];
             let formatted = if token.is_empty() {
                 number.to_string()
-            } else if let Some(width_text) = token.strip_prefix("%0").and_then(|t| t.strip_suffix('d')) {
+            } else if let Some(width_text) =
+                token.strip_prefix("%0").and_then(|t| t.strip_suffix('d'))
+            {
                 let width = width_text
                     .parse::<usize>()
                     .map_err(|e| format!("native transport: invalid Number format token: {e}"))?;
                 format!("{number:0width$}")
             } else {
-                return Err(format!("native transport: unsupported Number token '${token}$'"));
+                return Err(format!(
+                    "native transport: unsupported Number token '${token}$'"
+                ));
             };
             let whole = &template[start..start + "$Number".len() + end + 1];
             return Ok(template.replacen(whole, &formatted, 1));
@@ -2674,7 +2834,9 @@ impl Seek for SegmentSequenceReader {
     }
 }
 
-fn open_segment_reader(locator: &str) -> Result<Box<dyn Read + Send + Sync + 'static>, std::io::Error> {
+fn open_segment_reader(
+    locator: &str,
+) -> Result<Box<dyn Read + Send + Sync + 'static>, std::io::Error> {
     if let Some(path) = file_uri_to_path(locator) {
         return Ok(Box::new(fs::File::open(path)?));
     }
@@ -2698,20 +2860,23 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    fn wait_until(controller: &NativeTransportController, predicate: impl Fn(&NativeTransportSnapshot) -> bool) {
+    fn wait_until(
+        controller: &NativeTransportController,
+        predicate: impl Fn(&NativeTransportSnapshot) -> bool,
+    ) {
         let deadline = Instant::now() + Duration::from_millis(250);
         loop {
             let snapshot = controller.snapshot();
             if predicate(&snapshot) {
                 return;
             }
-            assert!(Instant::now() < deadline, "timed out waiting for transport state: {:?}", snapshot);
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for transport state: {:?}",
+                snapshot
+            );
             thread::sleep(Duration::from_millis(5));
         }
-    }
-
-    fn write_fixture(path: &str, bytes: &[u8]) {
-        std::fs::write(path, bytes).unwrap();
     }
 
     fn generate_flac_fixture(path: &str) {
@@ -2731,6 +2896,29 @@ mod tests {
             .status()
             .expect("ffmpeg must be available to generate the FLAC fixture");
         assert!(status.success(), "ffmpeg failed to generate FLAC fixture");
+    }
+
+    fn generate_aac_m4a_fixture(path: &str) {
+        let status = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=660:duration=0.05",
+                "-ac",
+                "2",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                path,
+            ])
+            .status()
+            .expect("ffmpeg must be available to generate the AAC fixture");
+        assert!(status.success(), "ffmpeg failed to generate AAC fixture");
     }
 
     fn generate_dash_fixture(dir: &str) -> String {
@@ -2759,13 +2947,44 @@ mod tests {
         mpd_path
     }
 
+    fn generate_aac_dash_fixture(dir: &str) -> String {
+        std::fs::create_dir_all(dir).unwrap();
+        let mpd_path = format!("{dir}/out.mpd");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=880:duration=1",
+                "-ac",
+                "2",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                "-f",
+                "dash",
+                &mpd_path,
+            ])
+            .status()
+            .expect("ffmpeg must be available to generate the AAC DASH fixture");
+        assert!(
+            status.success(),
+            "ffmpeg failed to generate AAC DASH fixture"
+        );
+        mpd_path
+    }
+
     #[test]
     fn load_transitions_transport_to_ready() {
         let flac_path = "/tmp/native-transport-test.flac";
         generate_flac_fixture(flac_path);
         let controller = NativeTransportController::new();
         let request = NativeTransportLoadRequest {
-            source: NativeTransportSource::TidalDirectFlac {
+            source: NativeTransportSource::TidalDirectMedia {
                 url: format!("file://{flac_path}"),
                 track: TidalTrackContext {
                     track_id: "123".to_string(),
@@ -2779,26 +2998,28 @@ mod tests {
             dsp_config: None,
         };
         controller.load(request).unwrap();
-        wait_until(&controller, |snapshot| snapshot.state == NativeTransportState::Ready);
+        wait_until(&controller, |snapshot| {
+            snapshot.state == NativeTransportState::Ready
+        });
         let snapshot = controller.snapshot();
         assert_eq!(snapshot.current_track_id.as_deref(), Some("123"));
-        assert_eq!(snapshot.decoder, Some(NativeDecoderKind::SymphoniaFlac));
-        assert_eq!(snapshot.stream_spec.as_ref().map(|spec| spec.sample_rate), Some(44100));
+        assert_eq!(snapshot.decoder, Some(NativeDecoderKind::SymphoniaAudio));
+        assert_eq!(
+            snapshot.stream_spec.as_ref().map(|spec| spec.sample_rate),
+            Some(44100)
+        );
         assert!(snapshot.supports_seek);
         let _ = std::fs::remove_file(flac_path);
     }
 
     #[test]
     fn play_pause_stop_roundtrip_updates_state() {
-        let manifest_path = "/tmp/native-transport-roundtrip.mpd";
-        write_fixture(
-            manifest_path,
-            br#"<MPD><Period><AdaptationSet mimeType="audio/flac"><Representation codecs="flac" audioSamplingRate="44100"><BaseURL>https://media.example.invalid/seg.m4s</BaseURL></Representation></AdaptationSet></Period></MPD>"#,
-        );
+        let dash_dir = "/tmp/native-transport-roundtrip";
+        let mpd_path = generate_dash_fixture(dash_dir);
         let controller = NativeTransportController::new();
         let request = NativeTransportLoadRequest {
             source: NativeTransportSource::TidalMpd {
-                manifest_uri: format!("file://{manifest_path}"),
+                manifest_uri: format!("file://{mpd_path}"),
                 track: TidalTrackContext {
                     track_id: "456".to_string(),
                     title: "Manifest Track".to_string(),
@@ -2811,23 +3032,31 @@ mod tests {
             dsp_config: None,
         };
         controller.load(request).unwrap();
-        wait_until(&controller, |snapshot| snapshot.state == NativeTransportState::Ready);
+        wait_until(&controller, |snapshot| {
+            snapshot.state == NativeTransportState::Ready
+        });
         controller.play().unwrap();
-        wait_until(&controller, |snapshot| snapshot.state == NativeTransportState::Playing);
+        wait_until(&controller, |snapshot| {
+            snapshot.state == NativeTransportState::Playing
+        });
         controller.pause().unwrap();
-        wait_until(&controller, |snapshot| snapshot.state == NativeTransportState::Paused);
+        wait_until(&controller, |snapshot| {
+            snapshot.state == NativeTransportState::Paused
+        });
         controller.stop().unwrap();
-        wait_until(&controller, |snapshot| snapshot.state == NativeTransportState::Stopped);
-        let _ = std::fs::remove_file(manifest_path);
+        wait_until(&controller, |snapshot| {
+            snapshot.state == NativeTransportState::Stopped
+        });
+        let _ = std::fs::remove_dir_all(dash_dir);
     }
 
     #[test]
-    fn direct_flac_play_decodes_pcm_slabs() {
+    fn direct_media_play_decodes_pcm_slabs() {
         let flac_path = "/tmp/native-transport-play.flac";
         generate_flac_fixture(flac_path);
         let controller = NativeTransportController::new();
         let request = NativeTransportLoadRequest {
-            source: NativeTransportSource::TidalDirectFlac {
+            source: NativeTransportSource::TidalDirectMedia {
                 url: format!("file://{flac_path}"),
                 track: TidalTrackContext {
                     track_id: "901".to_string(),
@@ -2841,9 +3070,13 @@ mod tests {
             dsp_config: None,
         };
         controller.load(request).unwrap();
-        wait_until(&controller, |snapshot| snapshot.state == NativeTransportState::Ready);
+        wait_until(&controller, |snapshot| {
+            snapshot.state == NativeTransportState::Ready
+        });
         controller.play().unwrap();
-        wait_until(&controller, |snapshot| snapshot.state == NativeTransportState::Playing);
+        wait_until(&controller, |snapshot| {
+            snapshot.state == NativeTransportState::Playing
+        });
         wait_until(&controller, |snapshot| snapshot.decoded_slab_count > 0);
         wait_until(&controller, |snapshot| snapshot.decode_completed);
         let snapshot = controller.snapshot();
@@ -2851,6 +3084,49 @@ mod tests {
         assert!(snapshot.decoded_byte_count > 0);
         assert!(!snapshot.decode_worker_running);
         let _ = std::fs::remove_file(flac_path);
+    }
+
+    #[test]
+    fn direct_aac_m4a_play_decodes_pcm_slabs() {
+        let m4a_path = "/tmp/native-transport-play.m4a";
+        generate_aac_m4a_fixture(m4a_path);
+        let controller = NativeTransportController::new();
+        let request = NativeTransportLoadRequest {
+            source: NativeTransportSource::TidalDirectMedia {
+                url: format!("file://{m4a_path}"),
+                track: TidalTrackContext {
+                    track_id: "903".to_string(),
+                    title: "AAC Decode Track".to_string(),
+                    quality_label: "HIGH".to_string(),
+                },
+            },
+            target_driver: "USB Rawlink v2".to_string(),
+            bit_perfect: true,
+            usb_output_config: None,
+            dsp_config: None,
+        };
+        controller.load(request).unwrap();
+        wait_until(&controller, |snapshot| {
+            snapshot.state == NativeTransportState::Ready
+        });
+        controller.play().unwrap();
+        wait_until(&controller, |snapshot| {
+            snapshot.state == NativeTransportState::Playing
+        });
+        wait_until(&controller, |snapshot| snapshot.decoded_slab_count > 0);
+        wait_until(&controller, |snapshot| snapshot.decode_completed);
+        let snapshot = controller.snapshot();
+        assert!(snapshot.decoded_frame_count > 0);
+        assert!(snapshot.decoded_byte_count > 0);
+        assert_eq!(
+            snapshot.stream_spec.as_ref().map(|spec| spec.sample_rate),
+            Some(44100)
+        );
+        let events = controller.take_events();
+        assert!(events
+            .iter()
+            .any(|(evt, msg)| *evt == crate::EVT_TAG && msg.contains("codec=AAC")));
+        let _ = std::fs::remove_file(m4a_path);
     }
 
     #[test]
@@ -2873,9 +3149,13 @@ mod tests {
             dsp_config: None,
         };
         controller.load(request).unwrap();
-        wait_until(&controller, |snapshot| snapshot.state == NativeTransportState::Ready);
+        wait_until(&controller, |snapshot| {
+            snapshot.state == NativeTransportState::Ready
+        });
         controller.play().unwrap();
-        wait_until(&controller, |snapshot| snapshot.state == NativeTransportState::Playing);
+        wait_until(&controller, |snapshot| {
+            snapshot.state == NativeTransportState::Playing
+        });
         wait_until(&controller, |snapshot| snapshot.decoded_slab_count > 0);
         wait_until(&controller, |snapshot| snapshot.decode_completed);
         let snapshot = controller.snapshot();
@@ -2885,17 +3165,52 @@ mod tests {
     }
 
     #[test]
-    fn load_mpd_sets_summary_from_manifest_probe() {
-        let manifest_path = "/tmp/native-transport-test.mpd";
-        std::fs::write(
-            manifest_path,
-            r#"<MPD><Period><AdaptationSet mimeType="audio/flac"><Representation codecs="flac" audioSamplingRate="44100"><BaseURL>https://media.example.invalid/seg.m4s</BaseURL></Representation></AdaptationSet></Period></MPD>"#,
-        )
-        .unwrap();
+    fn aac_mpd_play_decodes_pcm_slabs() {
+        let dash_dir = "/tmp/native-transport-aac-dash";
+        let mpd_path = generate_aac_dash_fixture(dash_dir);
         let controller = NativeTransportController::new();
         let request = NativeTransportLoadRequest {
             source: NativeTransportSource::TidalMpd {
-                manifest_uri: format!("file://{manifest_path}"),
+                manifest_uri: format!("file://{mpd_path}"),
+                track: TidalTrackContext {
+                    track_id: "904".to_string(),
+                    title: "AAC Dash Decode".to_string(),
+                    quality_label: "HIGH".to_string(),
+                },
+            },
+            target_driver: "USB Rawlink v2".to_string(),
+            bit_perfect: true,
+            usb_output_config: None,
+            dsp_config: None,
+        };
+        controller.load(request).unwrap();
+        wait_until(&controller, |snapshot| {
+            snapshot.state == NativeTransportState::Ready
+        });
+        controller.play().unwrap();
+        wait_until(&controller, |snapshot| {
+            snapshot.state == NativeTransportState::Playing
+        });
+        wait_until(&controller, |snapshot| snapshot.decoded_slab_count > 0);
+        wait_until(&controller, |snapshot| snapshot.decode_completed);
+        let snapshot = controller.snapshot();
+        assert!(snapshot.decoded_frame_count > 0);
+        assert!(snapshot.decoded_byte_count > 0);
+        let events = controller.take_events();
+        assert!(events
+            .iter()
+            .any(|(evt, msg)| *evt == crate::EVT_TAG && msg.contains("codec=AAC")));
+        let _ = std::fs::remove_dir_all(dash_dir);
+    }
+
+    #[test]
+    fn load_mpd_sets_summary_from_manifest_probe() {
+        let dash_dir = "/tmp/native-transport-summary";
+        let mpd_path = generate_dash_fixture(dash_dir);
+        let controller = NativeTransportController::new();
+        let request = NativeTransportLoadRequest {
+            source: NativeTransportSource::TidalMpd {
+                manifest_uri: format!("file://{mpd_path}"),
                 track: TidalTrackContext {
                     track_id: "789".to_string(),
                     title: "Manifest Probe".to_string(),
@@ -2908,13 +3223,15 @@ mod tests {
             dsp_config: None,
         };
         controller.load(request).unwrap();
-        wait_until(&controller, |snapshot| snapshot.state == NativeTransportState::Ready);
+        wait_until(&controller, |snapshot| {
+            snapshot.state == NativeTransportState::Ready
+        });
         let snapshot = controller.snapshot();
         assert!(snapshot
             .source_summary
             .as_deref()
             .unwrap_or_default()
             .contains("mpd representations=1"));
-        let _ = std::fs::remove_file(manifest_path);
+        let _ = std::fs::remove_dir_all(dash_dir);
     }
 }
