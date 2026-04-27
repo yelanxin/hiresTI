@@ -85,6 +85,14 @@ flatpak run com.hiresti.player
 
 GPL-3.0
 
+## 赞助 Sponsors
+
+感谢赞助 hiresTI 的朋友 ❤
+
+<a href="https://github.com/AriZone"><img src="https://github.com/AriZone.png" width="60" height="60" alt="AriZone" /></a>
+
+如果你也想支持本项目，可以通过 [GitHub Sponsors](https://github.com/sponsors/yelanxin) 赞助。
+
 ## 问题排查与日志反馈
 
 如果遇到问题，请优先通过命令行启动并采集日志，然后在 Issue 中反馈：

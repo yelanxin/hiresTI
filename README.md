@@ -182,6 +182,14 @@ When reporting, include:
 
 Special thanks to everyone who shares feedback. In particular, [ilijagosp](https://github.com/ilijagosp) has provided feedback and suggestions with every new release.
 
+## Sponsors
+
+Thanks to those supporting hiresTI ❤
+
+<a href="https://github.com/AriZone"><img src="https://github.com/AriZone.png" width="60" height="60" alt="AriZone" /></a>
+
+If you'd like to support development, you can sponsor via [GitHub Sponsors](https://github.com/sponsors/yelanxin).
+
 ## License
 
 GPL-3.0
