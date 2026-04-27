@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.9.2 - 2026-04-26
+
+### Added
+- **USB Rawlink V2 AAC playback support**: the native transport can now decode AAC streams, including direct `.m4a` / `.mp4` / `.aac` sources and TIDAL DASH/MPD manifests that expose AAC media URLs.
+
+### Changed
+- **Rawlink V2 direct media handling is now codec-generic**: the native transport source/probe path now treats direct media and MPD streams as general audio inputs instead of FLAC-only sources, while preserving codec, sample-rate, bit-depth and duration metadata for the playback UI.
+- **USB Rawlink V2 keeps the live USB session across sample-rate switches**: cross-rate track changes now reconfigure the existing libusb session instead of dropping and reopening the device, avoiding kernel-driver reattachment while still updating the DAC sample clock.
+- **Sample-rate switch settling is feedback-driven**: after a real rate change, Rawlink V2 waits for the USB feedback endpoint to report the target rate before starting the OUT ring, with short configurable bounds via `HIRESTI_USB_RATE_CHANGE_SETTLE_MIN_MS` and `HIRESTI_USB_RATE_CHANGE_SETTLE_MAX_MS`.
+
+### Fixed
+- **Rawlink V2 left-channel mute after switching sample rates**: fixed a DAC settle race where playback could start while the device feedback/PLL was still reporting the previous sample rate, causing the left channel to remain silent for roughly one second after cross-rate track changes.
+- **Same-rate Rawlink V2 track switches no longer reset the USB alt-setting or reissue SET_CUR**: consecutive tracks at the same sample rate now keep the active alt/rate configuration, reducing unnecessary DAC mute/recovery behavior.
+
 ## 1.9.1 - 2026-04-21
 
 ### Added

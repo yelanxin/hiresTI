@@ -15,6 +15,7 @@ URL="https://github.com/yourrepo/hiresti"
 # Each entry: TARGET_NAME  BASE_IMAGE  DISTRO_FAMILY  PKG_TYPE  SUFFIX
 TARGETS=(
     "ubuntu2404             ubuntu:24.04                deb   deb          ubuntu2404"
+    "ubuntu2604             ubuntu:26.04                deb   deb          ubuntu2604"
     "debian12               debian:12                   deb   deb          debian12"
     "debian13               debian:13                   deb   deb          debian13"
     "fedora43               fedora:43                   rpm   rpm-fedora   fedora43"
@@ -42,6 +43,7 @@ print_usage() {
     echo ""
     echo "Docker targets (build inside container for correct GLIBC):"
     echo "  ubuntu2404      Ubuntu 24.04 .deb"
+    echo "  ubuntu2604      Ubuntu 26.04 .deb"
     echo "  debian12        Debian 12 .deb"
     echo "  debian13        Debian 13 .deb"
     echo "  fedora43        Fedora 43 .rpm"
@@ -151,7 +153,7 @@ docker_build_target() {
 
 # Handle Docker targets
 case "$TYPE" in
-    ubuntu2404|debian12|debian13|fedora43|fedora44|archlinux|opensuse-tumbleweed)
+    ubuntu2404|ubuntu2604|debian12|debian13|fedora43|fedora44|archlinux|opensuse-tumbleweed)
         docker_build_target "$TYPE"
         echo ""
         echo "🎉 Build Complete! Packages in dist/:"
@@ -638,7 +640,7 @@ case "$TYPE" in
         ;;
     *)
         echo "Error: unsupported local type '$TYPE'. Use deb | rpm-fedora | rpm-opensuse | arch"
-        echo "  Or use a Docker target: ubuntu2204 | ubuntu2404 | debian12 | debian13 | fedora43 | fedora44 | archlinux | opensuse-tumbleweed | all"
+        echo "  Or use a Docker target: ubuntu2404 | ubuntu2604 | debian12 | debian13 | fedora43 | fedora44 | archlinux | opensuse-tumbleweed | all"
         exit 1
         ;;
 esac
