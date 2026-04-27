@@ -1361,10 +1361,12 @@ fn usb_audio_pusher_thread(
         let sample =
             appsink.emit_by_name::<Option<gst::Sample>>("try-pull-sample", &[&100_000_000u64]);
         let pull_ms = pull_start.elapsed().as_millis();
-        // Log pulls that take unusually long (>150 ms).  Normal GStreamer delivery
-        // for FLAC/AAC blocks is ~90 ms; 150 ms threshold avoids noise while
-        // still catching genuine decoder stalls (Tidal rebuffering etc.).
-        if pull_ms > 150 {
+        // Log pulls that took longer than the ISO ring's per-transfer cadence
+        // (~50 ms is well below the 192 ms ring depth, so a slow pull at this
+        // threshold is an early warning rather than a guaranteed underrun).
+        // Catches both genuine decoder stalls and sporadic upstream hiccups
+        // that correlate with later `direct queue fallback underrun` events.
+        if pull_ms > 50 {
             let q_ms = sink.as_ref().map_or(0, |s| {
                 s.queued_bytes() as u64 * 1000
                     / (s.state.rate as u64

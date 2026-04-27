@@ -75,7 +75,12 @@ use super::source::TransferSource;
 // ---------------------------------------------------------------------------
 
 /// Number of concurrent in-flight transfers.
-pub const N_TRANSFERS: usize = 16;
+///
+/// Ring depth = `N_TRANSFERS * N_PACKETS_TARGET_MS` ms (192 ms at the current
+/// values).  Deeper than the strict latency floor so that sporadic upstream
+/// hiccups (Tidal CDN reconnect, decoder thread preemption, GstBuffer pool
+/// boundary) do not starve the ISO ring before the queue can refill.
+pub const N_TRANSFERS: usize = 24;
 /// Target audio duration covered by one transfer, in milliseconds.
 /// Each transfer holds `N_PACKETS_TARGET_MS * packets_per_sec / 1000` ISO packets.
 /// 1ms/FS device (1000 pkt/s) → 8 packets; 125µs/HS device (8000 pkt/s) → 64 packets.
