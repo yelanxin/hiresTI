@@ -1361,6 +1361,18 @@ fn usb_audio_pusher_thread(
         let sample =
             appsink.emit_by_name::<Option<gst::Sample>>("try-pull-sample", &[&100_000_000u64]);
         let pull_ms = pull_start.elapsed().as_millis();
+        // Stash pull telemetry on the ring state so `queue_fallback_log`
+        // (running on the libusb event thread) can correlate underruns with
+        // recent upstream pull behavior.
+        if let Some(ref s) = sink {
+            s.state
+                .last_pull_ms
+                .store(pull_ms as u64, Ordering::Relaxed);
+            s.state.last_pull_at_ns.store(
+                usb_audio::transfer::clock_monotonic_ns(),
+                Ordering::Relaxed,
+            );
+        }
         // Log pulls that took longer than the ISO ring's per-transfer cadence
         // (~50 ms is well below the 192 ms ring depth, so a slow pull at this
         // threshold is an early warning rather than a guaranteed underrun).

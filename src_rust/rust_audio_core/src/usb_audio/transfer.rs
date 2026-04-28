@@ -56,7 +56,7 @@ fn set_thread_realtime(priority: i32) {
 }
 
 /// Read `CLOCK_MONOTONIC` as nanoseconds.
-fn clock_monotonic_ns() -> u64 {
+pub fn clock_monotonic_ns() -> u64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -248,6 +248,15 @@ pub struct RingState {
     /// Fallback count when there was not enough queued audio to lease a full
     /// transfer directly and scratch-copy + silence padding was required.
     pub direct_queue_underrun_fallbacks: AtomicU64,
+    /// Duration in milliseconds of the most recent appsink `try-pull-sample`
+    /// call.  Updated by the pusher thread after every pull.  Read by the
+    /// fallback-underrun logger so each underrun line shows whether upstream
+    /// was slow or healthy when the queue ran dry.
+    pub last_pull_ms: AtomicU64,
+    /// Monotonic timestamp (ns) when the most recent appsink pull completed.
+    /// Zero before the first pull.  Lets the fallback-underrun logger compute
+    /// "last pull was Xms ago" — if X is large, the pusher is idle/blocked.
+    pub last_pull_at_ns: AtomicU64,
     completion_tracker: Mutex<CompletionTracker>,
 }
 
@@ -307,6 +316,8 @@ impl RingState {
             direct_queue_submits: AtomicU64::new(0),
             direct_queue_wrap_fallbacks: AtomicU64::new(0),
             direct_queue_underrun_fallbacks: AtomicU64::new(0),
+            last_pull_ms: AtomicU64::new(0),
+            last_pull_at_ns: AtomicU64::new(0),
             completion_tracker: Mutex::new(CompletionTracker::default()),
         })
     }
@@ -423,11 +434,40 @@ fn queue_direct_log(count: u64, slot: usize, bytes: usize) {
     }
 }
 
-fn queue_fallback_log(label: &str, count: u64, slot: usize, total_bytes: usize, assign_avail: usize) {
+fn queue_fallback_log(
+    state: &RingState,
+    label: &str,
+    count: u64,
+    slot: usize,
+    total_bytes: usize,
+    assign_avail: usize,
+) {
     if count <= 4 || count % 1024 == 0 {
+        // Diagnostic context: was the upstream pusher slow when the queue
+        // dried up?  `pull_ago` large or `pull_ms` large -> upstream stall
+        // (Tidal CDN reconnect / decoder thread preemption / GstBuffer pool).
+        // Both small -> downstream issue (ring drained faster than expected).
+        let now_ns = clock_monotonic_ns();
+        let last_pull_at = state.last_pull_at_ns.load(Ordering::Relaxed);
+        let pull_ago_ms = if last_pull_at > 0 && now_ns >= last_pull_at {
+            (now_ns - last_pull_at) / 1_000_000
+        } else {
+            u64::MAX
+        };
+        let last_pull_ms = state.last_pull_ms.load(Ordering::Relaxed);
+        let queue_read = state.queue.available_read();
+        let in_flight = state.in_flight.load(Ordering::Acquire);
+        let pull_ago_s = if pull_ago_ms == u64::MAX {
+            "never".to_string()
+        } else {
+            format!("{}ms", pull_ago_ms)
+        };
         eprintln!(
-            "usb-audio: direct queue fallback {} #{} slot={} bytes={} assign_avail={}",
+            "usb-audio: direct queue fallback {} #{} slot={} bytes={} \
+             assign_avail={} queue_read={} in_flight={} \
+             last_pull_ago={} last_pull_took={}ms",
             label, count, slot, total_bytes, assign_avail,
+            queue_read, in_flight, pull_ago_s, last_pull_ms,
         );
     }
 }
@@ -508,7 +548,7 @@ unsafe fn fill_transfer(transfer: *mut libusb_transfer) {
                     .direct_queue_wrap_fallbacks
                     .fetch_add(1, Ordering::Relaxed)
                     + 1;
-                queue_fallback_log("wrap", count, ctx.slot, total_bytes, assign_avail);
+                queue_fallback_log(state, "wrap", count, ctx.slot, total_bytes, assign_avail);
                 false
             }
         }
@@ -517,7 +557,7 @@ unsafe fn fill_transfer(transfer: *mut libusb_transfer) {
             .direct_queue_underrun_fallbacks
             .fetch_add(1, Ordering::Relaxed)
             + 1;
-        queue_fallback_log("underrun", count, ctx.slot, total_bytes, assign_avail);
+        queue_fallback_log(state, "underrun", count, ctx.slot, total_bytes, assign_avail);
         false
     };
 
