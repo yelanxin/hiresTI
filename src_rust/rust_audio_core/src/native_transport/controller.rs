@@ -1634,6 +1634,7 @@ fn decode_direct_audio_stream(
     // setting (e.g., MOTU 4-channel-only audio interfaces fed Tidal
     // stereo).  Reused across iterations to avoid per-packet allocation.
     let mut channel_pad_buf: Vec<u8> = Vec::new();
+    let mut channel_pad_logged = false;
     let mut seeking = skip_until_ts.is_some();
     // Bitrate estimation: accumulate compressed bytes and sample count.
     // First two emissions happen quickly (~0.25s apart) so the Python
@@ -1816,6 +1817,27 @@ fn decode_direct_audio_stream(
                         let d_off = f * dst_frame_bytes;
                         channel_pad_buf[d_off..d_off + src_frame_bytes]
                             .copy_from_slice(&slab.data[s_off..s_off + src_frame_bytes]);
+                    }
+                    if !channel_pad_logged {
+                        eprintln!(
+                            "native-transport: channel zero-pad active src_ch={} -> dst_ch={} \
+                             bytes_per_sample={} (front {} channels carry the source signal, \
+                             trailing {} channels are silence)",
+                            src_ch,
+                            dst_ch,
+                            bytes_per_sample,
+                            src_ch,
+                            dst_ch - src_ch,
+                        );
+                        queue_native_event(
+                            events,
+                            crate::EVT_STATE,
+                            format!(
+                                "native-transport channel-pad src={} dst={}",
+                                src_ch, dst_ch
+                            ),
+                        );
+                        channel_pad_logged = true;
                     }
                     &channel_pad_buf
                 } else {
