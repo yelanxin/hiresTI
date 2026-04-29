@@ -1629,6 +1629,11 @@ fn decode_direct_audio_stream(
     let mut reuse_sess = reuse_session;
     let mut pre_handle = pre_claimed_handle;
     let mut reuse_buf: Vec<u8> = Vec::new();
+    // Scratch buffer used to zero-pad stereo (or N-channel) source data
+    // out to the device channel count when the DAC has no matching alt
+    // setting (e.g., MOTU 4-channel-only audio interfaces fed Tidal
+    // stereo).  Reused across iterations to avoid per-packet allocation.
+    let mut channel_pad_buf: Vec<u8> = Vec::new();
     let mut seeking = skip_until_ts.is_some();
     // Bitrate estimation: accumulate compressed bytes and sample count.
     // First two emissions happen quickly (~0.25s apart) so the Python
@@ -1716,10 +1721,14 @@ fn decode_direct_audio_stream(
             let process_ms = process_start.elapsed().as_millis();
             record_decoded_slab(snapshot, generation, &slab);
             if let Some(ref cfg) = output_config {
-                if slab.spec.channels != cfg.channels {
+                let src_ch = slab.spec.channels;
+                let dst_ch = cfg.channels as usize;
+                if src_ch > dst_ch {
+                    // Downmix is not supported in this path — refuse loudly
+                    // rather than silently dropping rear channels.
                     return Err(format!(
-                        "native transport: channel mismatch decoded={} configured={}",
-                        slab.spec.channels, cfg.channels
+                        "native transport: channel mismatch decoded={} configured={} (downmix unsupported)",
+                        src_ch, dst_ch
                     ));
                 }
                 if output_session.is_none() {
@@ -1786,6 +1795,33 @@ fn decode_direct_audio_stream(
                     // the hw-volume UI can sync with the actual DAC state.
                     queue_native_event(events, crate::EVT_STATE, "usb-audio configured");
                 }
+                // Zero-pad upmix: when the device has more channels than
+                // the source (e.g., MOTU 4-channel-only interface, stereo
+                // Tidal track), interleave silence into the trailing
+                // channels so frames stay aligned and the front L/R pair
+                // carries the original signal.
+                let push_data: &[u8] = if src_ch < dst_ch {
+                    let bytes_per_sample = match cfg.gst_format.as_str() {
+                        "S16LE" | "S16BE" | "U16LE" | "U16BE" => 2usize,
+                        "S24_3LE" | "S24_3BE" => 3usize,
+                        _ => 4usize,
+                    };
+                    let src_frame_bytes = src_ch * bytes_per_sample;
+                    let dst_frame_bytes = dst_ch * bytes_per_sample;
+                    let n_frames = slab.data.len() / src_frame_bytes.max(1);
+                    channel_pad_buf.clear();
+                    channel_pad_buf.resize(n_frames * dst_frame_bytes, 0);
+                    for f in 0..n_frames {
+                        let s_off = f * src_frame_bytes;
+                        let d_off = f * dst_frame_bytes;
+                        channel_pad_buf[d_off..d_off + src_frame_bytes]
+                            .copy_from_slice(&slab.data[s_off..s_off + src_frame_bytes]);
+                    }
+                    &channel_pad_buf
+                } else {
+                    &slab.data
+                };
+
                 let push_start = Instant::now();
                 push_slab_to_usb_output(
                     output_session
@@ -1793,7 +1829,7 @@ fn decode_direct_audio_stream(
                         .expect("output session just created"),
                     cfg,
                     slab.spec.sample_rate,
-                    &slab,
+                    push_data,
                     events,
                     auto_start,
                 )?;
@@ -2039,11 +2075,10 @@ fn push_slab_to_usb_output(
     session: &mut UsbAudioSink,
     cfg: &UsbRawSinkConfig,
     sample_rate: u32,
-    slab: &PcmSlab,
+    data: &[u8],
     events: &Arc<Mutex<VecDeque<(i32, String)>>>,
     auto_start: &AtomicBool,
 ) -> Result<(), String> {
-    let data = &slab.data;
     let mut offset = 0usize;
     while offset < data.len() {
         let written = session.push_bytes(&data[offset..]);
