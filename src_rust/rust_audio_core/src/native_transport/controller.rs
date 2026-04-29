@@ -17,6 +17,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Instant;
 use symphonia::core::audio::{AudioBuffer, AudioBufferRef, Signal};
 use symphonia::core::codecs::{
     CodecType, DecoderOptions, CODEC_TYPE_AAC, CODEC_TYPE_ALAC, CODEC_TYPE_FLAC, CODEC_TYPE_NULL,
@@ -1638,11 +1639,20 @@ fn decode_direct_audio_stream(
     let mut src_samples_accum: u64 = 0;
     let mut bitrate_emissions: u32 = 0;
 
+    // Stage-timing telemetry: each loop iteration measures next_packet
+    // (network/HTTP read), decode (CPU), processor_chain (DSP), and
+    // push_slab (queue back-pressure).  Iterations slower than this
+    // threshold print a breakdown so we can pinpoint stall causes from
+    // user logs without needing a tracer.
+    const SLOW_ITER_THRESHOLD_MS: u128 = 50;
+    let mut slow_iter_count: u64 = 0;
     let result = (|| -> Result<(), String> {
         loop {
             if stop.load(Ordering::Acquire) || !snapshot_generation_matches(snapshot, generation) {
                 return Ok(());
             }
+            let iter_start = Instant::now();
+            let read_start = iter_start;
             let packet = match format.next_packet() {
                 Ok(packet) => packet,
                 Err(SymphoniaError::IoError(err))
@@ -1652,6 +1662,7 @@ fn decode_direct_audio_stream(
                 }
                 Err(err) => return Err(format!("native transport: packet read failed: {err}")),
             };
+            let read_ms = read_start.elapsed().as_millis();
             if packet.track_id() != track_id {
                 continue;
             }
@@ -1671,9 +1682,11 @@ fn decode_direct_audio_stream(
             // Track compressed packet size for bitrate estimation.
             let pkt_compressed_bytes = packet.buf().len() as u64;
             let pkt_dur_samples = packet.dur();
+            let decode_start = Instant::now();
             let decoded = decoder
                 .decode(&packet)
                 .map_err(|e| format!("native transport: decode failed: {e}"))?;
+            let decode_ms = decode_start.elapsed().as_millis();
             src_bytes_accum += pkt_compressed_bytes;
             src_samples_accum += pkt_dur_samples;
             // First 2 emissions at ~0.25s for fast UI display, then every ~2s.
@@ -1693,12 +1706,14 @@ fn decode_direct_audio_stream(
                 .as_ref()
                 .map(|cfg| pcm_format_from_gst_format(cfg.gst_format.as_str()))
                 .transpose()?;
+            let process_start = Instant::now();
             let mut slab = audio_buffer_ref_to_slab(decoded, target_format, &mut reuse_buf)?;
             if !chain_configured {
                 processor_chain.configure(&slab.spec)?;
                 chain_configured = true;
             }
             slab = processor_chain.process(slab)?;
+            let process_ms = process_start.elapsed().as_millis();
             record_decoded_slab(snapshot, generation, &slab);
             if let Some(ref cfg) = output_config {
                 if slab.spec.channels != cfg.channels {
@@ -1771,6 +1786,7 @@ fn decode_direct_audio_stream(
                     // the hw-volume UI can sync with the actual DAC state.
                     queue_native_event(events, crate::EVT_STATE, "usb-audio configured");
                 }
+                let push_start = Instant::now();
                 push_slab_to_usb_output(
                     output_session
                         .as_mut()
@@ -1781,6 +1797,28 @@ fn decode_direct_audio_stream(
                     events,
                     auto_start,
                 )?;
+                let push_ms = push_start.elapsed().as_millis();
+                let total_ms = iter_start.elapsed().as_millis();
+                if total_ms > SLOW_ITER_THRESHOLD_MS {
+                    slow_iter_count = slow_iter_count.saturating_add(1);
+                    // Throttle: log first 8, then every 64th to keep noise bounded
+                    // during sustained stalls without losing the steady-state count.
+                    if slow_iter_count <= 8 || slow_iter_count % 64 == 0 {
+                        eprintln!(
+                            "native-transport: slow decode iter #{} total={}ms \
+                             read={}ms decode={}ms process={}ms push={}ms \
+                             pkt_bytes={} pkt_samples={}",
+                            slow_iter_count,
+                            total_ms,
+                            read_ms,
+                            decode_ms,
+                            process_ms,
+                            push_ms,
+                            pkt_compressed_bytes,
+                            pkt_dur_samples,
+                        );
+                    }
+                }
             }
             // Reclaim the data buffer for reuse in next iteration.
             reuse_buf = slab.data;

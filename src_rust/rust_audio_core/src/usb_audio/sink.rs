@@ -213,15 +213,61 @@ impl UsbAudioSink {
     }
 
     pub fn push_bytes(&self, data: &[u8]) -> usize {
-        self.queue.push_bytes(data)
+        let written = self.queue.push_bytes(data);
+        if written > 0 {
+            self.record_push(written);
+        }
+        written
     }
 
     pub fn push_owned_bytes(&self, data: Vec<u8>) -> Result<(), Vec<u8>> {
-        self.queue.push_owned_bytes(data)
+        let len = data.len();
+        let result = self.queue.push_owned_bytes(data);
+        if result.is_ok() && len > 0 {
+            self.record_push(len);
+        }
+        result
     }
 
     pub fn push_buffer(&self, buffer: gst::Buffer) -> Result<(), PushBufferError> {
-        self.queue.push_buffer(buffer)
+        let len = buffer.size();
+        let result = self.queue.push_buffer(buffer);
+        if result.is_ok() && len > 0 {
+            self.record_push(len);
+        }
+        result
+    }
+
+    /// Update producer-side telemetry on `RingState`.  Read by
+    /// `queue_fallback_log` so each underrun line shows when the queue last
+    /// accepted bytes.  Also emits a warning if the gap since the previous
+    /// push exceeded `PUSH_GAP_WARN_MS` while the ring was already running —
+    /// catches the case where the producer is alive but blocked between
+    /// pushes (HTTP read stall, decoder thread preempted).
+    #[inline]
+    fn record_push(&self, bytes: usize) {
+        const PUSH_GAP_WARN_MS: u64 = 200;
+        let now_ns = clock_monotonic_ns();
+        let prev_ns = self
+            .state
+            .last_push_at_ns
+            .swap(now_ns, Ordering::Relaxed);
+        if self.started && prev_ns > 0 && now_ns > prev_ns {
+            let gap_ms = (now_ns - prev_ns) / 1_000_000;
+            if gap_ms >= PUSH_GAP_WARN_MS {
+                let queue_read = self.queue.available_read();
+                eprintln!(
+                    "usb-audio: producer push gap {}ms (size={} queued={} B)",
+                    gap_ms, bytes, queue_read
+                );
+            }
+        }
+        self.state
+            .last_push_size
+            .store(bytes as u64, Ordering::Relaxed);
+        self.state
+            .total_pushed_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
     /// Mark the device to skip interface release on drop.  When set, the USB

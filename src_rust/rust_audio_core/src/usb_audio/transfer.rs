@@ -257,6 +257,24 @@ pub struct RingState {
     /// Zero before the first pull.  Lets the fallback-underrun logger compute
     /// "last pull was Xms ago" — if X is large, the pusher is idle/blocked.
     pub last_pull_at_ns: AtomicU64,
+    /// Monotonic timestamp (ns) of the most recent successful push into the
+    /// FrameQueue.  Updated by `UsbAudioSink::push_bytes` whenever a non-zero
+    /// number of bytes was accepted by the queue.  Zero before the first push.
+    /// The fallback-underrun logger reports "last push was Xms ago" — large
+    /// values pinpoint a stalled producer (decoder hung, HTTP read blocked,
+    /// thread preempted) rather than a downstream issue.
+    ///
+    /// Distinct from `last_pull_*`: pull tracks the V1 GstAppsink pusher
+    /// thread's `try-pull-sample` latency; push tracks how recently the
+    /// queue actually accepted bytes — the only signal that works on the V2
+    /// native_transport path (which has no pull loop).
+    pub last_push_at_ns: AtomicU64,
+    /// Bytes accepted by the queue on the most recent successful push call.
+    /// Zero before the first push.
+    pub last_push_size: AtomicU64,
+    /// Running total of bytes the producer has pushed into the queue.
+    /// Polled by the fallback-underrun logger to derive a recent push rate.
+    pub total_pushed_bytes: AtomicU64,
     completion_tracker: Mutex<CompletionTracker>,
 }
 
@@ -318,6 +336,9 @@ impl RingState {
             direct_queue_underrun_fallbacks: AtomicU64::new(0),
             last_pull_ms: AtomicU64::new(0),
             last_pull_at_ns: AtomicU64::new(0),
+            last_push_at_ns: AtomicU64::new(0),
+            last_push_size: AtomicU64::new(0),
+            total_pushed_bytes: AtomicU64::new(0),
             completion_tracker: Mutex::new(CompletionTracker::default()),
         })
     }
@@ -444,9 +465,12 @@ fn queue_fallback_log(
 ) {
     if count <= 4 || count % 1024 == 0 {
         // Diagnostic context: was the upstream pusher slow when the queue
-        // dried up?  `pull_ago` large or `pull_ms` large -> upstream stall
+        // dried up?  `pull_ago` / `push_ago` large -> upstream stall
         // (Tidal CDN reconnect / decoder thread preemption / GstBuffer pool).
         // Both small -> downstream issue (ring drained faster than expected).
+        // V1 (GstAppsink) populates pull telemetry; V2 (native_transport)
+        // populates push telemetry — so a "never" on one with a recent value
+        // on the other identifies the active path.
         let now_ns = clock_monotonic_ns();
         let last_pull_at = state.last_pull_at_ns.load(Ordering::Relaxed);
         let pull_ago_ms = if last_pull_at > 0 && now_ns >= last_pull_at {
@@ -455,6 +479,14 @@ fn queue_fallback_log(
             u64::MAX
         };
         let last_pull_ms = state.last_pull_ms.load(Ordering::Relaxed);
+        let last_push_at = state.last_push_at_ns.load(Ordering::Relaxed);
+        let push_ago_ms = if last_push_at > 0 && now_ns >= last_push_at {
+            (now_ns - last_push_at) / 1_000_000
+        } else {
+            u64::MAX
+        };
+        let last_push_size = state.last_push_size.load(Ordering::Relaxed);
+        let total_pushed = state.total_pushed_bytes.load(Ordering::Relaxed);
         let queue_read = state.queue.available_read();
         let in_flight = state.in_flight.load(Ordering::Acquire);
         let pull_ago_s = if pull_ago_ms == u64::MAX {
@@ -462,12 +494,19 @@ fn queue_fallback_log(
         } else {
             format!("{}ms", pull_ago_ms)
         };
+        let push_ago_s = if push_ago_ms == u64::MAX {
+            "never".to_string()
+        } else {
+            format!("{}ms", push_ago_ms)
+        };
         eprintln!(
             "usb-audio: direct queue fallback {} #{} slot={} bytes={} \
              assign_avail={} queue_read={} in_flight={} \
-             last_pull_ago={} last_pull_took={}ms",
+             last_pull_ago={} last_pull_took={}ms \
+             last_push_ago={} last_push_size={} total_pushed={}",
             label, count, slot, total_bytes, assign_avail,
             queue_read, in_flight, pull_ago_s, last_pull_ms,
+            push_ago_s, last_push_size, total_pushed,
         );
     }
 }
