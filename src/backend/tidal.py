@@ -1059,6 +1059,25 @@ class TidalBackend:
         out = []
         page_size = 50
 
+        # Some accounts / endpoints return identical pages regardless of the
+        # offset, which would let the loop append the same playlists until
+        # it hit max_items (typical user-visible symptom: "1000 playlists,
+        # the same few repeating").  Dedup by id while paginating and stop
+        # as soon as a page contributes zero new IDs.
+        seen = set()
+
+        def _ingest(page):
+            new = 0
+            for item in page:
+                pid = str(getattr(item, "id", "") or "")
+                if pid and pid in seen:
+                    continue
+                if pid:
+                    seen.add(pid)
+                out.append(item)
+                new += 1
+            return new
+
         # Root folder.
         if parent_folder is None or str(parent_folder) == "root":
             if not self.user or not hasattr(self.user, "favorites"):
@@ -1075,7 +1094,14 @@ class TidalBackend:
                     break
                 if not page:
                     break
-                out.extend(page)
+                new_in_page = _ingest(page)
+                if new_in_page == 0:
+                    logger.warning(
+                        "Root playlists pagination stalled at offset=%d (page=%d, no new ids); stopping.",
+                        offset,
+                        len(page),
+                    )
+                    break
                 if len(page) < page_size:
                     break
                 offset += len(page)
@@ -1098,7 +1124,15 @@ class TidalBackend:
                 break
             if not page:
                 break
-            out.extend(page)
+            new_in_page = _ingest(page)
+            if new_in_page == 0:
+                logger.warning(
+                    "Folder %s playlists pagination stalled at offset=%d (page=%d, no new ids); stopping.",
+                    getattr(folder, "id", None),
+                    offset,
+                    len(page),
+                )
+                break
             if len(page) < page_size:
                 break
             offset += len(page)
@@ -1236,14 +1270,43 @@ class TidalBackend:
                 unique.append(tid)
             track_ids = unique
 
-            # Skip existing tracks in target playlist.
+            # Skip existing tracks in target playlist.  Bounded paginated
+            # pre-fetch with id-dedup so a misbehaving upstream (offset
+            # ignored, page repeating) cannot hang the call indefinitely.
+            # Server-side `allow_duplicates=False` below provides the final
+            # safety net for whatever exceeds this window.
             existing = set()
+            EXISTING_TRACKS_FETCH_CAP = 5000
+            EXISTING_PAGE_SIZE = 200
             try:
-                existing_tracks = pl.tracks(limit=None)
-                for et in list(existing_tracks or []):
-                    eid = str(getattr(et, "id", "") or "").strip()
-                    if eid:
-                        existing.add(eid)
+                offset = 0
+                while len(existing) < EXISTING_TRACKS_FETCH_CAP:
+                    try:
+                        page = pl.tracks(limit=EXISTING_PAGE_SIZE, offset=offset)
+                    except TypeError:
+                        # Older tidalapi without limit/offset kwargs — fall
+                        # back to single call (still bounded by Python iter).
+                        page = pl.tracks()
+                    page = list(page or [])
+                    if not page:
+                        break
+                    new_in_page = 0
+                    for et in page:
+                        eid = str(getattr(et, "id", "") or "").strip()
+                        if eid and eid not in existing:
+                            existing.add(eid)
+                            new_in_page += 1
+                    if new_in_page == 0:
+                        logger.warning(
+                            "Playlist %s tracks pagination stalled at offset=%d (page=%d, no new ids); stopping pre-fetch.",
+                            getattr(pl, "id", None),
+                            offset,
+                            len(page),
+                        )
+                        break
+                    if len(page) < EXISTING_PAGE_SIZE:
+                        break
+                    offset += len(page)
             except Exception as e:
                 logger.debug("Failed to prefetch existing cloud playlist tracks for dedupe: %s", e)
             if existing:
@@ -1512,12 +1575,34 @@ class TidalBackend:
             merged = []
             offset = 0
             size = min(max(1, int(page_size or 100)), target)
+            # Dedup by album id: the upstream artist albums endpoint has
+            # been observed to ignore offset for some accounts, which made
+            # the loop append the same albums repeatedly (visible as
+            # "albums showing 3x" on the artist page).  Stop when a page
+            # contributes nothing new.
+            seen = set()
             while len(merged) < target:
                 page = fetcher(limit=size, offset=offset)
                 page = list((page() if callable(page) else page) or [])
                 if not page:
                     break
-                merged.extend(page)
+                new_in_page = 0
+                for item in page:
+                    aid = str(getattr(item, "id", "") or "")
+                    if aid and aid in seen:
+                        continue
+                    if aid:
+                        seen.add(aid)
+                    merged.append(item)
+                    new_in_page += 1
+                if new_in_page == 0:
+                    logger.warning(
+                        "Artist %s pagination stalled at offset=%d (page=%d, no new ids); stopping.",
+                        method_name,
+                        offset,
+                        len(page),
+                    )
+                    break
                 offset += len(page)
             return merged[:target]
 
