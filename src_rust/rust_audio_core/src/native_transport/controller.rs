@@ -2689,6 +2689,12 @@ fn spawn_download_thread(
     stop: Arc<AtomicBool>,
 ) -> crossbeam_channel::Receiver<Vec<u8>> {
     let (tx, rx) = crossbeam_channel::bounded(DOWNLOAD_CHANNEL_CAP);
+    eprintln!(
+        "native-transport: prefetch thread starting (chunk={} cap={} max~{}KiB)",
+        DOWNLOAD_CHUNK_SIZE,
+        DOWNLOAD_CHANNEL_CAP,
+        DOWNLOAD_CHANNEL_CAP * DOWNLOAD_CHUNK_SIZE / 1024,
+    );
     thread::Builder::new()
         .name("native-transport-download".to_string())
         .spawn(move || {
@@ -2773,8 +2779,22 @@ fn open_source_as_media_source_stream(
             let xml = read_locator_to_string(manifest_uri)?;
             let info = inspect_mpd_manifest(&xml)?;
             let sequence = build_mpd_segment_sequence(manifest_uri, &info)?;
+            // Wrap the serial segment reader in the same background-fetch
+            // channel pipeline used for TidalDirectMedia.  Without this,
+            // every Symphonia read for a DASH source blocked on the next
+            // ureq::get(segment).call() — turning HTTP setup latency and
+            // CDN jitter into queue-side underruns once the upfront ring
+            // prefill drained (observed at ~160-500ms per ~42ms-of-audio
+            // packet on weak Tidal connections, with occasional 5+ second
+            // stalls).  A bg thread now drains SegmentSequenceReader into
+            // a bounded crossbeam channel (64 × 32KiB ≈ 2MiB ≈ 5-6 s of
+            // compressed FLAC), letting the decoder pull from local
+            // memory while HTTP work happens in parallel.
+            let segment_reader: Box<dyn std::io::Read + Send> =
+                Box::new(SegmentSequenceReader::new(sequence));
+            let rx = spawn_download_thread(segment_reader, Arc::clone(stop));
             let source: Box<dyn MediaSource> =
-                Box::new(ReadOnlySource::new(SegmentSequenceReader::new(sequence)));
+                Box::new(ReadOnlySource::new(ChannelReader::new(rx)));
             Ok(MediaSourceStream::new(
                 source,
                 MediaSourceStreamOptions::default(),
