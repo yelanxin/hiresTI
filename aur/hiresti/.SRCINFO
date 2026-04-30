@@ -5,6 +5,7 @@ pkgbase = hiresti
 	url = https://github.com/yelanxin/hiresTI
 	arch = x86_64
 	license = GPL-3.0-or-later
+	options = !lto
 	makedepends = cargo
 	makedepends = clang
 	makedepends = pkgconf
