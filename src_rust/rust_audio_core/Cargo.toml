@@ -14,7 +14,7 @@ required-features = []
 
 [profile.release]
 opt-level = 3
-lto = true
+lto = "thin"
 codegen-units = 1
 debug-assertions = false
 overflow-checks = false
