@@ -852,18 +852,110 @@ class TidalBackend:
                     return cached
             return []
 
-    def get_favorite_tracks(self, limit=50):
+    def get_favorite_tracks(self, limit=50, sort="recent"):
+        """Fetch favorite tracks, ordered by date-added DESC by default.
+
+        The UI's default sort for the Liked Songs view is "recent", which
+        the Rust filter/sort layer treats as a no-op (sort_mode=0, keep
+        upstream order).  That makes the upstream order load-bearing —
+        tidalapi's `tracks_paginated()` defaults to NAME ascending, which
+        gave users a visibly wrong "recent" view.  Pass `ItemOrder.Date,
+        OrderDirection.Descending` explicitly so the rows arrive in
+        date-added DESC order.
+        """
+        sort_key = str(sort or "recent").strip().lower()
+        # Map UI sort modes to tidalapi ItemOrder/OrderDirection.  Anything
+        # unknown falls back to date-DESC (matches the UI's "recent" sort).
+        order_obj = None
+        order_direction = None
+        try:
+            if sort_key == "title":
+                order_obj = getattr(tidal_user.ItemOrder, "Name", None)
+                order_direction = getattr(tidal_user.OrderDirection, "Ascending", None)
+            elif sort_key == "artist":
+                order_obj = getattr(tidal_user.ItemOrder, "Artist", None)
+                order_direction = getattr(tidal_user.OrderDirection, "Ascending", None)
+            elif sort_key == "album":
+                order_obj = getattr(tidal_user.ItemOrder, "Album", None)
+                order_direction = getattr(tidal_user.OrderDirection, "Ascending", None)
+            elif sort_key == "duration":
+                order_obj = getattr(tidal_user.ItemOrder, "Length", None)
+                order_direction = getattr(tidal_user.OrderDirection, "Ascending", None)
+            else:
+                order_obj = getattr(tidal_user.ItemOrder, "Date", None)
+                order_direction = getattr(tidal_user.OrderDirection, "Descending", None)
+        except Exception:
+            order_obj = None
+            order_direction = None
+
         try:
             def _fetch():
                 if not self.user:
                     return []
                 fav = getattr(self.user, "favorites", None)
+                if fav is None:
+                    return []
+
+                # Prefer the manual `tracks(limit, offset, order, order_direction)`
+                # path so the upstream sort is honored.  Fall back to the
+                # generic `_fetch_favorites_collection` (tracks_paginated)
+                # when the manual API isn't usable on this tidalapi version.
+                target = max(0, int(limit or 0))
+                if target <= 0:
+                    return []
+                tracks_api = getattr(fav, "tracks", None)
+                if callable(tracks_api) and order_obj is not None:
+                    page_size = min(1000, max(1, target))
+                    merged = []
+                    seen = set()
+                    offset = 0
+                    while len(merged) < target:
+                        kwargs = {
+                            "limit": page_size,
+                            "offset": offset,
+                            "order": order_obj,
+                            "order_direction": order_direction,
+                        }
+                        try:
+                            res = tracks_api(**kwargs)
+                        except TypeError:
+                            # Older tidalapi: try without order kwargs and
+                            # fall back to the generic helper at the end.
+                            merged = []
+                            break
+                        page = list((res() if callable(res) else res) or [])
+                        if not page:
+                            break
+                        new_in_page = 0
+                        for t in page:
+                            tid = str(getattr(t, "id", "") or "")
+                            if tid and tid in seen:
+                                continue
+                            if tid:
+                                seen.add(tid)
+                            merged.append(t)
+                            new_in_page += 1
+                            if len(merged) >= target:
+                                break
+                        if new_in_page == 0:
+                            logger.warning(
+                                "Favorite tracks pagination stalled at offset=%d (page=%d, no new ids); stopping.",
+                                offset,
+                                len(page),
+                            )
+                            break
+                        if len(page) < page_size:
+                            break
+                        offset += len(page)
+                    if merged:
+                        return merged[:target]
+
                 return self._fetch_favorites_collection(
                     fav,
                     paginated_attr="tracks_paginated",
                     api_attr="tracks",
                     count_attr="get_tracks_count",
-                    limit=limit,
+                    limit=target,
                     page_size=1000,
                 )
 
