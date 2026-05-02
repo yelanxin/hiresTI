@@ -200,6 +200,75 @@ impl UsbAudioSink {
         self.queue.available_read()
     }
 
+    /// One-line periodic telemetry snapshot for the V2 native_transport path.
+    ///
+    /// V1 (GstAppsink pusher) emits `usb-audio: push=…` per second from its
+    /// pusher loop in `lib.rs`.  V2 has no equivalent loop because the decode
+    /// worker runs in `native_transport::controller`, so the controller calls
+    /// this function once per second to surface the same kind of telemetry —
+    /// queue depth, in-flight count, feedback rate, ISO jitter min/max, xrun
+    /// delta.  Atomically resets the windowed min/max counters after reading
+    /// so each line covers exactly the elapsed window.
+    ///
+    /// `push_bytes_window` is the bytes the producer accepted into the queue
+    /// during `secs`; the formatter shows it as a rate.
+    pub fn telemetry_line(&self, push_bytes_window: u64, secs: f64) -> String {
+        let q_bytes = self.queue.available_read();
+        let frame_bytes = self.state.channels * self.state.bytes_per_sample;
+        let q_ms = if frame_bytes > 0 && self.state.rate > 0 {
+            (q_bytes as u64 * 1000) / (frame_bytes as u64 * self.state.rate as u64)
+        } else {
+            0
+        };
+        let xruns = self.state.xruns.load(Ordering::Relaxed);
+        let in_flight = self.state.in_flight.load(Ordering::Acquire);
+        let feedback_ms = *self
+            .state
+            .feedback_ms
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let feedback_hz = feedback_ms.map(|ms| {
+            ms as f64 * self.state.packets_per_sec as f64 / 1_000_000.0
+        });
+        let nominal_hz = self.state.rate as f64;
+        let feedback_ppm = feedback_hz.map(|hz| {
+            if nominal_hz > 0.0 {
+                (hz - nominal_hz) / nominal_hz * 1_000_000.0
+            } else {
+                0.0
+            }
+        });
+        let iso_min_us = self
+            .state
+            .iso_interval_min_us
+            .swap(u64::MAX, Ordering::Relaxed);
+        let iso_max_us = self.state.iso_interval_max_us.swap(0, Ordering::Relaxed);
+        let iso_min_display = if iso_min_us == u64::MAX { 0 } else { iso_min_us };
+        let cb_max_us = self.state.callback_max_us.swap(0, Ordering::Relaxed);
+        let jitter = self.state.iso_jitter_events.load(Ordering::Relaxed);
+        let drained = self.state.bytes_drained_total.load(Ordering::Relaxed);
+        let pkt_errs = self.state.usb_pkt_errors.load(Ordering::Relaxed);
+        format!(
+            "v2-snapshot push={:.0} B/s drained={} q={} B ({}ms) xruns={} in_flight={} \
+             fb={} pkt_errs={} iso=[{}..{}µs] jitter={} cb_max={}µs",
+            push_bytes_window as f64 / secs.max(1e-6),
+            drained,
+            q_bytes,
+            q_ms,
+            xruns,
+            in_flight,
+            feedback_hz
+                .zip(feedback_ppm)
+                .map(|(hz, ppm)| format!("{:.3}Hz({:+.1}ppm)", hz, ppm))
+                .unwrap_or_else(|| "n/a".to_string()),
+            pkt_errs,
+            iso_min_display,
+            iso_max_us,
+            jitter,
+            cb_max_us,
+        )
+    }
+
     pub fn queue_available_write(&self) -> usize {
         self.queue.available_write()
     }

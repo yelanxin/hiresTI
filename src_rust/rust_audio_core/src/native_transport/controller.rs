@@ -1650,7 +1650,13 @@ fn decode_direct_audio_stream(
     // push_slab (queue back-pressure).  Iterations slower than this
     // threshold print a breakdown so we can pinpoint stall causes from
     // user logs without needing a tracer.
-    const SLOW_ITER_THRESHOLD_MS: u128 = 50;
+    //
+    // The threshold scales with packet duration so steady-state backpressure
+    // (decoder paced to playback rate, push_ms ≈ pkt_dur_ms) doesn't get
+    // flagged.  Only iterations that take materially longer than the audio
+    // they produced are interesting.
+    const SLOW_ITER_FLOOR_MS: u128 = 50;
+    const SLOW_ITER_PKT_DUR_MULT: u128 = 2;
     let mut slow_iter_count: u64 = 0;
     let result = (|| -> Result<(), String> {
         loop {
@@ -1857,7 +1863,14 @@ fn decode_direct_audio_stream(
                 )?;
                 let push_ms = push_start.elapsed().as_millis();
                 let total_ms = iter_start.elapsed().as_millis();
-                if total_ms > SLOW_ITER_THRESHOLD_MS {
+                let pkt_dur_ms = if slab.spec.sample_rate > 0 {
+                    (pkt_dur_samples as u128 * 1000) / slab.spec.sample_rate as u128
+                } else {
+                    0
+                };
+                let slow_threshold_ms = SLOW_ITER_FLOOR_MS
+                    .max(pkt_dur_ms.saturating_mul(SLOW_ITER_PKT_DUR_MULT));
+                if total_ms > slow_threshold_ms {
                     slow_iter_count = slow_iter_count.saturating_add(1);
                     // Throttle: log first 8, then every 64th to keep noise bounded
                     // during sustained stalls without losing the steady-state count.
@@ -2217,9 +2230,36 @@ fn push_slab_to_usb_output(
     events: &Arc<Mutex<VecDeque<(i32, String)>>>,
     auto_start: &AtomicBool,
 ) -> Result<(), String> {
+    use std::cell::Cell;
     static SESSION_START: OnceLock<Instant> = OnceLock::new();
     let start = *SESSION_START.get_or_init(Instant::now);
     detect_pcm_clicks(data, cfg, sample_rate, start);
+
+    // Per-second V2 telemetry snapshot.  V1 has an equivalent line emitted from
+    // the GstAppsink pusher loop in lib.rs; V2 has no such loop, so we attach
+    // the snapshot to the decode worker's push path.  The thread-local window
+    // resets to start=Instant::now() on first call after a session begins.
+    thread_local! {
+        static SNAPSHOT_WINDOW: Cell<Option<(Instant, u64)>> = const { Cell::new(None) };
+    }
+    SNAPSHOT_WINDOW.with(|cell| {
+        let now = Instant::now();
+        let (window_start, bytes) = match cell.get() {
+            Some((t, b)) => (t, b + data.len() as u64),
+            None => (now, data.len() as u64),
+        };
+        let elapsed = now.duration_since(window_start);
+        if elapsed.as_secs() >= 1 {
+            let secs = elapsed.as_secs_f64();
+            eprintln!(
+                "native-transport: {}",
+                session.telemetry_line(bytes, secs)
+            );
+            cell.set(Some((now, 0)));
+        } else {
+            cell.set(Some((window_start, bytes)));
+        }
+    });
 
     let mut offset = 0usize;
     while offset < data.len() {
