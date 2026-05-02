@@ -2632,10 +2632,14 @@ fn write_i24_le(value: i32, out: &mut Vec<u8>) {
     out.push((value >> 16) as u8);
 }
 
-/// Download buffer capacity: 64 chunks × 32 KiB = 2 MiB.
-/// At ~1000 kbps FLAC this covers ~16 seconds of audio, absorbing
-/// typical TIDAL network jitter without stalling the decode thread.
-const DOWNLOAD_CHANNEL_CAP: usize = 64;
+/// Download buffer capacity (number of channel slots).  Each slot holds one
+/// `reader.read()` worth of bytes — typically 1.5–8 KiB on slow paths,
+/// up to 32 KiB on fast ones.  At 256 slots × ~4 KiB average → ~1 MiB
+/// runway, enough to absorb the 200–700 ms CDN setup hitches the 96 kHz
+/// user has been reporting; brief 5+ second segment-open stalls (also
+/// observed) still bottom out the channel, but those need segment-level
+/// prefetch on top of buffer size to hide.
+const DOWNLOAD_CHANNEL_CAP: usize = 256;
 const DOWNLOAD_CHUNK_SIZE: usize = 32 * 1024;
 
 /// A `Read` adapter backed by a crossbeam channel.
@@ -2969,10 +2973,23 @@ fn replace_number_token(template: &str, number: u64) -> Result<String, String> {
     Ok(template.to_string())
 }
 
+/// Result of an in-flight prefetched segment open: the open setup time
+/// and either the resulting reader or the io error.
+type PrefetchResult = (u128, std::io::Result<Box<dyn Read + Send + Sync + 'static>>);
+
 struct SegmentSequenceReader {
     segments: Vec<String>,
     current_index: usize,
     current_reader: Option<Box<dyn Read + Send + Sync + 'static>>,
+    /// One-deep background prefetch: as soon as `ensure_reader` opens
+    /// segment N (synchronously the first time, then via the prefetch
+    /// channel below), it spawns a thread to open segment N+1.  By the
+    /// time N hits EOF, N+1's TCP+TLS handshake + HTTP response-headers
+    /// wait has already overlapped with N's body delivery, so the
+    /// SegmentSequenceReader::read() that triggers the swap returns
+    /// almost immediately instead of blocking for ~80–300 ms (typical)
+    /// or several seconds (transient CDN hiccups, observed up to 5 s).
+    next_rx: Option<crossbeam_channel::Receiver<PrefetchResult>>,
     /// Bytes read from the current segment so far.  Logged at transition
     /// boundaries to make it obvious how big each Tidal segment really is.
     bytes_in_current: u64,
@@ -2989,9 +3006,45 @@ impl SegmentSequenceReader {
             segments,
             current_index: 0,
             current_reader: None,
+            next_rx: None,
             bytes_in_current: 0,
             last_setup_ms: 0,
         }
+    }
+
+    /// Spawn a background thread to open `segments[idx]` if `idx` is in
+    /// range and no prefetch is already in flight.  Logs setup time
+    /// alongside the consumer-side log so the overlap is observable.
+    fn maybe_start_prefetch(&mut self) {
+        if self.next_rx.is_some() {
+            return;
+        }
+        let idx = self.current_index;
+        if idx >= self.segments.len() {
+            return;
+        }
+        let locator = self.segments[idx].clone();
+        let total = self.segments.len();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        thread::Builder::new()
+            .name("native-transport-segment-prefetch".to_string())
+            .spawn(move || {
+                let setup_start = Instant::now();
+                let result = open_segment_reader(&locator);
+                let setup_ms = setup_start.elapsed().as_millis();
+                if let Err(ref e) = result {
+                    eprintln!(
+                        "native-transport: segment #{}/{} prefetch open failed setup={}ms err={}",
+                        idx + 1,
+                        total,
+                        setup_ms,
+                        e
+                    );
+                }
+                let _ = tx.send((setup_ms, result));
+            })
+            .ok();
+        self.next_rx = Some(rx);
     }
 
     fn ensure_reader(&mut self) -> Result<bool, std::io::Error> {
@@ -3000,21 +3053,57 @@ impl SegmentSequenceReader {
                 return Ok(false);
             }
             let idx = self.current_index;
-            let locator = self.segments[idx].clone();
             self.current_index += 1;
-            let setup_start = Instant::now();
-            let reader = open_segment_reader(&locator)?;
-            let setup_ms = setup_start.elapsed().as_millis();
-            eprintln!(
-                "native-transport: segment #{}/{} open setup={}ms prev_bytes={}",
-                idx + 1,
-                self.segments.len(),
-                setup_ms,
-                self.bytes_in_current,
-            );
+            let (setup_ms, reader) = if let Some(rx) = self.next_rx.take() {
+                let wait_start = Instant::now();
+                match rx.recv() {
+                    Ok((bg_setup_ms, Ok(reader))) => {
+                        let wait_ms = wait_start.elapsed().as_millis();
+                        // bg_setup_ms is wall-time spent in the background
+                        // thread's open(); wait_ms is how much of that was
+                        // still in flight when the consumer asked for the
+                        // next reader.  wait_ms ≈ 0 → fully overlapped;
+                        // wait_ms ≈ bg_setup_ms → no overlap (segment
+                        // body finished before open responded).
+                        eprintln!(
+                            "native-transport: segment #{}/{} open setup={}ms (prefetch wait={}ms) prev_bytes={}",
+                            idx + 1,
+                            self.segments.len(),
+                            bg_setup_ms,
+                            wait_ms,
+                            self.bytes_in_current,
+                        );
+                        (bg_setup_ms, reader)
+                    }
+                    Ok((_, Err(e))) => return Err(e),
+                    Err(_) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "segment prefetch worker dropped before producing a reader",
+                        ));
+                    }
+                }
+            } else {
+                let locator = self.segments[idx].clone();
+                let setup_start = Instant::now();
+                let reader = open_segment_reader(&locator)?;
+                let setup_ms = setup_start.elapsed().as_millis();
+                eprintln!(
+                    "native-transport: segment #{}/{} open setup={}ms prev_bytes={}",
+                    idx + 1,
+                    self.segments.len(),
+                    setup_ms,
+                    self.bytes_in_current,
+                );
+                (setup_ms, reader)
+            };
             self.bytes_in_current = 0;
             self.last_setup_ms = setup_ms;
             self.current_reader = Some(reader);
+            // Kick off the next-segment open in parallel with this segment's
+            // body delivery so the next ensure_reader() call doesn't block
+            // on a fresh HTTP setup.
+            self.maybe_start_prefetch();
         }
         Ok(true)
     }
