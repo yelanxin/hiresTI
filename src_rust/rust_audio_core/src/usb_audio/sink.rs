@@ -1544,16 +1544,27 @@ extern "system" fn feedback_in_callback(transfer: *mut libusb_transfer) {
         // pops.  Also dump queue depth + recent xrun count so a click
         // that coincides with a feedback drop has visible OUT-side
         // context on the same line.
+        //
+        // pkt_status distinguishes:
+        //   COMPLETED + pkt_actual=0  → device sent ZLP (firmware/PLL stall,
+        //                                no rate update available this slot)
+        //   ERROR / TIMED_OUT / STALL → wire- or host-level error
+        // The cause matters: ZLP is a device-side hiccup (no host fix
+        // possible, only mitigation); wire errors point at hub/cable/xHCI.
         let queue_read = ctx.state.queue.available_read();
         let xruns = ctx.state.xruns.load(Ordering::Relaxed);
         let in_flight = ctx.state.in_flight.load(Ordering::Acquire);
         eprintln!(
-            "usb-audio: feedback parse failed ep=0x{:02x} cb#{} fail#{} pkt_actual={} \
+            "usb-audio: feedback parse failed ep=0x{:02x} cb#{} fail#{} \
+             pkt_actual={} pkt_configured={} pkt_status={} transfer_actual={} \
              raw=[{}] queue_read={} xruns={} in_flight={}",
             ctx.ep,
             ctx.callbacks,
             ctx.parse_failures,
             pkt_actual_len,
+            pkt_configured_len,
+            _pkt_status,
+            transfer_len,
             format_feedback_bytes(raw_storage),
             queue_read,
             xruns,
