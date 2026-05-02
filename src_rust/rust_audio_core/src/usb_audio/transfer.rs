@@ -76,11 +76,12 @@ use super::source::TransferSource;
 
 /// Number of concurrent in-flight transfers.
 ///
-/// Ring depth = `N_TRANSFERS * N_PACKETS_TARGET_MS` ms (192 ms at the current
-/// values).  Deeper than the strict latency floor so that sporadic upstream
-/// hiccups (Tidal CDN reconnect, decoder thread preemption, GstBuffer pool
-/// boundary) do not starve the ISO ring before the queue can refill.
-pub const N_TRANSFERS: usize = 24;
+/// Ring depth = `N_TRANSFERS * N_PACKETS_TARGET_MS` ms (128 ms at the current
+/// values).  Reverted from 24 → 16 because 24 raised `target_prefill` /
+/// `min_prefill` past the V1 GstAppsink path's natural startup buffer
+/// (~185 ms with appsink `max-buffers=8`), causing the ring to never start
+/// for tracks that played fine in 1.9.2.
+pub const N_TRANSFERS: usize = 16;
 /// Target audio duration covered by one transfer, in milliseconds.
 /// Each transfer holds `N_PACKETS_TARGET_MS * packets_per_sec / 1000` ISO packets.
 /// 1ms/FS device (1000 pkt/s) → 8 packets; 125µs/HS device (8000 pkt/s) → 64 packets.
