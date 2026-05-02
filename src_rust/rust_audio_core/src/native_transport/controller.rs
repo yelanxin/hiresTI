@@ -2642,6 +2642,24 @@ fn write_i24_le(value: i32, out: &mut Vec<u8>) {
 const DOWNLOAD_CHANNEL_CAP: usize = 256;
 const DOWNLOAD_CHUNK_SIZE: usize = 32 * 1024;
 
+/// Shared ureq Agent for all native_transport HTTP calls.  ureq's default
+/// global agent caps `max_idle_connections_per_host` at 1, which directly
+/// fights the 1-deep segment prefetch: while segment N's body is still
+/// streaming through one connection, opening segment N+1 has to spin up
+/// a fresh TCP+TLS handshake every time (~80–100 ms baseline observed
+/// with 12 ms ping, vs. ~25 ms on a reused connection).  Bumping the
+/// per-host cap to 8 keeps room for the prefetch + body-streaming pair
+/// plus the manifest/probe paths without thrashing the pool.
+fn http_agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .max_idle_connections(64)
+            .max_idle_connections_per_host(8)
+            .build()
+    })
+}
+
 /// A `Read` adapter backed by a crossbeam channel.
 /// The I/O thread sends `Vec<u8>` chunks; the decode thread reads from this.
 struct ChannelReader {
@@ -2786,7 +2804,8 @@ fn open_locator_as_probe_stream(locator: &str) -> Result<MediaSourceStream, Stri
         )
     } else if locator.starts_with("http://") || locator.starts_with("https://") {
         log_cdn_host_once(locator);
-        let response = ureq::get(locator)
+        let response = http_agent()
+            .get(locator)
             .call()
             .map_err(|e| format!("native transport: HTTP open failed: {e}"))?;
         Box::new(ReadOnlySource::new(response.into_reader()))
@@ -2810,7 +2829,8 @@ fn open_locator_as_media_source_stream(
         )
     } else if locator.starts_with("http://") || locator.starts_with("https://") {
         log_cdn_host_once(locator);
-        let response = ureq::get(locator)
+        let response = http_agent()
+            .get(locator)
             .call()
             .map_err(|e| format!("native transport: HTTP open failed: {e}"))?;
         let rx = spawn_download_thread(Box::new(response.into_reader()), Arc::clone(stop));
@@ -2868,7 +2888,8 @@ fn read_locator_to_string(locator: &str) -> Result<String, String> {
             .map_err(|e| format!("native transport: manifest read failed: {e}"))?;
     } else if locator.starts_with("http://") || locator.starts_with("https://") {
         log_cdn_host_once(locator);
-        let response = ureq::get(locator)
+        let response = http_agent()
+            .get(locator)
             .call()
             .map_err(|e| format!("native transport: manifest fetch failed: {e}"))?;
         let mut reader = response.into_reader();
@@ -3145,7 +3166,8 @@ fn open_segment_reader(
     }
     if locator.starts_with("http://") || locator.starts_with("https://") {
         log_cdn_host_once(locator);
-        let response = ureq::get(locator)
+        let response = http_agent()
+            .get(locator)
             .call()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
         return Ok(response.into_reader());
