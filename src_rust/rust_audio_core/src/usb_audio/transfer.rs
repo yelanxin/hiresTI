@@ -127,18 +127,23 @@ struct TransferCtx {
 // Shared state (Arc, accessed from both event thread and main thread)
 // ---------------------------------------------------------------------------
 
-/// Duration of the linear fade-in ramp after an xrun, in samples.
-/// ~2 ms at 48 kHz.  Short enough to be inaudible but long enough to
-/// suppress the hard silence→audio transition click.
-const XRUN_FADEIN_SAMPLES: u32 = 96;
+/// Target duration of the click-suppression fade ramp, in milliseconds.
+/// The actual sample count is computed from `state.rate` at use site so
+/// the audible window stays constant across sample rates — a fixed
+/// sample count (e.g. 96) shrinks to ~1 ms at 96 kHz / ~0.5 ms at 192 kHz,
+/// which is too short to mask a hard step on FiiO USB DACs.  5 ms is the
+/// value the lydex Android player uses for the same purpose; long enough
+/// that the residual ramp endpoint is well below the noise floor (1/N for
+/// N≥220 is ≤-46 dBFS) without eating audible amounts of program material.
+const XRUN_FADE_MS: u32 = 5;
 
-/// Duration of the linear fade-out ramp applied to the last samples of a
-/// partially-filled packet before zero-padding.  Without this, the
-/// audio→silence step at `pkt_buf[got]` produces an audible pop on every
-/// underrun (FiiO USB DACs hit ~1–2 of these per song under normal load
-/// from libusb ISO scheduling jitter).  Matched to FADEIN length for
-/// symmetry — total click-suppression window ≤ 4 ms at 48 kHz.
-const XRUN_FADEOUT_SAMPLES: usize = 96;
+#[inline]
+fn xrun_fade_samples(rate_hz: u32) -> u32 {
+    // 5 ms @ rate = rate * 5 / 1000.  Cap at 1024 to keep the ramp from
+    // dominating a single transfer at unusually high rates (≥204.8 kHz).
+    let n = rate_hz.saturating_mul(XRUN_FADE_MS) / 1000;
+    n.clamp(64, 1024)
+}
 
 fn usb_audio_ignore_feedback_enabled() -> bool {
     std::env::var("HIRESTI_USB_IGNORE_FEEDBACK")
@@ -162,7 +167,7 @@ pub struct RingState {
     pub has_feedback_ep: bool,
     /// Remaining fade-in samples after an xrun recovery.
     /// Decremented in `fill_transfer`; when >0, each sample is scaled by
-    /// `(XRUN_FADEIN_SAMPLES - remaining) / XRUN_FADEIN_SAMPLES`.
+    /// `(xrun_fade_samples(rate) - remaining) / xrun_fade_samples(rate)`.
     /// Only accessed from the ISO event thread — no contention.
     pub fadein_remaining: AtomicU32,
     /// Sample rate in Hz.
@@ -671,7 +676,7 @@ unsafe fn fill_transfer(transfer: *mut libusb_transfer) {
                         state.bytes_per_sample,
                         state.sample_is_float,
                         state.channels,
-                        XRUN_FADEOUT_SAMPLES,
+                        xrun_fade_samples(state.rate) as usize,
                     );
                 }
                 pkt_buf[got..].fill(0);
@@ -690,10 +695,10 @@ unsafe fn fill_transfer(transfer: *mut libusb_transfer) {
         }
 
         if fadein_rem > 0 && got > 0 && frame_bytes > 0 {
-            let ramp_total = XRUN_FADEIN_SAMPLES;
+            let ramp_total = xrun_fade_samples(state.rate);
             let n_frames = got / frame_bytes;
             for f in 0..n_frames {
-                let pos = ramp_total - fadein_rem;
+                let pos = ramp_total.saturating_sub(fadein_rem);
                 let frame_start = f * frame_bytes;
                 apply_fadein_frame(
                     &mut pkt_buf[frame_start..frame_start + frame_bytes],
@@ -713,7 +718,7 @@ unsafe fn fill_transfer(transfer: *mut libusb_transfer) {
     }
 
     if fadein_armed {
-        fadein_rem = XRUN_FADEIN_SAMPLES;
+        fadein_rem = xrun_fade_samples(state.rate);
     }
     state.fadein_remaining.store(fadein_rem, Ordering::Relaxed);
 
@@ -1090,14 +1095,14 @@ impl IsoTransferRing {
     pub fn start(&mut self) -> Result<(), String> {
         self.state.stop.store(false, Ordering::SeqCst);
         self.state.in_flight.store(0, Ordering::SeqCst);
-        // Fade in the first ~96 samples from silence: track-start click was
-        // audible whenever the audio file's sample 0 was non-zero (most music
-        // begins above the noise floor), since the device output sat at 0 V
-        // before the ring submitted its first packet.  XRUN_FADEIN_SAMPLES
-        // is the same ramp used after underruns.
+        // Fade in the first ~5 ms from silence: track-start click was audible
+        // whenever the audio file's sample 0 was non-zero (most music begins
+        // above the noise floor), since the device output sat at 0 V before
+        // the ring submitted its first packet.  Same ramp length used after
+        // mid-stream underruns; sample count scales with the active rate.
         self.state
             .fadein_remaining
-            .store(XRUN_FADEIN_SAMPLES, Ordering::Relaxed);
+            .store(xrun_fade_samples(self.state.rate), Ordering::Relaxed);
 
         let frame_bytes = self.state.channels * self.state.bytes_per_sample;
         let bytes_per_ms = self.state.rate as usize * frame_bytes / 1000;
