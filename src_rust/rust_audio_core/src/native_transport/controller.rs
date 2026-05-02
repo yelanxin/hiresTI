@@ -1606,8 +1606,27 @@ fn decode_direct_audio_stream(
     };
 
     let mut processor_chain = PcmProcessorChain::new();
-    // Always insert DspPcmProcessor so DSP can be hot-enabled/disabled mid-track.
-    {
+    // Diagnostic: HIRESTI_DISABLE_PROCESSOR_CHAIN=1 produces a passthrough
+    // chain identical to oxidac's bit-perfect path (no DSP, no software
+    // volume, no spectrum FFT, no LUFS).  Used to isolate whether clicks
+    // observed under matching conditions on oxidac arise from the chain
+    // (CPU work on the decode worker, FFT allocations, volume rounding)
+    // rather than from the USB / DAC side.
+    let disable_chain = std::env::var("HIRESTI_DISABLE_PROCESSOR_CHAIN")
+        .ok()
+        .map(|v| {
+            let s = v.trim().to_ascii_lowercase();
+            !s.is_empty() && s != "0" && s != "false" && s != "off"
+        })
+        .unwrap_or(false);
+    if disable_chain {
+        eprintln!(
+            "[native-transport] HIRESTI_DISABLE_PROCESSOR_CHAIN=1 — chain bypassed \
+             (no DSP / volume / spectrum / LUFS)"
+        );
+        let _ = (&volume, &spectrum_tx, &spectrum_bands, &lufs_values, &dsp_config);
+    } else {
+        // Always insert DspPcmProcessor so DSP can be hot-enabled/disabled mid-track.
         let init_cfg = dsp_config.as_ref().cloned().unwrap_or_default();
         eprintln!(
             "[native-transport] inserting DspPcmProcessor (active={})",
@@ -1617,13 +1636,13 @@ fn decode_direct_audio_stream(
             &init_cfg,
             Some(Arc::clone(&dsp_config_slot)),
         )));
+        processor_chain.push(Box::new(VolumePcmProcessor::new(volume)));
+        processor_chain.push(Box::new(SpectrumPcmProcessor::new(
+            spectrum_tx,
+            spectrum_bands,
+        )));
+        processor_chain.push(Box::new(LufsPcmProcessor::new(lufs_values)));
     }
-    processor_chain.push(Box::new(VolumePcmProcessor::new(volume)));
-    processor_chain.push(Box::new(SpectrumPcmProcessor::new(
-        spectrum_tx,
-        spectrum_bands,
-    )));
-    processor_chain.push(Box::new(LufsPcmProcessor::new(lufs_values)));
     let mut chain_configured = false;
     let mut output_session: Option<UsbAudioSink> = None;
     let mut reuse_sess = reuse_session;
