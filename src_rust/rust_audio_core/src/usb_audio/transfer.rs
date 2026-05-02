@@ -132,6 +132,14 @@ struct TransferCtx {
 /// suppress the hard silence→audio transition click.
 const XRUN_FADEIN_SAMPLES: u32 = 96;
 
+/// Duration of the linear fade-out ramp applied to the last samples of a
+/// partially-filled packet before zero-padding.  Without this, the
+/// audio→silence step at `pkt_buf[got]` produces an audible pop on every
+/// underrun (FiiO USB DACs hit ~1–2 of these per song under normal load
+/// from libusb ISO scheduling jitter).  Matched to FADEIN length for
+/// symmetry — total click-suppression window ≤ 4 ms at 48 kHz.
+const XRUN_FADEOUT_SAMPLES: usize = 96;
+
 fn usb_audio_ignore_feedback_enabled() -> bool {
     std::env::var("HIRESTI_USB_IGNORE_FEEDBACK")
         .ok()
@@ -417,6 +425,45 @@ fn apply_fadein_frame(
     }
 }
 
+/// Apply a linear fade-out to the last `fade_frames` frames inside
+/// `audio[..audio_bytes]`, ramping from full scale at the start of the
+/// fade region down to near-silence at `audio[audio_bytes]`.  The trailing
+/// silence pad after `audio_bytes` is then a smooth continuation rather
+/// than a step from the last good sample to zero.
+#[inline]
+fn apply_fadeout_tail(
+    audio: &mut [u8],
+    audio_bytes: usize,
+    bytes_per_sample: usize,
+    sample_is_float: bool,
+    channels: usize,
+    fade_frames: usize,
+) {
+    let frame_bytes = channels * bytes_per_sample;
+    if frame_bytes == 0 || fade_frames == 0 || audio_bytes == 0 {
+        return;
+    }
+    let total_frames = audio_bytes / frame_bytes;
+    let n = fade_frames.min(total_frames);
+    if n == 0 {
+        return;
+    }
+    let start = (total_frames - n) * frame_bytes;
+    for i in 0..n {
+        let frame_off = start + i * frame_bytes;
+        // pos counts down from `n` to 1 across the ramp; gain = pos / n
+        // (1.0 at the start of the fade, ~1/n at the last frame).
+        let pos = (n - i) as u32;
+        apply_fadein_frame(
+            &mut audio[frame_off..frame_off + frame_bytes],
+            bytes_per_sample,
+            sample_is_float,
+            pos,
+            n as u32,
+        );
+    }
+}
+
 unsafe fn transfer_ctx<'a>(transfer: *mut libusb_transfer) -> &'a mut TransferCtx {
     &mut *((*transfer).user_data as *mut TransferCtx)
 }
@@ -617,6 +664,16 @@ unsafe fn fill_transfer(transfer: *mut libusb_transfer) {
             let got = state.queue.reserve_copy_into(pkt_buf);
             queued_bytes = queued_bytes.saturating_add(got);
             if got < bytes {
+                if got > 0 && state.primed.load(Ordering::Relaxed) {
+                    apply_fadeout_tail(
+                        pkt_buf,
+                        got,
+                        state.bytes_per_sample,
+                        state.sample_is_float,
+                        state.channels,
+                        XRUN_FADEOUT_SAMPLES,
+                    );
+                }
                 pkt_buf[got..].fill(0);
                 if state.primed.load(Ordering::Relaxed) {
                     xrun_packets += 1;
@@ -1033,6 +1090,14 @@ impl IsoTransferRing {
     pub fn start(&mut self) -> Result<(), String> {
         self.state.stop.store(false, Ordering::SeqCst);
         self.state.in_flight.store(0, Ordering::SeqCst);
+        // Fade in the first ~96 samples from silence: track-start click was
+        // audible whenever the audio file's sample 0 was non-zero (most music
+        // begins above the noise floor), since the device output sat at 0 V
+        // before the ring submitted its first packet.  XRUN_FADEIN_SAMPLES
+        // is the same ramp used after underruns.
+        self.state
+            .fadein_remaining
+            .store(XRUN_FADEIN_SAMPLES, Ordering::Relaxed);
 
         let frame_bytes = self.state.channels * self.state.bytes_per_sample;
         let bytes_per_ms = self.state.rate as usize * frame_bytes / 1000;
