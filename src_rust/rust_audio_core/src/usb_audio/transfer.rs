@@ -865,9 +865,10 @@ extern "system" fn iso_out_callback(transfer: *mut libusb_transfer) {
     }
 
     // ── ISO completion jitter measurement ──────────────────────────────
-    // Each transfer covers ~8 ms of audio.  Measure inter-completion interval
-    // and flag outliers (> 50% deviation from expected).  This detects xHCI
-    // scheduling hiccups that could cause device-side FIFO gaps.
+    // Each transfer covers ~8 ms of audio.  Flag outliers > 25% deviation
+    // (so 8 ms ± 2 ms instead of ± 4 ms) — small xHCI scheduling slips of
+    // 3-6 ms are below an audible "click" but enough to cause the "very
+    // small pause" the user reports on 96 kHz, so we want to see those.
     {
         let now_ns = clock_monotonic_ns();
         let prev_ns = state.last_completion_ns.swap(now_ns, Ordering::Relaxed);
@@ -877,8 +878,8 @@ extern "system" fn iso_out_callback(transfer: *mut libusb_transfer) {
             // Expected interval: n_packets * 1_000_000 / packets_per_sec µs
             // For 64 packets @ 8000 pkt/s = 8000 µs (8 ms)
             let expected_us = n_pkt as u64 * 1_000_000 / state.packets_per_sec as u64;
-            let threshold_lo = expected_us / 2; // 4 ms
-            let threshold_hi = expected_us * 3 / 2; // 12 ms
+            let threshold_lo = expected_us * 3 / 4; // -25% (e.g. 6 ms for 8 ms expected)
+            let threshold_hi = expected_us * 5 / 4; // +25% (e.g. 10 ms for 8 ms expected)
 
             // Update min/max atomically (best-effort, no CAS loop needed for diagnostics).
             let cur_max = state.iso_interval_max_us.load(Ordering::Relaxed);
