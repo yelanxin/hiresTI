@@ -1,5 +1,6 @@
 from threading import Thread
 import logging
+import os
 import time
 
 from gi.repository import Gtk, GLib
@@ -365,6 +366,15 @@ def play_track(app, index):
                 _apply_track_redirect(app, track)
                 bit_depth = int(getattr(app.backend, "_last_stream_bit_depth", 0) or 0)
                 sample_rate = int(getattr(app.backend, "_last_stream_sample_rate", 0) or 0)
+
+            local_override = os.environ.get("HIRESTI_LOCAL_URI", "").strip()
+            if local_override:
+                if not local_override.startswith("file://"):
+                    local_override = "file://" + os.path.abspath(os.path.expanduser(local_override))
+                logger.warning("HIRESTI_LOCAL_URI override: %s", local_override)
+                url = local_override
+                bit_depth = 0
+                sample_rate = 0
 
             if url and max_tracks > 0 and str(url).startswith("http"):
                 Thread(

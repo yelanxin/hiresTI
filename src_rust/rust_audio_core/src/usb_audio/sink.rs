@@ -248,9 +248,10 @@ impl UsbAudioSink {
         let jitter = self.state.iso_jitter_events.load(Ordering::Relaxed);
         let drained = self.state.bytes_drained_total.load(Ordering::Relaxed);
         let pkt_errs = self.state.usb_pkt_errors.load(Ordering::Relaxed);
+        let parse_fails = self.state.feedback_parse_fails.load(Ordering::Relaxed);
         format!(
             "v2-snapshot push={:.0} B/s drained={} q={} B ({}ms) xruns={} in_flight={} \
-             fb={} pkt_errs={} iso=[{}..{}µs] jitter={} cb_max={}µs",
+             fb={} pkt_errs={} parse_fails={} iso=[{}..{}µs] jitter={} cb_max={}µs",
             push_bytes_window as f64 / secs.max(1e-6),
             drained,
             q_bytes,
@@ -262,6 +263,7 @@ impl UsbAudioSink {
                 .map(|(hz, ppm)| format!("{:.3}Hz({:+.1}ppm)", hz, ppm))
                 .unwrap_or_else(|| "n/a".to_string()),
             pkt_errs,
+            parse_fails,
             iso_min_display,
             iso_max_us,
             jitter,
@@ -271,6 +273,36 @@ impl UsbAudioSink {
 
     pub fn queue_available_write(&self) -> usize {
         self.queue.available_write()
+    }
+
+    /// One-line counter snapshot that only touches `Arc<RingState>` atomics —
+    /// no Mutex locking, no `&UsbAudioSink` borrow.  Suitable for a polling
+    /// thread that runs independently of the decode worker, so emitting it
+    /// can never stall decoding.  Fields are a strict subset of
+    /// `telemetry_line`: queue depth and feedback_hz are omitted because they
+    /// require borrowing the sink (queue) or taking a Mutex (feedback_ms).
+    pub fn snapshot_from_state(state: &RingState) -> String {
+        let xruns = state.xruns.load(Ordering::Relaxed);
+        let in_flight = state.in_flight.load(Ordering::Acquire);
+        let iso_min_us = state.iso_interval_min_us.swap(u64::MAX, Ordering::Relaxed);
+        let iso_max_us = state.iso_interval_max_us.swap(0, Ordering::Relaxed);
+        let iso_min_display = if iso_min_us == u64::MAX { 0 } else { iso_min_us };
+        let cb_max_us = state.callback_max_us.swap(0, Ordering::Relaxed);
+        let jitter = state.iso_jitter_events.load(Ordering::Relaxed);
+        let drained = state.bytes_drained_total.load(Ordering::Relaxed);
+        let pkt_errs = state.usb_pkt_errors.load(Ordering::Relaxed);
+        let parse_fails = state.feedback_parse_fails.load(Ordering::Relaxed);
+        let short_pkts = state.usb_short_pkt_log_count.load(Ordering::Relaxed);
+        let dq_under = state
+            .direct_queue_underrun_fallbacks
+            .load(Ordering::Relaxed);
+        let dq_wrap = state.direct_queue_wrap_fallbacks.load(Ordering::Relaxed);
+        format!(
+            "v2-poll drained={drained} xruns={xruns} in_flight={in_flight} \
+             pkt_errs={pkt_errs} parse_fails={parse_fails} short_pkts={short_pkts} \
+             dq_under={dq_under} dq_wrap={dq_wrap} \
+             iso=[{iso_min_display}..{iso_max_us}µs] jitter={jitter} cb_max={cb_max_us}µs"
+        )
     }
 
     pub fn source_kind(&self) -> &'static str {
@@ -1538,36 +1570,26 @@ extern "system" fn feedback_in_callback(transfer: *mut libusb_transfer) {
         }
     } else {
         ctx.parse_failures = ctx.parse_failures.saturating_add(1);
-        // Match oxidac's throttle exactly.  feedback_in_callback runs on the
-        // libusb event thread (SCHED_FIFO 70) which also handles ISO OUT
-        // completion callbacks.  An unthrottled eprintln on this thread is
-        // a blocking I/O call: stderr lock + pipe write + potential kernel
-        // transition can take 0.5-5 ms, well over the 0.125 ms ISO microframe
-        // budget.  Each parse-fail log delays the next OUT completion so the
-        // host misses a microframe slot — the device receives a gap and
-        // produces an audible click.  The earlier "log every parse fail"
-        // throttle (added to hunt the click) was itself causing the click.
-        if ctx.parse_failures <= 2 || (ctx.parse_failures % 4096 == 0) {
-            let queue_read = ctx.state.queue.available_read();
-            let xruns = ctx.state.xruns.load(Ordering::Relaxed);
-            let in_flight = ctx.state.in_flight.load(Ordering::Acquire);
-            eprintln!(
-                "usb-audio: feedback parse failed ep=0x{:02x} cb#{} fail#{} \
-                 pkt_actual={} pkt_configured={} pkt_status={} transfer_actual={} \
-                 raw=[{}] queue_read={} xruns={} in_flight={}",
-                ctx.ep,
-                ctx.callbacks,
-                ctx.parse_failures,
-                pkt_actual_len,
-                pkt_configured_len,
-                _pkt_status,
-                transfer_len,
-                format_feedback_bytes(raw_storage),
-                queue_read,
-                xruns,
-                in_flight,
-            );
-        }
+        // Increment a shared counter the periodic v2-snapshot can read.
+        // We deliberately do NOT eprintln here — feedback_in_callback runs on
+        // the libusb event thread (SCHED_FIFO 70) which also handles ISO OUT
+        // completion callbacks, and any blocking I/O on this thread (stderr
+        // lock + pipe write + potential kernel transition, 0.5-5 ms) would
+        // delay the next OUT completion past its 0.125 ms microframe budget,
+        // causing the host to miss a slot — i.e. the very click we'd be
+        // logging would be caused by the act of logging.  All diagnostic
+        // visibility for parse failures comes from the v2-snapshot's
+        // `parse_fails=N` counter, which is read on a non-RT thread.
+        ctx.state
+            .feedback_parse_fails
+            .fetch_add(1, Ordering::Relaxed);
+        let _ = (
+            pkt_actual_len,
+            pkt_configured_len,
+            _pkt_status,
+            transfer_len,
+            raw_storage,
+        );
     }
 
     // Re-check stop before resubmitting to avoid re-arming the transfer after

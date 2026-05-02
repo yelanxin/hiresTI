@@ -1648,6 +1648,12 @@ fn decode_direct_audio_stream(
     let mut reuse_sess = reuse_session;
     let mut pre_handle = pre_claimed_handle;
     let mut reuse_buf: Vec<u8> = Vec::new();
+    // Counter-snapshot polling thread: runs on its own non-RT thread, reads
+    // only `Arc<RingState>` atomics, no Mutex.  Spawned the first time a USB
+    // session is created so we get visibility into xruns/jitter/pkt_errs
+    // without adding any work to the decode worker or libusb event thread.
+    // Joined when the decode worker exits via `stop` signal.
+    let mut snapshot_join: Option<thread::JoinHandle<()>> = None;
     // Scratch buffer used to zero-pad stereo (or N-channel) source data
     // out to the device channel count when the DAC has no matching alt
     // setting (e.g., MOTU 4-channel-only audio interfaces fed Tidal
@@ -1820,6 +1826,26 @@ fn decode_direct_audio_stream(
                     // Notify Python layer that USB audio is configured so
                     // the hw-volume UI can sync with the actual DAC state.
                     queue_native_event(events, crate::EVT_STATE, "usb-audio configured");
+                    if snapshot_join.is_none() {
+                        let snap_state =
+                            Arc::clone(&output_session.as_ref().unwrap().state);
+                        let snap_stop = Arc::clone(stop);
+                        snapshot_join = thread::Builder::new()
+                            .name("native-transport-snapshot".to_string())
+                            .spawn(move || {
+                                while !snap_stop.load(Ordering::Acquire) {
+                                    thread::sleep(std::time::Duration::from_secs(1));
+                                    if snap_stop.load(Ordering::Acquire) {
+                                        break;
+                                    }
+                                    eprintln!(
+                                        "native-transport: {}",
+                                        UsbAudioSink::snapshot_from_state(&snap_state)
+                                    );
+                                }
+                            })
+                            .ok();
+                    }
                 }
                 // Zero-pad upmix: when the device has more channels than
                 // the source (e.g., MOTU 4-channel-only interface, stereo
@@ -1914,6 +1940,15 @@ fn decode_direct_audio_stream(
             reuse_buf = slab.data;
         }
     })();
+
+    // Stop the snapshot polling thread (non-RT diagnostic) before parking
+    // the session.  The thread checks `stop` each loop, so we just signal
+    // and join — sleep(1s) means worst case 1s teardown latency, which is
+    // fine for a diagnostic thread.
+    if let Some(handle) = snapshot_join.take() {
+        stop.store(true, Ordering::Release);
+        let _ = handle.join();
+    }
 
     // Park the USB session in the shared slot so the transport_worker can
     // keep the interface claimed between track switches.
@@ -2125,122 +2160,6 @@ fn configure_session_feed(session: &UsbAudioSink, cfg: &UsbRawSinkConfig) -> Clo
     clock_mode
 }
 
-/// Sample-level click detector for the V2 PCM path.
-///
-/// Runs on the decode worker thread before bytes enter the USB queue, so any
-/// spike found here is purely a property of the decoded/processed PCM —
-/// before USB transfer scheduling, feedback rate adjustment, or any
-/// device-side artifact gets a chance to influence it.
-///
-/// Uses the standard 3-sample midpoint test: a spike at `n-1` is flagged when
-/// `|sample[n-1] - (sample[n-2] + sample[n]) / 2|` exceeds CLICK_THRESHOLD.
-/// Threshold is i32::MAX / 16 — catches sample-level pops without false
-/// positives on legitimate transients (snare hits etc.).
-///
-/// State is per-thread; first ~2 samples per session pass without check while
-/// the history fills.  Track-switch in the same worker may emit a single false
-/// positive at the boundary — acceptable cost for diagnostic value.
-fn detect_pcm_clicks(
-    data: &[u8],
-    cfg: &UsbRawSinkConfig,
-    sample_rate: u32,
-    session_start: Instant,
-) {
-    use std::cell::RefCell;
-    const CLICK_THRESHOLD: i64 = (i32::MAX as i64) / 16;
-    const MAX_CHANNELS: usize = 8;
-    thread_local! {
-        // Per-channel history: [prev2, prev1].  history_count starts at 0,
-        // increments to 2, then stays.  click_count is monotonic across the
-        // worker's lifetime.
-        static STATE: RefCell<([[i32; 2]; MAX_CHANNELS], u32, u64, u64)> =
-            const { RefCell::new(([[0; 2]; MAX_CHANNELS], 0, 0, 0)) };
-    }
-
-    let channels = cfg.channels as usize;
-    if channels == 0 || channels > MAX_CHANNELS {
-        return;
-    }
-    let bps = match cfg.gst_format.as_str() {
-        "S16LE" | "S16BE" | "U16LE" | "U16BE" => 2usize,
-        "S24_3LE" | "S24_3BE" => 3usize,
-        _ => 4usize,
-    };
-    let frame_bytes = channels * bps;
-    if frame_bytes == 0 || data.len() < frame_bytes {
-        return;
-    }
-    let n_frames = data.len() / frame_bytes;
-    if n_frames == 0 {
-        return;
-    }
-
-    STATE.with(|st| {
-        let mut s = st.borrow_mut();
-        let s = &mut *s;
-        let hist = &mut s.0;
-        let hist_count = &mut s.1;
-        let click_count = &mut s.2;
-        let frame_pos = &mut s.3;
-        for f in 0..n_frames {
-            for c in 0..channels {
-                let off = f * frame_bytes + c * bps;
-                let cur = match bps {
-                    2 => {
-                        let v = i16::from_le_bytes([data[off], data[off + 1]]) as i32;
-                        v << 16
-                    }
-                    3 => {
-                        let v = (data[off] as i32)
-                            | ((data[off + 1] as i32) << 8)
-                            | ((data[off + 2] as i32) << 16);
-                        // sign-extend 24 -> 32, then shift up to align with i32
-                        let v = (v << 8) >> 8;
-                        v << 8
-                    }
-                    _ => i32::from_le_bytes([
-                        data[off],
-                        data[off + 1],
-                        data[off + 2],
-                        data[off + 3],
-                    ]),
-                };
-                if *hist_count >= 2 {
-                    let prev2 = hist[c][0] as i64;
-                    let prev1 = hist[c][1] as i64;
-                    let mid = (prev2 + cur as i64) / 2;
-                    let dev = (prev1 - mid).abs();
-                    if dev > CLICK_THRESHOLD {
-                        *click_count += 1;
-                        if *click_count <= 32 || (*click_count % 64 == 0) {
-                            let playback_sec = session_start.elapsed().as_secs_f64();
-                            eprintln!(
-                                "native-transport: PCM spike #{} ch={} frame@{} sr={} \
-                                 samples=[{}, {}, {}] dev={} @{:.2}s",
-                                *click_count,
-                                c,
-                                *frame_pos + f as u64,
-                                sample_rate,
-                                hist[c][0],
-                                hist[c][1],
-                                cur,
-                                dev,
-                                playback_sec,
-                            );
-                        }
-                    }
-                }
-                hist[c][0] = hist[c][1];
-                hist[c][1] = cur;
-            }
-            if *hist_count < 2 {
-                *hist_count += 1;
-            }
-        }
-        *frame_pos = frame_pos.saturating_add(n_frames as u64);
-    });
-}
-
 fn push_slab_to_usb_output(
     session: &mut UsbAudioSink,
     cfg: &UsbRawSinkConfig,
@@ -2249,37 +2168,6 @@ fn push_slab_to_usb_output(
     events: &Arc<Mutex<VecDeque<(i32, String)>>>,
     auto_start: &AtomicBool,
 ) -> Result<(), String> {
-    use std::cell::Cell;
-    static SESSION_START: OnceLock<Instant> = OnceLock::new();
-    let start = *SESSION_START.get_or_init(Instant::now);
-    detect_pcm_clicks(data, cfg, sample_rate, start);
-
-    // Per-second V2 telemetry snapshot.  V1 has an equivalent line emitted from
-    // the GstAppsink pusher loop in lib.rs; V2 has no such loop, so we attach
-    // the snapshot to the decode worker's push path.  The thread-local window
-    // resets to start=Instant::now() on first call after a session begins.
-    thread_local! {
-        static SNAPSHOT_WINDOW: Cell<Option<(Instant, u64)>> = const { Cell::new(None) };
-    }
-    SNAPSHOT_WINDOW.with(|cell| {
-        let now = Instant::now();
-        let (window_start, bytes) = match cell.get() {
-            Some((t, b)) => (t, b + data.len() as u64),
-            None => (now, data.len() as u64),
-        };
-        let elapsed = now.duration_since(window_start);
-        if elapsed.as_secs() >= 1 {
-            let secs = elapsed.as_secs_f64();
-            eprintln!(
-                "native-transport: {}",
-                session.telemetry_line(bytes, secs)
-            );
-            cell.set(Some((now, 0)));
-        } else {
-            cell.set(Some((window_start, bytes)));
-        }
-    });
-
     let mut offset = 0usize;
     while offset < data.len() {
         let written = session.push_bytes(&data[offset..]);

@@ -207,6 +207,14 @@ pub struct RingState {
     /// received no audio for that ~0.125 ms slot — audible as a brief pop.
     /// Distinct from `xruns` (which counts queue underruns, not USB errors).
     pub usb_pkt_errors: AtomicU64,
+    /// Count of feedback IN packets where parse_feedback_uac2 returned None
+    /// (zero-length payload or truncated buf).  Two distinct causes share
+    /// this counter — `pkt_status==COMPLETED && pkt_actual==0` is a device
+    /// ZLP (firmware/PLL stall, no rate ready); `pkt_status==ERROR` is a
+    /// wire/host-stack issue.  feedback_in_callback increments this from
+    /// the libusb event thread, telemetry_line reads it on the decode
+    /// worker thread; no eprintln on the event thread.
+    pub feedback_parse_fails: AtomicU64,
     /// Calibrated millisamples per ISO packet derived from `AlsaHwClockFeed`.
     ///
     /// Updated by `iso_out_callback` once the rate calibrator has converged.
@@ -248,8 +256,12 @@ pub struct RingState {
     /// Minimum observed inter-completion interval (µs) since last diagnostic
     /// snapshot.  Reset to u64::MAX by the pusher thread after each log line.
     pub iso_interval_min_us: AtomicU64,
-    /// Throttle counter for short-packet log messages in the ISO callback.
-    usb_short_pkt_log_count: AtomicU64,
+    /// Counter for ISO OUT short-packet events: device accepted fewer bytes
+    /// than the host submitted in this transfer.  Increments once per affected
+    /// transfer (not per packet).  An audible "lost samples" symptom even if
+    /// `xruns` stays at 0, since the missing bytes are simply gone from the
+    /// device's playback timeline.
+    pub usb_short_pkt_log_count: AtomicU64,
     /// Maximum callback latency (µs) — time spent inside `iso_out_callback`
     /// from entry to post-resubmit.  Reset by the pusher thread after each
     /// diagnostic snapshot.  A high value indicates the event thread was
@@ -339,6 +351,7 @@ impl RingState {
             xruns: AtomicU64::new(0),
             bytes_drained_total: AtomicU64::new(0),
             usb_pkt_errors: AtomicU64::new(0),
+            feedback_parse_fails: AtomicU64::new(0),
             calibrated_ms: AtomicU64::new(0),
             feedback_in_flight: AtomicBool::new(false),
             drift_window_start_ns: AtomicU64::new(0),
@@ -504,70 +517,29 @@ fn release_completed_transfer_bytes(ctx: &mut TransferCtx) {
     ctx.queued_bytes = 0;
 }
 
-fn queue_direct_log(count: u64, slot: usize, bytes: usize) {
-    if count <= 4 || count % 4096 == 0 {
-        eprintln!(
-            "usb-audio: direct queue lease #{} slot={} bytes={} (no queue->transfer copy)",
-            count, slot, bytes,
-        );
-    }
+fn queue_direct_log(_count: u64, _slot: usize, _bytes: usize) {
+    // Intentional no-op.  Counter `direct_queue_submits` is bumped at the
+    // call site; that's the diagnostic record.  Earlier this function did a
+    // throttled `eprintln!` from inside `iso_out_callback`, but every such
+    // print runs on the libusb event thread (SCHED_FIFO 70) which also drives
+    // ISO OUT completions: a stderr lock + pipe write can stall the thread
+    // long enough to delay the next OUT completion past its 0.125 ms
+    // microframe budget — a missed slot becomes an audible click.  Surface
+    // the count via the v2-poll snapshot (read on a non-RT thread) instead.
 }
 
 fn queue_fallback_log(
-    state: &RingState,
-    label: &str,
-    count: u64,
-    slot: usize,
-    total_bytes: usize,
-    assign_avail: usize,
+    _state: &RingState,
+    _label: &str,
+    _count: u64,
+    _slot: usize,
+    _total_bytes: usize,
+    _assign_avail: usize,
 ) {
-    if count <= 4 || count % 1024 == 0 {
-        // Match oxidac throttle.  Diagnostic context: was the upstream
-        // pusher slow when the queue dried up?  `pull_ago` / `push_ago`
-        // large -> upstream stall (Tidal CDN reconnect / decoder thread
-        // preemption / GstBuffer pool).
-        // Both small -> downstream issue (ring drained faster than expected).
-        // V1 (GstAppsink) populates pull telemetry; V2 (native_transport)
-        // populates push telemetry — so a "never" on one with a recent value
-        // on the other identifies the active path.
-        let now_ns = clock_monotonic_ns();
-        let last_pull_at = state.last_pull_at_ns.load(Ordering::Relaxed);
-        let pull_ago_ms = if last_pull_at > 0 && now_ns >= last_pull_at {
-            (now_ns - last_pull_at) / 1_000_000
-        } else {
-            u64::MAX
-        };
-        let last_pull_ms = state.last_pull_ms.load(Ordering::Relaxed);
-        let last_push_at = state.last_push_at_ns.load(Ordering::Relaxed);
-        let push_ago_ms = if last_push_at > 0 && now_ns >= last_push_at {
-            (now_ns - last_push_at) / 1_000_000
-        } else {
-            u64::MAX
-        };
-        let last_push_size = state.last_push_size.load(Ordering::Relaxed);
-        let total_pushed = state.total_pushed_bytes.load(Ordering::Relaxed);
-        let queue_read = state.queue.available_read();
-        let in_flight = state.in_flight.load(Ordering::Acquire);
-        let pull_ago_s = if pull_ago_ms == u64::MAX {
-            "never".to_string()
-        } else {
-            format!("{}ms", pull_ago_ms)
-        };
-        let push_ago_s = if push_ago_ms == u64::MAX {
-            "never".to_string()
-        } else {
-            format!("{}ms", push_ago_ms)
-        };
-        eprintln!(
-            "usb-audio: direct queue fallback {} #{} slot={} bytes={} \
-             assign_avail={} queue_read={} in_flight={} \
-             last_pull_ago={} last_pull_took={}ms \
-             last_push_ago={} last_push_size={} total_pushed={}",
-            label, count, slot, total_bytes, assign_avail,
-            queue_read, in_flight, pull_ago_s, last_pull_ms,
-            push_ago_s, last_push_size, total_pushed,
-        );
-    }
+    // Intentional no-op.  Counters `direct_queue_wrap_fallbacks` /
+    // `direct_queue_underrun_fallbacks` are bumped at the call site and
+    // surface via the v2-poll snapshot.  See the matching note in
+    // `queue_direct_log` for why we don't `eprintln!` from the event thread.
 }
 
 /// Prepare the next transfer payload from [`FrameQueue`], setting each ISO
@@ -792,20 +764,12 @@ extern "system" fn iso_out_callback(transfer: *mut libusb_transfer) {
         }
     }
     if short_pkts > 0 {
-        let count = state.usb_short_pkt_log_count.fetch_add(1, Ordering::Relaxed) + 1;
-        // Match oxidac throttle: stderr writes on the libusb event thread
-        // are blocking I/O that can delay the next ISO OUT completion past
-        // its 0.125 ms microframe budget, producing the very click we're
-        // trying to log.
-        if count <= 4 || count % 256 == 0 {
-            eprintln!(
-                "usb-audio: ISO OUT short packets: {}/{} in this transfer (queue={} B, event #{})",
-                short_pkts,
-                n_pkt,
-                state.queue.available_read(),
-                count,
-            );
-        }
+        // Counter only — see ISO jitter / parse-fail comments below.
+        // Visible in v2-snapshot via `usb_short_pkt_log_count` if needed
+        // later; today we just keep it for diagnostics on a non-RT thread.
+        state
+            .usb_short_pkt_log_count
+            .fetch_add(1, Ordering::Relaxed);
     }
     if bad_pkts > 0 {
         let total_errors_before = state.usb_pkt_errors.fetch_add(bad_pkts, Ordering::Relaxed);
@@ -836,41 +800,15 @@ extern "system" fn iso_out_callback(transfer: *mut libusb_transfer) {
                 let count = state.drift_window_count.fetch_add(1, Ordering::Relaxed) + 1;
                 if count >= MIN_ERRORS {
                     // Confirmed: repeated errors within window → device FIFO underflow.
+                    // Bump drift but DO NOT eprintln from event thread.
                     let mut adapter = state.rate_adapter.lock().unwrap_or_else(|e| e.into_inner());
-                    let old_ppb = adapter.drift_correction_ppb();
                     adapter.bump_drift(DRIFT_BUMP_PPB);
-                    eprintln!(
-                        "usb-audio: device FIFO underflow inferred ({} errors in window) — \
-                         drift correction {} → {} ppb  (queue={} B, bad_pkts={}/{})",
-                        count,
-                        old_ppb,
-                        adapter.drift_correction_ppb(),
-                        queue_bytes,
-                        bad_pkts,
-                        n_pkt,
-                    );
-                    // Reset window after bump.
                     state.drift_window_start_ns.store(0, Ordering::Relaxed);
                     state.drift_window_count.store(0, Ordering::Relaxed);
                 }
             }
-        } else {
-            let total = total_errors_before + bad_pkts;
-            // Match oxidac throttle (4 + every 256th).  See short-packet
-            // throttle comment above: unthrottled stderr on the event
-            // thread is itself a click cause.
-            if total <= 4 || total % 256 == 0 {
-                eprintln!(
-                    "usb-audio: ISO OUT packet errors: {}/{} bad in this transfer (total={})  \
-                     queue={} B  feedback={:?}",
-                    bad_pkts,
-                    n_pkt,
-                    total,
-                    queue_bytes,
-                    feedback.map(|v| v / 1000),
-                );
-            }
         }
+        let _ = total_errors_before;
     }
 
     // ── ISO completion jitter measurement ──────────────────────────────
@@ -901,21 +839,13 @@ extern "system" fn iso_out_callback(transfer: *mut libusb_transfer) {
             }
 
             if delta_us < threshold_lo || delta_us > threshold_hi {
-                let jitter_count = state.iso_jitter_events.fetch_add(1, Ordering::Relaxed) + 1;
-                // Match oxidac throttle (8 + every 64th).  See short-packet
-                // throttle comment above: unthrottled stderr on the libusb
-                // event thread is itself a click cause.
-                if jitter_count <= 8 || (jitter_count % 64 == 0) {
-                    let queue_bytes = state.queue.available_read();
-                    eprintln!(
-                        "usb-audio: ISO jitter #{}: interval={}µs expected={}µs (delta={:+}µs) queue={} B",
-                        jitter_count,
-                        delta_us,
-                        expected_us,
-                        delta_us as i64 - expected_us as i64,
-                        queue_bytes,
-                    );
-                }
+                // Counter only.  v2-snapshot exposes the cumulative
+                // `jitter=N` field plus the windowed iso=[min..max] range,
+                // so a per-event eprintln on the event thread isn't
+                // needed — and would itself cause the click it'd be
+                // logging by blocking on stderr long enough to delay the
+                // next OUT completion past its microframe budget.
+                state.iso_jitter_events.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
