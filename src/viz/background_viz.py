@@ -449,6 +449,7 @@ class _BackgroundVisualizerGL(Gtk.GLArea, _BackgroundCommon):
                 self._program = gl_shaders.compileProgram(
                     gl_shaders.compileShader(vs_src, GL.GL_VERTEX_SHADER),
                     gl_shaders.compileShader(fs_src, GL.GL_FRAGMENT_SHADER),
+                    validate=False,
                 )
                 logger.info("Lyrics background GL shader selected: %s", label)
                 break

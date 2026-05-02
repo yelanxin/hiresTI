@@ -4184,6 +4184,7 @@ class DotsGLVisualizer(Gtk.GLArea):
                 self._program = gl_shaders.compileProgram(
                     gl_shaders.compileShader(vs, GL.GL_VERTEX_SHADER),
                     gl_shaders.compileShader(fs, GL.GL_FRAGMENT_SHADER),
+                    validate=False,
                 )
                 logger.info("DotsGL shader: GLSL %s", label)
                 break
@@ -5328,6 +5329,7 @@ class BarsGLVisualizer(Gtk.GLArea):
                 self._program = gl_shaders.compileProgram(
                     gl_shaders.compileShader(vs, GL.GL_VERTEX_SHADER),
                     gl_shaders.compileShader(fs, GL.GL_FRAGMENT_SHADER),
+                    validate=False,
                 )
                 logger.info("BarsGL shader: GLSL %s", label)
                 break
