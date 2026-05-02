@@ -1469,16 +1469,27 @@ extern "system" fn feedback_in_callback(transfer: *mut libusb_transfer) {
         }
     } else {
         ctx.parse_failures = ctx.parse_failures.saturating_add(1);
-        if ctx.parse_failures <= 2 || (ctx.parse_failures % 4096 == 0) {
-            eprintln!(
-                "usb-audio: feedback parse failed ep=0x{:02x} cb#{} fail#{} pkt_actual={} raw=[{}]",
-                ctx.ep,
-                ctx.callbacks,
-                ctx.parse_failures,
-                pkt_actual_len,
-                format_feedback_bytes(raw_storage),
-            );
-        }
+        // Log every parse failure (no throttle) while hunting the 96 kHz
+        // click — pkt_actual=0 events are rare (~1 per 40k feedback cbs)
+        // and the user wants every occurrence correlated with audible
+        // pops.  Also dump queue depth + recent xrun count so a click
+        // that coincides with a feedback drop has visible OUT-side
+        // context on the same line.
+        let queue_read = ctx.state.queue.available_read();
+        let xruns = ctx.state.xruns.load(Ordering::Relaxed);
+        let in_flight = ctx.state.in_flight.load(Ordering::Acquire);
+        eprintln!(
+            "usb-audio: feedback parse failed ep=0x{:02x} cb#{} fail#{} pkt_actual={} \
+             raw=[{}] queue_read={} xruns={} in_flight={}",
+            ctx.ep,
+            ctx.callbacks,
+            ctx.parse_failures,
+            pkt_actual_len,
+            format_feedback_bytes(raw_storage),
+            queue_read,
+            xruns,
+            in_flight,
+        );
     }
 
     // Re-check stop before resubmitting to avoid re-arming the transfer after
