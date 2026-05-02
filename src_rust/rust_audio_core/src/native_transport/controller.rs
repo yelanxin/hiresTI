@@ -2698,46 +2698,35 @@ fn spawn_download_thread(
     thread::Builder::new()
         .name("native-transport-download".to_string())
         .spawn(move || {
-            // Aggregate small TCP reads into full DOWNLOAD_CHUNK_SIZE chunks
-            // before sending through the bounded channel.  Without this,
-            // reader.read() on a TCP-backed HTTP body typically returns one
-            // MSS (~1448 B) per call, so DOWNLOAD_CHANNEL_CAP × MSS becomes
-            // ~96 KiB instead of the intended 2 MiB — far too small to
-            // absorb Tidal CDN delivery jitter (observed 200-700 ms stalls
-            // on otherwise healthy connections).
+            // Forward each TCP read straight through.  Earlier we batched up
+            // to DOWNLOAD_CHUNK_SIZE before sending, intending to grow the
+            // effective channel buffer from ~96 KiB (64 × MSS) to ~2 MiB.
+            // On a slow CDN that becomes head-of-line blocking: the decoder
+            // gets nothing for the 300–600 ms it takes to accumulate 32 KiB
+            // and underruns immediately.  On a healthy CDN, reader.read()
+            // already returns large blocks (kernel TCP coalescing), so
+            // skipping the aggregation costs nothing there but keeps small
+            // reads flowing on jittery networks.
             let mut buf = vec![0u8; DOWNLOAD_CHUNK_SIZE];
-            let mut filled = 0usize;
-            let mut eof = false;
             loop {
                 if stop.load(Ordering::Relaxed) {
                     return;
                 }
-                while filled < DOWNLOAD_CHUNK_SIZE {
-                    if stop.load(Ordering::Relaxed) {
+                match reader.read(&mut buf) {
+                    Ok(0) => {
+                        let _ = tx.send(Vec::new());
                         return;
                     }
-                    match reader.read(&mut buf[filled..]) {
-                        Ok(0) => {
-                            eof = true;
-                            break;
-                        }
-                        Ok(n) => filled += n,
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                        Err(_) => {
-                            eof = true;
-                            break;
+                    Ok(n) => {
+                        if tx.send(buf[..n].to_vec()).is_err() {
+                            return; // Receiver dropped.
                         }
                     }
-                }
-                if filled > 0 {
-                    if tx.send(buf[..filled].to_vec()).is_err() {
-                        return; // Receiver dropped.
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => {
+                        let _ = tx.send(Vec::new());
+                        return;
                     }
-                    filled = 0;
-                }
-                if eof {
-                    let _ = tx.send(Vec::new());
-                    return;
                 }
             }
         })
