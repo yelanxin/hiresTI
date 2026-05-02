@@ -76,12 +76,17 @@ use super::source::TransferSource;
 
 /// Number of concurrent in-flight transfers.
 ///
-/// Ring depth = `N_TRANSFERS * N_PACKETS_TARGET_MS` ms (128 ms at the current
-/// values).  Reverted from 24 → 16 because 24 raised `target_prefill` /
-/// `min_prefill` past the V1 GstAppsink path's natural startup buffer
-/// (~185 ms with appsink `max-buffers=8`), causing the ring to never start
-/// for tracks that played fine in 1.9.2.
-pub const N_TRANSFERS: usize = 16;
+/// Ring depth = `N_TRANSFERS * N_PACKETS_TARGET_MS` ms (192 ms at the current
+/// values).  Matches oxidac, which plays the same FLAC on the same FiiO DAC
+/// click-free under V2.  Earlier hiresTI dropped to 16 to keep
+/// `target_prefill` below the V1 GstAppsink natural startup buffer (~185 ms
+/// with appsink max-buffers=8), but the V1 force-start fallback
+/// (`min_prefill = target_prefill / 2 ≈ 96 ms`) covers that case, and the
+/// extra in-flight depth gives the device's audio FIFO substantially more
+/// headroom to absorb sporadic xHCI scheduling slips and device-side PLL
+/// adjustments without the FIFO ever briefly running dry — the most plausible
+/// remaining mechanism for the V2 96 kHz clicks.
+pub const N_TRANSFERS: usize = 24;
 /// Target audio duration covered by one transfer, in milliseconds.
 /// Each transfer holds `N_PACKETS_TARGET_MS * packets_per_sec / 1000` ISO packets.
 /// 1ms/FS device (1000 pkt/s) → 8 packets; 125µs/HS device (8000 pkt/s) → 64 packets.
