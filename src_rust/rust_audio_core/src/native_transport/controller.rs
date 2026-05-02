@@ -2984,6 +2984,14 @@ struct SegmentSequenceReader {
     segments: Vec<String>,
     current_index: usize,
     current_reader: Option<Box<dyn Read + Send + Sync + 'static>>,
+    /// Bytes read from the current segment so far.  Logged at transition
+    /// boundaries to make it obvious how big each Tidal segment really is.
+    bytes_in_current: u64,
+    /// Time spent inside `open_segment_reader()` for the current segment
+    /// (TCP+TLS handshake reuse, HTTP request, response-headers wait).
+    /// Logged so a long stall on the producer side can be attributed to
+    /// the segment-transition setup vs. mid-segment body delivery.
+    last_setup_ms: u128,
 }
 
 impl SegmentSequenceReader {
@@ -2992,6 +3000,8 @@ impl SegmentSequenceReader {
             segments,
             current_index: 0,
             current_reader: None,
+            bytes_in_current: 0,
+            last_setup_ms: 0,
         }
     }
 
@@ -3000,9 +3010,22 @@ impl SegmentSequenceReader {
             if self.current_index >= self.segments.len() {
                 return Ok(false);
             }
-            let locator = self.segments[self.current_index].clone();
+            let idx = self.current_index;
+            let locator = self.segments[idx].clone();
             self.current_index += 1;
-            self.current_reader = Some(open_segment_reader(&locator)?);
+            let setup_start = Instant::now();
+            let reader = open_segment_reader(&locator)?;
+            let setup_ms = setup_start.elapsed().as_millis();
+            eprintln!(
+                "native-transport: segment #{}/{} open setup={}ms prev_bytes={}",
+                idx + 1,
+                self.segments.len(),
+                setup_ms,
+                self.bytes_in_current,
+            );
+            self.bytes_in_current = 0;
+            self.last_setup_ms = setup_ms;
+            self.current_reader = Some(reader);
         }
         Ok(true)
     }
@@ -3019,6 +3042,7 @@ impl Read for SegmentSequenceReader {
             };
             let n = reader.read(buf)?;
             if n > 0 {
+                self.bytes_in_current = self.bytes_in_current.saturating_add(n as u64);
                 return Ok(n);
             }
             self.current_reader = None;
