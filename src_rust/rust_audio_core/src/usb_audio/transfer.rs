@@ -21,7 +21,7 @@
 
 use std::collections::BTreeMap;
 use std::os::raw::{c_int, c_uchar, c_uint};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
@@ -241,6 +241,16 @@ pub struct RingState {
     drift_window_start_ns: AtomicU64,
     /// Count of error events within the current hysteresis window.
     drift_window_count: AtomicU32,
+    /// Snapshot of `RateAdapter::drift_correction_ppb` mirrored from the
+    /// libusb event thread.  Updated under the rate_adapter lock at the end
+    /// of every `fill_transfer` so it captures both `bump_drift` (in the
+    /// bad_pkts handler) and `decay_drift` (called from
+    /// `samples_this_packet` every DRIFT_DECAY_INTERVAL_SECS).  Read by the
+    /// non-RT v2-poll snapshot thread without locking — a stale value (1
+    /// transfer = 8 ms behind) is fine for a 1-Hz human-readable diagnostic.
+    /// Existence of this mirror is purely diagnostic; the authoritative
+    /// drift value still lives inside RateAdapter.
+    pub drift_correction_ppb: AtomicI64,
 
     // ── ISO completion jitter tracking ──────────────────────────────────
     /// Monotonic timestamp (ns) of the last ISO OUT transfer completion.
@@ -356,6 +366,7 @@ impl RingState {
             feedback_in_flight: AtomicBool::new(false),
             drift_window_start_ns: AtomicU64::new(0),
             drift_window_count: AtomicU32::new(0),
+            drift_correction_ppb: AtomicI64::new(0),
             last_completion_ns: AtomicU64::new(0),
             iso_jitter_events: AtomicU64::new(0),
             iso_interval_max_us: AtomicU64::new(0),
@@ -595,6 +606,12 @@ unsafe fn fill_transfer(transfer: *mut libusb_transfer) {
         total_bytes += bytes;
         total_frames += (if frame_bytes > 0 { bytes / frame_bytes } else { samples }) as u64;
     }
+    // Mirror current drift to the diagnostic atomic before releasing the
+    // lock; captures both `bump_drift` (called from this thread's bad_pkts
+    // handler) and `decay_drift` (called inside `samples_this_packet`).
+    state
+        .drift_correction_ppb
+        .store(adapter.drift_correction_ppb(), Ordering::Relaxed);
     drop(adapter);
 
     let assign_avail = state.queue.available_assign();
@@ -775,18 +792,36 @@ extern "system" fn iso_out_callback(transfer: *mut libusb_transfer) {
         let total_errors_before = state.usb_pkt_errors.fetch_add(bad_pkts, Ordering::Relaxed);
 
         // If the host-side FrameQueue has plenty of data, bad ISO packets
-        // indicate the *device* FIFO underflowed — its crystal is faster
-        // than the USB SOF-derived delivery rate.  Bump the adaptive drift
-        // correction so we deliver slightly more samples per second.
+        // *can* indicate the device FIFO underflowed — its crystal faster
+        // than the USB SOF-derived delivery rate — and bumping host rate
+        // up by +2 ppm per confirmed window is the textbook compensation.
         //
-        // Hysteresis: require ≥ 2 error events within a 1-second window
-        // before bumping, to filter sporadic EMI / USB hub glitches.
+        // BUT: this is only safe when the device has a feedback endpoint.
+        // The bump is one-directional (+); it assumes "errors mean
+        // underflow."  On devices with NO feedback endpoint at all
+        // (`has_feedback_ep=false`, e.g. MOTU M4 in synchronous mode),
+        // bad_pkts can equally mean device FIFO *overflowed* — host SOF
+        // faster than device crystal — and bumping host higher then makes
+        // it worse, producing more bad_pkts, producing more bumps.  This
+        // is a positive-feedback runaway: the click-period halves with
+        // every bump until drift saturates at ±100 ppm and noise repeats
+        // many times per second (reported by 4-ch DAC users as
+        // "noise tempo accelerating with track time").
+        //
+        // So restrict the bump to the originally-intended scenario:
+        // device DOES have a feedback EP, but we haven't received a valid
+        // value yet (early settling, transient ZLP storm).  Without a
+        // feedback EP at all, leave drift at 0 and let the device's own
+        // PLL absorb the small static rate offset.
+        //
+        // Hysteresis: ≥ 2 errors within a 1-second window, to filter
+        // sporadic EMI / USB hub glitches.
         let queue_bytes = state.queue.available_read();
         let frame_bytes = state.channels * state.bytes_per_sample;
         // "Healthy" threshold: ≥ 20 ms of audio in the queue.
         let healthy_bytes = state.rate as usize * frame_bytes * 20 / 1000;
         let feedback = *state.feedback_ms.lock().unwrap_or_else(|e| e.into_inner());
-        if queue_bytes >= healthy_bytes && feedback.is_none() {
+        if queue_bytes >= healthy_bytes && feedback.is_none() && state.has_feedback_ep {
             let now_ns = clock_monotonic_ns();
             let window_start = state.drift_window_start_ns.load(Ordering::Relaxed);
             const WINDOW_NS: u64 = 1_000_000_000; // 1 second

@@ -297,10 +297,13 @@ impl UsbAudioSink {
             .direct_queue_underrun_fallbacks
             .load(Ordering::Relaxed);
         let dq_wrap = state.direct_queue_wrap_fallbacks.load(Ordering::Relaxed);
+        let drift_ppb = state.drift_correction_ppb.load(Ordering::Relaxed);
+        let calibrated_ms = state.calibrated_ms.load(Ordering::Relaxed);
         format!(
             "v2-poll drained={drained} xruns={xruns} in_flight={in_flight} \
              pkt_errs={pkt_errs} parse_fails={parse_fails} short_pkts={short_pkts} \
              dq_under={dq_under} dq_wrap={dq_wrap} \
+             drift_ppb={drift_ppb} calibrated_ms={calibrated_ms} \
              iso=[{iso_min_display}..{iso_max_us}µs] jitter={jitter} cb_max={cb_max_us}µs"
         )
     }
