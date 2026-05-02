@@ -821,62 +821,95 @@ def _prompt_playlist_pick(self, on_pick):
     if not getattr(self.backend, "user", None):
         self._show_simple_dialog("Login Required", "Please login first.")
         return
-    playlists = list(self.backend.get_user_playlists(limit=1000) or [])
-    if not playlists:
-        created = self.backend.create_cloud_playlist(self._next_playlist_name(), "Created from HiresTI")
-        if created is not None:
-            on_pick(created, True)
-        else:
-            self.show_output_notice("Failed to create cloud playlist.", "warn", 2600)
-        return
 
-    dialog = Gtk.Dialog(title="Add to Playlist", transient_for=self.win, modal=True)
-    root = Gtk.Box(
-        orientation=Gtk.Orientation.VERTICAL,
-        spacing=12,
-        margin_top=12,
-        margin_bottom=12,
-        margin_start=12,
-        margin_end=12,
-    )
-    box_wrap = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
-    box_wrap.append(Gtk.Label(label="Select a playlist:", xalign=0))
+    # `get_user_playlists(limit=1000)` is paginated — up to ~20 HTTP
+    # round-trips at 50/page.  Running it synchronously on the GTK main
+    # thread froze the UI long enough for Wayland to tear down the surface
+    # (vkAcquireNextImageKHR → VK_SUBOPTIMAL_KHR →
+    # VK_ERROR_SURFACE_LOST_KHR → "Broken pipe dispatching to Wayland
+    # display") and the app crashed.  Fetch on a daemon thread and build
+    # the dialog only after the data lands.
+    self.show_output_notice("Loading playlists…", "ok", 1800)
 
-    names = [getattr(p, "name", None) or "Untitled Playlist" for p in playlists]
-    dd = Gtk.DropDown(model=Gtk.StringList.new(names))
-    dd.set_selected(0)
-    box_wrap.append(dd)
-    dedupe_ck = Gtk.CheckButton(label="Auto de-duplicate", active=True)
-    box_wrap.append(dedupe_ck)
-    root.append(box_wrap)
-    action_row = Gtk.Box(spacing=8, halign=Gtk.Align.END)
-    cancel_btn = Gtk.Button(label="Cancel")
-    new_btn = Gtk.Button(label="New Playlist")
-    add_btn = Gtk.Button(label="Add")
-    cancel_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.CANCEL))
-    new_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.APPLY))
-    add_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.OK))
-    action_row.append(cancel_btn)
-    action_row.append(new_btn)
-    action_row.append(add_btn)
-    root.append(action_row)
-    dialog.set_child(root)
+    def _create_and_pick(use_dedupe):
+        def _task():
+            created = self.backend.create_cloud_playlist(
+                self._next_playlist_name(), "Created from HiresTI"
+            )
 
-    def _on_response(d, resp):
-        if resp == Gtk.ResponseType.OK:
-            idx = dd.get_selected()
-            if 0 <= idx < len(playlists):
-                on_pick(playlists[idx], dedupe_ck.get_active())
-        elif resp == Gtk.ResponseType.APPLY:
-            created = self.backend.create_cloud_playlist(self._next_playlist_name(), "Created from HiresTI")
-            if created is not None:
-                on_pick(created, dedupe_ck.get_active())
-            else:
-                self.show_output_notice("Failed to create cloud playlist.", "warn", 2600)
-        d.destroy()
+            def _apply():
+                if created is not None:
+                    on_pick(created, use_dedupe)
+                else:
+                    self.show_output_notice(
+                        "Failed to create cloud playlist.", "warn", 2600
+                    )
+                return False
 
-    dialog.connect("response", _on_response)
-    dialog.present()
+            GLib.idle_add(_apply)
+
+        submit_daemon(_task)
+
+    def _fetch_task():
+        playlists = list(self.backend.get_user_playlists(limit=1000) or [])
+
+        def _present():
+            if not playlists:
+                _create_and_pick(True)
+                return False
+
+            dialog = Gtk.Dialog(title="Add to Playlist", transient_for=self.win, modal=True)
+            root = Gtk.Box(
+                orientation=Gtk.Orientation.VERTICAL,
+                spacing=12,
+                margin_top=12,
+                margin_bottom=12,
+                margin_start=12,
+                margin_end=12,
+            )
+            box_wrap = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
+            box_wrap.append(Gtk.Label(label="Select a playlist:", xalign=0))
+
+            names = [getattr(p, "name", None) or "Untitled Playlist" for p in playlists]
+            dd = Gtk.DropDown(model=Gtk.StringList.new(names))
+            dd.set_selected(0)
+            box_wrap.append(dd)
+            dedupe_ck = Gtk.CheckButton(label="Auto de-duplicate", active=True)
+            box_wrap.append(dedupe_ck)
+            root.append(box_wrap)
+            action_row = Gtk.Box(spacing=8, halign=Gtk.Align.END)
+            cancel_btn = Gtk.Button(label="Cancel")
+            new_btn = Gtk.Button(label="New Playlist")
+            add_btn = Gtk.Button(label="Add")
+            cancel_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.CANCEL))
+            new_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.APPLY))
+            add_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.OK))
+            action_row.append(cancel_btn)
+            action_row.append(new_btn)
+            action_row.append(add_btn)
+            root.append(action_row)
+            dialog.set_child(root)
+
+            def _on_response(d, resp):
+                if resp == Gtk.ResponseType.OK:
+                    idx = dd.get_selected()
+                    if 0 <= idx < len(playlists):
+                        on_pick(playlists[idx], dedupe_ck.get_active())
+                    d.destroy()
+                elif resp == Gtk.ResponseType.APPLY:
+                    use_dedupe = dedupe_ck.get_active()
+                    d.destroy()
+                    _create_and_pick(use_dedupe)
+                else:
+                    d.destroy()
+
+            dialog.connect("response", _on_response)
+            dialog.present()
+            return False
+
+        GLib.idle_add(_present)
+
+    submit_daemon(_fetch_task)
 
 
 def on_add_tracks_to_playlist(self, tracks):
