@@ -1652,8 +1652,15 @@ fn decode_direct_audio_stream(
     // only `Arc<RingState>` atomics, no Mutex.  Spawned the first time a USB
     // session is created so we get visibility into xruns/jitter/pkt_errs
     // without adding any work to the decode worker or libusb event thread.
-    // Joined when the decode worker exits via `stop` signal.
+    //
+    // The snapshot thread MUST NOT share the worker's `stop` signal: that
+    // signal is checked in the worker's exit path (controller.rs:1387) to
+    // distinguish "natural EOS, set decode_completed=true and emit EOS"
+    // from "user-requested stop, skip EOS".  Setting it from the snapshot
+    // teardown clobbers that distinction and breaks auto-advance to the
+    // next track.  Use a private `AtomicBool` instead.
     let mut snapshot_join: Option<thread::JoinHandle<()>> = None;
+    let snapshot_stop: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     // Scratch buffer used to zero-pad stereo (or N-channel) source data
     // out to the device channel count when the DAC has no matching alt
     // setting (e.g., MOTU 4-channel-only audio interfaces fed Tidal
@@ -1829,7 +1836,7 @@ fn decode_direct_audio_stream(
                     if snapshot_join.is_none() {
                         let snap_state =
                             Arc::clone(&output_session.as_ref().unwrap().state);
-                        let snap_stop = Arc::clone(stop);
+                        let snap_stop = Arc::clone(&snapshot_stop);
                         snapshot_join = thread::Builder::new()
                             .name("native-transport-snapshot".to_string())
                             .spawn(move || {
@@ -1942,11 +1949,13 @@ fn decode_direct_audio_stream(
     })();
 
     // Stop the snapshot polling thread (non-RT diagnostic) before parking
-    // the session.  The thread checks `stop` each loop, so we just signal
-    // and join — sleep(1s) means worst case 1s teardown latency, which is
-    // fine for a diagnostic thread.
+    // the session.  Use the snapshot's *private* stop signal — sharing the
+    // worker's `stop` signal here would be observed by the worker-exit path
+    // at controller.rs:1387 as "user-requested stop", suppressing the
+    // `decode_completed = true` write that the lib.rs EOS detector polls
+    // for, breaking auto-advance to the next track.
     if let Some(handle) = snapshot_join.take() {
-        stop.store(true, Ordering::Release);
+        snapshot_stop.store(true, Ordering::Release);
         let _ = handle.join();
     }
 
