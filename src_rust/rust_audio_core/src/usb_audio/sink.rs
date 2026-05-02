@@ -1538,38 +1538,36 @@ extern "system" fn feedback_in_callback(transfer: *mut libusb_transfer) {
         }
     } else {
         ctx.parse_failures = ctx.parse_failures.saturating_add(1);
-        // Log every parse failure (no throttle) while hunting the 96 kHz
-        // click — pkt_actual=0 events are rare (~1 per 40k feedback cbs)
-        // and the user wants every occurrence correlated with audible
-        // pops.  Also dump queue depth + recent xrun count so a click
-        // that coincides with a feedback drop has visible OUT-side
-        // context on the same line.
-        //
-        // pkt_status distinguishes:
-        //   COMPLETED + pkt_actual=0  → device sent ZLP (firmware/PLL stall,
-        //                                no rate update available this slot)
-        //   ERROR / TIMED_OUT / STALL → wire- or host-level error
-        // The cause matters: ZLP is a device-side hiccup (no host fix
-        // possible, only mitigation); wire errors point at hub/cable/xHCI.
-        let queue_read = ctx.state.queue.available_read();
-        let xruns = ctx.state.xruns.load(Ordering::Relaxed);
-        let in_flight = ctx.state.in_flight.load(Ordering::Acquire);
-        eprintln!(
-            "usb-audio: feedback parse failed ep=0x{:02x} cb#{} fail#{} \
-             pkt_actual={} pkt_configured={} pkt_status={} transfer_actual={} \
-             raw=[{}] queue_read={} xruns={} in_flight={}",
-            ctx.ep,
-            ctx.callbacks,
-            ctx.parse_failures,
-            pkt_actual_len,
-            pkt_configured_len,
-            _pkt_status,
-            transfer_len,
-            format_feedback_bytes(raw_storage),
-            queue_read,
-            xruns,
-            in_flight,
-        );
+        // Match oxidac's throttle exactly.  feedback_in_callback runs on the
+        // libusb event thread (SCHED_FIFO 70) which also handles ISO OUT
+        // completion callbacks.  An unthrottled eprintln on this thread is
+        // a blocking I/O call: stderr lock + pipe write + potential kernel
+        // transition can take 0.5-5 ms, well over the 0.125 ms ISO microframe
+        // budget.  Each parse-fail log delays the next OUT completion so the
+        // host misses a microframe slot — the device receives a gap and
+        // produces an audible click.  The earlier "log every parse fail"
+        // throttle (added to hunt the click) was itself causing the click.
+        if ctx.parse_failures <= 2 || (ctx.parse_failures % 4096 == 0) {
+            let queue_read = ctx.state.queue.available_read();
+            let xruns = ctx.state.xruns.load(Ordering::Relaxed);
+            let in_flight = ctx.state.in_flight.load(Ordering::Acquire);
+            eprintln!(
+                "usb-audio: feedback parse failed ep=0x{:02x} cb#{} fail#{} \
+                 pkt_actual={} pkt_configured={} pkt_status={} transfer_actual={} \
+                 raw=[{}] queue_read={} xruns={} in_flight={}",
+                ctx.ep,
+                ctx.callbacks,
+                ctx.parse_failures,
+                pkt_actual_len,
+                pkt_configured_len,
+                _pkt_status,
+                transfer_len,
+                format_feedback_bytes(raw_storage),
+                queue_read,
+                xruns,
+                in_flight,
+            );
+        }
     }
 
     // Re-check stop before resubmitting to avoid re-arming the transfer after

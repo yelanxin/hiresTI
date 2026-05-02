@@ -521,10 +521,11 @@ fn queue_fallback_log(
     total_bytes: usize,
     assign_avail: usize,
 ) {
-    if count <= 200 || count % 100 == 0 {
-        // Diagnostic context: was the upstream pusher slow when the queue
-        // dried up?  `pull_ago` / `push_ago` large -> upstream stall
-        // (Tidal CDN reconnect / decoder thread preemption / GstBuffer pool).
+    if count <= 4 || count % 1024 == 0 {
+        // Match oxidac throttle.  Diagnostic context: was the upstream
+        // pusher slow when the queue dried up?  `pull_ago` / `push_ago`
+        // large -> upstream stall (Tidal CDN reconnect / decoder thread
+        // preemption / GstBuffer pool).
         // Both small -> downstream issue (ring drained faster than expected).
         // V1 (GstAppsink) populates pull telemetry; V2 (native_transport)
         // populates push telemetry — so a "never" on one with a recent value
@@ -792,7 +793,11 @@ extern "system" fn iso_out_callback(transfer: *mut libusb_transfer) {
     }
     if short_pkts > 0 {
         let count = state.usb_short_pkt_log_count.fetch_add(1, Ordering::Relaxed) + 1;
-        if count <= 100 || count % 50 == 0 {
+        // Match oxidac throttle: stderr writes on the libusb event thread
+        // are blocking I/O that can delay the next ISO OUT completion past
+        // its 0.125 ms microframe budget, producing the very click we're
+        // trying to log.
+        if count <= 4 || count % 256 == 0 {
             eprintln!(
                 "usb-audio: ISO OUT short packets: {}/{} in this transfer (queue={} B, event #{})",
                 short_pkts,
@@ -851,11 +856,10 @@ extern "system" fn iso_out_callback(transfer: *mut libusb_transfer) {
             }
         } else {
             let total = total_errors_before + bad_pkts;
-            // Throttle generously while we're hunting the 96 kHz click root
-            // cause: log first 100, then every 50th, so a sporadic OUT
-            // packet error is virtually guaranteed to show up in user logs
-            // alongside the audible click.
-            if total <= 100 || total % 50 == 0 {
+            // Match oxidac throttle (4 + every 256th).  See short-packet
+            // throttle comment above: unthrottled stderr on the event
+            // thread is itself a click cause.
+            if total <= 4 || total % 256 == 0 {
                 eprintln!(
                     "usb-audio: ISO OUT packet errors: {}/{} bad in this transfer (total={})  \
                      queue={} B  feedback={:?}",
@@ -898,10 +902,10 @@ extern "system" fn iso_out_callback(transfer: *mut libusb_transfer) {
 
             if delta_us < threshold_lo || delta_us > threshold_hi {
                 let jitter_count = state.iso_jitter_events.fetch_add(1, Ordering::Relaxed) + 1;
-                // Verbose during 96 kHz click hunt: first 100 events visible,
-                // then every 25 — a single audible click that maps to an
-                // xHCI scheduling slip should never get throttled away.
-                if jitter_count <= 100 || (jitter_count % 25 == 0) {
+                // Match oxidac throttle (8 + every 64th).  See short-packet
+                // throttle comment above: unthrottled stderr on the libusb
+                // event thread is itself a click cause.
+                if jitter_count <= 8 || (jitter_count % 64 == 0) {
                     let queue_bytes = state.queue.available_read();
                     eprintln!(
                         "usb-audio: ISO jitter #{}: interval={}µs expected={}µs (delta={:+}µs) queue={} B",
