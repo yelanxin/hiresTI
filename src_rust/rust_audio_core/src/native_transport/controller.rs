@@ -11,11 +11,11 @@ use crate::usb_audio::{
     self, OpenUsbDevice, QueueMode, UacAltProfile, UsbAudioSink, UsbRawSinkConfig,
 };
 use crossbeam_channel::{unbounded, Receiver, Sender};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Instant;
 use symphonia::core::audio::{AudioBuffer, AudioBufferRef, Signal};
@@ -2698,29 +2698,91 @@ fn spawn_download_thread(
     thread::Builder::new()
         .name("native-transport-download".to_string())
         .spawn(move || {
+            // Aggregate small TCP reads into full DOWNLOAD_CHUNK_SIZE chunks
+            // before sending through the bounded channel.  Without this,
+            // reader.read() on a TCP-backed HTTP body typically returns one
+            // MSS (~1448 B) per call, so DOWNLOAD_CHANNEL_CAP × MSS becomes
+            // ~96 KiB instead of the intended 2 MiB — far too small to
+            // absorb Tidal CDN delivery jitter (observed 200-700 ms stalls
+            // on otherwise healthy connections).
             let mut buf = vec![0u8; DOWNLOAD_CHUNK_SIZE];
+            let mut filled = 0usize;
+            let mut eof = false;
             loop {
                 if stop.load(Ordering::Relaxed) {
-                    break;
+                    return;
                 }
-                match reader.read(&mut buf) {
-                    Ok(0) => {
-                        // EOF — send empty chunk to signal completion.
-                        let _ = tx.send(Vec::new());
-                        break;
+                while filled < DOWNLOAD_CHUNK_SIZE {
+                    if stop.load(Ordering::Relaxed) {
+                        return;
                     }
-                    Ok(n) => {
-                        if tx.send(buf[..n].to_vec()).is_err() {
-                            break; // Receiver dropped.
+                    match reader.read(&mut buf[filled..]) {
+                        Ok(0) => {
+                            eof = true;
+                            break;
+                        }
+                        Ok(n) => filled += n,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => {
+                            eof = true;
+                            break;
                         }
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(_) => break,
+                }
+                if filled > 0 {
+                    if tx.send(buf[..filled].to_vec()).is_err() {
+                        return; // Receiver dropped.
+                    }
+                    filled = 0;
+                }
+                if eof {
+                    let _ = tx.send(Vec::new());
+                    return;
                 }
             }
         })
         .expect("native transport: failed to spawn download thread");
     rx
+}
+
+/// Extract the host (`host:port` if present) from an http/https locator,
+/// returning `None` for file:// / unknown schemes.
+fn extract_http_host(locator: &str) -> Option<String> {
+    let rest = if let Some(r) = locator.strip_prefix("https://") {
+        r
+    } else if let Some(r) = locator.strip_prefix("http://") {
+        r
+    } else {
+        return None;
+    };
+    let host_end = rest
+        .find(|c: char| c == '/' || c == '?' || c == '#')
+        .unwrap_or(rest.len());
+    let host = &rest[..host_end];
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
+}
+
+/// Log each CDN host the native transport touches, once per process.
+/// Helps diagnose "why does this player struggle on the same connection
+/// other Tidal clients handle fine" by exposing actual edge routing
+/// (e.g., Tidal's own `*.audio.tidal.com`, CloudFront-fronted
+/// `sp-*-cf.audio.tidal.com`, Akamai, etc.) without leaking the signed
+/// query string of any particular segment.
+fn log_cdn_host_once(locator: &str) {
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let Some(host) = extract_http_host(locator) else {
+        return;
+    };
+    let set = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    if let Ok(mut guard) = set.lock() {
+        if guard.insert(host.clone()) {
+            eprintln!("native-transport: streaming from CDN host {}", host);
+        }
+    }
 }
 
 /// Open a stream for short-lived probing (no download thread).
@@ -2730,6 +2792,7 @@ fn open_locator_as_probe_stream(locator: &str) -> Result<MediaSourceStream, Stri
             fs::File::open(path).map_err(|e| format!("native transport: file open failed: {e}"))?,
         )
     } else if locator.starts_with("http://") || locator.starts_with("https://") {
+        log_cdn_host_once(locator);
         let response = ureq::get(locator)
             .call()
             .map_err(|e| format!("native transport: HTTP open failed: {e}"))?;
@@ -2753,6 +2816,7 @@ fn open_locator_as_media_source_stream(
             fs::File::open(path).map_err(|e| format!("native transport: file open failed: {e}"))?,
         )
     } else if locator.starts_with("http://") || locator.starts_with("https://") {
+        log_cdn_host_once(locator);
         let response = ureq::get(locator)
             .call()
             .map_err(|e| format!("native transport: HTTP open failed: {e}"))?;
@@ -2810,6 +2874,7 @@ fn read_locator_to_string(locator: &str) -> Result<String, String> {
             .and_then(|mut file| file.read_to_string(&mut text))
             .map_err(|e| format!("native transport: manifest read failed: {e}"))?;
     } else if locator.starts_with("http://") || locator.starts_with("https://") {
+        log_cdn_host_once(locator);
         let response = ureq::get(locator)
             .call()
             .map_err(|e| format!("native transport: manifest fetch failed: {e}"))?;
@@ -2977,6 +3042,7 @@ fn open_segment_reader(
         return Ok(Box::new(fs::File::open(path)?));
     }
     if locator.starts_with("http://") || locator.starts_with("https://") {
+        log_cdn_host_once(locator);
         let response = ureq::get(locator)
             .call()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
