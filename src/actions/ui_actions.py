@@ -1697,8 +1697,12 @@ def show_album_details(app, alb):
     app.current_remote_playlist = None
     app._remote_playlist_is_own = False
     app.current_playlist_id = None
+    # show_album_details is the catch-all renderer for non-track / non-artist
+    # / non-playlist items, which includes Mix / MixV2 objects (My Mix 1-6,
+    # daily/genre mixes). Detect any *Mix* type name and adjust UI accordingly.
+    is_mix = "Mix" in type(alb).__name__
     if getattr(app, "header_kicker", None) is not None:
-        app.header_kicker.set_text("Album")
+        app.header_kicker.set_text("Mix" if is_mix else "Album")
 
     current_view = app.right_stack.get_visible_child_name()
     if current_view and current_view != "tracks":
@@ -1731,8 +1735,9 @@ def show_album_details(app, alb):
     utils.load_img(app.header_art, lambda: app.backend.get_artwork_url(alb, 640), app.cache_dir, utils.COVER_SIZE)
     if hasattr(app, "album_header_bg") and app.album_header_bg is not None:
         _load_album_header_bg(app, lambda: app.backend.get_artwork_url(alb, 640))
-    is_fav = app.backend.is_favorite(getattr(alb, "id", ""))
-    app._update_fav_icon(app.fav_btn, is_fav)
+    if not is_mix:
+        is_fav = app.backend.is_favorite(getattr(alb, "id", ""))
+        app._update_fav_icon(app.fav_btn, is_fav)
     if app.remote_playlist_edit_btn is not None:
         app.remote_playlist_edit_btn.set_visible(False)
     if getattr(app, "remote_playlist_visibility_btn", None) is not None:
@@ -1740,7 +1745,8 @@ def show_album_details(app, alb):
     if app.remote_playlist_more_btn is not None:
         app.remote_playlist_more_btn.set_visible(False)
     if app.fav_btn is not None:
-        app.fav_btn.set_visible(True)
+        # Mixes can't be favorited via the catalog API — hide the heart button.
+        app.fav_btn.set_visible(not is_mix)
     if app.add_playlist_btn is not None:
         app.add_playlist_btn.set_visible(True)
 
