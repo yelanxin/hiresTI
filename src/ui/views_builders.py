@@ -173,7 +173,16 @@ def build_tracks_view(app):
     trk_content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
 
     # Header: overlay with the dimmed album cover as background, content on top.
+    # The overlay's natural size must be driven by the content box (so the
+    # area below the action pills doesn't sit on the bg Picture's full
+    # natural texture height ~640 px). Use an empty sizing anchor as the
+    # main child and add the bg Picture as a non-measured overlay child;
+    # only the content is measured.
     app.album_header_overlay = Gtk.Overlay(css_classes=["album-header-overlay"])
+    bg_anchor = Gtk.Box(can_target=False)
+    bg_anchor.set_size_request(-1, 200)  # min-height; content usually drives
+    app.album_header_overlay.set_child(bg_anchor)
+
     app.album_header_bg = Gtk.Picture()
     app.album_header_bg.set_can_shrink(True)
     try:
@@ -181,8 +190,9 @@ def build_tracks_view(app):
     except Exception:
         pass
     app.album_header_bg.add_css_class("album-header-bg")
-    app.album_header_bg.set_size_request(-1, 280)
-    app.album_header_overlay.set_child(app.album_header_bg)
+    app.album_header_bg.set_can_target(False)
+    app.album_header_overlay.add_overlay(app.album_header_bg)
+
     album_header_dim = Gtk.Box(
         css_classes=["album-header-bg-dim"], hexpand=True, vexpand=True,
         can_target=False,
@@ -190,8 +200,8 @@ def build_tracks_view(app):
     app.album_header_overlay.add_overlay(album_header_dim)
 
     app.album_header_box = Gtk.Box(
-        orientation=Gtk.Orientation.VERTICAL, spacing=20,
-        margin_top=24, margin_bottom=24, margin_start=32, margin_end=32,
+        orientation=Gtk.Orientation.VERTICAL, spacing=16,
+        margin_top=20, margin_bottom=16, margin_start=32, margin_end=32,
         css_classes=["album-header-box"],
     )
     album_header_top = Gtk.Box(spacing=24, css_classes=["album-header-top"])
