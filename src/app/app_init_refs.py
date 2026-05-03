@@ -298,6 +298,8 @@ def _init_runtime_refs(self):
     self.search_selected_indices = set()
     self.search_tracks_page = 0
     self.search_tracks_page_size = 50
+    self.track_list_select_mode = False
+    self.track_list_selected_track_ids = set()
     self.collection_base_margin_bottom = 32
     self.track_list_base_margin_bottom = 32
     self.search_base_margin_bottom = 32

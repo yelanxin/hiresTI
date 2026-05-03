@@ -160,6 +160,12 @@ def bind_search(TidalApp, seen=None):
         on_like_selected_search_tracks,
         on_search_tracks_prev_page,
         on_search_tracks_next_page,
+        on_track_list_select_mode_toggled,
+        exit_track_list_select_mode,
+        on_track_list_checkbox_toggled,
+        on_track_list_select_all_clicked,
+        on_track_list_add_selected_clicked,
+        _refresh_track_list_select_ui,
     )
 
     bind_map(TidalApp, [
@@ -174,6 +180,12 @@ def bind_search(TidalApp, seen=None):
         ("on_like_selected_search_tracks", on_like_selected_search_tracks),
         ("on_search_tracks_prev_page", on_search_tracks_prev_page),
         ("on_search_tracks_next_page", on_search_tracks_next_page),
+        ("on_track_list_select_mode_toggled", on_track_list_select_mode_toggled),
+        ("exit_track_list_select_mode", exit_track_list_select_mode),
+        ("on_track_list_checkbox_toggled", on_track_list_checkbox_toggled),
+        ("on_track_list_select_all_clicked", on_track_list_select_all_clicked),
+        ("on_track_list_add_selected_clicked", on_track_list_add_selected_clicked),
+        ("_refresh_track_list_select_ui", _refresh_track_list_select_ui),
     ], seen=seen)
 
 

@@ -272,9 +272,18 @@ def build_tracks_view(app):
     app.remote_playlist_more_pop.set_child(more_box)
     app.remote_playlist_more_btn.connect("clicked", lambda _b: app.remote_playlist_more_pop.popup())
 
+    app.track_list_select_btn = Gtk.ToggleButton(
+        icon_name="object-select-symbolic",
+        css_classes=["flat", "circular", "history-scroll-btn"],
+        valign=Gtk.Align.CENTER,
+    )
+    app.track_list_select_btn.set_tooltip_text("Select Multiple")
+    app.track_list_select_btn.connect("toggled", app.on_track_list_select_mode_toggled)
+
     app.album_action_btns_box = Gtk.Box(spacing=4, valign=Gtk.Align.CENTER, css_classes=["album-action-btns"])
     app.album_action_btns_box.append(app.remote_playlist_more_btn)
     app.album_action_btns_box.append(app.fav_btn)
+    app.album_action_btns_box.append(app.track_list_select_btn)
     app.album_action_btns_box.append(app.add_playlist_btn)
 
     app.album_header_box.append(app.header_art)
@@ -296,6 +305,33 @@ def build_tracks_view(app):
     app.track_list_base_margin_bottom = 32
     app.track_list.connect("row-activated", app.on_track_selected)
     trk_content.append(app.track_list)
+
+    app.track_list_select_revealer = Gtk.Revealer(
+        transition_type=Gtk.RevealerTransitionType.SLIDE_UP,
+        transition_duration=180,
+        reveal_child=False,
+    )
+    select_bar = Gtk.Box(
+        spacing=12,
+        margin_top=8, margin_bottom=8, margin_start=12, margin_end=12,
+        css_classes=["select-action-bar"],
+    )
+    app.track_list_select_count_label = Gtk.Label(
+        label="0 selected", xalign=0, hexpand=True, css_classes=["dim-label"],
+    )
+    select_bar.append(app.track_list_select_count_label)
+    app.track_list_select_all_btn = Gtk.Button(label="Select All", css_classes=["flat", "pill"])
+    app.track_list_select_all_btn.connect("clicked", app.on_track_list_select_all_clicked)
+    select_bar.append(app.track_list_select_all_btn)
+    app.track_list_add_selected_btn = Gtk.Button(label="Add to Playlist", css_classes=["pill", "suggested-action"])
+    app.track_list_add_selected_btn.set_sensitive(False)
+    app.track_list_add_selected_btn.connect("clicked", app.on_track_list_add_selected_clicked)
+    select_bar.append(app.track_list_add_selected_btn)
+    app.track_list_select_cancel_btn = Gtk.Button(label="Cancel", css_classes=["flat", "pill"])
+    app.track_list_select_cancel_btn.connect("clicked", lambda _b: app.exit_track_list_select_mode())
+    select_bar.append(app.track_list_select_cancel_btn)
+    app.track_list_select_revealer.set_child(select_bar)
+    trk_content.append(app.track_list_select_revealer)
 
     # Similar albums section (populated async in show_album_details).
     # Placed as a sibling of trk_content (not a child) so it can use its own

@@ -1716,6 +1716,16 @@ def populate_tracks(app, tracks):
     while c := app.track_list.get_first_child():
         app.track_list.remove(c)
 
+    select_mode = bool(getattr(app, "track_list_select_mode", False))
+    selected_ids = getattr(app, "track_list_selected_track_ids", None) or set()
+    if select_mode:
+        # Drop ids that are no longer in the visible list so the count stays right.
+        visible_ids = {t.id for t in tracks}
+        stale = selected_ids - visible_ids
+        if stale:
+            selected_ids -= stale
+            app.track_list_selected_track_ids = selected_ids
+
     for i, t in enumerate(tracks):
         row = Gtk.ListBoxRow()
         row.track_id = t.id
@@ -1727,6 +1737,16 @@ def populate_tracks(app, tracks):
             margin_start=LAYOUT["row_margin_x"],
             margin_end=LAYOUT["row_margin_x"],
         )
+
+        if select_mode:
+            sel_cb = Gtk.CheckButton(valign=Gtk.Align.CENTER)
+            sel_cb.set_active(t.id in selected_ids)
+            sel_cb.connect(
+                "toggled",
+                lambda cb, tid=t.id: app.on_track_list_checkbox_toggled(tid, cb.get_active()),
+            )
+            row.track_select_checkbox = sel_cb
+            box.append(sel_cb)
 
         stack = Gtk.Stack()
         stack.set_size_request(LAYOUT["index_width"], -1)
@@ -1771,30 +1791,33 @@ def populate_tracks(app, tracks):
             lbl_dur.set_size_request(LAYOUT["time_width"], -1)
             box.append(lbl_dur)
 
-        fav_btn = app.create_track_fav_button(t)
-        box.append(fav_btn)
-        next_btn = Gtk.Button(icon_name="hiresti-play-next-symbolic", css_classes=["flat", "circular", "history-scroll-btn"])
-        next_btn.set_tooltip_text("Play Next")
-        next_btn.connect("clicked", lambda _b, tr=t: app.on_play_next_track_clicked(tr))
-        box.append(next_btn)
-        current_remote = getattr(app, "current_remote_playlist", None)
-        is_own_remote = getattr(app, "_remote_playlist_is_own", False)
-        if current_remote is not None and is_own_remote:
-            rm_btn = Gtk.Button(icon_name="user-trash-symbolic", css_classes=["flat", "playlist-tool-btn"])
-            rm_btn.set_tooltip_text("Remove from Playlist")
-            rm_btn.connect("clicked", lambda _b, tr=t: app.on_remove_single_track_from_remote_playlist(tr))
-            box.append(rm_btn)
-        else:
-            add_btn = Gtk.Button(icon_name="list-add-symbolic", css_classes=["flat", "circular", "history-scroll-btn"])
-            add_btn.set_tooltip_text("Add to Playlist")
-            add_btn.connect("clicked", lambda _b, tr=t: app.on_add_single_track_to_playlist(tr))
-            box.append(add_btn)
+        if not select_mode:
+            fav_btn = app.create_track_fav_button(t)
+            box.append(fav_btn)
+            next_btn = Gtk.Button(icon_name="hiresti-play-next-symbolic", css_classes=["flat", "circular", "history-scroll-btn"])
+            next_btn.set_tooltip_text("Play Next")
+            next_btn.connect("clicked", lambda _b, tr=t: app.on_play_next_track_clicked(tr))
+            box.append(next_btn)
+            current_remote = getattr(app, "current_remote_playlist", None)
+            is_own_remote = getattr(app, "_remote_playlist_is_own", False)
+            if current_remote is not None and is_own_remote:
+                rm_btn = Gtk.Button(icon_name="user-trash-symbolic", css_classes=["flat", "playlist-tool-btn"])
+                rm_btn.set_tooltip_text("Remove from Playlist")
+                rm_btn.connect("clicked", lambda _b, tr=t: app.on_remove_single_track_from_remote_playlist(tr))
+                box.append(rm_btn)
+            else:
+                add_btn = Gtk.Button(icon_name="list-add-symbolic", css_classes=["flat", "circular", "history-scroll-btn"])
+                add_btn.set_tooltip_text("Add to Playlist")
+                add_btn.connect("clicked", lambda _b, tr=t: app.on_add_single_track_to_playlist(tr))
+                box.append(add_btn)
 
         row.set_child(box)
         app.track_list.append(row)
 
     if hasattr(app, "_update_track_list_icon"):
         app._update_track_list_icon()
+    if hasattr(app, "_refresh_track_list_select_ui"):
+        app._refresh_track_list_select_ui()
 
 
 def batch_load_albums(app, albs, batch=6, _flow=None, _token=None, _token_attr=None):

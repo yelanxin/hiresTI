@@ -45,6 +45,12 @@ def on_search_history_track_selected(self, box, row):
 def on_track_selected(self, box, row):
     if not row:
         return
+    if getattr(self, "track_list_select_mode", False):
+        # In select mode, row activation toggles the row's checkbox instead.
+        cb = getattr(row, "track_select_checkbox", None)
+        if cb is not None:
+            cb.set_active(not cb.get_active())
+        return
     idx = row.get_index()
     view_src = getattr(self, "_track_view_source", None)
     if view_src:
@@ -53,6 +59,91 @@ def on_track_selected(self, box, row):
         self.playback_source = {"type": "tracks", "name": "Tracks"}
     self._set_play_queue(getattr(self, "current_track_list", []))
     self.play_track(idx)
+
+
+def on_track_list_select_mode_toggled(self, btn):
+    active = bool(btn.get_active())
+    if active == bool(getattr(self, "track_list_select_mode", False)):
+        return
+    self.track_list_select_mode = active
+    if active:
+        self.track_list_selected_track_ids = set()
+    else:
+        self.track_list_selected_track_ids = set()
+    self._refresh_track_list_select_ui()
+    self.populate_tracks(getattr(self, "current_track_list", []) or [])
+
+
+def exit_track_list_select_mode(self):
+    if not getattr(self, "track_list_select_mode", False):
+        return
+    btn = getattr(self, "track_list_select_btn", None)
+    if btn is not None:
+        # set_active() fires the toggled signal, which routes back through
+        # on_track_list_select_mode_toggled and re-populates.
+        btn.set_active(False)
+        return
+    self.track_list_select_mode = False
+    self.track_list_selected_track_ids = set()
+    self._refresh_track_list_select_ui()
+    self.populate_tracks(getattr(self, "current_track_list", []) or [])
+
+
+def on_track_list_checkbox_toggled(self, track_id, checked):
+    if not isinstance(getattr(self, "track_list_selected_track_ids", None), set):
+        self.track_list_selected_track_ids = set()
+    if checked:
+        self.track_list_selected_track_ids.add(track_id)
+    else:
+        self.track_list_selected_track_ids.discard(track_id)
+    self._refresh_track_list_select_ui()
+
+
+def on_track_list_select_all_clicked(self, _btn=None):
+    tracks = list(getattr(self, "current_track_list", []) or [])
+    visible_ids = {t.id for t in tracks}
+    selected = getattr(self, "track_list_selected_track_ids", set()) or set()
+    # Toggle: if everything in view is selected, clear; otherwise select all.
+    if visible_ids and visible_ids.issubset(selected):
+        self.track_list_selected_track_ids = set()
+    else:
+        self.track_list_selected_track_ids = set(visible_ids)
+    self.populate_tracks(tracks)
+    self._refresh_track_list_select_ui()
+
+
+def on_track_list_add_selected_clicked(self, _btn=None):
+    selected_ids = getattr(self, "track_list_selected_track_ids", set()) or set()
+    if not selected_ids:
+        return
+    tracks = list(getattr(self, "current_track_list", []) or [])
+    chosen = [t for t in tracks if t.id in selected_ids]
+    if not chosen:
+        return
+    self.on_add_tracks_to_playlist(chosen)
+    self.exit_track_list_select_mode()
+
+
+def _refresh_track_list_select_ui(self):
+    revealer = getattr(self, "track_list_select_revealer", None)
+    count_lbl = getattr(self, "track_list_select_count_label", None)
+    add_btn = getattr(self, "track_list_add_selected_btn", None)
+    select_all_btn = getattr(self, "track_list_select_all_btn", None)
+    in_mode = bool(getattr(self, "track_list_select_mode", False))
+    selected = getattr(self, "track_list_selected_track_ids", set()) or set()
+    n = len(selected)
+    if revealer is not None:
+        revealer.set_reveal_child(in_mode)
+    if count_lbl is not None:
+        count_lbl.set_label(f"{n} selected" if in_mode else "")
+    if add_btn is not None:
+        add_btn.set_sensitive(n > 0)
+        add_btn.set_label(f"Add {n} to Playlist" if n > 0 else "Add to Playlist")
+    if select_all_btn is not None:
+        tracks = list(getattr(self, "current_track_list", []) or [])
+        visible_ids = {t.id for t in tracks}
+        all_selected = bool(visible_ids) and visible_ids.issubset(selected)
+        select_all_btn.set_label("Clear" if all_selected else "Select All")
 
 
 def on_player_art_clicked(self, gest, n, x, y):
