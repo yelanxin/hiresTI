@@ -3604,13 +3604,20 @@ def render_history_dashboard(app):
         win = getattr(app, "win", None)
         if win is None:
             return 2
+        # When notify::default-width fires we're being told the *intended* new
+        # window width; the allocated width can lag a frame or two. Mini-mode
+        # → normal transitions hit this case (set_default_size jumps from
+        # 390 → saved_width while get_width() still reports 390 at signal
+        # time), so prefer the default-size and fall back to the allocated
+        # width only when default is unset.
+        w = 0
         try:
-            w = int(win.get_width() or 0)
+            w = int(win.get_default_size()[0] or 0)
         except Exception:
-            w = 0
+            pass
         if w <= 0:
             try:
-                w = int(win.get_default_size()[0] or 0)
+                w = int(win.get_width() or 0)
             except Exception:
                 w = 0
         # Reserve space for sidebar (~250px) + paddings
