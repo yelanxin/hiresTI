@@ -903,6 +903,12 @@ button.circular {
         font-size: 20px; font-weight: 800; color: #ffffff; opacity: 1;
         margin-bottom: 24px; margin-top: 8px; text-shadow: 0 0 15px rgba(255, 255, 255, 0.2);
     }
+    .lyric-row-clickable:hover .lyric-line {
+        color: rgba(255, 255, 255, 0.85);
+    }
+    .lyrics-theme-light .lyric-row-clickable:hover .lyric-line {
+        color: rgba(12, 16, 24, 0.92);
+    }
 
 .player-overlay-container { background-color: transparent; }
 window.mini-mode,
@@ -1554,7 +1560,7 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
     padding: 6px;
 }
 .album-action-btns button image {
-    -gtk-icon-size: 24px;
+    -gtk-icon-size: 28px;
 }
 
 .playlist-more-menu button {

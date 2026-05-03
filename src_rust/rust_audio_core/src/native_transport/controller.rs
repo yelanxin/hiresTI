@@ -908,6 +908,31 @@ fn transport_worker(
                             claimed_device.take()
                         };
 
+                        // Wait for the USB ring to drain before pushing post-seek
+                        // audio. Without this the ring still holds ~200 ms of
+                        // pre-seek samples; new audio lands abruptly after them
+                        // and the waveform discontinuity is audible as a click.
+                        // After draining, the transfer thread's existing
+                        // underrun fade-out + silence-pad + fade-in path smooths
+                        // the boundary on its own.
+                        if let Some(ref session) = seek_reuse_session {
+                            let drain_deadline = std::time::Instant::now()
+                                + std::time::Duration::from_millis(280);
+                            // ~2 ms at 96 kHz/24-bit/stereo. Small enough that the
+                            // next ISO callback hits the underrun branch and the
+                            // fade-out tail engages cleanly.
+                            let drain_target_bytes: usize = 1152;
+                            loop {
+                                if session.queued_bytes() <= drain_target_bytes {
+                                    break;
+                                }
+                                if std::time::Instant::now() >= drain_deadline {
+                                    break;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(2));
+                            }
+                        }
+
                         // Reset decoded counters for the new position.
                         if let Ok(mut state) = snapshot.lock() {
                             state.decoded_slab_count = 0;

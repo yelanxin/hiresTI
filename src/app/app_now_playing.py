@@ -11,6 +11,7 @@ from gi.repository import GLib, Gtk, Pango, Gdk, GdkPixbuf
 
 from actions.lyrics_playback_actions import (
     NO_LYRICS_BOTTOM_HINT,
+    _attach_lyric_seek_gesture,
     _karaoke_active_idx,
     _karaoke_markup,
     _split_bilingual_line,
@@ -2368,6 +2369,8 @@ def _render_now_playing_lyrics(self, lyrics_obj=None, status_msg=None):
             main_lbl.set_use_markup(True)
             main_lbl.set_markup(_karaoke_markup(karaoke_words, -1))
             row.append(main_lbl)
+            if lyrics_obj.has_synced:
+                _attach_lyric_seek_gesture(row, self, time_point)
             self.now_playing_lyrics_vbox.append(row)
             if lyrics_obj.has_synced:
                 self.now_playing_lyric_widgets.append(
@@ -2400,6 +2403,8 @@ def _render_now_playing_lyrics(self, lyrics_obj=None, status_msg=None):
             sub_lbl.set_justify(Gtk.Justification.CENTER)
             row.append(sub_lbl)
 
+        if lyrics_obj.has_synced:
+            _attach_lyric_seek_gesture(row, self, time_point)
         self.now_playing_lyrics_vbox.append(row)
         if lyrics_obj.has_synced:
             self.now_playing_lyric_widgets.append(

@@ -3,7 +3,7 @@ import logging
 import os
 import time
 
-from gi.repository import Gtk, GLib
+from gi.repository import Gtk, GLib, Gdk
 from app.app_ui_loop import _is_now_playing_overlay_open, _ui_loop_has_high_frequency_consumer
 from core.errors import classify_exception, user_message
 from actions import audio_settings_actions
@@ -13,6 +13,28 @@ MAX_PREFETCH_CACHE = 6
 # Tidal CDN stream URLs are pre-signed and expire; 20 min is a safe margin.
 PREFETCH_URL_TTL_SECONDS = 20 * 60
 NO_LYRICS_BOTTOM_HINT = "No usable lyrics for this track."
+
+
+def _attach_lyric_seek_gesture(row, app, time_point):
+    """Make a synced lyric row clickable: click → player.seek(time_point)."""
+    gesture = Gtk.GestureClick.new()
+    gesture.set_button(1)
+
+    def _on_released(_g, n_press, _x, _y):
+        if n_press != 1:
+            return
+        try:
+            app.player.seek(float(time_point))
+        except Exception:
+            logger.exception("lyric seek failed")
+
+    gesture.connect("released", _on_released)
+    row.add_controller(gesture)
+    row.add_css_class("lyric-row-clickable")
+    try:
+        row.set_cursor(Gdk.Cursor.new_from_name("pointer", None))
+    except Exception:
+        pass
 
 
 def _apply_track_redirect(app, original_track):
@@ -214,6 +236,8 @@ def render_lyrics_list(app, lyrics_obj=None, status_msg=None):
                 main_lbl.set_use_markup(True)
                 main_lbl.set_markup(_karaoke_markup(karaoke_words, -1))
                 row.append(main_lbl)
+                if lyrics_obj.has_synced:
+                    _attach_lyric_seek_gesture(row, app, t)
                 app.lyrics_vbox.append(row)
 
                 if lyrics_obj.has_synced:
@@ -251,6 +275,8 @@ def render_lyrics_list(app, lyrics_obj=None, status_msg=None):
                 sub_lbl.set_justify(Gtk.Justification.CENTER)
                 row.append(sub_lbl)
 
+            if lyrics_obj.has_synced:
+                _attach_lyric_seek_gesture(row, app, t)
             app.lyrics_vbox.append(row)
 
             if lyrics_obj.has_synced:
