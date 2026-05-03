@@ -324,6 +324,10 @@ def build_tracks_view(app):
     app.album_header_box.append(album_header_actions)
 
     app.album_header_overlay.add_overlay(app.album_header_box)
+    # By default Gtk.Overlay sizes to its main child only; without this the
+    # content row spills below the 280 px bg Picture and overlaps the first
+    # track row of trk_body.
+    app.album_header_overlay.set_measure_overlay(app.album_header_box, True)
     trk_content.append(app.album_header_overlay)
 
     # Restore horizontal margin for the rest of the page below the header.
