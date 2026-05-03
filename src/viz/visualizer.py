@@ -3979,7 +3979,7 @@ _DOTS_FRAG_330 = """
 #version 330 core
 in vec2 vUV;
 out vec4 FragColor;
-const int MAX_BARS = 512;
+const int MAX_BARS = 128;
 uniform int   uNumBars;
 uniform float uHeights[MAX_BARS];
 uniform vec4  uColors[MAX_BARS];
@@ -4018,7 +4018,7 @@ _DOTS_FRAG_300ES = """
 precision mediump float;
 in vec2 vUV;
 out vec4 FragColor;
-const int MAX_BARS = 512;
+const int MAX_BARS = 128;
 uniform int   uNumBars;
 uniform float uHeights[MAX_BARS];
 uniform vec4  uColors[MAX_BARS];
@@ -4235,7 +4235,7 @@ class DotsGLVisualizer(Gtk.GLArea):
             self._cached_h = h
             self._get_colors()   # rebuilds _c_arr if theme/bars changed
             GL.glUniform1i (self._u_num_bars,   self.num_bars)
-            GL.glUniform4fv(self._u_colors,     512, self._c_arr)
+            GL.glUniform4fv(self._u_colors,     128, self._c_arr)
             GL.glUniform1f (self._u_gain,       self._cached_gain)
             GL.glUniform1f (self._u_spacing,    self._cached_spacing)
             GL.glUniform2f (self._u_resolution, float(w), float(h))
@@ -4243,8 +4243,8 @@ class DotsGLVisualizer(Gtk.GLArea):
 
         # Heights change every animated frame
         if self._rust_state_engine is None:
-            self._h_arr[:512] = self.current_heights[:512]
-        GL.glUniform1fv(self._u_heights, 512, self._h_arr)
+            self._h_arr[:128] = self.current_heights[:128]
+        GL.glUniform1fv(self._u_heights, 128, self._h_arr)
 
         GL.glBindVertexArray(self._vao)
         GL.glDrawArrays(GL.GL_TRIANGLE_STRIP, 0, 4)
@@ -4418,7 +4418,7 @@ class DotsGLVisualizer(Gtk.GLArea):
             return
         if n <= 0 or n == self.num_bars:
             return
-        self.num_bars = min(n, 512)
+        self.num_bars = min(n, 128)
         self.target_heights  = [0.0] * 512
         self.current_heights = [0.0] * 512
         self._reset_rust_state_engine()
@@ -4507,7 +4507,7 @@ _BARS_FRAG_330 = """
 #version 330 core
 in vec2 vUV;
 out vec4 FragColor;
-const int MAX_BARS = 512;
+const int MAX_BARS = 128;
 uniform int   uNumBars;
 uniform float uHeights[MAX_BARS];
 uniform float uPeakHeights[MAX_BARS];
@@ -4856,7 +4856,7 @@ _BARS_FRAG_300ES = """
 precision mediump float;
 in vec2 vUV;
 out vec4 FragColor;
-const int MAX_BARS = 512;
+const int MAX_BARS = 128;
 uniform int   uNumBars;
 uniform float uHeights[MAX_BARS];
 uniform float uPeakHeights[MAX_BARS];
@@ -5413,7 +5413,7 @@ class BarsGLVisualizer(Gtk.GLArea):
             bc = self._color_from_gradient(grad, 0.12)
             pc = self._color_from_gradient(grad, 0.0)
             GL.glUniform1i(self._u_num_bars,    self.num_bars)
-            GL.glUniform4fv(self._u_colors,     512, self._c_arr)
+            GL.glUniform4fv(self._u_colors,     128, self._c_arr)
             GL.glUniform4f(self._u_top_color,   *tc)
             GL.glUniform4f(self._u_bottom_color,*bc)
             GL.glUniform4f(self._u_pulse_color, *pc)
@@ -5425,16 +5425,16 @@ class BarsGLVisualizer(Gtk.GLArea):
             self._cached_h     = ph
             self._dirty_static = False
         if self._should_use_python_render_state():
-            self._h_arr[:512]  = self.current_heights[:512]
-            self._ph_arr[:512] = self.peak_holds[:512]
-            self._tr_arr[:512] = self.trail_heights[:512]
-            self._lh_arr[:512] = self.left_heights[:512]
-            self._rh_arr[:512] = self.right_heights[:512]
-        GL.glUniform1fv(self._u_heights,        512, self._h_arr)
-        GL.glUniform1fv(self._u_peak_heights,   512, self._ph_arr)
-        GL.glUniform1fv(self._u_trail_heights,  512, self._tr_arr)
-        GL.glUniform1fv(self._u_left_heights,   512, self._lh_arr)
-        GL.glUniform1fv(self._u_right_heights,  512, self._rh_arr)
+            self._h_arr[:128]  = self.current_heights[:128]
+            self._ph_arr[:128] = self.peak_holds[:128]
+            self._tr_arr[:128] = self.trail_heights[:128]
+            self._lh_arr[:128] = self.left_heights[:128]
+            self._rh_arr[:128] = self.right_heights[:128]
+        GL.glUniform1fv(self._u_heights,        128, self._h_arr)
+        GL.glUniform1fv(self._u_peak_heights,   128, self._ph_arr)
+        GL.glUniform1fv(self._u_trail_heights,  128, self._tr_arr)
+        GL.glUniform1fv(self._u_left_heights,   128, self._lh_arr)
+        GL.glUniform1fv(self._u_right_heights,  128, self._rh_arr)
         GL.glUniform1f(self._u_bass_level,      self.bass_level)
         GL.glUniform1f(self._u_balance,         self.balance)
         GL.glBindVertexArray(self._vao)
@@ -5633,7 +5633,7 @@ class BarsGLVisualizer(Gtk.GLArea):
             return
         if n <= 0 or n == self.num_bars:
             return
-        self.num_bars        = min(n, 512)
+        self.num_bars        = min(n, 128)
         self.target_heights  = [0.0] * 512
         self.current_heights = [0.0] * 512
         self.peak_holds      = [0.0] * 512
