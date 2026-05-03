@@ -1126,7 +1126,8 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
 }
 .album-cover-img { border-radius: 8px; -gtk-icon-transform: scale(1);}
 .header-art { border-radius: 12px; }
-.album-header-box { padding: 32px 6px 32px 32px; margin-bottom: 10px; }
+/* Vertical padding/margin handled by Python margin_top/bottom on the
+ * vertical Gtk.Box; horizontal margin handled by margin_start/end. */
 .album-title-large { font-size: 28px; font-weight: 800; margin-bottom: 4px; }
 .album-artist-medium { font-size: 16px; font-weight: 600; color: @accent_color; margin-bottom: 8px; }
 .album-meta { font-size: 13px; opacity: 0.7; }
