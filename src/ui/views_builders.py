@@ -200,8 +200,8 @@ def build_tracks_view(app):
     app.album_header_overlay.add_overlay(album_header_dim)
 
     app.album_header_box = Gtk.Box(
-        orientation=Gtk.Orientation.VERTICAL, spacing=16,
-        margin_top=20, margin_bottom=16, margin_start=32, margin_end=32,
+        orientation=Gtk.Orientation.VERTICAL, spacing=20,
+        margin_top=20, margin_bottom=20, margin_start=32, margin_end=32,
         css_classes=["album-header-box"],
     )
     album_header_top = Gtk.Box(spacing=24, css_classes=["album-header-top"])
