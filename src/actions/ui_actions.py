@@ -1486,15 +1486,17 @@ def _ensure_play_shuffle_btns(app):
         app._album_shuffle_btn.set_tooltip_text("Shuffle and play")
         app._album_shuffle_btn.connect("clicked", lambda _b: _on_shuffle_album_tracks(app))
 
-    if not hasattr(app, "_album_play_next_btn") or app._album_play_next_btn is None:
-        app._album_play_next_btn = Gtk.Button(
-            icon_name="hiresti-play-next-symbolic",
+    if not hasattr(app, "_album_actions_menu_btn") or app._album_actions_menu_btn is None:
+        menu_btn = Gtk.MenuButton(
+            icon_name="view-more-symbolic",
             css_classes=["flat", "circular", "history-scroll-btn"],
         )
-        app._album_play_next_btn.connect("clicked", app.on_play_next_current_tracks_clicked)
-
-    is_playlist = bool(getattr(app, "current_remote_playlist", None) is not None or getattr(app, "current_playlist_id", None) is not None)
-    app._album_play_next_btn.set_tooltip_text("Play Playlist Next" if is_playlist else "Play Album Next")
+        menu_btn.set_tooltip_text("More actions")
+        menu_btn.set_popover(_build_overflow_popover([
+            ("Play Next", lambda: app.on_play_next_current_tracks_clicked()),
+            ("Add to Queue", lambda: app.on_add_current_tracks_to_queue_clicked()),
+        ]))
+        app._album_actions_menu_btn = menu_btn
 
     primary_box = getattr(app, "album_primary_actions_box", None)
     if primary_box is not None:
@@ -1506,12 +1508,11 @@ def _ensure_play_shuffle_btns(app):
 
     secondary_box = getattr(app, "album_action_btns_box", None)
     if secondary_box is not None:
-        if app._album_play_next_btn.get_parent() is secondary_box:
-            secondary_box.remove(app._album_play_next_btn)
-        # Insert between fav and select for natural grouping.
-        secondary_box.append(app._album_play_next_btn)
+        if app._album_actions_menu_btn.get_parent() is secondary_box:
+            secondary_box.remove(app._album_actions_menu_btn)
+        secondary_box.append(app._album_actions_menu_btn)
 
-    for btn in (app._album_play_btn, app._album_shuffle_btn, app._album_play_next_btn):
+    for btn in (app._album_play_btn, app._album_shuffle_btn, app._album_actions_menu_btn):
         if btn is not None:
             btn.set_visible(True)
 
@@ -1763,6 +1764,54 @@ def show_album_details(app, alb):
     Thread(target=detail_task, daemon=True).start()
 
 
+def _build_overflow_popover(actions):
+    """Build a compact popover with a list of (label, callback) menu items.
+
+    Uses Gtk.ListBox + Gtk.ListBoxRow rather than Gtk.Button to sidestep
+    Adwaita's bulky default button padding.
+    """
+    pop = Gtk.Popover()
+    pop.add_css_class("track-row-overflow-popover")
+
+    list_box = Gtk.ListBox(css_classes=["track-row-overflow-menu"])
+    list_box.set_selection_mode(Gtk.SelectionMode.NONE)
+
+    rows = []
+    for label_text, _cb in actions:
+        row = Gtk.ListBoxRow(css_classes=["track-row-overflow-item"])
+        lbl = Gtk.Label(
+            label=label_text, xalign=0.0, halign=Gtk.Align.START,
+            margin_top=8, margin_bottom=8, margin_start=14, margin_end=14,
+        )
+        row.set_child(lbl)
+        list_box.append(row)
+        rows.append(row)
+
+    def _on_row_activated(_lb, activated_row):
+        pop.popdown()
+        for row, (_label, cb) in zip(rows, actions):
+            if row is activated_row:
+                cb()
+                return
+
+    list_box.connect("row-activated", _on_row_activated)
+    pop.set_child(list_box)
+    return pop
+
+
+def _build_track_row_overflow_menu(app, track):
+    menu_btn = Gtk.MenuButton(
+        icon_name="view-more-symbolic",
+        css_classes=["flat", "circular", "history-scroll-btn", "track-row-overflow-btn"],
+    )
+    menu_btn.set_tooltip_text("More")
+    menu_btn.set_popover(_build_overflow_popover([
+        ("Play Next", lambda tr=track: app.on_play_next_track_clicked(tr)),
+        ("Add to Queue", lambda tr=track: app.on_add_track_to_queue_clicked(tr)),
+    ]))
+    return menu_btn
+
+
 def populate_tracks(app, tracks):
     app.current_track_list = tracks
     if app.playing_track_id:
@@ -1855,13 +1904,6 @@ def populate_tracks(app, tracks):
         if not select_mode:
             fav_btn = app.create_track_fav_button(t)
             box.append(fav_btn)
-            next_img = Gtk.Image.new_from_icon_name("hiresti-play-next-symbolic")
-            next_img.set_pixel_size(22)
-            next_btn = Gtk.Button(css_classes=["flat", "circular", "history-scroll-btn", "track-row-next-btn"])
-            next_btn.set_child(next_img)
-            next_btn.set_tooltip_text("Play Next")
-            next_btn.connect("clicked", lambda _b, tr=t: app.on_play_next_track_clicked(tr))
-            box.append(next_btn)
             current_remote = getattr(app, "current_remote_playlist", None)
             is_own_remote = getattr(app, "_remote_playlist_is_own", False)
             if current_remote is not None and is_own_remote:
@@ -1874,6 +1916,7 @@ def populate_tracks(app, tracks):
                 add_btn.set_tooltip_text("Add to Playlist")
                 add_btn.connect("clicked", lambda _b, tr=t: app.on_add_single_track_to_playlist(tr))
                 box.append(add_btn)
+            box.append(_build_track_row_overflow_menu(app, t))
 
         row.set_child(box)
         app.track_list.append(row)
@@ -6603,7 +6646,7 @@ def render_playlist_detail(app, playlist_id):
     if edit_mode:
         append_header_action_spacers(tracks_head, ["fav", "drag", "playlist_remove"])
     else:
-        append_header_action_spacers(tracks_head, ["fav", "next", "add"])
+        append_header_action_spacers(tracks_head, ["fav", "add", "menu"])
     title_head = head_btns["title"]
     artist_head = head_btns["artist"]
     album_head = head_btns["album"]
@@ -6675,18 +6718,12 @@ def render_playlist_detail(app, playlist_id):
             rm_btn.connect("clicked", lambda _b, pid=p.get("id"), idx=i: app.on_playlist_remove_track_clicked(pid, idx))
             box.append(rm_btn)
         else:
-            next_img = Gtk.Image.new_from_icon_name("hiresti-play-next-symbolic")
-            next_img.set_pixel_size(22)
-            next_btn = Gtk.Button(css_classes=["flat", "circular", "history-scroll-btn", "track-row-next-btn"])
-            next_btn.set_child(next_img)
-            next_btn.set_tooltip_text("Play Next")
-            next_btn.connect("clicked", lambda _b, tr=t: app.on_play_next_track_clicked(tr))
-            box.append(next_btn)
-            # Keep identical row height/footprint with album rows by reserving a hidden action button slot.
+            # Match album-row footprint: reserve a hidden add-to-playlist slot, then the overflow menu.
             ghost_btn = Gtk.Button(icon_name="list-add-symbolic", css_classes=["flat", "circular", "history-scroll-btn", "ghost-row-btn"])
             ghost_btn.set_sensitive(False)
             ghost_btn.set_focusable(False)
             box.append(ghost_btn)
+            box.append(_build_track_row_overflow_menu(app, t))
         row.set_child(box)
 
         if edit_mode:

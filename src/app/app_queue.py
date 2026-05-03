@@ -384,6 +384,35 @@ def on_play_next_track_clicked(self, track):
     _show_play_next_notice(self, items, played_now=False)
 
 
+def on_add_track_to_queue_clicked(self, track):
+    if track is None:
+        return
+    items = [track]
+    if getattr(self, "playing_track", None) is None:
+        _play_tracks_now(self, items)
+        _show_add_to_queue_notice(self, items, played_now=True)
+        return
+    base_queue = list(self._get_active_queue() if hasattr(self, "_get_active_queue") else [])
+    _insert_queue_at(self, items, len(base_queue), event_reason="queue_appended")
+    _show_add_to_queue_notice(self, items, played_now=False)
+
+
+def _show_add_to_queue_notice(self, tracks, played_now=False):
+    notice = getattr(self, "show_output_notice", None)
+    if not callable(notice):
+        return
+    items = [track for track in list(tracks or []) if track is not None]
+    if not items:
+        return
+    count = len(items)
+    if count == 1:
+        title = str(getattr(items[0], "name", "Unknown Track") or "Unknown Track")
+        text = f"Playing now: {title}" if played_now else f"Added to queue: {title}"
+    else:
+        text = f"Playing {count} tracks now" if played_now else f"Added {count} tracks to queue"
+    notice(text, "ok", 2400)
+
+
 def on_play_next_current_tracks_clicked(self, _btn=None):
     tracks = _get_current_track_view_tracks(self)
     if not tracks:
@@ -394,6 +423,19 @@ def on_play_next_current_tracks_clicked(self, _btn=None):
         return
     _insert_queue_next(self, tracks)
     _show_play_next_notice(self, tracks, played_now=False)
+
+
+def on_add_current_tracks_to_queue_clicked(self, _btn=None):
+    tracks = _get_current_track_view_tracks(self)
+    if not tracks:
+        return
+    if getattr(self, "playing_track", None) is None:
+        _play_tracks_now(self, tracks)
+        _show_add_to_queue_notice(self, tracks, played_now=True)
+        return
+    base_queue = list(self._get_active_queue() if hasattr(self, "_get_active_queue") else [])
+    _insert_queue_at(self, tracks, len(base_queue), event_reason="queue_appended")
+    _show_add_to_queue_notice(self, tracks, played_now=False)
 
 
 def on_queue_remove_track_clicked(self, track_index):

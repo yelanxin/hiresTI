@@ -52,6 +52,8 @@ from app.app_queue import (
     _insert_queue_next,
     on_play_next_track_clicked,
     on_play_next_current_tracks_clicked,
+    on_add_track_to_queue_clicked,
+    on_add_current_tracks_to_queue_clicked,
     on_queue_remove_track_clicked,
     on_queue_clear_clicked,
 )

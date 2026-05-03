@@ -1073,6 +1073,29 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
     min-width: 30px;
     min-height: 30px;
 }
+.track-row-overflow-popover > contents {
+    padding: 4px;
+}
+.track-row-overflow-menu {
+    min-width: 150px;
+    background: transparent;
+    background-color: transparent;
+}
+.track-row-overflow-menu > row,
+.track-row-overflow-item {
+    min-height: 0;
+    padding: 0;
+    border-radius: 4px;
+    background: transparent;
+    background-color: transparent;
+}
+.track-row-overflow-menu > row:hover,
+.track-row-overflow-item:hover {
+    background-color: alpha(currentColor, 0.08);
+}
+.track-row-overflow-menu > row label {
+    font-size: 0.95em;
+}
 .history-card-btn {
     min-height: 28px;
     padding: 0;
