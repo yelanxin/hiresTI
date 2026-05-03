@@ -170,9 +170,31 @@ def build_tracks_view(app):
     trk_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["tracks-view"])
     trk_scroll = Gtk.ScrolledWindow(vexpand=True)
     app.trk_scroll = trk_scroll
-    trk_content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, margin_start=32, margin_end=32)
+    trk_content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
 
-    app.album_header_box = Gtk.Box(spacing=24, css_classes=["album-header-box"])
+    # Header: overlay with the dimmed album cover as background, content on top.
+    app.album_header_overlay = Gtk.Overlay(css_classes=["album-header-overlay"])
+    app.album_header_bg = Gtk.Picture()
+    app.album_header_bg.set_can_shrink(True)
+    try:
+        app.album_header_bg.set_content_fit(Gtk.ContentFit.COVER)
+    except Exception:
+        pass
+    app.album_header_bg.add_css_class("album-header-bg")
+    app.album_header_bg.set_size_request(-1, 280)
+    app.album_header_overlay.set_child(app.album_header_bg)
+    album_header_dim = Gtk.Box(
+        css_classes=["album-header-bg-dim"], hexpand=True, vexpand=True,
+        can_target=False,
+    )
+    app.album_header_overlay.add_overlay(album_header_dim)
+
+    app.album_header_box = Gtk.Box(
+        orientation=Gtk.Orientation.VERTICAL, spacing=20,
+        margin_top=24, margin_bottom=24, margin_start=32, margin_end=32,
+        css_classes=["album-header-box"],
+    )
+    album_header_top = Gtk.Box(spacing=24, css_classes=["album-header-top"])
     app.header_art = Gtk.Picture()
     app.header_art.set_size_request(utils.COVER_SIZE, utils.COVER_SIZE)
     app.header_art.set_can_shrink(True)
@@ -280,16 +302,33 @@ def build_tracks_view(app):
     app.track_list_select_btn.set_tooltip_text("Select Multiple")
     app.track_list_select_btn.connect("toggled", app.on_track_list_select_mode_toggled)
 
-    app.album_action_btns_box = Gtk.Box(spacing=4, valign=Gtk.Align.CENTER, css_classes=["album-action-btns"])
+    app.album_action_btns_box = Gtk.Box(spacing=4, valign=Gtk.Align.CENTER, halign=Gtk.Align.END, css_classes=["album-action-btns"])
     app.album_action_btns_box.append(app.remote_playlist_more_btn)
     app.album_action_btns_box.append(app.fav_btn)
     app.album_action_btns_box.append(app.track_list_select_btn)
     app.album_action_btns_box.append(app.add_playlist_btn)
 
-    app.album_header_box.append(app.header_art)
-    app.album_header_box.append(info)
-    app.album_header_box.append(app.album_action_btns_box)
-    trk_content.append(app.album_header_box)
+    # Top row: cover + textual info (no action icons here anymore).
+    album_header_top.append(app.header_art)
+    album_header_top.append(info)
+    app.album_header_box.append(album_header_top)
+
+    # Bottom row: Play / Shuffle pills on the left, secondary icons on the right.
+    album_header_actions = Gtk.Box(spacing=12, css_classes=["album-header-actions"])
+    app.album_primary_actions_box = Gtk.Box(
+        spacing=8, valign=Gtk.Align.CENTER, halign=Gtk.Align.START, hexpand=True,
+        css_classes=["album-primary-actions"],
+    )
+    album_header_actions.append(app.album_primary_actions_box)
+    album_header_actions.append(app.album_action_btns_box)
+    app.album_header_box.append(album_header_actions)
+
+    app.album_header_overlay.add_overlay(app.album_header_box)
+    trk_content.append(app.album_header_overlay)
+
+    # Restore horizontal margin for the rest of the page below the header.
+    trk_body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, margin_start=32, margin_end=32)
+    trk_content.append(trk_body)
 
     tracks_head, head_btns = build_tracks_header(
         on_sort_title=lambda _b: app.on_album_sort_clicked("title"),
@@ -298,13 +337,13 @@ def build_tracks_view(app):
         on_sort_time=lambda _b: app.on_album_sort_clicked("time"),
     )
     append_header_action_spacers(tracks_head, ["fav", "next", "add"])
-    trk_content.append(tracks_head)
+    trk_body.append(tracks_head)
     app.album_sort_buttons = head_btns
 
     app.track_list = Gtk.ListBox(css_classes=["tracks-list"], margin_start=0, margin_end=0, margin_bottom=32)
     app.track_list_base_margin_bottom = 32
     app.track_list.connect("row-activated", app.on_track_selected)
-    trk_content.append(app.track_list)
+    trk_body.append(app.track_list)
 
     app.track_list_select_revealer = Gtk.Revealer(
         transition_type=Gtk.RevealerTransitionType.SLIDE_UP,
@@ -331,7 +370,7 @@ def build_tracks_view(app):
     app.track_list_select_cancel_btn.connect("clicked", lambda _b: app.exit_track_list_select_mode())
     select_bar.append(app.track_list_select_cancel_btn)
     app.track_list_select_revealer.set_child(select_bar)
-    trk_content.append(app.track_list_select_revealer)
+    trk_body.append(app.track_list_select_revealer)
 
     # Similar albums section (populated async in show_album_details).
     # Placed as a sibling of trk_content (not a child) so it can use its own

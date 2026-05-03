@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import gi
 
 gi.require_version("Gtk", "4.0")
-from gi.repository import Gtk, GLib, Pango, Gdk, GObject
+from gi.repository import Gtk, GLib, Pango, Gdk, GObject, GdkPixbuf
 
 import utils.helpers as utils
 from _rust.viz import RustVizCore
@@ -1457,40 +1457,63 @@ def _on_shuffle_album_tracks(app):
     app.play_track(0)
 
 
+def _make_pill_button(icon_name, label, css_extra):
+    box = Gtk.Box(spacing=8, valign=Gtk.Align.CENTER, halign=Gtk.Align.CENTER)
+    img = Gtk.Image.new_from_icon_name(icon_name)
+    img.set_pixel_size(18)
+    box.append(img)
+    box.append(Gtk.Label(label=label))
+    btn = Gtk.Button(css_classes=["pill", "album-pill-btn"] + list(css_extra))
+    btn.set_child(box)
+    return btn
+
+
 def _ensure_play_shuffle_btns(app):
-    """Create play/shuffle/play-next buttons if needed and add them to album_action_btns_box."""
+    """Create play / shuffle pill buttons (left side) and the play-next icon
+    (right side, secondary action) if needed, and re-parent them to the
+    appropriate box on every album/playlist render."""
     if not hasattr(app, "_album_play_btn") or app._album_play_btn is None:
-        app._album_play_btn = Gtk.Button(icon_name="media-playback-start-symbolic", css_classes=["flat", "circular", "history-scroll-btn"])
+        app._album_play_btn = _make_pill_button(
+            "media-playback-start-symbolic", "Play", ["album-play-pill", "suggested-action"]
+        )
         app._album_play_btn.set_tooltip_text("Play all tracks")
         app._album_play_btn.connect("clicked", lambda _b: _on_play_album_tracks(app))
 
-    if not hasattr(app, "_album_play_next_btn") or app._album_play_next_btn is None:
-        app._album_play_next_btn = Gtk.Button(icon_name="hiresti-play-next-symbolic", css_classes=["flat", "circular", "history-scroll-btn"])
-        app._album_play_next_btn.connect("clicked", app.on_play_next_current_tracks_clicked)
-
     if not hasattr(app, "_album_shuffle_btn") or app._album_shuffle_btn is None:
-        app._album_shuffle_btn = Gtk.Button(icon_name="media-playlist-shuffle-symbolic", css_classes=["flat", "circular", "history-scroll-btn"])
+        app._album_shuffle_btn = _make_pill_button(
+            "media-playlist-shuffle-symbolic", "Shuffle", ["album-shuffle-pill"]
+        )
         app._album_shuffle_btn.set_tooltip_text("Shuffle and play")
         app._album_shuffle_btn.connect("clicked", lambda _b: _on_shuffle_album_tracks(app))
+
+    if not hasattr(app, "_album_play_next_btn") or app._album_play_next_btn is None:
+        app._album_play_next_btn = Gtk.Button(
+            icon_name="hiresti-play-next-symbolic",
+            css_classes=["flat", "circular", "history-scroll-btn"],
+        )
+        app._album_play_next_btn.connect("clicked", app.on_play_next_current_tracks_clicked)
 
     is_playlist = bool(getattr(app, "current_remote_playlist", None) is not None or getattr(app, "current_playlist_id", None) is not None)
     app._album_play_next_btn.set_tooltip_text("Play Playlist Next" if is_playlist else "Play Album Next")
 
-    action_box = getattr(app, "album_action_btns_box", None)
-    if action_box:
-        for btn in (app._album_play_btn, app._album_play_next_btn, app._album_shuffle_btn):
-            if btn.get_parent() is action_box:
-                action_box.remove(btn)
-        action_box.append(app._album_play_btn)
-        action_box.append(app._album_play_next_btn)
-        action_box.append(app._album_shuffle_btn)
+    primary_box = getattr(app, "album_primary_actions_box", None)
+    if primary_box is not None:
+        for btn in (app._album_play_btn, app._album_shuffle_btn):
+            if btn.get_parent() is primary_box:
+                primary_box.remove(btn)
+        primary_box.append(app._album_play_btn)
+        primary_box.append(app._album_shuffle_btn)
 
-    if app._album_play_btn:
-        app._album_play_btn.set_visible(True)
-    if app._album_play_next_btn:
-        app._album_play_next_btn.set_visible(True)
-    if app._album_shuffle_btn:
-        app._album_shuffle_btn.set_visible(True)
+    secondary_box = getattr(app, "album_action_btns_box", None)
+    if secondary_box is not None:
+        if app._album_play_next_btn.get_parent() is secondary_box:
+            secondary_box.remove(app._album_play_next_btn)
+        # Insert between fav and select for natural grouping.
+        secondary_box.append(app._album_play_next_btn)
+
+    for btn in (app._album_play_btn, app._album_shuffle_btn, app._album_play_next_btn):
+        if btn is not None:
+            btn.set_visible(True)
 
 
 def _artist_context_values(candidate):
@@ -1626,6 +1649,42 @@ def _load_similar_albums(app, alb):
     GLib.idle_add(populate)
 
 
+def _load_album_header_bg(app, url_provider):
+    """Load the album cover into app.album_header_bg without imposing a
+    fixed size_request (so the Picture fills the overlay's actual width)."""
+    pic = getattr(app, "album_header_bg", None)
+    if pic is None:
+        return
+
+    def fetch():
+        try:
+            url = url_provider() if callable(url_provider) else url_provider
+            if not url:
+                return
+            pic._target_url = url
+            from hashlib import md5
+            f_name = md5(str(url).encode()).hexdigest()
+            f_path = utils.download_to_cache(str(url), app.cache_dir, filename=f_name, timeout=10)
+            if not f_path:
+                return
+            pb = GdkPixbuf.Pixbuf.new_from_file(f_path)
+            if not pb:
+                return
+            texture = Gdk.Texture.new_for_pixbuf(pb)
+
+            def apply():
+                if getattr(pic, "_target_url", None) != url:
+                    return False
+                pic.set_paintable(texture)
+                return False
+
+            GLib.idle_add(apply)
+        except Exception:
+            logger.debug("album header bg load failed", exc_info=True)
+
+    Thread(target=fetch, daemon=True).start()
+
+
 def show_album_details(app, alb):
     # Invalidate any in-flight playlist page-load callbacks so they don't
     # overwrite the track list we're about to populate with album tracks.
@@ -1660,6 +1719,8 @@ def show_album_details(app, alb):
     app.header_artist.set_tooltip_text(artist_name)
 
     utils.load_img(app.header_art, lambda: app.backend.get_artwork_url(alb, 640), app.cache_dir, utils.COVER_SIZE)
+    if hasattr(app, "album_header_bg") and app.album_header_bg is not None:
+        _load_album_header_bg(app, lambda: app.backend.get_artwork_url(alb, 640))
     is_fav = app.backend.is_favorite(getattr(alb, "id", ""))
     app._update_fav_icon(app.fav_btn, is_fav)
     if app.remote_playlist_edit_btn is not None:

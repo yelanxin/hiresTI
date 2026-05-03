@@ -1571,6 +1571,49 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
     -gtk-icon-size: 28px;
 }
 
+/* Album / playlist detail header — dimmed cover background + Tidal-style
+ * primary action pills on the left. */
+.album-header-overlay {
+    background-color: rgba(0, 0, 0, 0.92);
+}
+.album-header-bg {
+    opacity: 0.45;
+}
+.album-header-bg-dim {
+    background: linear-gradient(
+        to bottom,
+        rgba(0, 0, 0, 0.45) 0%,
+        rgba(0, 0, 0, 0.65) 60%,
+        rgba(0, 0, 0, 0.92) 100%
+    );
+}
+.album-pill-btn {
+    border-radius: 9999px;
+    padding: 10px 22px;
+    font-weight: 600;
+    min-height: 0;
+}
+.album-pill-btn image {
+    -gtk-icon-size: 18px;
+}
+.album-play-pill {
+    color: #111418;
+    background-color: #ffffff;
+    box-shadow: none;
+}
+.album-play-pill:hover {
+    background-color: rgba(255, 255, 255, 0.88);
+}
+.album-shuffle-pill {
+    color: #ffffff;
+    background-color: rgba(255, 255, 255, 0.12);
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    box-shadow: none;
+}
+.album-shuffle-pill:hover {
+    background-color: rgba(255, 255, 255, 0.20);
+}
+
 .playlist-more-menu button {
     padding: 12px 16px;
     min-height: 0;

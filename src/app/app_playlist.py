@@ -265,10 +265,12 @@ def on_remote_playlist_card_clicked(self, playlist_obj):
         self.remote_playlist_more_btn.set_visible(self._remote_playlist_is_own)
     self._refresh_remote_playlist_visibility_button(playlist_obj)
     # Ensure play/shuffle buttons exist and are visible
-    from actions.ui_actions import _ensure_play_shuffle_btns
+    from actions.ui_actions import _ensure_play_shuffle_btns, _load_album_header_bg
     _ensure_play_shuffle_btns(self)
     import utils.helpers as utils
     utils.load_img(self.header_art, lambda: self.backend.get_artwork_url(playlist_obj, 640), self.cache_dir, utils.COVER_SIZE)
+    if hasattr(self, "album_header_bg") and self.album_header_bg is not None:
+        _load_album_header_bg(self, lambda: self.backend.get_artwork_url(playlist_obj, 640))
 
     while c := self.track_list.get_first_child():
         self.track_list.remove(c)
