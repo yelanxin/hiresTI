@@ -833,6 +833,16 @@ fn transport_worker(
                 }
             }
             NativeTransportCommand::Pause => {
+                // Capture the live play-head position BEFORE tearing down the
+                // runtime.  The Play handler later asks for it via the same
+                // helper, but by then `runtime` is None and only the
+                // `decoded_frame_count / rate` fallback is available — which
+                // diverges from real playback time under a network underrun
+                // storm (decoder throttled below realtime by slow HTTP reads),
+                // and can round to 0, causing resume to restart from segment 1.
+                // Stash the authoritative position into seek_offset_s so the
+                // Play handler reads it straight out of the snapshot.
+                let pause_pos_ms = current_native_playback_position_ms(&snapshot, &runtime);
                 set_native_runtime(&runtime, None);
                 let old_sink = stop_decode_worker(&mut decode_worker);
                 if let Some(mut sink) = old_sink {
@@ -844,6 +854,10 @@ fn transport_worker(
                     Err(_) => break,
                 };
                 state.decode_worker_running = false;
+                if pause_pos_ms > 0 {
+                    state.seek_offset_s = pause_pos_ms as f64 / 1000.0;
+                    state.decoded_frame_count = 0;
+                }
                 if matches!(
                     state.state,
                     NativeTransportState::Playing | NativeTransportState::Ready
