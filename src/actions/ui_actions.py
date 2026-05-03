@@ -3433,7 +3433,8 @@ def render_history_dashboard(app):
     _clear_container(app.collection_content_box)
 
     recent_albums = app.history_mgr.get_albums() if hasattr(app, "history_mgr") else []
-    top_tracks = app.history_mgr.get_top_tracks(limit=20) if hasattr(app, "history_mgr") else []
+    top_tracks = app.history_mgr.get_top_tracks(limit=100) if hasattr(app, "history_mgr") else []
+    recent_tracks = app.history_mgr.get_recent_tracks(limit=100) if hasattr(app, "history_mgr") else []
 
     tabs_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
     history_stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
@@ -3444,13 +3445,19 @@ def render_history_dashboard(app):
     tabs_box.append(history_switcher)
     tabs_box.append(history_stack)
 
-    # --- Tab 1: Top 20 (shell + header) ---
+    # --- Tab 1: Top 100 (shell + header) ---
     sec_top = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, css_classes=["home-section", "history-section"])
     top_grid = Gtk.Grid(column_spacing=16, row_spacing=8, hexpand=True)
     sec_top.append(top_grid)
-    history_stack.add_titled(sec_top, "history-top20", "Top 20")
+    history_stack.add_titled(sec_top, "history-top100", "Top 100")
 
-    # --- Tab 2: Recent Albums (shell + header only, content populated lazily) ---
+    # --- Tab 2: Recent Tracks (shell + header) ---
+    sec_recent_tracks = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, css_classes=["home-section", "history-section"])
+    recent_tracks_grid = Gtk.Grid(column_spacing=16, row_spacing=8, hexpand=True)
+    sec_recent_tracks.append(recent_tracks_grid)
+    history_stack.add_titled(sec_recent_tracks, "history-recent-tracks", "Recent Tracks")
+
+    # --- Tab 3: Recent Albums (shell + header only, content populated lazily) ---
     sec_recent = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, css_classes=["home-section", "history-section"])
     flow_recent = Gtk.FlowBox(
         homogeneous=True,
@@ -3464,7 +3471,7 @@ def render_history_dashboard(app):
     sec_recent.append(flow_recent)
     history_stack.add_titled(sec_recent, "history-recent", "Recent Albums")
 
-    history_stack.set_visible_child_name("history-top20")
+    history_stack.set_visible_child_name("history-top100")
     app.collection_content_box.append(tabs_box)
 
     def _norm_text(v):
@@ -3480,21 +3487,22 @@ def render_history_dashboard(app):
     _now_name = _norm_text(getattr(_playing_track, "name", "")) if _playing_track else ""
     _now_artist = _norm_text(getattr(getattr(_playing_track, "artist", None), "name", "")) if _playing_track else ""
 
-    # --- Populate Tab 1 immediately (data is local, 20 items max) ---
-    for i, tr in enumerate(top_tracks):
+    # --- Helper: build a single track-card button ---
+    def _build_history_track_button(i, tr, *, show_rank, click_tracks, click_label):
         row_box = Gtk.Box(spacing=10, margin_start=6, margin_end=6, margin_top=4, margin_bottom=4)
-        rank_classes = ["history-rank-chip"]
-        if i == 0:
-            rank_classes.append("history-rank-top1")
-        elif i == 1:
-            rank_classes.append("history-rank-top2")
-        elif i == 2:
-            rank_classes.append("history-rank-top3")
-        rank_label = Gtk.Label(label=f"{i + 1:02d}", xalign=0.5, css_classes=rank_classes)
-        rank_label.set_size_request(24, 24)
-        rank_label.set_valign(Gtk.Align.CENTER)
-        rank_label.set_vexpand(False)
-        row_box.append(rank_label)
+        if show_rank:
+            rank_classes = ["history-rank-chip"]
+            if i == 0:
+                rank_classes.append("history-rank-top1")
+            elif i == 1:
+                rank_classes.append("history-rank-top2")
+            elif i == 2:
+                rank_classes.append("history-rank-top3")
+            rank_label = Gtk.Label(label=f"{i + 1:02d}", xalign=0.5, css_classes=rank_classes)
+            rank_label.set_size_request(24, 24)
+            rank_label.set_valign(Gtk.Align.CENTER)
+            rank_label.set_vexpand(False)
+            row_box.append(rank_label)
 
         img = Gtk.Image(pixel_size=DASHBOARD_TRACK_COVER_SIZE, css_classes=["album-cover-img"])
         cover = app.backend.get_artwork_url(tr, 320)
@@ -3529,11 +3537,12 @@ def render_history_dashboard(app):
         text_box.append(subtitle)
         row_box.append(text_box)
 
-        play_count = int(getattr(tr, "play_count", 0) or 0)
-        play_count_label = Gtk.Label(label=f"x{play_count}", xalign=1.0, css_classes=["dim-label", "home-card-subtitle"])
-        play_count_label.set_halign(Gtk.Align.END)
-        play_count_label.set_size_request(42, -1)
-        row_box.append(play_count_label)
+        if show_rank:
+            play_count = int(getattr(tr, "play_count", 0) or 0)
+            play_count_label = Gtk.Label(label=f"x{play_count}", xalign=1.0, css_classes=["dim-label", "home-card-subtitle"])
+            play_count_label.set_halign(Gtk.Align.END)
+            play_count_label.set_size_request(42, -1)
+            row_box.append(play_count_label)
 
         track_id = getattr(tr, "id", None) or getattr(tr, "track_id", None)
         row_name_norm = _norm_text(track_name)
@@ -3571,11 +3580,94 @@ def render_history_dashboard(app):
         btn._dashboard_track_artist = row_artist_norm
         btn._dashboard_playing_icon = playing_icon
         btn.set_child(row_box)
-        btn.connect("clicked", lambda _b, idx=i: app.on_history_track_clicked(top_tracks, idx, {"type": "history", "name": "Top 20"}))
+        btn.connect(
+            "clicked",
+            lambda _b, idx=i, tracks=click_tracks, lbl=click_label:
+                app.on_history_track_clicked(tracks, idx, {"type": "history", "name": lbl}),
+        )
+        return btn
 
-        col = 0 if i < 10 else 1
-        row = i if i < 10 else i - 10
-        top_grid.attach(btn, col, row, 1, 1)
+    # --- Populate Tab 1 (Top 100) ---
+    top_buttons = [
+        _build_history_track_button(i, tr, show_rank=True, click_tracks=top_tracks, click_label="Top 100")
+        for i, tr in enumerate(top_tracks)
+    ]
+
+    # --- Populate Tab 2 (Recent Tracks) ---
+    recent_tracks_buttons = [
+        _build_history_track_button(i, tr, show_rank=False, click_tracks=recent_tracks, click_label="Recent Tracks")
+        for i, tr in enumerate(recent_tracks)
+    ]
+
+    # --- Responsive column-balanced layout (shared logic) ---
+    def _compute_history_grid_cols():
+        win = getattr(app, "win", None)
+        if win is None:
+            return 2
+        try:
+            w = int(win.get_width() or 0)
+        except Exception:
+            w = 0
+        if w <= 0:
+            try:
+                w = int(win.get_default_size()[0] or 0)
+            except Exception:
+                w = 0
+        # Reserve space for sidebar (~250px) + paddings
+        avail = max(360, w - 320)
+        # Aim for ~360px per column card
+        cols = max(1, min(5, avail // 360))
+        return int(cols)
+
+    def _make_relayout_fn(grid, buttons):
+        state = {"cols": 0}
+        def _fn():
+            if not buttons:
+                return
+            cols = _compute_history_grid_cols()
+            if cols == state["cols"]:
+                return
+            state["cols"] = cols
+            while c := grid.get_first_child():
+                grid.remove(c)
+            n = len(buttons)
+            per_col = (n + cols - 1) // cols
+            for idx, b in enumerate(buttons):
+                grid.attach(b, idx // per_col, idx % per_col, 1, 1)
+        return _fn
+
+    relayout_fns = [
+        _make_relayout_fn(top_grid, top_buttons),
+        _make_relayout_fn(recent_tracks_grid, recent_tracks_buttons),
+    ]
+    for fn in relayout_fns:
+        fn()
+
+    # Disconnect any previous resize hook from a prior render before binding.
+    prev_handler = getattr(app, "_history_top_resize_handler", None)
+    prev_win = getattr(app, "_history_top_resize_win", None)
+    if prev_handler and prev_win is not None:
+        try:
+            prev_win.disconnect(prev_handler)
+        except Exception:
+            pass
+    app._history_top_resize_handler = None
+    app._history_top_resize_win = None
+
+    if getattr(app, "win", None) is not None:
+        # Only run if at least one of our grids is still in the widget tree.
+        watched_grids = [top_grid, recent_tracks_grid]
+        def _on_resize(*_):
+            if all(g.get_root() is None for g in watched_grids):
+                return
+            for fn in relayout_fns:
+                fn()
+        try:
+            handler_id = app.win.connect("notify::default-width", _on_resize)
+            app._history_top_resize_handler = handler_id
+            app._history_top_resize_win = app.win
+        except Exception:
+            logger.exception("Failed to bind history grid resize handler")
 
     # --- Populate Tab 2 lazily on first switch ---
     _recent_populated = [False]

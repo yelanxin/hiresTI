@@ -91,6 +91,28 @@ class HistoryManager:
                 break
         return out
 
+    def get_recent_tracks(self, limit=100):
+        """Return the N most recently played unique tracks (newest first)."""
+        seen = set()
+        out = []
+        for item in self.load_raw():
+            if not isinstance(item, dict):
+                continue
+            tid = item.get("track_id")
+            if not tid:
+                continue
+            key = str(tid)
+            if key in seen:
+                continue
+            seen.add(key)
+            tr = self.to_local_track(item)
+            if tr is None:
+                continue
+            out.append(tr)
+            if len(out) >= limit:
+                break
+        return out
+
     def get_top_tracks(self, limit=20):
         counts = {}
         latest_meta = {}
