@@ -623,6 +623,8 @@ def build_settings_page(app):
     app.device_dd = Gtk.DropDown(model=Gtk.StringList.new(["Default"]))
     app.device_dd.set_sensitive(False)
     app.device_dd.connect("notify::selected-item", app.on_device_changed)
+    from actions.audio_settings_actions import setup_device_dropdown_refresh_gesture
+    setup_device_dropdown_refresh_gesture(app)
     row_dev.append(app.device_dd)
     group_out.append(row_dev)
 

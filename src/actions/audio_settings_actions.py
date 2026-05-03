@@ -417,34 +417,6 @@ def _stop_output_hotplug_watch(app):
     app._output_hotplug_source = 0
 
 
-def _touch_output_probe_burst(app, seconds=20):
-    try:
-        app._output_probe_burst_until = time.monotonic() + max(1.0, float(seconds))
-    except Exception:
-        app._output_probe_burst_until = time.monotonic() + 20.0
-
-
-def _get_output_probe_intervals(app):
-    # Event-priority strategy:
-    # - playing / recent output event => fast probe
-    # - idle => low-frequency fallback probe
-    try:
-        is_playing = bool(getattr(app, "player", None) is not None and app.player.is_playing())
-    except Exception:
-        is_playing = False
-    now = time.monotonic()
-    burst_until = float(getattr(app, "_output_probe_burst_until", 0.0) or 0.0)
-    in_burst = now < burst_until
-    mode = "fast" if (is_playing or in_burst) else "idle"
-    prev_mode = getattr(app, "_output_probe_mode", None)
-    if prev_mode != mode:
-        app._output_probe_mode = mode
-        logger.info("Output probe mode: %s", mode)
-    if is_playing or in_burst:
-        return 2.0, 4.0
-    return 12.0, 20.0
-
-
 def _refresh_devices_for_current_driver_ui_only(app, reason="hotplug-watch", prefer_device_id=None):
     """Refresh current driver's device dropdown only, without applying output switch."""
     selected_driver = app.driver_dd.get_selected_item()
@@ -595,7 +567,6 @@ def start_output_hotplug_watch(app, seconds=60, interval_ms=1000, slow_interval_
     Stage-2 (slow): slow_interval_ms until stopped by rediscovery or caller.
     """
     _stop_output_hotplug_watch(app)
-    _touch_output_probe_burst(app, seconds=max(20, seconds))
     now_us = GLib.get_monotonic_time()
     app._output_hotplug_deadline = now_us + int(seconds * 1_000_000)
     app._output_hotplug_fast_interval_us = int(max(200, interval_ms) * 1000)
@@ -700,167 +671,42 @@ def refresh_devices_keep_driver_select_first(app, reason="device-refresh"):
     Thread(target=worker, daemon=True).start()
 
 
-def _monitor_selected_device_presence(app):
-    """Detect unplugged selected device even when idle (no active playback errors)."""
-    try:
-        # Skip during playback: enumerating USB devices issues control transfers
-        # to every connected device including the actively streaming DAC, which
-        # produces audible micro-stutters on FiiO KA13 (and likely others).
-        if bool(getattr(app.player, "is_playing", lambda: False)()):
-            return
-        now = time.monotonic()
-        next_ts = float(getattr(app, "_device_presence_next_ts", 0.0) or 0.0)
-        if now < next_ts:
-            return
-        presence_interval_s, _ = _get_output_probe_intervals(app)
-        app._device_presence_next_ts = now + presence_interval_s
-        if getattr(app, "_device_presence_probe_running", False):
-            return
-        if getattr(app, "ignore_device_change", False):
-            return
-        if getattr(app, "_output_hotplug_source", 0):
-            return
+def setup_device_dropdown_refresh_gesture(app):
+    """Attach a click gesture so the device dropdown re-enumerates USB only on user open.
 
-        drv_item = app.driver_dd.get_selected_item() if hasattr(app, "driver_dd") else None
-        dev_item = app.device_dd.get_selected_item() if hasattr(app, "device_dd") else None
-        if not drv_item or not dev_item:
-            return
-        driver_name = drv_item.get_string()
-        device_name = dev_item.get_string()
-        if not driver_name or not device_name:
-            return
-        if _driver_key(driver_name) not in ("alsa_auto", "alsa_mmap", "pipewire", "usbrawlink", "usb_rawlink_v2"):
-            return
-        if device_name in ("Default Output", "Default System Output", "Unavailable", "Default"):
-            return
+    Replaces the previous 2.5s polling loop. Enumerating USB devices issues
+    control transfers to every connected device (including the actively
+    streaming DAC), which produces audible micro-stutters on some firmware
+    (e.g. FiiO KA13). Doing it only on user-initiated drop-open keeps the
+    list fresh without bothering the audio path during steady-state playback.
+    """
+    if getattr(app, "_device_dd_refresh_gesture", None) is not None:
+        return
+    if not hasattr(app, "device_dd") or app.device_dd is None:
+        return
+    gesture = Gtk.GestureClick.new()
+    gesture.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+    gesture.set_button(0)
 
-        app._device_presence_probe_running = True
+    def _on_press(_g, _n_press, _x, _y):
+        try:
+            drv_item = app.driver_dd.get_selected_item() if hasattr(app, "driver_dd") else None
+            if not drv_item:
+                return
+            driver_name = drv_item.get_string()
+            if _driver_key(driver_name) not in (
+                "alsa_auto", "alsa_mmap", "pipewire", "usbrawlink", "usb_rawlink_v2"
+            ):
+                return
+            if getattr(app, "ignore_device_change", False):
+                return
+            _refresh_devices_for_current_driver_ui_only(app, reason="dropdown-open")
+        except Exception:
+            logger.exception("device dropdown refresh failed")
 
-        def worker():
-            try:
-                devices = app.player.get_devices_for_driver(driver_name)
-                names = [d.get("name") for d in devices]
-                ids = [d.get("device_id") for d in devices]
-                requested_id = getattr(app.player, "requested_device_id", None)
-
-                def apply_result():
-                    app._device_presence_probe_running = False
-                    if device_name in names:
-                        return False
-                    if requested_id and requested_id in ids:
-                        return False
-                    # USB Rawlink: also match by vid:pid prefix — id may have/lack serial
-                    # or the cache may have already restored the real name, so a strict
-                    # string compare could miss a physically-present device.
-                    if _driver_is_usb_rawlink_family(driver_name) and requested_id:
-                        req_prefix = ":".join(requested_id.split(":")[:3])  # "usb:vid:pid"
-                        if any(
-                            str(d.get("device_id") or "").startswith(req_prefix)
-                            for d in devices
-                        ):
-                            return False
-                    if hasattr(app, "show_output_notice"):
-                        app.show_output_notice(
-                            f"Audio device disconnected: {device_name}",
-                            "warn",
-                            3600,
-                        )
-                    app._last_disconnected_device_name = device_name
-                    app._last_disconnected_driver = driver_name
-                    logger.warning(
-                        "Selected device disappeared (idle monitor): driver=%s device=%s",
-                        driver_name,
-                        device_name,
-                    )
-                    refresh_devices_keep_driver_select_first(app, reason="device-missing-idle")
-                    start_output_hotplug_watch(app, seconds=60, interval_ms=1000, slow_interval_ms=5000)
-                    return False
-
-                GLib.idle_add(apply_result)
-            except Exception:
-                app._device_presence_probe_running = False
-
-        Thread(target=worker, daemon=True).start()
-    except Exception:
-        pass
-
-
-def _passive_sync_device_list(app):
-    """Keep device dropdown in sync with actual hardware even if selected device is unaffected."""
-    try:
-        # Skip during playback: enumerating USB devices issues control transfers
-        # to every connected device including the actively streaming DAC, which
-        # produces audible micro-stutters on FiiO KA13 (and likely others).
-        if bool(getattr(app.player, "is_playing", lambda: False)()):
-            return
-        now = time.monotonic()
-        next_ts = float(getattr(app, "_device_list_sync_next_ts", 0.0) or 0.0)
-        if now < next_ts:
-            return
-        _, sync_interval_s = _get_output_probe_intervals(app)
-        app._device_list_sync_next_ts = now + sync_interval_s
-        if getattr(app, "_device_list_sync_running", False):
-            return
-        if getattr(app, "ignore_device_change", False):
-            return
-        if getattr(app, "_output_hotplug_source", 0):
-            return
-
-        drv_item = app.driver_dd.get_selected_item() if hasattr(app, "driver_dd") else None
-        if not drv_item:
-            return
-        driver_name = drv_item.get_string()
-        if _driver_key(driver_name) not in ("alsa_auto", "alsa_mmap", "pipewire", "usbrawlink", "usb_rawlink_v2"):
-            return
-
-        selected_item = app.device_dd.get_selected_item() if hasattr(app, "device_dd") else None
-        prefer_name = selected_item.get_string() if selected_item else getattr(app, "current_device_name", None)
-        old_sig = _device_enum_signature(getattr(app, "current_device_list", []))
-
-        app._device_list_sync_running = True
-
-        def worker():
-            try:
-                devices = app.player.get_devices_for_driver(driver_name)
-                new_sig = _device_enum_signature(devices)
-                new_names = [d.get("name") for d in devices]
-
-                def apply_result():
-                    app._device_list_sync_running = False
-                    if new_sig == old_sig:
-                        return False
-
-                    app.ignore_device_change = True
-                    app.current_device_list = devices
-                    app.device_dd.set_model(Gtk.StringList.new(new_names))
-                    _min_dev = 1 if _driver_is_usb_rawlink_family(driver_name) else 2
-                    app.device_dd.set_sensitive(len(devices) >= _min_dev)
-
-                    sel_idx = 0
-                    if prefer_name:
-                        for i, d in enumerate(devices):
-                            if d.get("name") == prefer_name:
-                                sel_idx = i
-                                break
-                    if devices and sel_idx < len(devices):
-                        app.device_dd.set_selected(sel_idx)
-                        app.current_device_name = devices[sel_idx].get("name") or app.current_device_name
-                    device_info = devices[sel_idx] if devices and sel_idx < len(devices) else None
-                    _sync_output_bit_depth_dropdown(app, device_info)
-                    app.ignore_device_change = False
-                    app.update_tech_label(app.player.stream_info)
-                    if hasattr(app, "_update_dsp_ui_state"):
-                        app._update_dsp_ui_state()
-                    logger.info("Output device list synced (passive): driver=%s count=%d", driver_name, len(devices))
-                    return False
-
-                GLib.idle_add(apply_result)
-            except Exception:
-                app._device_list_sync_running = False
-
-        Thread(target=worker, daemon=True).start()
-    except Exception:
-        pass
+    gesture.connect("pressed", _on_press)
+    app.device_dd.add_controller(gesture)
+    app._device_dd_refresh_gesture = gesture
 
 
 def update_output_status_ui(app):
@@ -940,8 +786,6 @@ def update_output_status_ui(app):
             app.set_diag_health("output", "error", err)
         else:
             app.set_diag_health("output", "idle")
-    _monitor_selected_device_presence(app)
-    _passive_sync_device_list(app)
     if hasattr(app, "_sync_playback_status_icon"):
         app._sync_playback_status_icon()
 
@@ -1220,7 +1064,6 @@ def on_recover_output_clicked(app, _btn=None):
     device_id = getattr(app.player, "requested_device_id", None)
     if not driver:
         return
-    _touch_output_probe_burst(app, seconds=30)
     logger.info("Recovering output to requested target: driver=%s device=%s", driver, device_id)
     if hasattr(app, "record_diag_event"):
         app.record_diag_event(f"Recover output requested: {driver} / {device_id or 'default'}")
@@ -1306,7 +1149,6 @@ def on_driver_changed(app, dd, p):
         return
     app._usb_perm_dialog_shown = False  # reset so prompt can fire for this driver selection
     _stop_output_hotplug_watch(app)
-    _touch_output_probe_burst(app, seconds=30)
     selected = dd.get_selected_item()
     if not selected:
         return
@@ -1518,7 +1360,6 @@ def on_device_changed(app, dd, p):
     if app.ignore_device_change:
         return
     _stop_output_hotplug_watch(app)
-    _touch_output_probe_burst(app, seconds=30)
     idx = dd.get_selected()
     if not (hasattr(app, "current_device_list") and idx < len(app.current_device_list)):
         return
@@ -1632,10 +1473,6 @@ def on_output_bit_depth_changed(app, dd, p):
 def on_output_state_transition(self, prev_state, state, detail=None):
     player = getattr(self, "player", None)
     if state == "switching":
-        try:
-            _touch_output_probe_burst(self, seconds=30)
-        except Exception:
-            pass
         self.show_output_notice("Audio device changed, reconnecting...", "switching", 2400)
         return
     if state == "active" and prev_state in ("switching", "fallback", "error"):
@@ -1670,10 +1507,6 @@ def on_output_state_transition(self, prev_state, state, detail=None):
                 GLib.timeout_add(200, _usb_resume)
         return
     if state == "fallback":
-        try:
-            _touch_output_probe_burst(self, seconds=60)
-        except Exception:
-            pass
         if self.play_btn is not None:
             self.play_btn.set_icon_name("media-playback-start-symbolic")
         detail_text = str(detail or "")
@@ -1706,10 +1539,6 @@ def on_output_state_transition(self, prev_state, state, detail=None):
             self.show_output_notice("Primary output unavailable, switched to fallback", "warn", 3200)
         return
     if state == "error":
-        try:
-            _touch_output_probe_burst(self, seconds=45)
-        except Exception:
-            pass
         if self.play_btn is not None:
             self.play_btn.set_icon_name("media-playback-start-symbolic")
         msg = str(detail or "Unknown output error")
