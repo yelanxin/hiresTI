@@ -1065,6 +1065,12 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
     min-height: 28px;
     padding: 2px;
 }
+/* The play-next glyph is visually lighter than the heart/trash glyphs
+ * (just a triangle + bar in the 16×16 box), so render it at a larger
+ * icon size in track-row buttons to keep optical balance. */
+.track-row-next-btn image {
+    -gtk-icon-size: 22px;
+}
 .history-card-btn {
     min-height: 28px;
     padding: 0;

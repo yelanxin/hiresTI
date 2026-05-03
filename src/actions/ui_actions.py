@@ -1794,7 +1794,7 @@ def populate_tracks(app, tracks):
         if not select_mode:
             fav_btn = app.create_track_fav_button(t)
             box.append(fav_btn)
-            next_btn = Gtk.Button(icon_name="hiresti-play-next-symbolic", css_classes=["flat", "circular", "history-scroll-btn"])
+            next_btn = Gtk.Button(icon_name="hiresti-play-next-symbolic", css_classes=["flat", "circular", "history-scroll-btn", "track-row-next-btn"])
             next_btn.set_tooltip_text("Play Next")
             next_btn.connect("clicked", lambda _b, tr=t: app.on_play_next_track_clicked(tr))
             box.append(next_btn)
@@ -6611,7 +6611,7 @@ def render_playlist_detail(app, playlist_id):
             rm_btn.connect("clicked", lambda _b, pid=p.get("id"), idx=i: app.on_playlist_remove_track_clicked(pid, idx))
             box.append(rm_btn)
         else:
-            next_btn = Gtk.Button(icon_name="hiresti-play-next-symbolic", css_classes=["flat", "circular", "history-scroll-btn"])
+            next_btn = Gtk.Button(icon_name="hiresti-play-next-symbolic", css_classes=["flat", "circular", "history-scroll-btn", "track-row-next-btn"])
             next_btn.set_tooltip_text("Play Next")
             next_btn.connect("clicked", lambda _b, tr=t: app.on_play_next_track_clicked(tr))
             box.append(next_btn)
