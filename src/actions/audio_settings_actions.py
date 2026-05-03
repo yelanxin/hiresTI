@@ -703,6 +703,11 @@ def refresh_devices_keep_driver_select_first(app, reason="device-refresh"):
 def _monitor_selected_device_presence(app):
     """Detect unplugged selected device even when idle (no active playback errors)."""
     try:
+        # Skip during playback: enumerating USB devices issues control transfers
+        # to every connected device including the actively streaming DAC, which
+        # produces audible micro-stutters on FiiO KA13 (and likely others).
+        if bool(getattr(app.player, "is_playing", lambda: False)()):
+            return
         now = time.monotonic()
         next_ts = float(getattr(app, "_device_presence_next_ts", 0.0) or 0.0)
         if now < next_ts:
@@ -783,6 +788,11 @@ def _monitor_selected_device_presence(app):
 def _passive_sync_device_list(app):
     """Keep device dropdown in sync with actual hardware even if selected device is unaffected."""
     try:
+        # Skip during playback: enumerating USB devices issues control transfers
+        # to every connected device including the actively streaming DAC, which
+        # produces audible micro-stutters on FiiO KA13 (and likely others).
+        if bool(getattr(app.player, "is_playing", lambda: False)()):
+            return
         now = time.monotonic()
         next_ts = float(getattr(app, "_device_list_sync_next_ts", 0.0) or 0.0)
         if now < next_ts:

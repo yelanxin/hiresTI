@@ -347,7 +347,7 @@ fn locator_extension(locator: &str) -> Option<&str> {
 
 fn is_direct_audio_locator(locator: &str) -> bool {
     if let Some(ext) = locator_extension(locator).map(|ext| ext.to_ascii_lowercase()) {
-        return matches!(ext.as_str(), "flac" | "m4a" | "mp4" | "m4s" | "aac");
+        return matches!(ext.as_str(), "flac" | "m4a" | "mp4" | "m4s" | "aac" | "wav");
     }
 
     // TIDAL signed BTS URLs are often opaque and may not expose a file

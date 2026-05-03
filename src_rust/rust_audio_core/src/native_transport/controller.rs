@@ -1453,6 +1453,8 @@ fn direct_locator_probe_hint(locator: &str) -> Option<&'static str> {
         Some("mp4")
     } else if name.ends_with(".aac") {
         Some("aac")
+    } else if name.ends_with(".wav") {
+        Some("wav")
     } else {
         None
     }

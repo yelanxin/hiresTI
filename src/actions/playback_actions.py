@@ -63,10 +63,12 @@ def on_play_pause(app, btn):
             app._remote_publish_playback_event("paused")
     else:
         local_override = os.environ.get("HIRESTI_LOCAL_URI", "").strip()
-        if local_override and not getattr(app.player, "_last_loaded_uri", ""):
+        if local_override:
             if not local_override.startswith("file://"):
                 local_override = "file://" + os.path.abspath(os.path.expanduser(local_override))
-            app.player.load(local_override)
+            current_uri = str(getattr(app.player, "_last_loaded_uri", "") or "")
+            if current_uri != local_override:
+                app.player.load(local_override)
         app.player.play()
         audio_settings_actions.update_output_status_ui(app)
         state = str(getattr(app.player, "output_state", "idle") or "idle")
