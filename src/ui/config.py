@@ -1065,14 +1065,6 @@ flowboxchild { background-color: transparent; padding: 0; margin: 0; }
     min-height: 28px;
     padding: 2px;
 }
-/* The play-next glyph is visually lighter than the heart/trash glyphs
- * (just a triangle + bar in the 16×16 box). The pixel size is set in
- * Python via Gtk.Image.set_pixel_size(22); this rule just makes sure
- * the surrounding button has room so the larger image isn't clipped. */
-.track-row-next-btn {
-    min-width: 30px;
-    min-height: 30px;
-}
 .track-row-overflow-popover > contents {
     padding: 4px;
 }
