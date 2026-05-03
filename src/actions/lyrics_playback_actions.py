@@ -414,19 +414,28 @@ def play_track(app, index):
                     app.set_diag_health("network", "ok")
                     app.set_diag_health("decoder", "ok")
 
-                def apply_playback():
+                # Drive load/play directly from the bg thread — these are Rust
+                # FFI calls that don't need the GTK main loop. Going via
+                # GLib.idle_add can stall behind heavier UI work
+                # (render_queue_drawer / _refresh_now_playing_from_track) that
+                # was scheduled earlier in this function, adding 100-300ms of
+                # latency between click and audio.
+                if request_id != getattr(app, "_play_request_id", 0):
+                    return
+                app._stream_missing_skip_count = 0
+                prev_state = str(getattr(app.player, "output_state", "idle") or "idle")
+                if hasattr(app.player, "hint_source_format") and (bit_depth or sample_rate):
+                    app.player.hint_source_format(bit_depth, sample_rate)
+                app.player.load(url)
+                app.player.play()
+                cur_state = str(getattr(app.player, "output_state", "idle") or "idle")
+                cur_err = str(getattr(app.player, "output_error", "") or "").strip()
+                blocked = bool(getattr(app.player, "_pipewire_rate_blocked", False))
+
+                def apply_playback_ui():
                     if request_id != getattr(app, "_play_request_id", 0):
                         return False
-                    app._stream_missing_skip_count = 0
-                    prev_state = str(getattr(app.player, "output_state", "idle") or "idle")
-                    if hasattr(app.player, "hint_source_format") and (bit_depth or sample_rate):
-                        app.player.hint_source_format(bit_depth, sample_rate)
-                    app.player.load(url)
-                    app.player.play()
                     audio_settings_actions.update_output_status_ui(app)
-                    cur_state = str(getattr(app.player, "output_state", "idle") or "idle")
-                    cur_err = str(getattr(app.player, "output_error", "") or "").strip()
-                    blocked = bool(getattr(app.player, "_pipewire_rate_blocked", False))
                     if blocked or cur_state == "error":
                         if app.play_btn is not None:
                             app.play_btn.set_icon_name("media-playback-start-symbolic")
@@ -457,7 +466,7 @@ def play_track(app, index):
                         app._remote_publish_playback_event("track_started")
                     return False
 
-                GLib.idle_add(apply_playback)
+                GLib.idle_add(apply_playback_ui)
             else:
                 logger.warning("Stream URL is None")
 
