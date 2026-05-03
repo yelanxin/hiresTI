@@ -341,7 +341,7 @@ def build_tracks_view(app):
     trk_content.append(app.album_header_overlay)
 
     # Restore horizontal margin for the rest of the page below the header.
-    trk_body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, margin_start=32, margin_end=32)
+    trk_body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, margin_top=20, margin_start=32, margin_end=32)
     trk_content.append(trk_body)
 
     # Column header (#/Title/Artist/Album/Time) intentionally hidden:
