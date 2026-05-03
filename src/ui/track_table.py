@@ -93,10 +93,12 @@ def _build_header_action_spacer(kind):
         return w
 
     if kind == "next":
+        img = Gtk.Image.new_from_icon_name("hiresti-play-next-symbolic")
+        img.set_pixel_size(22)
         w = Gtk.Button(
-            icon_name="hiresti-play-next-symbolic",
             css_classes=["flat", "circular", "history-scroll-btn", "track-row-next-btn"],
         )
+        w.set_child(img)
         w.set_sensitive(False)
         w.set_focusable(False)
         w.set_opacity(0.0)
