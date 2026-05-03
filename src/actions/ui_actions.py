@@ -1691,6 +1691,15 @@ def show_album_details(app, alb):
     # overwrite the track list we're about to populate with album tracks.
     app._remote_pl_render_token = int(getattr(app, "_remote_pl_render_token", 0) or 0) + 1
 
+    # Reset playlist-view state so leftover flags from a previous remote /
+    # local playlist render don't bleed into this album page (e.g. trash
+    # "Remove from Playlist" icons or a stale "Playlist" header kicker).
+    app.current_remote_playlist = None
+    app._remote_playlist_is_own = False
+    app.current_playlist_id = None
+    if getattr(app, "header_kicker", None) is not None:
+        app.header_kicker.set_text("Album")
+
     current_view = app.right_stack.get_visible_child_name()
     if current_view and current_view != "tracks":
         app.nav_history.append(current_view)
