@@ -1,5 +1,63 @@
 # Changelog
 
+## 1.9.4 - 2026-05-03
+
+This release consolidates the entire 1.9.3 beta cycle (beta1 → beta3.28) plus follow-up UI work.
+Highlights: a Tidal LOSSLESS → HI_RES_LOSSLESS auto-upgrade workaround for the recent server-side AAC downgrade, a major USB Rawlink V2 stability and diagnostics pass (synchronous-mode DACs, FiiO click fix, DASH prefetch, EOS regression hotfix, Wayland surface-loss fix), an album / playlist header redesign with overflow menu actions, a redesigned history dashboard, click-to-seek synced lyrics, and lower playback start latency on track click.
+
+### Added
+
+- **Tidal LOSSLESS → HI_RES_LOSSLESS auto-upgrade**: works around Tidal's server-side downgrade of `LOSSLESS` to AAC 320 by automatically requesting `HI_RES_LOSSLESS` when the user's account allows it, restoring CD-quality / HiRes FLAC playback.
+- **Bulk select + Add to playlist**: track lists support multi-select with a bulk Add-to-playlist action.
+- **Album / playlist overflow menu**: the per-row and header `Play Next` icon is replaced with a three-dot overflow menu offering both **Play Next** and **Add to Queue**.
+- **Album / playlist header redesign**: dimmed-cover background with a Tidal-style action layout (cover, metadata, primary actions on a single row) and consistent vertical / horizontal spacing.
+- **History dashboard rework**:
+  - **Top 20 → Top 100** with a responsive column-balanced grid that adapts to window width and keeps every column the same length.
+  - New **Recent Tracks** tab showing the last 100 unique played tracks (no rank chip).
+- **Click-to-seek on synced lyrics**: clicking a synced lyric line seeks playback to that timestamp, with a smoothed seek boundary in the V2 native transport.
+- **Multi-channel-only DAC support**: stereo Tidal content is interleaved with silence in trailing channels for DACs that expose only multi-channel alt settings (e.g. MOTU 4-channel-only interfaces). V2 previously errored out with `channel mismatch decoded=2 configured=4`; V1 played misaligned static.
+- **V2 DASH background prefetch**: TidalMpd (chunked DASH) now drains its segment reader through the same background-fetch pipeline used by direct-FLAC playback, giving the decoder ~5–6 s of compressed-FLAC head-room and absorbing CDN jitter / short stalls.
+- **Diagnostic env vars** for development and bug repro:
+  - `HIRESTI_LOCAL_URI=file://path/to/file.flac` — load a local file URI on next `play_track` / `on_play_pause`, exercising the Rust core on a known-good 24-bit/96 kHz FLAC without going through Tidal.
+  - `HIRESTI_DISABLE_PROCESSOR_CHAIN=1` — skip DSP / Volume / Spectrum / LUFS processors entirely; bit-perfect passthrough.
+  - `HIRESTI_USB_RATE_CHANGE_SETTLE_MIN_MS` / `..._MAX_MS` — bound the USB feedback-driven sample-rate settle window.
+- **V2 USB diagnostic line** `native-transport: v2-poll …` once per second on a non-RT polling thread, exposing `xruns / pkt_errs / parse_fails / short_pkts / dq_under / dq_wrap / drift_ppb / calibrated_ms / iso=[min..max] / jitter / cb_max` — visibility into runtime drift and underrun precursors without burdening the libusb event thread.
+- **Producer-side underrun telemetry**: every `direct queue fallback` underrun line now also reports `last_push_ago / last_push_size / total_pushed`, the V2 decode worker logs slow-loop iterations (>50 ms) with a per-stage `read / decode / process / push` breakdown, and `producer push gap …ms` warnings fire when a push gap exceeds 200 ms while the ring is running.
+- **CDN host logging**: the native transport logs each unique CDN host it touches once per process via `native-transport: streaming from CDN host …`, useful for pinning down whether stuttering correlates with a particular CDN edge.
+- **V2 per-segment open-setup logging**: `native-transport: segment #N/T open setup=Xms prev_bytes=Y` — distinguishes slow first-byte responses from mid-segment stalls when investigating producer push gaps.
+
+### Changed
+
+- **Playback start latency reduced**: clicking a track now drives `app.player.load(url)` and `app.player.play()` directly from the bg thread instead of routing them through `GLib.idle_add`. The Rust FFI does not need the GTK main loop, and going via idle_add was stalling behind heavier UI work (`render_queue_drawer`, now-playing refresh) for ~100–300 ms per click.
+- **Output device list refresh on demand**: removed the 2.5 s polling timer in Output Settings that called `get_devices_for_driver()` → libusb enumerates every USB device on the bus. The list now refreshes once per dropdown click via a capture-phase `Gtk.GestureClick`. Net change: −169 lines.
+- **V2 USB ISO ring depth bumped 16 → 24 transfers** (128 ms → 192 ms ring), with sample-rate-aware xrun fade-in/out and SLOW_ITER threshold scaling. Reduces sensitivity to brief upstream stalls.
+- **V2 HTTP routed via a shared `ureq::Agent`** with a per-host pool of 8, so segment / probe / manifest / direct-media reads share TCP and TLS state.
+- **V2 prefetch chunk aggregation**: the download thread now accumulates up to 32 KiB per send before forwarding into the bounded crossbeam channel, so the channel actually carries the documented ~2 MiB of head-room instead of `cap × MSS ≈ 96 KiB`.
+- **Album / playlist header polish**: the `# / Title / Artist / Album / Time` column header is hidden on these pages, with a 20 px gap between the header overlay and the first track row.
+- **Library "Recent" sort actually returns recently-added tracks**: the Liked Songs view now routes through `fav.tracks(order=ItemOrder.Date, order_direction=Descending)`, threading the UI's other sort modes (title / artist / album / duration) through matching `ItemOrder` values. The previous default fell through to a no-op and effectively returned alphabetical order.
+- **Smooth audio↔silence transitions** on USB ISO underrun and cold start, with sample-rate-aware fade durations (96 samples at 96 kHz → ~1 ms; scaled to a 5 ms target at lower rates).
+- **Slow-pull diagnostic threshold lowered 150 ms → 50 ms**, so `slow pull` log lines appear before underruns and separate upstream-cause from ring-cause.
+
+### Fixed
+
+- **Tidal AAC 320 fallback (server-side downgrade)**: see the LOSSLESS → HI_RES_LOSSLESS auto-upgrade above.
+- **V2 click/pop on FiiO USB DACs (e.g. KA13)**: a 2.5 s polling timer in Output Settings was issuing `libusb_get_device_descriptor` against every device on the bus, which momentarily blocked the active ISO OUT endpoint on FiiO firmware. Fixed by removing the polling and refreshing the device list on dropdown click instead. Same code, clean host metrics, clicks only on certain DACs → root cause was background USB control transfers, not the audio path.
+- **V2 noise tempo accelerating with track time on synchronous-mode DACs**: the iso-out `bump_drift` heuristic (+2 ppm on confirmed packet errors) is one-directional and assumes "errors mean device FIFO underflow", which is inverted on synchronous-mode DACs (no async feedback endpoint). Now gated on `state.has_feedback_ep`; synchronous-mode DACs keep `drift_correction_ppb = 0` and rely on their own PLL.
+- **V2 click hunting observer-effect**: every `eprintln!` on the libusb event thread (SCHED_FIFO 70) was itself causing the click it was trying to record — stderr lock + pipe write delays the next ISO OUT completion past its 0.125 ms microframe budget. All event-thread emissions are now atomic counters; the decode-worker push path matches `oxidac`'s bare path.
+- **V2 auto-advance regression**: the snapshot polling thread shared its stop signal with the decode worker, so on natural EOS the worker-exit path saw `stop = true`, returned early, and never set `decode_completed = true` — so `EVT_EOS` never fired and Python never auto-advanced. The snapshot thread now has its own `Arc<AtomicBool>`.
+- **Wayland surface-loss crash on `+ Add to playlist`**: `_prompt_playlist_pick` was calling `get_user_playlists(limit=1000)` synchronously on the GTK main thread (paginated, 2–10 s), which blocked the main loop long enough for the compositor to issue `VK_ERROR_SURFACE_LOST_KHR` / "Broken pipe dispatching to Wayland display". The picker now fetches off the main thread with a "Loading playlists…" notice; create-playlist also runs in a daemon thread.
+- **Runaway pagination in playlist + artist-album fetchers**: some accounts hit a state where Tidal returns the same page regardless of offset, causing pagination loops to pile duplicates up to their max-items cap (1000 cloud playlists that were just a handful repeating; artist pages with each album three times). Fetchers now dedup by id and stop on a no-new-ids page; warnings log the short-circuit.
+- **Album view inheriting playlist state**: leftover `current_remote_playlist` / `_remote_playlist_is_own` flags from a prior playlist render caused the album view to show a trash icon and label albums as "Playlist". Album entry now resets the relevant state.
+- **Mix detail view**: kicker now reads "Mix" instead of "Album", and the favorite button is hidden — Mixes are not favoritable. (`type(alb).__name__` now uses substring match to cover both `Mix` and `MixV2`.)
+- **History grid stuck at one column** after entering and leaving mini mode: `notify::default-width` fires immediately with the new intended width, but `win.get_width()` lagged a frame and still reported 390. The column-count calculation now reads `get_default_size()[0]` first and falls back to `get_width()` only when default is unset.
+- **GL shader setup on Mesa/Arch**: skip GL program validation, which was failing on some Mesa versions and disabling visualizer rendering.
+- **AUR install fails to launch on CachyOS** (and other distros with non-baseline CPUs / aggressive system LTO): the previous build used `target-cpu=native` plus `makepkg` LTO, which produced a binary that pulled in CPU-specific instructions and miscompiled Rust `ring` (TLS) — the app exited immediately with `ring` symbol resolution errors before the GTK window could appear. The PKGBUILD now disables `makepkg` LTO and the project-level build profile drops `target-cpu=native` and softens LTO, so AUR builds are portable across x86-64-v2/v3 CPUs and CachyOS users get a binary that actually starts.
+
+### Removed
+
+- **Output device polling**: `_monitor_selected_device_presence`, `_passive_sync_device_list`, and their probe-burst infrastructure are gone. USB enumeration during steady-state playback no longer happens.
+- **Unused per-row Play Next icon and dead spacer / CSS**: replaced by the new overflow menu.
+
 ## 1.9.2 - 2026-04-26
 
 ### Added
