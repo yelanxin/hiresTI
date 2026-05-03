@@ -344,14 +344,15 @@ def build_tracks_view(app):
     trk_body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, margin_start=32, margin_end=32)
     trk_content.append(trk_body)
 
-    tracks_head, head_btns = build_tracks_header(
+    # Column header (#/Title/Artist/Album/Time) intentionally hidden:
+    # build the widget so app.album_sort_buttons stays populated for any
+    # callers that look it up, but don't attach it to the body.
+    _tracks_head, head_btns = build_tracks_header(
         on_sort_title=lambda _b: app.on_album_sort_clicked("title"),
         on_sort_artist=lambda _b: app.on_album_sort_clicked("artist"),
         on_sort_album=lambda _b: app.on_album_sort_clicked("album"),
         on_sort_time=lambda _b: app.on_album_sort_clicked("time"),
     )
-    append_header_action_spacers(tracks_head, ["fav", "next", "add"])
-    trk_body.append(tracks_head)
     app.album_sort_buttons = head_btns
 
     app.track_list = Gtk.ListBox(css_classes=["tracks-list"], margin_start=0, margin_end=0, margin_bottom=32)
