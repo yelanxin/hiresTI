@@ -577,21 +577,37 @@ unsafe fn fill_transfer(transfer: *mut libusb_transfer) {
         feedback = None;
     }
     let mut adapter = state.rate_adapter.lock().unwrap_or_else(|e| e.into_inner());
-    if feedback.is_none() && (ignore_feedback || !state.has_feedback_ep) {
-        let calibrated_fp32 = state
-            .clock_feed
-            .calibrated_rate_hz()
-            .map(|rate_hz| rate_hz * 1_000_000.0 / state.packets_per_sec as f64);
-        if let Some(calibrated_ms) = calibrated_fp32 {
-            let clamped = calibrated_ms
-                .round()
-                .clamp(i64::MIN as f64, i64::MAX as f64) as i64;
-            state
-                .calibrated_ms
-                .store(clamped.max(0) as u64, Ordering::Relaxed);
-            if clamped > 0 {
-                feedback = Some(clamped);
-            }
+
+    // Always update the diagnostic atomic so v2-poll can show what the
+    // ISO-completion-timestamp regression *would* have estimated.  Reading
+    // it does not depend on us actually applying it.
+    let calibrated_fp32 = state
+        .clock_feed
+        .calibrated_rate_hz()
+        .map(|rate_hz| rate_hz * 1_000_000.0 / state.packets_per_sec as f64);
+    if let Some(calibrated_ms) = calibrated_fp32 {
+        let clamped = calibrated_ms
+            .round()
+            .clamp(i64::MIN as f64, i64::MAX as f64) as i64;
+        state
+            .calibrated_ms
+            .store(clamped.max(0) as u64, Ordering::Relaxed);
+        // Synthetic feedback from the regression-fitted rate is only safe
+        // when the device has an async feedback endpoint and the real
+        // value is just temporarily missing during early settling.  On a
+        // synchronous-mode DAC (no feedback EP), the regression is
+        // driven purely by ISO completion timestamps — which become
+        // noisy when the iso-events thread can't acquire SCHED_FIFO and
+        // gets preempted.  A noise-biased estimate then gets applied as
+        // host feed rate, and on a 4-channel MOTU M4 with `feedback_ep=
+        // None` the calibration drifts ~9000 ppm low over a few minutes.
+        // Audible symptom: noise appears ~5 s into a track and repeats
+        // faster as the calibrated rate keeps falling.  Mirrors the
+        // 3.24 `bump_drift` gating fix; let the DAC's own PLL absorb
+        // the static SOF↔crystal offset, which is what synchronous-mode
+        // devices are designed for.
+        if feedback.is_none() && state.has_feedback_ep && !ignore_feedback && clamped > 0 {
+            feedback = Some(clamped);
         }
     }
 
