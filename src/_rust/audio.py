@@ -1597,7 +1597,7 @@ class RustAudioPlayerAdapter:
                 pass
         return nums
 
-    def _wait_pipewire_metadata(self, check_fn, timeout_s=0.45, interval_s=0.05):
+    def _wait_pipewire_metadata(self, check_fn, timeout_s=0.45, interval_s=0.06):
         deadline = time.monotonic() + max(0.05, float(timeout_s or 0.45))
         while True:
             meta = self._read_pipewire_clock_metadata()
@@ -1610,7 +1610,7 @@ class RustAudioPlayerAdapter:
                 return meta, True
             if time.monotonic() >= deadline:
                 return meta, False
-            time.sleep(max(0.01, float(interval_s or 0.05)))
+            time.sleep(max(0.01, float(interval_s or 0.06)))
 
     def _release_pipewire_clock_override(self, reason="idle"):
         """
@@ -1629,7 +1629,6 @@ class RustAudioPlayerAdapter:
             meta, released_ok = self._wait_pipewire_metadata(
                 lambda m: int(m.get("force_rate", 0) or 0) == 0,
                 timeout_s=1.4,
-                interval_s=0.06,
             )
             if not released_ok:
                 effective = int(meta.get("force_rate", 0) or 0)
@@ -2269,7 +2268,6 @@ class RustAudioPlayerAdapter:
                 meta_allow, allow_ok = self._wait_pipewire_metadata(
                     lambda m: allow_required.issubset(self._parse_allowed_rates(m.get("allowed_rates_raw"))),
                     timeout_s=1.2,
-                    interval_s=0.06,
                 )
                 allowed_now = self._parse_allowed_rates(meta_allow.get("allowed_rates_raw"))
                 if not allow_required.issubset(allowed_now):
@@ -2300,7 +2298,6 @@ class RustAudioPlayerAdapter:
                         meta, force_ok = self._wait_pipewire_metadata(
                             lambda m: int(m.get("force_rate", 0) or 0) == int(target_rate),
                             timeout_s=1.0 if attempt == 1 else 0.6,
-                            interval_s=0.06,
                         )
                         effective = int(meta.get("force_rate", 0) or 0)
                         if effective == int(target_rate):
@@ -3501,7 +3498,7 @@ class RustAudioPlayerAdapter:
                 delay_ms = self._estimate_rust_visual_delay_ms(current_pos_s=cur_pos, msg_pos_s=None)
                 target_pos = max(
                     0.0,
-                    cur_pos - (float(delay_ms) / 1000.0) - float(getattr(self, "_viz_interp_lookback_s", 0.12)),
+                    cur_pos - (float(delay_ms) / 1000.0) - float(self._viz_interp_lookback_s),
                 )
                 frame = self._sample_spectrum_at_pos(target_pos)
                 if frame is None:
