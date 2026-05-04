@@ -2072,10 +2072,6 @@ fn driver_is_usb_rawlink_v2(driver: &str) -> bool {
         || norm.starts_with("usbrawlinkv2(")
 }
 
-fn driver_is_usb_rawlink_family(driver: &str) -> bool {
-    driver_is_usb_rawlink(driver) || driver_is_usb_rawlink_v2(driver)
-}
-
 fn transport_reports_playing(
     output_driver: &str,
     native_state: native_transport::NativeTransportState,
@@ -2119,34 +2115,6 @@ fn usb_audio_ignore_feedback_enabled() -> bool {
         .unwrap_or(false)
 }
 
-fn usb_audio_custom_sink_enabled() -> bool {
-    env::var("HIRESTI_USB_CUSTOM_SINK")
-        .ok()
-        .map(|v| {
-            let text = v.trim().to_ascii_lowercase();
-            !text.is_empty() && text != "0" && text != "false" && text != "off"
-        })
-        .unwrap_or(false)
-}
-
-fn active_usb_raw_sink(engine: &Engine) -> Option<usb_audio::UsbRawSink> {
-    engine.usb_raw_sink.clone().or_else(|| {
-        engine
-            .playbin
-            .property::<Option<gst::Element>>("audio-sink")
-            .and_then(|sink| sink.dynamic_cast::<usb_audio::UsbRawSink>().ok())
-    })
-}
-
-fn active_usb_raw_sink_mut(engine: &mut Engine) -> Option<usb_audio::UsbRawSink> {
-    engine.usb_raw_sink.clone().or_else(|| {
-        engine
-            .playbin
-            .property::<Option<gst::Element>>("audio-sink")
-            .and_then(|sink| sink.dynamic_cast::<usb_audio::UsbRawSink>().ok())
-    })
-}
-
 struct UsbRuntimeInfo {
     rate: u32,
     total_frames: u64,
@@ -2165,21 +2133,12 @@ fn active_usb_runtime_info(engine: &Engine) -> Option<UsbRuntimeInfo> {
             device_name: runtime.device_name,
         });
     }
-    if let Some(ref us) = engine.usb_sink {
-        return Some(UsbRuntimeInfo {
-            rate: us.feed.rate.load(Ordering::Relaxed),
-            total_frames: us.feed.total_frames.load(Ordering::Relaxed),
-            anchor_stream_pos_ns: us.anchor_stream_pos_ns.load(Ordering::Acquire),
-            bit_depth: us.bit_depth,
-            device_name: us.device_name.clone(),
-        });
-    }
-    active_usb_raw_sink(engine).map(|raw| UsbRuntimeInfo {
-        rate: raw.runtime_rate(),
-        total_frames: raw.runtime_total_frames(),
-        anchor_stream_pos_ns: raw.runtime_anchor_stream_pos_ns(),
-        bit_depth: raw.runtime_bit_depth(),
-        device_name: raw.runtime_device_name(),
+    engine.usb_sink.as_ref().map(|us| UsbRuntimeInfo {
+        rate: us.feed.rate.load(Ordering::Relaxed),
+        total_frames: us.feed.total_frames.load(Ordering::Relaxed),
+        anchor_stream_pos_ns: us.anchor_stream_pos_ns.load(Ordering::Acquire),
+        bit_depth: us.bit_depth,
+        device_name: us.device_name.clone(),
     })
 }
 
@@ -2187,11 +2146,10 @@ fn active_usb_hw_volume_supported(engine: &Engine) -> bool {
     if engine.native_transport.hw_volume_supported() {
         return true;
     }
-    if let Some(us) = engine.usb_sink.as_ref() {
-        return us.hw_volume_supported;
-    }
-    active_usb_raw_sink(engine)
-        .map(|raw| raw.hw_volume_supported())
+    engine
+        .usb_sink
+        .as_ref()
+        .map(|us| us.hw_volume_supported)
         .unwrap_or(false)
 }
 
@@ -2199,40 +2157,45 @@ fn active_usb_hw_volume_range(engine: &Engine) -> Option<(i32, i32, i32)> {
     if let Some(range) = engine.native_transport.hw_volume_range() {
         return Some(range);
     }
-    if let Some(us) = engine.usb_sink.as_ref().filter(|u| u.hw_volume_supported) {
-        return Some((
-            us.hw_volume_min.load(Ordering::Relaxed),
-            us.hw_volume_max.load(Ordering::Relaxed),
-            us.hw_volume_res.load(Ordering::Relaxed),
-        ));
-    }
-    active_usb_raw_sink(engine).and_then(|raw| raw.hw_volume_get_range())
+    engine
+        .usb_sink
+        .as_ref()
+        .filter(|u| u.hw_volume_supported)
+        .map(|us| {
+            (
+                us.hw_volume_min.load(Ordering::Relaxed),
+                us.hw_volume_max.load(Ordering::Relaxed),
+                us.hw_volume_res.load(Ordering::Relaxed),
+            )
+        })
 }
 
 fn active_usb_hw_volume_channels(engine: &Engine) -> Option<Vec<u8>> {
     if let Some(chs) = engine.native_transport.hw_volume_channels() {
         return Some(chs);
     }
-    if let Some(us) = engine.usb_sink.as_ref().filter(|u| u.hw_volume_supported) {
-        return Some(us.hw_volume_channels.clone());
-    }
-    active_usb_raw_sink(engine).map(|raw| raw.hw_volume_channels())
+    engine
+        .usb_sink
+        .as_ref()
+        .filter(|u| u.hw_volume_supported)
+        .map(|us| us.hw_volume_channels.clone())
 }
 
 fn active_usb_hw_volume_get_ch(engine: &Engine, idx: usize) -> Option<i32> {
     if let Some(v) = engine.native_transport.hw_volume_get_ch(idx) {
         return Some(v);
     }
-    if let Some(us) = engine.usb_sink.as_ref().filter(|u| u.hw_volume_supported) {
-        if idx < us.hw_volume_channels.len() && idx < 3 {
-            let v = us.hw_volume_currents[idx].load(Ordering::Relaxed);
-            if v != i32::MIN {
-                return Some(v);
-            }
+    let us = engine
+        .usb_sink
+        .as_ref()
+        .filter(|u| u.hw_volume_supported)?;
+    if idx < us.hw_volume_channels.len() && idx < 3 {
+        let v = us.hw_volume_currents[idx].load(Ordering::Relaxed);
+        if v != i32::MIN {
+            return Some(v);
         }
-        return None;
     }
-    active_usb_raw_sink(engine).and_then(|raw| raw.hw_volume_get_ch(idx))
+    None
 }
 
 fn active_usb_hw_volume_set_all(engine: &mut Engine, value_raw: i32) -> bool {
@@ -2245,9 +2208,7 @@ fn active_usb_hw_volume_set_all(engine: &mut Engine, value_raw: i32) -> bool {
         }
         return true;
     }
-    active_usb_raw_sink_mut(engine)
-        .map(|raw| raw.hw_volume_set_all(value_raw))
-        .unwrap_or(false)
+    false
 }
 
 fn active_usb_hw_volume_set_ch(engine: &mut Engine, idx: usize, value_raw: i32) -> bool {
@@ -2259,11 +2220,8 @@ fn active_usb_hw_volume_set_ch(engine: &mut Engine, idx: usize, value_raw: i32) 
             us.hw_volume_targets[idx].store(value_raw, Ordering::Relaxed);
             return true;
         }
-        return false;
     }
-    active_usb_raw_sink_mut(engine)
-        .map(|raw| raw.hw_volume_set_ch(idx, value_raw))
-        .unwrap_or(false)
+    false
 }
 
 fn usb_audio_rate_mismatch_error(requested_rate: u32, actual_rate: u32) -> String {
@@ -2923,11 +2881,8 @@ pub struct Engine {
     spectrum_active_bands: u32,
     mmap_sink: Option<MmapSink>,
     usb_sink: Option<UsbSinkHandle>,
-    usb_raw_sink: Option<usb_audio::UsbRawSink>,
     /// USB output config for native transport (V2). Populated when the V2
-    /// driver is selected and consumed when a track is loaded so V2 can
-    /// open the USB device without going through the (V1, GStreamer)
-    /// `UsbRawSink` element.
+    /// driver is selected and consumed when a track is loaded.
     native_usb_config: Option<usb_audio::UsbRawSinkConfig>,
     #[allow(dead_code)]
     native_transport: native_transport::NativeTransportController,
@@ -3535,15 +3490,6 @@ impl Engine {
         let Some(sink) = sink else {
             return (None, None);
         };
-        if let Ok(raw_sink) = sink.clone().dynamic_cast::<usb_audio::UsbRawSink>() {
-            let rate = raw_sink.runtime_rate();
-            let depth = raw_sink.runtime_bit_depth() as i32;
-            let rate = if rate > 0 { Some(rate as i32) } else { None };
-            let depth = if depth > 0 { Some(depth) } else { None };
-            if rate.is_some() || depth.is_some() {
-                return (rate, depth);
-            }
-        }
         let Some(pad) = sink.static_pad("sink") else {
             return (None, None);
         };
@@ -4688,7 +4634,6 @@ impl Engine {
             spectrum_active_bands: SPECTRUM_ACTIVE_BANDS_DEFAULT,
             mmap_sink: None,
             usb_sink: None,
-            usb_raw_sink: None,
             native_usb_config: None,
             native_transport: native_transport::NativeTransportController::new(),
             usb_clock_mode: 0,
@@ -4832,16 +4777,6 @@ impl Engine {
                 Err(_) => return,
             };
             for (evt, msg) in drained {
-                if evt == EVT_ERROR {
-                    self.set_error(msg.clone());
-                }
-                self.emit_event(evt, &msg);
-            }
-        } else if let Some(raw) = active_usb_raw_sink(self) {
-            if raw.take_spectrum_reset_after_open() {
-                self.reset_spectrum_timeline();
-            }
-            for (evt, msg) in raw.take_events() {
                 if evt == EVT_ERROR {
                     self.set_error(msg.clone());
                 }
@@ -5058,7 +4993,6 @@ impl Engine {
     }
 
     fn stop_usb_sink(&mut self) {
-        self.usb_raw_sink = None;
         if let Some(mut us) = self.usb_sink.take() {
             us.stop_and_join();
             // The pusher thread dropped its owned UsbAudioSink on exit, which
@@ -5084,13 +5018,11 @@ impl Engine {
     fn build_appsink_usb(
         &self,
         device_id: &str,
-        use_custom_sink: bool,
     ) -> Result<
         (
             gst::Element,
             String,
             Option<UsbSinkHandle>,
-            Option<usb_audio::UsbRawSink>,
             Option<AlsaHwClock>,
         ),
         String,
@@ -5152,59 +5084,6 @@ impl Engine {
             };
             ("audio/x-raw", fmt)
         };
-
-        let custom_sink_enabled = (use_custom_sink || usb_audio_custom_sink_enabled()) && !is_dop;
-
-        // Collect every PCM / Float bit depth the device advertises across
-        // all alt-settings.  Native transport uses this set to decide if the
-        // source can be passed through verbatim (depth supported) or must be
-        // promoted to the device's chosen `bit_depth` (depth not supported,
-        // e.g. 16-bit source on a 32-bit-only DAC like Topping Monitor 09).
-        let supported_bit_depths: Vec<u8> = {
-            let mut depths: Vec<u8> = dev
-                .alts
-                .iter()
-                .filter(|a| {
-                    matches!(
-                        a.format,
-                        usb_audio::UacFormat::Pcm | usb_audio::UacFormat::Float32
-                    )
-                })
-                .map(|a| a.bit_depth)
-                .collect();
-            depths.sort_unstable();
-            depths.dedup();
-            depths
-        };
-
-        if custom_sink_enabled {
-            let sink = usb_audio::UsbRawSink::new(
-                Some("rust-usb-rawsink"),
-                usb_audio::UsbRawSinkConfig {
-                    device_id: device_id.to_string(),
-                    bit_depth: alt.bit_depth,
-                    alt_profile,
-                    gst_format: gst_format.to_string(),
-                    channels: alt.channels as usize,
-                    clock_mode: self.usb_clock_mode,
-                    supported_bit_depths: supported_bit_depths.clone(),
-                },
-            );
-            sink.set_property("sync", true);
-            sink.set_property("async", true);
-            let hw_clock = sink.clock();
-            let configured_msg = format!(
-                "usb-rawsink configured device={} format={} channels={} (custom-sink)",
-                device_id, gst_format, alt.channels
-            );
-            return Ok((
-                sink.clone().upcast::<gst::Element>(),
-                configured_msg,
-                None,
-                Some(sink),
-                Some(hw_clock),
-            ));
-        }
 
         // Create the shared clock feed and GStreamer clock NOW — before the
         // device is open.  The clock falls back to CLOCK_MONOTONIC until the
@@ -5420,7 +5299,6 @@ impl Engine {
                 hw_volume_currents,
                 hw_volume_channels: hw_vol_channels,
             }),
-            None,
             Some(hw_clock),
         ))
     }
@@ -5600,17 +5478,12 @@ impl Engine {
         } else {
             let _ = self.native_transport.stop();
         }
-        if self.usb_raw_sink.is_some() && driver_is_usb_rawlink_family(driver) {
-            if let Some(raw_sink) = active_usb_raw_sink_mut(self) {
-                raw_sink.prepare_track_switch();
-            }
-        }
         let cur_state = self.playbin.state(gst::ClockTime::from_mseconds(50)).1;
         let _ = self.playbin.set_state(gst::State::Null);
         // Stop any running output sink threads *after* set_state(Null) so the
         // appsink sees EOS and pull-sample unblocks cleanly.
         self.stop_mmap_sink();
-        let had_usb_rawlink = self.usb_sink.is_some() || self.usb_raw_sink.is_some() || had_native_transport;
+        let had_usb_rawlink = self.usb_sink.is_some() || had_native_transport;
         self.stop_usb_sink();
 
         // After releasing a USB rawlink session, snd-usb-audio re-attaches
@@ -5827,7 +5700,6 @@ impl Engine {
                 .build();
             match elem {
                 Ok(elem) => {
-                    self.usb_raw_sink = None;
                     self.usb_sink = None;
                     self.emit_event(
                         EVT_STATE,
@@ -5848,9 +5720,8 @@ impl Engine {
             // Self-hosted USB Audio Class output via libusb isochronous transfers.
             // `device_norm` must be a "usb:VID:PID" or "usb:VID:PID:SERIAL" ID.
             let usb_device_id = device_norm.unwrap_or("");
-            match self.build_appsink_usb(usb_device_id, false) {
-                Ok((elem, configured_msg, usb_handle, usb_raw_sink, hw_clock)) => {
-                    self.usb_raw_sink = usb_raw_sink;
+            match self.build_appsink_usb(usb_device_id) {
+                Ok((elem, configured_msg, usb_handle, hw_clock)) => {
                     self.usb_sink = usb_handle;
                     self.emit_event(EVT_STATE, &configured_msg);
                     if let Some(hw_clock) = hw_clock {
@@ -7766,16 +7637,6 @@ pub extern "C" fn rac_set_uri(ptr: *mut Engine, uri: *const c_char) -> c_int {
         return 0;
     }
 
-    // For the custom usbrawsink path, explicitly drop the current USB session
-    // before driving the pipeline to NULL on track switches.  This mirrors the
-    // old appsink path's "keep interface claimed across URI changes" behavior
-    // and avoids a needless kernel-driver re-attach between consecutive tracks.
-    if engine.usb_sink.is_none() {
-        if let Some(raw_sink) = active_usb_raw_sink_mut(engine) {
-            raw_sink.prepare_track_switch();
-        }
-    }
-
     if engine.output_driver_is_mmap() {
         let driver = engine.output_driver.clone();
         let device = engine.output_device.clone();
@@ -7952,7 +7813,7 @@ pub extern "C" fn rac_release_output(ptr: *mut Engine) -> c_int {
         return -1;
     };
     let had_native_transport = driver_is_usb_rawlink_v2(&engine.output_driver);
-    let had_usb_rawlink = engine.usb_sink.is_some() || active_usb_raw_sink(engine).is_some() || had_native_transport;
+    let had_usb_rawlink = engine.usb_sink.is_some() || had_native_transport;
     engine.reset_spectrum_timeline();
     if had_native_transport {
         let _ = engine.native_transport.stop_and_release();
@@ -7960,9 +7821,6 @@ pub extern "C" fn rac_release_output(ptr: *mut Engine) -> c_int {
         let _ = engine.native_transport.stop();
     }
     let _ = engine.playbin.set_state(gst::State::Null);
-    if let Some(raw_sink) = active_usb_raw_sink_mut(engine) {
-        raw_sink.reset_session("release_output");
-    }
     engine.stop_mmap_sink();
     engine.stop_usb_sink();
     if had_usb_rawlink {
@@ -8681,11 +8539,6 @@ pub extern "C" fn rac_set_usb_clock_mode(ptr: *mut Engine, mode: c_int) -> c_int
         sink.clock_mode.store(mode as u8, Ordering::Release);
         sink.feed.set_mode(clock_mode);
         eprintln!("usb-audio: clock mode updated live → {:?}", clock_mode);
-    }
-    if let Some(audio_sink) = engine.playbin.property::<Option<gst::Element>>("audio-sink") {
-        if let Ok(raw_sink) = audio_sink.clone().dynamic_cast::<usb_audio::UsbRawSink>() {
-            raw_sink.set_clock_mode(mode as u8);
-        }
     }
     0
 }
