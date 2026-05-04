@@ -48,6 +48,7 @@ def _sidebar_nav_sections():
                 ("liked_songs", "hiresti-favorite-symbolic", "Tracks"),
                 ("artists", "hiresti-artists-symbolic", "Artists"),
                 ("playlists", "hiresti-playlists-symbolic", "Playlists"),
+                ("mixes", "hiresti-mixes-symbolic", "Mixes & Radio"),
             ],
         ),
         (

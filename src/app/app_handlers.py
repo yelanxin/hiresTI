@@ -185,9 +185,22 @@ def on_fav_clicked(self, btn):
         return
     is_currently_active = "active" in btn.get_css_classes()
     is_add = not is_currently_active
+    # `current_album` is the catch-all "thing currently shown in the
+    # tracks pane" — it can be an Album, a Playlist, or a Mix / MixV2.
+    # Dispatch to the matching backend toggle so add_mixes lands when
+    # the open item is a Mix.
+    item = self.current_album
+    is_mix = "Mix" in type(item).__name__
+    item_id = getattr(item, "id", None)
+    if item_id is None:
+        return
 
     def do():
-        if self.backend.toggle_album_favorite(self.current_album.id, is_add):
+        if is_mix:
+            ok = self.backend.toggle_mix_favorite(item_id, is_add)
+        else:
+            ok = self.backend.toggle_album_favorite(item_id, is_add)
+        if ok:
             GLib.idle_add(lambda: self._update_fav_icon(btn, is_add))
 
     submit_daemon(do)

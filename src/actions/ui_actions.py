@@ -1735,9 +1735,11 @@ def show_album_details(app, alb):
     utils.load_img(app.header_art, lambda: app.backend.get_artwork_url(alb, 640), app.cache_dir, utils.COVER_SIZE)
     if hasattr(app, "album_header_bg") and app.album_header_bg is not None:
         _load_album_header_bg(app, lambda: app.backend.get_artwork_url(alb, 640))
-    if not is_mix:
+    if is_mix:
+        is_fav = app.backend.is_mix_favorite(getattr(alb, "id", ""))
+    else:
         is_fav = app.backend.is_favorite(getattr(alb, "id", ""))
-        app._update_fav_icon(app.fav_btn, is_fav)
+    app._update_fav_icon(app.fav_btn, is_fav)
     if app.remote_playlist_edit_btn is not None:
         app.remote_playlist_edit_btn.set_visible(False)
     if getattr(app, "remote_playlist_visibility_btn", None) is not None:
@@ -1745,8 +1747,9 @@ def show_album_details(app, alb):
     if app.remote_playlist_more_btn is not None:
         app.remote_playlist_more_btn.set_visible(False)
     if app.fav_btn is not None:
-        # Mixes can't be favorited via the catalog API — hide the heart button.
-        app.fav_btn.set_visible(not is_mix)
+        # Mix favorites went live with tidalapi 0.8.11's add_mixes /
+        # remove_mixes; the heart button now works for both Album and Mix.
+        app.fav_btn.set_visible(True)
     if app.add_playlist_btn is not None:
         app.add_playlist_btn.set_visible(True)
 
@@ -2086,6 +2089,130 @@ def _sort_artist_index_entries(entries, sort_key):
     else:
         seq.sort(key=lambda entry: (str(entry.get("name_lc", "") or ""), str(entry.get("id", "") or "")))
     return seq
+
+
+def _build_mix_tile(app, mix, on_click):
+    """Card-style tile for the Mixes & Radio dashboard.  Uses Mix-specific
+    attribute names (title / sub_title) instead of the album helpers, so
+    "My Mix 1 — Daily personalized" renders correctly."""
+    card = Gtk.Box(
+        orientation=Gtk.Orientation.VERTICAL,
+        spacing=6,
+        css_classes=_feed_card_classes("history-card"),
+    )
+    img = Gtk.Image(pixel_size=utils.COVER_SIZE, css_classes=["album-cover-img"])
+    img.set_from_icon_name("audio-x-generic-symbolic")
+    utils.load_img(
+        img,
+        lambda m=mix: app.backend.get_artwork_url(m, 320),
+        app.cache_dir,
+        utils.COVER_SIZE,
+    )
+    card.append(_build_feed_media_overlay(img, utils.COVER_SIZE, "album-cover-img"))
+
+    title = str(getattr(mix, "title", "") or getattr(mix, "name", "") or "Mix")
+    card.append(
+        Gtk.Label(
+            label=title,
+            halign=Gtk.Align.CENTER,
+            ellipsize=3,
+            max_width_chars=14,
+            css_classes=["home-card-title"],
+        )
+    )
+    subtitle = str(getattr(mix, "sub_title", "") or getattr(mix, "short_subtitle", "") or "")
+    if not subtitle:
+        # Fall back to mix_type when the API didn't ship a subtitle.
+        mix_type = getattr(mix, "mix_type", None)
+        if mix_type is not None:
+            subtitle = str(getattr(mix_type, "value", mix_type) or "")
+    sub_label = Gtk.Label(
+        label=subtitle,
+        halign=Gtk.Align.CENTER,
+        ellipsize=3,
+        max_width_chars=18,
+        css_classes=["dim-label", "home-card-subtitle"],
+    )
+    if subtitle:
+        sub_label.set_tooltip_text(subtitle)
+    card.append(sub_label)
+
+    btn = Gtk.Button(css_classes=["flat", "history-card-btn", "home-feed-btn"])
+    btn.set_child(card)
+    btn.connect("clicked", lambda _b, m=mix: on_click(m))
+    return btn
+
+
+def render_mixes_dashboard(app):
+    """Render the user's favorited Tidal Mixes & Radio as a flow grid.
+    Clicking a tile opens the same `show_album_details` view that
+    My-Mix-N tiles use elsewhere — that path already detects Mix via
+    `"Mix" in type(...).__name__` and routes track loading through
+    `backend.get_tracks(mix)` (which calls `session.mix(id).items()`)."""
+    logger.info("Mixes dashboard opened")
+    _clear_container(app.collection_content_box)
+    app.playlist_track_list = None
+    app.queue_track_list = None
+
+    status_bar = Gtk.Box(spacing=8, margin_top=4, margin_bottom=8)
+    status_lbl = Gtk.Label(label="Loading Mixes & Radio…", css_classes=["dim-label"], xalign=0)
+    status_lbl.set_hexpand(True)
+    status_bar.append(status_lbl)
+    app.collection_content_box.append(status_bar)
+
+    scroller = Gtk.ScrolledWindow(
+        hexpand=True, vexpand=True, css_classes=["history-row-scroller"]
+    )
+    scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+    flow = Gtk.FlowBox(
+        homogeneous=True,
+        min_children_per_line=4,
+        max_children_per_line=10,
+        column_spacing=16,
+        row_spacing=16,
+        selection_mode=Gtk.SelectionMode.NONE,
+    )
+    scroller.set_child(flow)
+    app.collection_content_box.append(scroller)
+
+    # Stamp the in-flight token so a second navigation away/back doesn't
+    # let the older daemon's idle_add land on the new view.
+    render_token = int(getattr(app, "_mixes_render_token", 0) or 0) + 1
+    app._mixes_render_token = render_token
+
+    def _on_click(mix):
+        app.show_album_details(mix)
+
+    def _populate(mixes):
+        if int(getattr(app, "_mixes_render_token", 0) or 0) != render_token:
+            return False
+        _clear_container(flow)
+        if not mixes:
+            status_lbl.set_text(
+                "No Mixes or Radio in your collection yet. Open any mix and tap the heart to add it here."
+            )
+            return False
+        # Refresh the cached id-set from the freshly-fetched list so
+        # heart-button state on the detail view is correct immediately.
+        app.backend.fav_mix_ids = {
+            str(getattr(m, "id", "") or "")
+            for m in mixes
+            if getattr(m, "id", None) is not None
+        }
+        for mix in mixes:
+            flow.append(_build_mix_tile(app, mix, _on_click))
+        status_lbl.set_text(f"{len(mixes)} mixes & radio")
+        return False
+
+    def _fetch():
+        try:
+            mixes = app.backend.get_favorite_mixes(limit=500) or []
+        except Exception as e:
+            logger.warning("get_favorite_mixes failed: %s", e)
+            mixes = []
+        GLib.idle_add(_populate, mixes)
+
+    Thread(target=_fetch, daemon=True).start()
 
 
 def render_artists_dashboard(app):

@@ -395,6 +395,13 @@ def on_nav_selected(app, box, row):
         ui_actions.render_artists_dashboard(app)
         return
 
+    if row.nav_id == "mixes":
+        app.grid_title_label.set_text("Mixes & Radio")
+        if hasattr(app, "grid_subtitle_label") and app.grid_subtitle_label is not None:
+            app.grid_subtitle_label.set_text("Mixes and radio stations you've favorited")
+        ui_actions.render_mixes_dashboard(app)
+        return
+
 
 def on_artist_clicked(app, artist):
     current_view = app.right_stack.get_visible_child_name()

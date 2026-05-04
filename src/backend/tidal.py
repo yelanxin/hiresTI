@@ -33,6 +33,7 @@ class TidalBackend:
         self.fav_album_ids = set()
         self.fav_artist_ids = set()
         self.fav_track_ids = set()
+        self.fav_mix_ids = set()
         self._cached_albums = []
         self._cached_albums_ts = 0.0
         self._albums_cache_ttl = 0.0
@@ -516,6 +517,17 @@ class TidalBackend:
             }
         except Exception as e:
             logger.debug("Failed to refresh favorite track ids: %s", e)
+        try:
+            if not self.user:
+                return
+            mixes = self.get_favorite_mixes(limit=2000)
+            self.fav_mix_ids = {
+                str(getattr(m, "id", ""))
+                for m in (mixes or [])
+                if getattr(m, "id", None) is not None
+            }
+        except Exception as e:
+            logger.debug("Failed to refresh favorite mix ids: %s", e)
 
     def is_favorite(self, album_id):
         return str(album_id) in self.fav_album_ids
@@ -525,6 +537,9 @@ class TidalBackend:
 
     def is_track_favorite(self, track_id):
         return str(track_id) in self.fav_track_ids
+
+    def is_mix_favorite(self, mix_id):
+        return str(mix_id) in self.fav_mix_ids
 
     def _album_cache_ttl_seconds(self, default=300.0):
         try:
@@ -596,6 +611,24 @@ class TidalBackend:
             return True
         except Exception as e:
             logger.warning("Failed to toggle artist favorite for %s (add=%s): %s", artist_id, add, e)
+            return False
+
+    def toggle_mix_favorite(self, mix_id, add=True):
+        # Tidal's "Mixes & Radio" favorites collection.  tidalapi 0.8.11
+        # exposes these as `add_mixes` / `remove_mixes` and accepts either
+        # a string or a list of ids; we always pass a single id so the
+        # request URL stays small.
+        try:
+            fav = self.user.favorites
+            if add:
+                fav.add_mixes(str(mix_id))
+                self.fav_mix_ids.add(str(mix_id))
+            else:
+                fav.remove_mixes(str(mix_id))
+                self.fav_mix_ids.discard(str(mix_id))
+            return True
+        except Exception as e:
+            logger.warning("Failed to toggle mix favorite for %s (add=%s): %s", mix_id, add, e)
             return False
 
     def toggle_track_favorite(self, track_id, add=True):
@@ -850,6 +883,45 @@ class TidalBackend:
                 if cached:
                     logger.info("Using cached recent albums after transient failure: count=%s", len(cached))
                     return cached
+            return []
+
+    def get_favorite_mixes(self, limit=200, offset=0):
+        # tidalapi 0.8.11 has no `*_paginated` helper for mixes — the v2
+        # endpoint accepts (limit, offset) directly and returns a flat
+        # List[MixV2].  Most users have well under 200 favorited mixes,
+        # so a single page is enough; we still loop in case Tidal returns
+        # short pages.
+        try:
+            def _fetch():
+                if not self.user:
+                    return []
+                fav = getattr(self.user, "favorites", None)
+                if not fav or not hasattr(fav, "mixes"):
+                    return []
+                seen = set()
+                out = []
+                page_size = min(int(limit), 50)
+                local_offset = int(offset)
+                while len(out) < int(limit):
+                    page = fav.mixes(limit=page_size, offset=local_offset) or []
+                    if not isinstance(page, list):
+                        page = list(page)
+                    if not page:
+                        break
+                    for mix in page:
+                        mix_id = str(getattr(mix, "id", "") or "")
+                        if not mix_id or mix_id in seen:
+                            continue
+                        seen.add(mix_id)
+                        out.append(mix)
+                    if len(page) < page_size:
+                        break
+                    local_offset += page_size
+                return out
+
+            return self._call_with_session_recovery(_fetch, context="favorite mixes")
+        except Exception as e:
+            logger.warning("Failed to fetch favorite mixes: %s", e)
             return []
 
     def get_favorite_tracks(self, limit=50, sort="recent"):
