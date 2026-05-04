@@ -193,49 +193,45 @@ fn main() {
     eprintln!("[play_test] device={device} uri={} clock={}", args.uri,
         if args.clock_mode == RAC_USB_CLOCK_PULL { "pull" } else { "push" });
 
-    let engine: *mut Engine = unsafe { rac_new() };
+    let engine: *mut Engine = rac_new();
     if engine.is_null() {
         eprintln!("rac_new returned null");
         std::process::exit(1);
     }
 
-    unsafe {
-        rac_set_event_callback(engine, Some(event_cb), std::ptr::null_mut());
+    rac_set_event_callback(engine, Some(event_cb), std::ptr::null_mut());
 
-        let driver = CString::new("USB Rawlink v2").unwrap();
-        let dev_c = CString::new(device.as_str()).unwrap();
-        let rc = rac_set_output(engine, driver.as_ptr(), dev_c.as_ptr());
-        if rc != 0 {
-            eprintln!("rac_set_output failed rc={rc}");
-            rac_free(engine);
-            std::process::exit(1);
-        }
+    let driver = CString::new("USB Rawlink v2").unwrap();
+    let dev_c = CString::new(device.as_str()).unwrap();
+    let rc = rac_set_output(engine, driver.as_ptr(), dev_c.as_ptr());
+    if rc != 0 {
+        eprintln!("rac_set_output failed rc={rc}");
+        rac_free(engine);
+        std::process::exit(1);
+    }
 
-        let _ = rac_set_usb_clock_mode(engine, args.clock_mode);
+    let _ = rac_set_usb_clock_mode(engine, args.clock_mode);
 
-        let uri_c = CString::new(args.uri.as_str()).unwrap();
-        let rc = rac_set_uri(engine, uri_c.as_ptr());
-        if rc != 0 {
-            eprintln!("rac_set_uri failed rc={rc}");
-            rac_free(engine);
-            std::process::exit(1);
-        }
+    let uri_c = CString::new(args.uri.as_str()).unwrap();
+    let rc = rac_set_uri(engine, uri_c.as_ptr());
+    if rc != 0 {
+        eprintln!("rac_set_uri failed rc={rc}");
+        rac_free(engine);
+        std::process::exit(1);
+    }
 
-        let rc = rac_play(engine);
-        if rc != 0 {
-            eprintln!("rac_play failed rc={rc}");
-            rac_free(engine);
-            std::process::exit(1);
-        }
+    let rc = rac_play(engine);
+    if rc != 0 {
+        eprintln!("rac_play failed rc={rc}");
+        rac_free(engine);
+        std::process::exit(1);
     }
 
     // Tight pump loop — no GLib timers, no GTK, no MPRIS, no spectrum.
     let started = Instant::now();
     let deadline = args.seconds.map(|s| started + Duration::from_secs(s));
     loop {
-        unsafe {
-            rac_pump_events(engine);
-        }
+        rac_pump_events(engine);
         if EOS_FIRED.load(Ordering::Acquire) {
             eprintln!("[play_test] EOS — exiting");
             break;
@@ -253,8 +249,6 @@ fn main() {
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    unsafe {
-        rac_stop(engine);
-        rac_free(engine);
-    }
+    rac_stop(engine);
+    rac_free(engine);
 }
