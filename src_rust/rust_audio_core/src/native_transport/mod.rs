@@ -1,11 +1,14 @@
 pub mod controller;
 pub mod format_util;
 pub mod native_dsp;
+pub mod output;
 pub mod processor;
 pub mod source;
 
 #[allow(unused_imports)]
 pub use native_dsp::DspPcmProcessor;
+#[allow(unused_imports)]
+pub use output::{AlsaMmapOutputConfig, NativeOutputTarget};
 #[allow(unused_imports)]
 pub use controller::{
     NativeTransportCommand, NativeTransportController, NativeTransportLoadRequest,
