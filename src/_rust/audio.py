@@ -1904,8 +1904,11 @@ class RustAudioPlayerAdapter:
         self._rust_pump_idle_interval_playing_s = 0.08
         self._rust_pump_idle_interval_paused_s = 0.25
         # Extra lookback to ensure interpolation has both neighbors even when
-        # spectrum frames arrive in coarse bursts.
-        self._viz_interp_lookback_s = 0.06
+        # spectrum frames arrive in coarse bursts. 20ms is small enough that
+        # missing the trailing neighbour just falls back to a single-frame
+        # hold (≤1 spectrum-frame stale at our ~50 Hz emit rate), but cuts a
+        # measurable chunk of the visible spectrum-vs-audio lag.
+        self._viz_interp_lookback_s = 0.02
         self._output_switch_lock = threading.RLock()
         self._output_switch_inflight = False
         self._output_switch_pending = None
@@ -1965,8 +1968,11 @@ class RustAudioPlayerAdapter:
     def _retune_idle_timers(self):
         if bool(getattr(self, "_rust_spectrum_enabled", False)):
             self._restart_rust_pump_timer(16)
+            # 8ms render tick (~125Hz nominal). GLib.timeout is non-vsync so the
+            # actual rate drifts under load, but at this rate a spectrum frame
+            # waiting for the next tick adds at most ~4ms average vs ~8ms at 16ms.
             if int(getattr(self, "_viz_render_source", 0) or 0) == 0:
-                self._viz_render_source = GLib.timeout_add(16, self._viz_render_tick)
+                self._viz_render_source = GLib.timeout_add(8, self._viz_render_tick)
             return
         # No spectrum: keep pump low-frequency and stop render loop completely.
         is_playing_cached = bool(getattr(self, "_cached_is_playing", False))

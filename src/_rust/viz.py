@@ -489,12 +489,14 @@ class RustVizCore:
         self._viz_state_free = None
         self._viz_state_reset = None
         self._viz_state_set_params = None
+        self._viz_state_set_release_smooth = None
         self._viz_state_set_target = None
         self._viz_state_tick_copy = None
         self._viz_state_stereo_new = None
         self._viz_state_stereo_free = None
         self._viz_state_stereo_reset = None
         self._viz_state_stereo_set_params = None
+        self._viz_state_stereo_set_release_smooth = None
         self._viz_state_stereo_set_targets = None
         self._viz_state_stereo_tick_copy = None
         try:
@@ -545,6 +547,14 @@ class RustVizCore:
             self._viz_state_tick_copy = st_tick
         except Exception:
             logger.info("Rust viz core lacks viz_state_* symbols; using Python animation fallback.")
+        try:
+            st_setr = self._lib.viz_state_set_release_smooth
+            st_setr.argtypes = [ctypes.c_void_p, ctypes.c_float]
+            st_setr.restype = ctypes.c_int
+            self._viz_state_set_release_smooth = st_setr
+        except Exception:
+            # Older lib without asymmetric EMA — release tracks attack as before.
+            self._viz_state_set_release_smooth = None
         try:
             st_new = self._lib.viz_state_stereo_new
             st_new.argtypes = [
@@ -602,6 +612,13 @@ class RustVizCore:
             self._viz_state_stereo_tick_copy = st_tick
         except Exception:
             logger.info("Rust viz core lacks viz_state_stereo_* symbols; using Python stereo animation fallback.")
+        try:
+            st_setr = self._lib.viz_state_stereo_set_release_smooth
+            st_setr.argtypes = [ctypes.c_void_p, ctypes.c_float]
+            st_setr.restype = ctypes.c_int
+            self._viz_state_stereo_set_release_smooth = st_setr
+        except Exception:
+            self._viz_state_stereo_set_release_smooth = None
 
     @property
     def available(self) -> bool:
@@ -747,6 +764,7 @@ class RustVizCore:
         peak_hold_frames: int = 8,
         peak_fall: float = 0.02,
         bass_smooth: float = 0.22,
+        release_smooth: Optional[float] = None,
     ) -> Optional["RustVizStateEngine"]:
         if self._lib is None or self._viz_state_new is None:
             return None
@@ -760,6 +778,8 @@ class RustVizCore:
         )
         if not ptr:
             return None
+        if release_smooth is not None and self._viz_state_set_release_smooth is not None:
+            self._viz_state_set_release_smooth(ptr, ctypes.c_float(float(release_smooth)))
         return RustVizStateEngine(self, ptr, int(num_bars))
 
     def create_stereo_state_engine(
@@ -771,6 +791,7 @@ class RustVizCore:
         peak_fall: float = 0.02,
         bass_smooth: float = 0.22,
         balance_smooth: float = 0.22,
+        release_smooth: Optional[float] = None,
     ) -> Optional["RustStereoVizStateEngine"]:
         if self._lib is None or self._viz_state_stereo_new is None:
             return None
@@ -785,6 +806,8 @@ class RustVizCore:
         )
         if not ptr:
             return None
+        if release_smooth is not None and self._viz_state_stereo_set_release_smooth is not None:
+            self._viz_state_stereo_set_release_smooth(ptr, ctypes.c_float(float(release_smooth)))
         return RustStereoVizStateEngine(self, ptr, int(num_bars))
 
     def build_log_bins(self, values: Iterable[float], out_count: int) -> Optional[List[float]]:
@@ -1805,6 +1828,7 @@ class RustVizStateEngine:
         peak_hold_frames: int,
         peak_fall: float,
         bass_smooth: float = 0.22,
+        release_smooth: Optional[float] = None,
     ) -> bool:
         if not self._ptr:
             return False
@@ -1818,6 +1842,14 @@ class RustVizStateEngine:
                 ctypes.c_float(float(bass_smooth)),
             )
         )
+        if rc == 0 and release_smooth is not None and self._core._viz_state_set_release_smooth is not None:
+            # Asymmetric EMA: attack stays at `smooth`, falling edges use the
+            # slower release coefficient. Older liblua/lib without this symbol
+            # silently keeps the symmetric (release == smooth) behaviour.
+            self._core._viz_state_set_release_smooth(
+                self._ptr,
+                ctypes.c_float(float(release_smooth)),
+            )
         return rc == 0
 
     def set_target(self, levels: Iterable[float]) -> int:
@@ -1890,6 +1922,7 @@ class RustStereoVizStateEngine:
         peak_fall: float,
         bass_smooth: float = 0.22,
         balance_smooth: float = 0.22,
+        release_smooth: Optional[float] = None,
     ) -> bool:
         if not self._ptr:
             return False
@@ -1904,6 +1937,11 @@ class RustStereoVizStateEngine:
                 ctypes.c_float(float(balance_smooth)),
             )
         )
+        if rc == 0 and release_smooth is not None and self._core._viz_state_stereo_set_release_smooth is not None:
+            self._core._viz_state_stereo_set_release_smooth(
+                self._ptr,
+                ctypes.c_float(float(release_smooth)),
+            )
         return rc == 0
 
     def set_targets(self, left_levels: Iterable[float], right_levels: Iterable[float]) -> int:

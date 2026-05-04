@@ -20,7 +20,15 @@ pub struct VizStateEngine {
     peak: Vec<f32>,
     peak_ttl: Vec<u16>,
     bass_level: f32,
+    /// Attack EMA coefficient: applied when `target > current` (rising edges,
+    /// transients).  A higher value here makes the visualizer track audio
+    /// onsets faster, removing perceived lag without making the steady-state
+    /// look jittery (release stays slow).
     smooth: f32,
+    /// Release EMA coefficient: applied when `target <= current` (falling).
+    /// Defaults to `smooth` for symmetric behaviour; callers that want
+    /// asymmetric attack/release set this lower via `set_release_smooth`.
+    release_smooth: f32,
     trail_decay: f32,
     peak_hold_frames: u16,
     peak_fall: f32,
@@ -259,6 +267,7 @@ impl VizStateEngine {
         bass_smooth: f32,
     ) -> Self {
         let n = num_bars.max(1);
+        let s = smooth.clamp(0.0, 1.0);
         Self {
             num_bars: n,
             target: vec![0.0; n],
@@ -267,7 +276,8 @@ impl VizStateEngine {
             peak: vec![0.0; n],
             peak_ttl: vec![0; n],
             bass_level: 0.0,
-            smooth: smooth.clamp(0.0, 1.0),
+            smooth: s,
+            release_smooth: s,
             trail_decay: trail_decay.clamp(0.0, 1.0),
             peak_hold_frames,
             peak_fall: peak_fall.max(0.0),
@@ -292,11 +302,20 @@ impl VizStateEngine {
         peak_fall: f32,
         bass_smooth: f32,
     ) {
-        self.smooth = smooth.clamp(0.0, 1.0);
+        let s = smooth.clamp(0.0, 1.0);
+        self.smooth = s;
+        // Reset release back to symmetric.  Callers that want asymmetric
+        // behaviour should follow with `set_release_smooth`.  This keeps
+        // existing single-knob callers behaving as before.
+        self.release_smooth = s;
         self.trail_decay = trail_decay.clamp(0.0, 1.0);
         self.peak_hold_frames = peak_hold_frames;
         self.peak_fall = peak_fall.max(0.0);
         self.bass_smooth = bass_smooth.clamp(0.0, 1.0);
+    }
+
+    fn set_release_smooth(&mut self, release_smooth: f32) {
+        self.release_smooth = release_smooth.clamp(0.0, 1.0);
     }
 
     fn set_target_from_slice(&mut self, input: &[f32]) -> usize {
@@ -315,7 +334,12 @@ impl VizStateEngine {
         for i in 0..n {
             let cur = self.current[i];
             let tgt = self.target[i];
-            let next = cur + ((tgt - cur) * self.smooth);
+            // Asymmetric EMA: rising uses `smooth` (attack), falling uses
+            // `release_smooth`.  When the two are equal this matches the
+            // original symmetric behaviour exactly.
+            let diff = tgt - cur;
+            let coef = if diff > 0.0 { self.smooth } else { self.release_smooth };
+            let next = cur + (diff * coef);
             self.current[i] = next;
 
             let tr = self.trail[i] * self.trail_decay;
@@ -391,6 +415,11 @@ impl StereoVizStateEngine {
         self.right
             .set_params(smooth, trail_decay, peak_hold_frames, peak_fall, bass_smooth);
         self.balance_smooth = balance_smooth.clamp(0.0, 1.0);
+    }
+
+    fn set_release_smooth(&mut self, release_smooth: f32) {
+        self.left.set_release_smooth(release_smooth);
+        self.right.set_release_smooth(release_smooth);
     }
 
     fn set_targets_from_slices(&mut self, left: &[f32], right: &[f32]) -> usize {
@@ -1022,6 +1051,22 @@ pub extern "C" fn viz_state_set_params(
     0
 }
 
+/// Set the release-side EMA coefficient independently from the attack.
+/// Call after `viz_state_set_params` (which resets release to match attack)
+/// when asymmetric behaviour is desired.
+#[no_mangle]
+pub extern "C" fn viz_state_set_release_smooth(
+    ptr: *mut VizStateEngine,
+    release_smooth: f32,
+) -> c_int {
+    if ptr.is_null() {
+        return -1;
+    }
+    let st = unsafe { &mut *ptr };
+    st.set_release_smooth(release_smooth);
+    0
+}
+
 #[no_mangle]
 pub extern "C" fn viz_state_set_target(
     ptr: *mut VizStateEngine,
@@ -1139,6 +1184,21 @@ pub extern "C" fn viz_state_stereo_set_params(
         bass_smooth,
         balance_smooth,
     );
+    0
+}
+
+/// Stereo equivalent of `viz_state_set_release_smooth` — applies the same
+/// release coefficient to both channels.
+#[no_mangle]
+pub extern "C" fn viz_state_stereo_set_release_smooth(
+    ptr: *mut StereoVizStateEngine,
+    release_smooth: f32,
+) -> c_int {
+    if ptr.is_null() {
+        return -1;
+    }
+    let st = unsafe { &mut *ptr };
+    st.set_release_smooth(release_smooth);
     0
 }
 

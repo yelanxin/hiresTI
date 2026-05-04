@@ -792,11 +792,17 @@ class SpectrumVisualizer(Gtk.DrawingArea):
             "Dual Fall": 25,
         }
         self.profiles = {
+            # `smooth` is the attack EMA coefficient (rising edges).
+            # `release_smooth` controls falling edges; keeping it at the old
+            # `smooth` values preserves each profile's smooth-decay character
+            # while letting attack track audio transients much faster, which
+            # is what cuts the perceived spectrum-vs-audio lag.
             "Gentle": {
                 "gain_mul": 0.72,
                 "spacing_mul": 1.10,
                 "grid_mul": 0.78,
-                "smooth": 0.12,
+                "smooth": 0.45,
+                "release_smooth": 0.12,
                 "trail_decay": 0.975,
                 "peak_hold_frames": 29,
                 "peak_fall": 0.005,
@@ -806,7 +812,8 @@ class SpectrumVisualizer(Gtk.DrawingArea):
                 "gain_mul": 0.84,
                 "spacing_mul": 1.08,
                 "grid_mul": 0.85,
-                "smooth": 0.17,
+                "smooth": 0.50,
+                "release_smooth": 0.17,
                 "trail_decay": 0.965,
                 "peak_hold_frames": 25,
                 "peak_fall": 0.007,
@@ -816,7 +823,8 @@ class SpectrumVisualizer(Gtk.DrawingArea):
                 "gain_mul": 1.0,
                 "spacing_mul": 1.0,
                 "grid_mul": 1.0,
-                "smooth": 0.26,
+                "smooth": 0.60,
+                "release_smooth": 0.26,
                 "trail_decay": 0.951,
                 "peak_hold_frames": 17,
                 "peak_fall": 0.010,
@@ -826,7 +834,8 @@ class SpectrumVisualizer(Gtk.DrawingArea):
                 "gain_mul": 1.18,
                 "spacing_mul": 0.92,
                 "grid_mul": 1.18,
-                "smooth": 0.34,
+                "smooth": 0.68,
+                "release_smooth": 0.34,
                 "trail_decay": 0.935,
                 "peak_hold_frames": 12,
                 "peak_fall": 0.015,
@@ -836,7 +845,8 @@ class SpectrumVisualizer(Gtk.DrawingArea):
                 "gain_mul": 1.32,
                 "spacing_mul": 0.88,
                 "grid_mul": 1.28,
-                "smooth": 0.39,
+                "smooth": 0.75,
+                "release_smooth": 0.39,
                 "trail_decay": 0.918,
                 "peak_hold_frames": 8,
                 "peak_fall": 0.019,
@@ -1203,8 +1213,17 @@ class SpectrumVisualizer(Gtk.DrawingArea):
         time-to-target) so its frame-to-frame response visually matches log."""
         smooth = float(self._profile_cfg["smooth"])
         if self.frequency_scale_name == _FREQ_SCALE_LINEAR:
-            smooth *= 0.65
+            smooth *= 0.85
         return smooth
+
+    def _scaled_release_smooth(self):
+        """Release-side EMA coefficient. Falls back to attack value when the
+        profile pre-dates asymmetric EMA. Linear keeps the 0.85x slowdown for
+        consistency with the attack-side scaling."""
+        release = float(self._profile_cfg.get("release_smooth", self._profile_cfg["smooth"]))
+        if self.frequency_scale_name == _FREQ_SCALE_LINEAR:
+            release *= 0.85
+        return release
 
     def _push_state_engine_params(self):
         if self._rust_state_engine is not None:
@@ -1214,6 +1233,7 @@ class SpectrumVisualizer(Gtk.DrawingArea):
                 peak_hold_frames=int(self._profile_cfg["peak_hold_frames"]),
                 peak_fall=float(self._profile_cfg["peak_fall"]),
                 bass_smooth=max(0.12, min(0.62, 0.28 * float(self._profile_cfg["beat_mul"]))),
+                release_smooth=self._scaled_release_smooth(),
             )
 
     def set_profile(self, profile_name):
@@ -1291,6 +1311,7 @@ class SpectrumVisualizer(Gtk.DrawingArea):
         self._rust_right_peak_arr = (ctypes.c_float * self.num_bars)(*([0.0] * self.num_bars))
         if self._rust_core is not None and getattr(self._rust_core, "available", False):
             scaled_smooth = self._scaled_smooth()
+            scaled_release = self._scaled_release_smooth()
             try:
                 self._rust_state_engine = self._rust_core.create_state_engine(
                     self.num_bars,
@@ -1299,6 +1320,7 @@ class SpectrumVisualizer(Gtk.DrawingArea):
                     peak_hold_frames=int(self._profile_cfg["peak_hold_frames"]),
                     peak_fall=float(self._profile_cfg["peak_fall"]),
                     bass_smooth=max(0.12, min(0.62, 0.28 * float(self._profile_cfg["beat_mul"]))),
+                    release_smooth=scaled_release,
                 )
             except Exception:
                 self._rust_state_engine = None
@@ -1311,6 +1333,7 @@ class SpectrumVisualizer(Gtk.DrawingArea):
                     peak_fall=float(self._profile_cfg["peak_fall"]),
                     bass_smooth=max(0.12, min(0.62, 0.28 * float(self._profile_cfg["beat_mul"]))),
                     balance_smooth=scaled_smooth,
+                    release_smooth=scaled_release,
                 )
             except Exception:
                 self._rust_stereo_state_engine = None
@@ -1489,19 +1512,20 @@ class SpectrumVisualizer(Gtk.DrawingArea):
                 self.bass_level += (self._bass_target - self.bass_level) * bass_response
                 # Linear gets a slower EMA coefficient (see _scaled_smooth) so its
                 # response speed visually matches log without altering magnitudes.
-                smooth_factor = self._scaled_smooth()
+                attack = self._scaled_smooth()
+                release = self._scaled_release_smooth()
                 for i in range(self.num_bars):
                     diff = self.target_heights[i] - self.current_heights[i]
                     if abs(diff) > 0.001:
-                        self.current_heights[i] += diff * smooth_factor
+                        self.current_heights[i] += diff * (attack if diff > 0 else release)
                         changed = True
                     ldiff = self.target_left_channel_heights[i] - self.left_channel_heights[i]
                     if abs(ldiff) > 0.001:
-                        self.left_channel_heights[i] += ldiff * smooth_factor
+                        self.left_channel_heights[i] += ldiff * (attack if ldiff > 0 else release)
                         changed = True
                     rdiff = self.target_right_channel_heights[i] - self.right_channel_heights[i]
                     if abs(rdiff) > 0.001:
-                        self.right_channel_heights[i] += rdiff * smooth_factor
+                        self.right_channel_heights[i] += rdiff * (attack if rdiff > 0 else release)
                         changed = True
                     lcur = self.left_channel_heights[i]
                     if lcur >= self.left_peak_holds[i]:
@@ -3949,8 +3973,14 @@ class DotsGLVisualizer(Gtk.GLArea):
     def _scaled_smooth(self):
         smooth = float(self._profile_cfg["smooth"])
         if self.frequency_scale_name == _FREQ_SCALE_LINEAR:
-            smooth *= 0.65
+            smooth *= 0.85
         return smooth
+
+    def _scaled_release_smooth(self):
+        release = float(self._profile_cfg.get("release_smooth", self._profile_cfg["smooth"]))
+        if self.frequency_scale_name == _FREQ_SCALE_LINEAR:
+            release *= 0.85
+        return release
 
     def _reset_rust_state_engine(self):
         try:
@@ -3968,6 +3998,7 @@ class DotsGLVisualizer(Gtk.GLArea):
                     peak_hold_frames=0,
                     peak_fall=0.0,
                     bass_smooth=0.22,
+                    release_smooth=self._scaled_release_smooth(),
                 )
             except Exception:
                 self._rust_state_engine = None
@@ -4066,12 +4097,13 @@ class DotsGLVisualizer(Gtk.GLArea):
                 if written > 0:
                     self.queue_render()
                 return True
-            smooth = float(self._profile_cfg["smooth"])
+            attack = self._scaled_smooth()
+            release = self._scaled_release_smooth()
             changed = False
             for i in range(self.num_bars):
                 diff = self.target_heights[i] - self.current_heights[i]
                 if abs(diff) > 0.001:
-                    self.current_heights[i] += diff * smooth
+                    self.current_heights[i] += diff * (attack if diff > 0 else release)
                     changed = True
             if changed:
                 self.queue_render()
@@ -4266,6 +4298,7 @@ class DotsGLVisualizer(Gtk.GLArea):
                 peak_hold_frames=0,
                 peak_fall=0.0,
                 bass_smooth=0.22,
+                release_smooth=self._scaled_release_smooth(),
             )
 
     def set_frequency_scale(self, name):
@@ -5004,6 +5037,12 @@ _BARS_GL_EFFECT_MODES = {
 class BarsGLVisualizer(Gtk.GLArea):
     """GL-accelerated visualizer for Bars, Peak, and Trail effects."""
 
+    # Per-mode dynamic uniform requirements (see fragment shader uMode branches).
+    _HEIGHTS_MODES = frozenset({0, 1, 2, 3, 4, 5, 6, 9})  # any mono mode that reads uHeights
+    _PEAK_MODES    = frozenset({1})                       # Peak adds uPeakHeights
+    _TRAIL_MODES   = frozenset({2})                       # Trail adds uTrailHeights
+    _STEREO_MODES  = frozenset({7, 8, 10, 11})            # uLeftHeights / uRightHeights
+
     def __init__(self):
         if GL is None:
             raise RuntimeError("PyOpenGL not available")
@@ -5055,6 +5094,11 @@ class BarsGLVisualizer(Gtk.GLArea):
         self._color_cache  = None
         self._color_cache_key = None
         self._dirty_static = True
+        # Force a full per-frame uniform refresh on the next render. Set when
+        # the effect mode changes or when the widget is reactivated, so the
+        # selective-upload path can't ship a frame with stale data for a
+        # uniform that the previous mode didn't bother updating.
+        self._dirty_dynamic = True
         self._cached_w     = 0
         self._cached_h     = 0
 
@@ -5109,6 +5153,7 @@ class BarsGLVisualizer(Gtk.GLArea):
         self._rust_stereo_state_engine = None
         if self._rust_core is not None and getattr(self._rust_core, "available", False):
             scaled_smooth = self._scaled_smooth()
+            scaled_release = self._scaled_release_smooth()
             try:
                 self._rust_state_engine = self._rust_core.create_state_engine(
                     self.num_bars,
@@ -5117,6 +5162,7 @@ class BarsGLVisualizer(Gtk.GLArea):
                     peak_hold_frames=int(self._profile_cfg["peak_hold_frames"]),
                     peak_fall=float(self._profile_cfg["peak_fall"]),
                     bass_smooth=max(0.12, min(0.62, 0.28 * float(self._profile_cfg["beat_mul"]))),
+                    release_smooth=scaled_release,
                 )
             except Exception:
                 self._rust_state_engine = None
@@ -5129,6 +5175,7 @@ class BarsGLVisualizer(Gtk.GLArea):
                     peak_fall=float(self._profile_cfg["peak_fall"]),
                     bass_smooth=max(0.12, min(0.62, 0.28 * float(self._profile_cfg["beat_mul"]))),
                     balance_smooth=scaled_smooth,
+                    release_smooth=scaled_release,
                 )
             except Exception:
                 self._rust_stereo_state_engine = None
@@ -5245,13 +5292,25 @@ class BarsGLVisualizer(Gtk.GLArea):
             self._tr_arr[:self.num_bars] = self.trail_heights[:self.num_bars]
             self._lh_arr[:self.num_bars] = self.left_heights[:self.num_bars]
             self._rh_arr[:self.num_bars] = self.right_heights[:self.num_bars]
-        GL.glUniform1fv(self._u_heights,        self.num_bars, self._h_arr)
-        GL.glUniform1fv(self._u_peak_heights,   self.num_bars, self._ph_arr)
-        GL.glUniform1fv(self._u_trail_heights,  self.num_bars, self._tr_arr)
-        GL.glUniform1fv(self._u_left_heights,   self.num_bars, self._lh_arr)
-        GL.glUniform1fv(self._u_right_heights,  self.num_bars, self._rh_arr)
+        # Selective uniform upload: each `glUniform1fv` call costs ~30-100 µs
+        # of PyOpenGL FFI, so we skip arrays the active shader branch doesn't
+        # read. `_dirty_dynamic` (set on mode change / re-activate) forces a
+        # full refresh on the first frame after the mode boundary so a newly-
+        # active uniform is never serving stale data from the prior mode.
+        force = self._dirty_dynamic
+        mode  = self.effect_mode
+        if force or mode in self._HEIGHTS_MODES:
+            GL.glUniform1fv(self._u_heights,       self.num_bars, self._h_arr)
+        if force or mode in self._PEAK_MODES:
+            GL.glUniform1fv(self._u_peak_heights,  self.num_bars, self._ph_arr)
+        if force or mode in self._TRAIL_MODES:
+            GL.glUniform1fv(self._u_trail_heights, self.num_bars, self._tr_arr)
+        if force or mode in self._STEREO_MODES:
+            GL.glUniform1fv(self._u_left_heights,  self.num_bars, self._lh_arr)
+            GL.glUniform1fv(self._u_right_heights, self.num_bars, self._rh_arr)
         GL.glUniform1f(self._u_bass_level,      self.bass_level)
         GL.glUniform1f(self._u_balance,         self.balance)
+        self._dirty_dynamic = False
         GL.glBindVertexArray(self._vao)
         GL.glDrawArrays(GL.GL_TRIANGLE_STRIP, 0, 4)
         GL.glBindVertexArray(0)
@@ -5291,7 +5350,8 @@ class BarsGLVisualizer(Gtk.GLArea):
                     self.queue_render()
                 return True
             profile = self._profile_cfg
-            smooth      = float(profile["smooth"])
+            attack      = self._scaled_smooth()
+            release     = self._scaled_release_smooth()
             trail_decay = float(profile["trail_decay"])
             peak_fall   = float(profile["peak_fall"])
             peak_hold_f = int(profile["peak_hold_frames"])
@@ -5300,15 +5360,15 @@ class BarsGLVisualizer(Gtk.GLArea):
             for i in range(self.num_bars):
                 diff = self.target_heights[i] - self.current_heights[i]
                 if abs(diff) > 0.001:
-                    self.current_heights[i] += diff * smooth
+                    self.current_heights[i] += diff * (attack if diff > 0 else release)
                     changed = True
                 ldiff = self.target_left_heights[i] - self.left_heights[i]
                 if abs(ldiff) > 0.001:
-                    self.left_heights[i] += ldiff * smooth
+                    self.left_heights[i] += ldiff * (attack if ldiff > 0 else release)
                     changed = True
                 rdiff = self.target_right_heights[i] - self.right_heights[i]
                 if abs(rdiff) > 0.001:
-                    self.right_heights[i] += rdiff * smooth
+                    self.right_heights[i] += rdiff * (attack if rdiff > 0 else release)
                     changed = True
                 cur = self.current_heights[i]
                 self.trail_heights[i] = max(cur, self.trail_heights[i] * trail_decay)
@@ -5321,7 +5381,8 @@ class BarsGLVisualizer(Gtk.GLArea):
                     else:
                         self.peak_holds[i] = max(0.0, self.peak_holds[i] - peak_fall)
             self.bass_level += (self._bass_target - self.bass_level) * bass_resp
-            self.balance    += (self._balance_target - self.balance) * smooth
+            bdiff = self._balance_target - self.balance
+            self.balance    += bdiff * (attack if bdiff > 0 else release)
             if changed:
                 self.queue_render()
             return True
@@ -5331,6 +5392,7 @@ class BarsGLVisualizer(Gtk.GLArea):
             return
         self._active = active
         if active:
+            self._dirty_dynamic = True
             if self._anim_source is None:
                 self._anim_source = self.add_tick_callback(self._on_tick_cb)
             self.queue_render()
@@ -5483,8 +5545,9 @@ class BarsGLVisualizer(Gtk.GLArea):
     def set_effect(self, name):
         mode = _BARS_GL_EFFECT_MODES.get(name, 0)
         if mode != self.effect_mode:
-            self.effect_mode   = mode
-            self._dirty_static = True
+            self.effect_mode    = mode
+            self._dirty_static  = True
+            self._dirty_dynamic = True
 
     def requires_stereo_spectrum(self):
         return self.effect_mode in {7, 10, 11}
@@ -5492,8 +5555,14 @@ class BarsGLVisualizer(Gtk.GLArea):
     def _scaled_smooth(self):
         smooth = float(self._profile_cfg["smooth"])
         if self.frequency_scale_name == _FREQ_SCALE_LINEAR:
-            smooth *= 0.65
+            smooth *= 0.85
         return smooth
+
+    def _scaled_release_smooth(self):
+        rel = float(self._profile_cfg.get("release_smooth", self._profile_cfg["smooth"]))
+        if self.frequency_scale_name == _FREQ_SCALE_LINEAR:
+            rel *= 0.85
+        return rel
 
     def _push_state_engine_params(self):
         if self._rust_state_engine is not None:
@@ -5503,6 +5572,7 @@ class BarsGLVisualizer(Gtk.GLArea):
                 peak_hold_frames=int(self._profile_cfg["peak_hold_frames"]),
                 peak_fall=float(self._profile_cfg["peak_fall"]),
                 bass_smooth=max(0.12, min(0.62, 0.28 * float(self._profile_cfg["beat_mul"]))),
+                release_smooth=self._scaled_release_smooth(),
             )
 
     def set_profile(self, name):
