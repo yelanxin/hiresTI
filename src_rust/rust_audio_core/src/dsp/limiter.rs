@@ -26,14 +26,19 @@ pub(crate) struct LimiterState {
 
 impl LimiterState {
     pub(crate) fn new() -> Self {
-        Self {
+        // Initialise from `LimiterConfig::default()` so the threshold/ratio
+        // defaults live in exactly one place (the public config type).
+        let mut state = Self {
             enabled: false,
-            threshold: 0.85,
-            ratio: 20.0,
+            threshold: 0.0,
+            ratio: 1.0,
             gain: 1.0,
             release_coeff: Self::release_coeff_for(44100),
             sample_rate: 44100,
-        }
+        };
+        state.apply_config(&LimiterConfig::default());
+        state.enabled = false;
+        state
     }
 
     pub(crate) fn release_coeff_for(rate: u32) -> f64 {
