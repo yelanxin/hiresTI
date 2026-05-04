@@ -1795,14 +1795,21 @@ fn decode_direct_audio_stream(
             // chosen `cfg.bit_depth` so slab stride matches what the alt
             // expects — feeding S16LE bytes into a 32-bit alt re-aligns
             // every frame and produces white noise.
+            //
+            // Lossy codecs (AAC, MP3) leave `bits_per_sample` unset because
+            // they decode to internal f32; falling through to None here would
+            // make the slab keep the buffer's native F32LE and the USB ring
+            // would interpret those float bytes as S16LE/S24_3LE → noise.
+            // For that case, honor the device's configured gst_format so the
+            // sample loop converts f32 → wire format.
             let target_format = if let Some(ref cfg) = output_config {
-                track.codec_params.bits_per_sample.map(|src_bits| {
+                if let Some(src_bits) = track.codec_params.bits_per_sample {
                     let target = pick_target_bit_depth(
                         src_bits as u8,
                         &cfg.supported_bit_depths,
                         cfg.bit_depth,
                     );
-                    if target == cfg.bit_depth {
+                    Some(if target == cfg.bit_depth {
                         // Device-pref path: honor the alt's exact subframe
                         // layout (S24_3LE vs S24LE etc.) via cfg.gst_format.
                         pcm_format_from_gst_format(&cfg.gst_format)
@@ -1810,8 +1817,13 @@ fn decode_direct_audio_stream(
                     } else {
                         // Pass-through path: canonical layout for that depth.
                         bits_per_sample_to_pcm_format(target as u32)
-                    }
-                })
+                    })
+                } else {
+                    Some(
+                        pcm_format_from_gst_format(&cfg.gst_format)
+                            .unwrap_or_else(|_| bits_per_sample_to_pcm_format(cfg.bit_depth as u32)),
+                    )
+                }
             } else {
                 track
                     .codec_params
