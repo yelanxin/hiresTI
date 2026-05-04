@@ -1,4 +1,5 @@
 pub mod controller;
+pub mod format_util;
 pub mod native_dsp;
 pub mod processor;
 pub mod source;

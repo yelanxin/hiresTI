@@ -33,7 +33,10 @@ pub(crate) use widener::WidenerState;
 pub(crate) const SPECTRUM_ACTIVE_BANDS_DEFAULT: u32 = 512;
 pub(crate) const SPECTRUM_ACTIVE_BANDS_MAX: u32 = 2048;
 const SPECTRUM_IDLE_BANDS: u32 = 16;
-const SPECTRUM_ACTIVE_INTERVAL_NS: u64 = 16_000_000;
+/// Spectrum-frame emit cadence (matches GStreamer's `spectrum` element).
+/// Shared by V1 (GStreamer pipeline) and V2 (native_transport processor)
+/// so both paths produce frames at the same rate.
+pub(crate) const SPECTRUM_ACTIVE_INTERVAL_NS: u64 = 16_000_000;
 const SPECTRUM_IDLE_INTERVAL_NS: u64 = 10_000_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
