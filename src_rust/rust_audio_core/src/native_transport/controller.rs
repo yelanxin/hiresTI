@@ -1996,7 +1996,11 @@ fn decode_direct_audio_stream(
                     push_data,
                     events,
                     auto_start,
+                    stop,
                 )?;
+                if stop.load(Ordering::Acquire) {
+                    return Ok(());
+                }
                 let push_ms = push_start.elapsed().as_millis();
                 let total_ms = iter_start.elapsed().as_millis();
                 let pkt_dur_ms = if slab.spec.sample_rate > 0 {
@@ -2281,9 +2285,18 @@ fn push_slab_to_usb_output(
     data: &[u8],
     events: &Arc<Mutex<VecDeque<(i32, String)>>>,
     auto_start: &AtomicBool,
+    stop: &Arc<AtomicBool>,
 ) -> Result<(), String> {
     let mut offset = 0usize;
     while offset < data.len() {
+        // After suspend/resume the USB consumer may be wedged (iso transfers
+        // never complete because the device dropped during sleep), so the
+        // queue stays full and `push_bytes` returns 0 indefinitely.  Without
+        // a stop check the worker spins here forever and shutdown / `rac_free`
+        // hangs waiting on the join.  Bail out promptly when stop is signalled.
+        if stop.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let written = session.push_bytes(&data[offset..]);
         if written > 0 {
             offset += written;
