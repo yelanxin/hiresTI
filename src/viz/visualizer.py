@@ -749,7 +749,6 @@ class SpectrumVisualizer(Gtk.DrawingArea):
             "Fill",
             "Mirror",
             "Dots",
-            "Neon",
             "Peak",
             "Trail",
             "Pulse",
@@ -774,7 +773,6 @@ class SpectrumVisualizer(Gtk.DrawingArea):
             "Fill": 2,
             "Mirror": 3,
             "Dots": 4,
-            "Neon": 5,
             "Peak": 6,
             "Trail": 7,
             "Pulse": 8,
@@ -1092,10 +1090,6 @@ class SpectrumVisualizer(Gtk.DrawingArea):
         self._logged_python_bins = False
         self._logged_rust_spiral = False
         self._logged_python_spiral = False
-        self._logged_rust_neon = False
-        self._logged_python_neon = False
-        self._logged_rust_neon_rings = False
-        self._logged_python_neon_rings = False
         self._logged_rust_line = False
         self._logged_python_line = False
         self._logged_rust_fall = False
@@ -1204,23 +1198,35 @@ class SpectrumVisualizer(Gtk.DrawingArea):
             self._refresh_effect_cache()
             self.queue_draw()
 
+    def _scaled_smooth(self):
+        """Linear gets a slower smoothing coefficient (same target heights, slower
+        time-to-target) so its frame-to-frame response visually matches log."""
+        smooth = float(self._profile_cfg["smooth"])
+        if self.frequency_scale_name == _FREQ_SCALE_LINEAR:
+            smooth *= 0.65
+        return smooth
+
+    def _push_state_engine_params(self):
+        if self._rust_state_engine is not None:
+            self._rust_state_engine.set_params(
+                smooth=self._scaled_smooth(),
+                trail_decay=float(self._profile_cfg["trail_decay"]),
+                peak_hold_frames=int(self._profile_cfg["peak_hold_frames"]),
+                peak_fall=float(self._profile_cfg["peak_fall"]),
+                bass_smooth=max(0.12, min(0.62, 0.28 * float(self._profile_cfg["beat_mul"]))),
+            )
+
     def set_profile(self, profile_name):
         if profile_name in self.profiles:
             self.profile_name = profile_name
             self._refresh_profile_cache()
-            if self._rust_state_engine is not None:
-                self._rust_state_engine.set_params(
-                    smooth=float(self._profile_cfg["smooth"]),
-                    trail_decay=float(self._profile_cfg["trail_decay"]),
-                    peak_hold_frames=int(self._profile_cfg["peak_hold_frames"]),
-                    peak_fall=float(self._profile_cfg["peak_fall"]),
-                    bass_smooth=max(0.12, min(0.62, 0.28 * float(self._profile_cfg["beat_mul"]))),
-                )
+            self._push_state_engine_params()
             self.queue_draw()
 
     def set_frequency_scale(self, scale_name):
         if scale_name in self.frequency_scale_names:
             self.frequency_scale_name = scale_name
+            self._push_state_engine_params()
             self.queue_draw()
 
     def set_input_band_count(self, count):
@@ -1284,10 +1290,11 @@ class SpectrumVisualizer(Gtk.DrawingArea):
         self._rust_left_peak_arr = (ctypes.c_float * self.num_bars)(*([0.0] * self.num_bars))
         self._rust_right_peak_arr = (ctypes.c_float * self.num_bars)(*([0.0] * self.num_bars))
         if self._rust_core is not None and getattr(self._rust_core, "available", False):
+            scaled_smooth = self._scaled_smooth()
             try:
                 self._rust_state_engine = self._rust_core.create_state_engine(
                     self.num_bars,
-                    smooth=float(self._profile_cfg["smooth"]),
+                    smooth=scaled_smooth,
                     trail_decay=float(self._profile_cfg["trail_decay"]),
                     peak_hold_frames=int(self._profile_cfg["peak_hold_frames"]),
                     peak_fall=float(self._profile_cfg["peak_fall"]),
@@ -1298,12 +1305,12 @@ class SpectrumVisualizer(Gtk.DrawingArea):
             try:
                 self._rust_stereo_state_engine = self._rust_core.create_stereo_state_engine(
                     self.num_bars,
-                    smooth=float(self._profile_cfg["smooth"]),
+                    smooth=scaled_smooth,
                     trail_decay=float(self._profile_cfg["trail_decay"]),
                     peak_hold_frames=int(self._profile_cfg["peak_hold_frames"]),
                     peak_fall=float(self._profile_cfg["peak_fall"]),
                     bass_smooth=max(0.12, min(0.62, 0.28 * float(self._profile_cfg["beat_mul"]))),
-                    balance_smooth=float(self._profile_cfg["smooth"]),
+                    balance_smooth=scaled_smooth,
                 )
             except Exception:
                 self._rust_stereo_state_engine = None
@@ -1480,18 +1487,21 @@ class SpectrumVisualizer(Gtk.DrawingArea):
                 changed = False
                 bass_response = max(0.12, min(0.62, 0.28 * float(profile["beat_mul"])))
                 self.bass_level += (self._bass_target - self.bass_level) * bass_response
+                # Linear gets a slower EMA coefficient (see _scaled_smooth) so its
+                # response speed visually matches log without altering magnitudes.
+                smooth_factor = self._scaled_smooth()
                 for i in range(self.num_bars):
                     diff = self.target_heights[i] - self.current_heights[i]
                     if abs(diff) > 0.001:
-                        self.current_heights[i] += diff * float(profile["smooth"])
+                        self.current_heights[i] += diff * smooth_factor
                         changed = True
                     ldiff = self.target_left_channel_heights[i] - self.left_channel_heights[i]
                     if abs(ldiff) > 0.001:
-                        self.left_channel_heights[i] += ldiff * float(profile["smooth"])
+                        self.left_channel_heights[i] += ldiff * smooth_factor
                         changed = True
                     rdiff = self.target_right_channel_heights[i] - self.right_channel_heights[i]
                     if abs(rdiff) > 0.001:
-                        self.right_channel_heights[i] += rdiff * float(profile["smooth"])
+                        self.right_channel_heights[i] += rdiff * smooth_factor
                         changed = True
                     lcur = self.left_channel_heights[i]
                     if lcur >= self.left_peak_holds[i]:
@@ -1580,8 +1590,6 @@ class SpectrumVisualizer(Gtk.DrawingArea):
             elif effect == 4:
                 with _VIZ_DRAW_PERF.track("dots"):
                     self._draw_dot_matrix(cr, width, height, gain, bar_w, spacing, theme["gradient"])
-            elif effect == 5:
-                self._draw_neon_tunnel(cr, width, height, gain, theme["gradient"])
             elif effect == 6:
                 gradient = self._make_gradient(height, theme)
                 with _VIZ_DRAW_PERF.track("bars"):
@@ -2584,235 +2592,6 @@ class SpectrumVisualizer(Gtk.DrawingArea):
             r, g, b, a = self._color_from_gradient(grad, i / float(max(1, n - 1)))
             cr.set_source_rgba(r, g, b, a)
             cr.set_line_width(2.0)
-            cr.move_to(x1, y1)
-            cr.line_to(x2, y2)
-            cr.stroke()
-
-    def _draw_neon_tunnel(self, cr, width, height, gain, grad):
-        n = self.num_bars
-        if n <= 0:
-            return
-        curve_mul = {
-            "Gentle": 0.56,
-            "Soft": 0.70,
-            "Dynamic": 1.00,
-            "Extreme": 1.38,
-        }.get(self.profile_name, 1.00)
-        cx = width * 0.5
-        cy = height * 0.54
-        bass = max(0.0, min(1.0, self.bass_level * 1.25))
-        size = min(width, height)
-        full_span = math.hypot(width, height)
-
-        # Subtle vignette for the classic neon tunnel contrast.
-        bg = cairo.RadialGradient(cx, cy, size * 0.08, cx, cy, full_span * 0.72)
-        c0 = self._color_from_gradient(grad, 0.72)
-        c1 = self._color_from_gradient(grad, 0.95)
-        bg.add_color_stop_rgba(0.0, c0[0] * 0.10, c0[1] * 0.08, c0[2] * 0.14, 0.22)
-        bg.add_color_stop_rgba(1.0, c1[0] * 0.02, c1[1] * 0.02, c1[2] * 0.03, 0.0)
-        cr.set_source(bg)
-        cr.rectangle(0, 0, width, height)
-        cr.fill()
-
-        # Fluid "paint-mix" streams converging towards the tunnel center.
-        flow_layers = 8
-        outer_r = full_span * 0.60
-        inner_r = size * 0.06
-        seg_n = 64
-        for li in range(flow_layers):
-            t = li / float(max(1, flow_layers - 1))
-            c = self._color_from_gradient(grad, (0.12 + (0.78 * t)) % 1.0)
-            alpha = 0.040 + (0.050 * (1.0 - t)) + (0.020 * bass)
-            base_ang = (li * (2.0 * math.pi / flow_layers)) + (self.phase * 0.10)
-            lane_w = (0.22 + (0.08 * math.sin((self.phase * 0.35) + li))) * (1.0 - (0.25 * t)) * (0.90 + (0.35 * curve_mul))
-            phase1 = (self.phase * (0.62 + (0.06 * li))) + (li * 1.17)
-            phase2 = (self.phase * (0.47 + (0.05 * li))) - (li * 0.83)
-
-            cr.new_path()
-            for si in range(seg_n + 1):
-                s = si / float(seg_n)
-                r = outer_r - ((outer_r - inner_r) * (s ** 1.10))
-                twist = (
-                    (1.55 * (1.0 - s))
-                    + (0.42 * math.sin((s * 8.0) + phase1))
-                    + (0.18 * math.sin((s * 17.0) + phase2))
-                ) * curve_mul
-                ang_center = base_ang + twist
-                spread = lane_w * (0.32 + (0.68 * (1.0 - s)))
-                ang = ang_center - spread
-                x = cx + (math.cos(ang) * r)
-                y = cy + (math.sin(ang) * r)
-                if si == 0:
-                    cr.move_to(x, y)
-                else:
-                    cr.line_to(x, y)
-            for si in range(seg_n, -1, -1):
-                s = si / float(seg_n)
-                r = outer_r - ((outer_r - inner_r) * (s ** 1.10))
-                twist = (
-                    (1.55 * (1.0 - s))
-                    + (0.42 * math.sin((s * 8.0) + phase1))
-                    + (0.18 * math.sin((s * 17.0) + phase2))
-                ) * curve_mul
-                ang_center = base_ang + twist
-                spread = lane_w * (0.32 + (0.68 * (1.0 - s)))
-                ang = ang_center + spread
-                x = cx + (math.cos(ang) * r)
-                y = cy + (math.sin(ang) * r)
-                cr.line_to(x, y)
-            cr.close_path()
-            cr.set_source_rgba(c[0], c[1], c[2], alpha)
-            cr.fill()
-
-        # Tunnel rings.
-        ring_count = max(6, int(self.num_bars))
-        base = size * 0.04
-        depth_span = full_span * 0.62
-        drift = self.phase * 0.85
-        ring_points = None
-        if self._rust_core.available:
-            ring_points = self._rust_core.build_neon_ring_points(
-                ring_count=ring_count,
-                width=float(width),
-                height=float(height),
-                phase=float(self.phase),
-                bass=float(bass * curve_mul),
-                seg_n=180,
-            )
-            if ring_points is not None and not self._logged_rust_neon_rings:
-                logger.info("Neon ring-generation path: Rust")
-                self._logged_rust_neon_rings = True
-        if ring_points:
-            cr.set_line_join(cairo.LineJoin.ROUND)
-            cr.set_line_cap(cairo.LineCap.ROUND)
-            open_path = False
-            cur_style = None
-            for px, py, alpha, lw, color_t, start_flag in ring_points:
-                style = (alpha, lw, color_t)
-                if start_flag >= 0.5:
-                    if open_path:
-                        cr.close_path()
-                        cr.stroke()
-                    col = self._color_from_gradient(grad, color_t)
-                    cr.set_source_rgba(col[0], col[1], col[2], min(0.68, alpha))
-                    cr.set_line_width(lw)
-                    cr.new_path()
-                    cr.move_to(px, py)
-                    open_path = True
-                    cur_style = style
-                else:
-                    if not open_path:
-                        col = self._color_from_gradient(grad, color_t)
-                        cr.set_source_rgba(col[0], col[1], col[2], min(0.68, alpha))
-                        cr.set_line_width(lw)
-                        cr.new_path()
-                        cr.move_to(px, py)
-                        open_path = True
-                        cur_style = style
-                    elif style != cur_style:
-                        cr.close_path()
-                        cr.stroke()
-                        col = self._color_from_gradient(grad, color_t)
-                        cr.set_source_rgba(col[0], col[1], col[2], min(0.68, alpha))
-                        cr.set_line_width(lw)
-                        cr.new_path()
-                        cr.move_to(px, py)
-                        cur_style = style
-                    else:
-                        cr.line_to(px, py)
-            if open_path:
-                cr.close_path()
-                cr.stroke()
-        else:
-            if not self._logged_python_neon_rings:
-                logger.info("Neon ring-generation path: Python fallback")
-                self._logged_python_neon_rings = True
-            for ri in range(ring_count):
-                z = ((ri / float(ring_count)) + (drift * 0.10)) % 1.0
-                radius = base + ((1.0 - z) ** 1.65) * depth_span
-                t = 1.0 - z
-                col = self._color_from_gradient(grad, 0.05 + (0.90 * t))
-                alpha = 0.10 + (0.42 * (t ** 1.8)) + (0.10 * bass * t)
-                lw = 0.8 + (2.6 * (t ** 1.4))
-                cr.set_source_rgba(col[0], col[1], col[2], min(0.68, alpha))
-                cr.set_line_width(lw)
-                cr.set_line_join(cairo.LineJoin.ROUND)
-                cr.set_line_cap(cairo.LineCap.ROUND)
-                seg_n = 180
-                warp_amp = (10.0 + (42.0 * t)) * (1.0 + (1.10 * bass)) * curve_mul
-                f1 = 2.6 + (2.8 * t)
-                f2 = 6.4 + (4.4 * (1.0 - t))
-                phase = (self.phase * (1.2 + (0.25 * t))) + (ri * 0.19)
-                start_a = (
-                    (ri * 2.399963229728653)
-                    + (self.phase * 0.17)
-                    + (t * 1.1)
-                ) % (2.0 * math.pi)
-                cr.new_path()
-                for si in range(seg_n):
-                    a = start_a + ((2.0 * math.pi) * (si / float(seg_n)))
-                    wobble_raw = (
-                        math.sin((a * f1) + phase) * warp_amp
-                        + math.sin((a * f2) - (phase * 1.35)) * (warp_amp * 0.72)
-                    )
-                    wobble = max(-radius * 0.34, min(radius * 0.34, wobble_raw))
-                    rr = max(2.0, radius + wobble)
-                    px = cx + (math.cos(a) * rr)
-                    py = cy + (math.sin(a) * rr)
-                    if si == 0:
-                        cr.move_to(px, py)
-                    else:
-                        cr.line_to(px, py)
-                cr.close_path()
-                cr.stroke()
-
-        # Beat pulse in tunnel center.
-        if bass > 0.03:
-            pr = base * (1.2 + (2.8 * bass))
-            pulse = cairo.RadialGradient(cx, cy, pr * 0.25, cx, cy, pr)
-            hot = self._color_from_gradient(grad, 0.18)
-            pulse.add_color_stop_rgba(0.0, hot[0], hot[1], hot[2], 0.42 * bass)
-            pulse.add_color_stop_rgba(1.0, hot[0], hot[1], hot[2], 0.0)
-            cr.set_source(pulse)
-            cr.arc(cx, cy, pr, 0, 2 * math.pi)
-            cr.fill()
-
-        # Radial spokes driven by spectrum bins.
-        spokes = None
-        if self._rust_core.available:
-            spokes = self._rust_core.build_neon_spokes(
-                bins=self.current_heights,
-                width=float(width),
-                height=float(height),
-                phase=float(self.phase),
-                gain=float(gain),
-                max_points=max(64, n),
-            )
-            if spokes is not None and not self._logged_rust_neon:
-                logger.info("Neon spoke-generation path: Rust")
-                self._logged_rust_neon = True
-        if spokes is None:
-            if not self._logged_python_neon:
-                logger.info("Neon spoke-generation path: Python fallback")
-                self._logged_python_neon = True
-            max_len = full_span * 0.62
-            spokes = []
-            for i in range(n):
-                lvl = max(0.0, min(self.current_heights[i] * gain, 1.0))
-                if lvl < 0.02:
-                    continue
-                angle = ((2.0 * math.pi) * (i / float(n))) + (self.phase * 0.30)
-                ln = (size * 0.06) + (lvl * max_len)
-                x2 = cx + math.cos(angle) * ln
-                y2 = cy + math.sin(angle) * ln
-                tt = i / float(max(1, n - 1))
-                spokes.append((cx, cy, x2, y2, lvl, tt))
-
-        for x1, y1, x2, y2, lvl, tt in spokes:
-            col = self._color_from_gradient(grad, tt)
-            a = min(0.95, 0.20 + (0.78 * lvl))
-            cr.set_source_rgba(col[0], col[1], col[2], a)
-            cr.set_line_width(1.0 + (1.6 * lvl))
             cr.move_to(x1, y1)
             cr.line_to(x2, y2)
             cr.stroke()
@@ -3995,18 +3774,23 @@ uniform float uGain;
 uniform float uSpacingPx;
 uniform vec2  uResolution;
 const float DOT_H = 4.0;
-const float GAP   = 3.0;
 void main() {
     float x_px            = vUV.x * uResolution.x;
     float y_from_bot_px   = vUV.y * uResolution.y;
-    float slot_w          = uResolution.x / float(uNumBars);
-    int   bar_i           = int(x_px / slot_w);
-    if (bar_i >= uNumBars) discard;
-    float pos_in_slot     = x_px - float(bar_i) * slot_w;
-    if (pos_in_slot >= max(1.0, slot_w - uSpacingPx)) discard;
+    // Proportional integer slot boundaries: each bar's pixel range is
+    // [floor(i*W/N), floor((i+1)*W/N)). Sum of widths = W exactly (no right
+    // margin), gaps are uniform integer pixels, and bar widths vary by ±1 px
+    // distributed evenly across the row instead of dumped on the right edge.
+    float gap_h  = max(1.0, floor(uSpacingPx + 0.5));
+    int   bar_i  = int(floor(x_px * float(uNumBars) / uResolution.x));
+    if (bar_i >= uNumBars) bar_i = uNumBars - 1;
+    if (bar_i < 0) bar_i = 0;
+    float bar_x1 = floor(float(bar_i + 1) * uResolution.x / float(uNumBars));
+    if (x_px >= bar_x1 - gap_h) discard;
     float h_px = clamp(uHeights[bar_i] * uResolution.y * uGain, 0.0, uResolution.y);
     if (y_from_bot_px >= h_px) discard;
-    if (mod(y_from_bot_px, DOT_H + GAP) >= DOT_H) discard;
+    float gap_v = max(1.0, floor(uSpacingPx + 0.5));
+    if (mod(y_from_bot_px, DOT_H + gap_v) >= DOT_H) discard;
     FragColor = uColors[bar_i];
 }
 """
@@ -4034,18 +3818,20 @@ uniform float uGain;
 uniform float uSpacingPx;
 uniform vec2  uResolution;
 const float DOT_H = 4.0;
-const float GAP   = 3.0;
 void main() {
     float x_px          = vUV.x * uResolution.x;
     float y_from_bot_px = vUV.y * uResolution.y;
-    float slot_w        = uResolution.x / float(uNumBars);
-    int   bar_i         = int(x_px / slot_w);
-    if (bar_i >= uNumBars) discard;
-    float pos_in_slot   = x_px - float(bar_i) * slot_w;
-    if (pos_in_slot >= max(1.0, slot_w - uSpacingPx)) discard;
+    // See _DOTS_FRAG_330 — proportional integer boundaries fill full width.
+    float gap_h  = max(1.0, floor(uSpacingPx + 0.5));
+    int   bar_i  = int(floor(x_px * float(uNumBars) / uResolution.x));
+    if (bar_i >= uNumBars) bar_i = uNumBars - 1;
+    if (bar_i < 0) bar_i = 0;
+    float bar_x1 = floor(float(bar_i + 1) * uResolution.x / float(uNumBars));
+    if (x_px >= bar_x1 - gap_h) discard;
     float h_px = clamp(uHeights[bar_i] * uResolution.y * uGain, 0.0, uResolution.y);
     if (y_from_bot_px >= h_px) discard;
-    if (mod(y_from_bot_px, DOT_H + GAP) >= DOT_H) discard;
+    float gap_v = max(1.0, floor(uSpacingPx + 0.5));
+    if (mod(y_from_bot_px, DOT_H + gap_v) >= DOT_H) discard;
     FragColor = uColors[bar_i];
 }
 """
@@ -4160,6 +3946,12 @@ class DotsGLVisualizer(Gtk.GLArea):
             GL.glDeleteProgram(self._program)
             self._program = None
 
+    def _scaled_smooth(self):
+        smooth = float(self._profile_cfg["smooth"])
+        if self.frequency_scale_name == _FREQ_SCALE_LINEAR:
+            smooth *= 0.65
+        return smooth
+
     def _reset_rust_state_engine(self):
         try:
             if self._rust_state_engine is not None:
@@ -4171,7 +3963,7 @@ class DotsGLVisualizer(Gtk.GLArea):
             try:
                 self._rust_state_engine = self._rust_core.create_state_engine(
                     self.num_bars,
-                    smooth=float(self._profile_cfg["smooth"]),
+                    smooth=self._scaled_smooth(),
                     trail_decay=1.0,
                     peak_hold_frames=0,
                     peak_fall=0.0,
@@ -4466,9 +4258,20 @@ class DotsGLVisualizer(Gtk.GLArea):
     def set_effect(self, _name):
         pass   # DotsGLVisualizer only renders Dots
 
+    def _push_state_engine_params(self):
+        if self._rust_state_engine is not None:
+            self._rust_state_engine.set_params(
+                smooth=self._scaled_smooth(),
+                trail_decay=1.0,
+                peak_hold_frames=0,
+                peak_fall=0.0,
+                bass_smooth=0.22,
+            )
+
     def set_frequency_scale(self, name):
         if name in self.frequency_scale_names:
             self.frequency_scale_name = name
+            self._push_state_engine_params()
             self._update_render_cache()
             self.queue_render()
 
@@ -4476,14 +4279,7 @@ class DotsGLVisualizer(Gtk.GLArea):
         if name in self.profiles:
             self.profile_name = name
             self._profile_cfg = self.profiles[name]
-            if self._rust_state_engine is not None:
-                self._rust_state_engine.set_params(
-                    smooth=float(self._profile_cfg["smooth"]),
-                    trail_decay=1.0,
-                    peak_hold_frames=0,
-                    peak_fall=0.0,
-                    bass_smooth=0.22,
-                )
+            self._push_state_engine_params()
             self._update_render_cache()
 
     def get_theme_names(self):
@@ -4775,15 +4571,16 @@ void main() {
             float fade = 1.0 - smoothstep(r_px * 0.35, r_px, dist);
             bg = vec4(uPulseColor.rgb, uPulseColor.a * 0.24 * uBassLevel * fade);
         }
-        float slot_w2     = uResolution.x / float(uNumBars);
-        int   bar_i2      = int(x_px / slot_w2);
-        bool  in_bar      = false;
-        vec4  bar_col     = vec4(0.0);
-        if (bar_i2 < uNumBars) {
-            float pos2 = x_px - float(bar_i2) * slot_w2;
-            float bw2  = max(1.0, slot_w2 - uSpacingPx);
-            float hp2  = clamp(uHeights[bar_i2] * uGain, 0.0, 1.0) * uResolution.y;
-            if (pos2 < bw2 && y_from_bot_px < hp2) {
+        float gap_h2  = max(1.0, floor(uSpacingPx + 0.5));
+        int   bar_i2  = int(floor(x_px * float(uNumBars) / uResolution.x));
+        if (bar_i2 >= uNumBars) bar_i2 = uNumBars - 1;
+        if (bar_i2 < 0) bar_i2 = 0;
+        bool  in_bar  = false;
+        vec4  bar_col = vec4(0.0);
+        {
+            float bar_x1_2 = floor(float(bar_i2 + 1) * uResolution.x / float(uNumBars));
+            float hp2 = clamp(uHeights[bar_i2] * uGain, 0.0, 1.0) * uResolution.y;
+            if (x_px < bar_x1_2 - gap_h2 && y_from_bot_px < hp2) {
                 in_bar  = true;
                 bar_col = uColors[bar_i2];
             }
@@ -4799,12 +4596,12 @@ void main() {
     }
     // Stereo Mirror: L channel above center, R channel below
     if (uMode == 7) {
-        float slot_w3 = uResolution.x / float(uNumBars);
-        int   bar_i3  = int(x_px / slot_w3);
-        if (bar_i3 >= uNumBars) discard;
-        float pos3 = x_px - float(bar_i3) * slot_w3;
-        float bw3  = max(1.0, slot_w3 - uSpacingPx);
-        if (pos3 >= bw3) discard;
+        float gap_h3  = max(1.0, floor(uSpacingPx + 0.5));
+        int   bar_i3  = int(floor(x_px * float(uNumBars) / uResolution.x));
+        if (bar_i3 >= uNumBars) bar_i3 = uNumBars - 1;
+        if (bar_i3 < 0) bar_i3 = 0;
+        float bar_x1_3 = floor(float(bar_i3 + 1) * uResolution.x / float(uNumBars));
+        if (x_px >= bar_x1_3 - gap_h3) discard;
         float center = uResolution.y * 0.5;
         if (y_from_bot_px >= center) {
             float lh = clamp(uLeftHeights[bar_i3] * uGain, 0.0, 1.0) * uResolution.y * 0.48;
@@ -4817,13 +4614,17 @@ void main() {
         }
         return;
     }
-    // Slot-based x (Bars, Peak, Trail, Mirror)
-    float slot_w = uResolution.x / float(uNumBars);
-    int   bar_i  = int(x_px / slot_w);
-    if (bar_i >= uNumBars) discard;
-    float pos_in_slot = x_px - float(bar_i) * slot_w;
-    float bar_w       = max(1.0, slot_w - uSpacingPx);
-    if (pos_in_slot >= bar_w) discard;
+    // Slot-based x (Bars, Peak, Trail, Mirror).  Use proportional integer
+    // boundaries: bar i covers pixels [floor(i*W/N), floor((i+1)*W/N)).
+    // Sum of widths == W exactly (no right-edge margin at any resolution),
+    // gap is a uniform integer, individual bar widths vary by ±1 px
+    // distributed across the row instead of dumped at the right.
+    float gap_h  = max(1.0, floor(uSpacingPx + 0.5));
+    int   bar_i  = int(floor(x_px * float(uNumBars) / uResolution.x));
+    if (bar_i >= uNumBars) bar_i = uNumBars - 1;
+    if (bar_i < 0) bar_i = 0;
+    float bar_x1 = floor(float(bar_i + 1) * uResolution.x / float(uNumBars));
+    if (x_px >= bar_x1 - gap_h) discard;
     vec4  col  = uColors[bar_i];
     float h_px = clamp(uHeights[bar_i] * uGain, 0.0, 1.0) * uResolution.y;
     if (uMode == 3) {
@@ -5109,15 +4910,16 @@ void main() {
             float fade = 1.0 - smoothstep(r_px * 0.35, r_px, dist);
             bg = vec4(uPulseColor.rgb, uPulseColor.a * 0.24 * uBassLevel * fade);
         }
-        float slot_w2 = uResolution.x / float(uNumBars);
-        int   bar_i2  = int(x_px / slot_w2);
+        float gap_h2  = max(1.0, floor(uSpacingPx + 0.5));
+        int   bar_i2  = int(floor(x_px * float(uNumBars) / uResolution.x));
+        if (bar_i2 >= uNumBars) bar_i2 = uNumBars - 1;
+        if (bar_i2 < 0) bar_i2 = 0;
         bool  in_bar  = false;
         vec4  bar_col = vec4(0.0);
-        if (bar_i2 < uNumBars) {
-            float pos2 = x_px - float(bar_i2) * slot_w2;
-            float bw2  = max(1.0, slot_w2 - uSpacingPx);
-            float hp2  = clamp(uHeights[bar_i2] * uGain, 0.0, 1.0) * uResolution.y;
-            if (pos2 < bw2 && y_from_bot_px < hp2) {
+        {
+            float bar_x1_2 = floor(float(bar_i2 + 1) * uResolution.x / float(uNumBars));
+            float hp2 = clamp(uHeights[bar_i2] * uGain, 0.0, 1.0) * uResolution.y;
+            if (x_px < bar_x1_2 - gap_h2 && y_from_bot_px < hp2) {
                 in_bar  = true;
                 bar_col = uColors[bar_i2];
             }
@@ -5132,12 +4934,12 @@ void main() {
         return;
     }
     if (uMode == 7) {
-        float slot_w3 = uResolution.x / float(uNumBars);
-        int   bar_i3  = int(x_px / slot_w3);
-        if (bar_i3 >= uNumBars) discard;
-        float pos3 = x_px - float(bar_i3) * slot_w3;
-        float bw3  = max(1.0, slot_w3 - uSpacingPx);
-        if (pos3 >= bw3) discard;
+        float gap_h3  = max(1.0, floor(uSpacingPx + 0.5));
+        int   bar_i3  = int(floor(x_px * float(uNumBars) / uResolution.x));
+        if (bar_i3 >= uNumBars) bar_i3 = uNumBars - 1;
+        if (bar_i3 < 0) bar_i3 = 0;
+        float bar_x1_3 = floor(float(bar_i3 + 1) * uResolution.x / float(uNumBars));
+        if (x_px >= bar_x1_3 - gap_h3) discard;
         float center = uResolution.y * 0.5;
         if (y_from_bot_px >= center) {
             float lh = clamp(uLeftHeights[bar_i3] * uGain, 0.0, 1.0) * uResolution.y * 0.48;
@@ -5150,12 +4952,13 @@ void main() {
         }
         return;
     }
-    float slot_w = uResolution.x / float(uNumBars);
-    int   bar_i  = int(x_px / slot_w);
-    if (bar_i >= uNumBars) discard;
-    float pos_in_slot = x_px - float(bar_i) * slot_w;
-    float bar_w       = max(1.0, slot_w - uSpacingPx);
-    if (pos_in_slot >= bar_w) discard;
+    // See _BARS_FRAG_330 for the rationale on integer slot widths.
+    float gap_h  = max(1.0, floor(uSpacingPx + 0.5));
+    int   bar_i  = int(floor(x_px * float(uNumBars) / uResolution.x));
+    if (bar_i >= uNumBars) bar_i = uNumBars - 1;
+    if (bar_i < 0) bar_i = 0;
+    float bar_x1 = floor(float(bar_i + 1) * uResolution.x / float(uNumBars));
+    if (x_px >= bar_x1 - gap_h) discard;
     vec4  col  = uColors[bar_i];
     float h_px = clamp(uHeights[bar_i] * uGain, 0.0, 1.0) * uResolution.y;
     if (uMode == 3) {
@@ -5305,10 +5108,11 @@ class BarsGLVisualizer(Gtk.GLArea):
             pass
         self._rust_stereo_state_engine = None
         if self._rust_core is not None and getattr(self._rust_core, "available", False):
+            scaled_smooth = self._scaled_smooth()
             try:
                 self._rust_state_engine = self._rust_core.create_state_engine(
                     self.num_bars,
-                    smooth=float(self._profile_cfg["smooth"]),
+                    smooth=scaled_smooth,
                     trail_decay=float(self._profile_cfg["trail_decay"]),
                     peak_hold_frames=int(self._profile_cfg["peak_hold_frames"]),
                     peak_fall=float(self._profile_cfg["peak_fall"]),
@@ -5319,12 +5123,12 @@ class BarsGLVisualizer(Gtk.GLArea):
             try:
                 self._rust_stereo_state_engine = self._rust_core.create_stereo_state_engine(
                     self.num_bars,
-                    smooth=float(self._profile_cfg["smooth"]),
+                    smooth=scaled_smooth,
                     trail_decay=float(self._profile_cfg["trail_decay"]),
                     peak_hold_frames=int(self._profile_cfg["peak_hold_frames"]),
                     peak_fall=float(self._profile_cfg["peak_fall"]),
                     bass_smooth=max(0.12, min(0.62, 0.28 * float(self._profile_cfg["beat_mul"]))),
-                    balance_smooth=float(self._profile_cfg["smooth"]),
+                    balance_smooth=scaled_smooth,
                 )
             except Exception:
                 self._rust_stereo_state_engine = None
@@ -5685,23 +5489,33 @@ class BarsGLVisualizer(Gtk.GLArea):
     def requires_stereo_spectrum(self):
         return self.effect_mode in {7, 10, 11}
 
+    def _scaled_smooth(self):
+        smooth = float(self._profile_cfg["smooth"])
+        if self.frequency_scale_name == _FREQ_SCALE_LINEAR:
+            smooth *= 0.65
+        return smooth
+
+    def _push_state_engine_params(self):
+        if self._rust_state_engine is not None:
+            self._rust_state_engine.set_params(
+                smooth=self._scaled_smooth(),
+                trail_decay=float(self._profile_cfg["trail_decay"]),
+                peak_hold_frames=int(self._profile_cfg["peak_hold_frames"]),
+                peak_fall=float(self._profile_cfg["peak_fall"]),
+                bass_smooth=max(0.12, min(0.62, 0.28 * float(self._profile_cfg["beat_mul"]))),
+            )
+
     def set_profile(self, name):
         if name in self.profiles:
             self.profile_name = name
             self._profile_cfg = self.profiles[name]
-            if self._rust_state_engine is not None:
-                self._rust_state_engine.set_params(
-                    smooth=float(self._profile_cfg["smooth"]),
-                    trail_decay=float(self._profile_cfg["trail_decay"]),
-                    peak_hold_frames=int(self._profile_cfg["peak_hold_frames"]),
-                    peak_fall=float(self._profile_cfg["peak_fall"]),
-                    bass_smooth=max(0.12, min(0.62, 0.28 * float(self._profile_cfg["beat_mul"]))),
-                )
+            self._push_state_engine_params()
             self._update_render_cache()
 
     def set_frequency_scale(self, name):
         if name in self.frequency_scale_names:
             self.frequency_scale_name = name
+            self._push_state_engine_params()
             self._update_render_cache()
 
     def get_theme_names(self):

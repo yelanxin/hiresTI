@@ -396,7 +396,7 @@ def normalize_settings(raw: Optional[dict[str, Any]]) -> dict[str, Any]:
     normalized["viz_expanded"] = _as_bool(raw.get("viz_expanded"), DEFAULT_SETTINGS["viz_expanded"])
     normalized["spectrum_theme"] = _as_int(raw.get("spectrum_theme"), DEFAULT_SETTINGS["spectrum_theme"], minimum=0, maximum=64)
     normalized["viz_frequency_scale"] = _as_int(raw.get("viz_frequency_scale"), DEFAULT_SETTINGS["viz_frequency_scale"], minimum=0, maximum=1)
-    normalized["viz_bar_count"] = _as_int(raw.get("viz_bar_count"), DEFAULT_SETTINGS["viz_bar_count"], minimum=4, maximum=128)
+    normalized["viz_bar_count"] = _as_int(raw.get("viz_bar_count"), DEFAULT_SETTINGS["viz_bar_count"], minimum=4, maximum=256)
     if normalized["viz_bar_count"] not in VisualizerSettings.BAR_OPTIONS:
         normalized["viz_bar_count"] = DEFAULT_SETTINGS["viz_bar_count"]
     # Current profile options: Gentle/Soft/Dynamic/Extreme/Insane => 0..4

@@ -14,7 +14,7 @@ from core.viz_perf import VizPerfWindow
 
 logger = logging.getLogger(__name__)
 _APP_VIZ_PERF = VizPerfWindow("callback", logger)
-_LINEAR_ACTIVE_BANDS_DEFAULT = 128
+_LINEAR_ACTIVE_BANDS_DEFAULT = 256
 _DR_METER_UPDATE_INTERVAL_S = 1.0 / 60.0
 
 
