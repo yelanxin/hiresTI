@@ -2164,9 +2164,15 @@ def render_mixes_dashboard(app):
         hexpand=True, vexpand=True, css_classes=["history-row-scroller"]
     )
     scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+    # `homogeneous=False` is critical here: with the typical user having
+    # only 3-6 favorited mixes, a homogeneous flow stretches each cell
+    # to 1/min_children_per_line of the row width, so hovering anywhere
+    # in the wide cell (well outside the visible card) triggers the
+    # button's `:hover` and turns the labels orange — which looks like
+    # "card got selected even though my mouse is nowhere near it."
     flow = Gtk.FlowBox(
-        homogeneous=True,
-        min_children_per_line=4,
+        homogeneous=False,
+        min_children_per_line=1,
         max_children_per_line=10,
         column_spacing=16,
         row_spacing=16,
@@ -2200,7 +2206,17 @@ def render_mixes_dashboard(app):
             if getattr(m, "id", None) is not None
         }
         for mix in mixes:
-            flow.append(_build_mix_tile(app, mix, _on_click))
+            tile = _build_mix_tile(app, mix, _on_click)
+            # Wrap in a FlowBoxChild that hugs the tile's natural width,
+            # so the hit area never extends past the visible card even
+            # when the row is sparsely populated.
+            child = Gtk.FlowBoxChild()
+            child.set_child(tile)
+            child.set_halign(Gtk.Align.START)
+            child.set_valign(Gtk.Align.START)
+            child.set_hexpand(False)
+            child.set_can_focus(False)
+            flow.append(child)
         status_lbl.set_text(f"{len(mixes)} mixes & radio")
         return False
 
