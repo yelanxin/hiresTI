@@ -387,14 +387,24 @@ def _show_pkce_webview_dialog(self, login_url, attempt_id):
     status_bar.append(cancel_btn)
     root.append(status_bar)
 
-    # Ephemeral session so the previous user's cookies don't auto-skip
-    # the password screen — needed when switching accounts.
+    # Use the default network session.  An earlier draft created a
+    # fresh `WebKit.NetworkSession.new_ephemeral()` each invocation,
+    # but on second open the new web process inherited a broken state
+    # from the previous teardown and rendered a blank page.  The
+    # default session is shared across WebViews and survives open /
+    # close cycles cleanly.
+    webview = WebKit.WebView()
+
+    # Tidal's bot challenge flags WebKitGTK's default Safari UA on Linux.
+    # Spoof a recent stable Chrome string so the login page loads without
+    # the captcha gate.
     try:
-        net_session = WebKit.NetworkSession.new_ephemeral()
-        webview = WebKit.WebView.new_with_network_session(net_session)
+        webview.get_settings().set_user_agent(
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"
+        )
     except Exception as e:
-        logger.debug("Ephemeral WebKit session unavailable, falling back: %s", e)
-        webview = WebKit.WebView()
+        logger.debug("Could not override WebView user agent: %s", e)
 
     webview.set_hexpand(True)
     webview.set_vexpand(True)
@@ -402,9 +412,43 @@ def _show_pkce_webview_dialog(self, login_url, attempt_id):
 
     submitted_marker = {"done": False}
 
+    closed_marker = {"done": False}
+
     def _close_window():
+        if closed_marker["done"]:
+            return
+        closed_marker["done"] = True
+        # Drop self-reference + modal grab BEFORE destroying so any
+        # signals that fire during teardown don't see a half-alive
+        # window.  Stop the in-flight load so the WebKit web process
+        # has a chance to release its resources cleanly.
+        if self._login_dialog is window:
+            self._login_dialog = None
+        # Cancel the login attempt eagerly here.  Relying solely on
+        # the destroy callback is racey with WebKit's web-process
+        # teardown after the captcha challenge — by the time destroy
+        # runs, `_login_in_progress` may not get cleared and the next
+        # login click hits "Login already in progress."
+        if (
+            self._login_in_progress
+            and attempt_id == self._login_attempt_id
+            and not submitted_marker["done"]
+        ):
+            self._cancel_login_attempt(attempt_id, reason="user-cancel")
         try:
-            window.close()
+            window.set_modal(False)
+        except Exception:
+            pass
+        try:
+            window.set_transient_for(None)
+        except Exception:
+            pass
+        try:
+            webview.stop_loading()
+        except Exception:
+            pass
+        try:
+            window.destroy()
         except Exception:
             pass
 
@@ -477,7 +521,13 @@ def _show_pkce_webview_dialog(self, login_url, attempt_id):
 
     cancel_btn.connect("clicked", lambda _b: _close_window())
 
-    def _on_close(_w):
+    def _on_close_request(_w):
+        # GDK_EVENT_PROPAGATE — let the default handler destroy the
+        # window.  If we returned True the window would stay open.
+        _close_window()
+        return False
+
+    def _on_destroy(_w):
         if self._login_dialog is window:
             self._login_dialog = None
         if (
@@ -487,8 +537,14 @@ def _show_pkce_webview_dialog(self, login_url, attempt_id):
         ):
             self._cancel_login_attempt(attempt_id, reason="user-cancel")
 
-    window.connect("close-request", lambda w: (False))
-    window.connect("destroy", _on_close)
+    window.connect("close-request", _on_close_request)
+    window.connect("destroy", _on_destroy)
+
+    # Escape closes the dialog even if Tidal's iframe has captured focus.
+    esc_ctrl = Gtk.EventControllerKey()
+    esc_ctrl.connect("key-pressed", lambda _c, keyval, _kc, _st: (
+        _close_window() if keyval == 0xff1b else None) or False)
+    window.add_controller(esc_ctrl)
 
     window.set_child(root)
     self._login_dialog = window
