@@ -5815,11 +5815,40 @@ impl Engine {
                     return -15;
                 }
             }
-        } else if driver_is_usb(driver) || driver_is_usb_rawlink(driver) || driver_is_usb_rawlink_v2(driver) {
+        } else if driver_is_usb_rawlink_v2(driver) {
+            // V2 native_transport bypasses GStreamer entirely (rac_set_uri
+            // never drives the pipeline to Playing for V2). All we need is
+            // a placeholder sink so playbin has something wired up.
+            let elem = gst::ElementFactory::make("fakesink")
+                .name("rust-v2-placeholder-sink")
+                .property("sync", false)
+                .property("async", false)
+                .property("enable-last-sample", false)
+                .build();
+            match elem {
+                Ok(elem) => {
+                    self.usb_raw_sink = None;
+                    self.usb_sink = None;
+                    self.emit_event(
+                        EVT_STATE,
+                        &format!(
+                            "usb-rawlink-v2 placeholder configured device={}",
+                            device_norm.unwrap_or("")
+                        ),
+                    );
+                    (Some(elem), None::<String>)
+                }
+                Err(e) => {
+                    self.set_error(format!("fakesink unavailable: {e}"));
+                    self.emit_event(EVT_ERROR, &format!("fakesink unavailable: {e}"));
+                    return -18;
+                }
+            }
+        } else if driver_is_usb(driver) || driver_is_usb_rawlink(driver) {
             // Self-hosted USB Audio Class output via libusb isochronous transfers.
             // `device_norm` must be a "usb:VID:PID" or "usb:VID:PID:SERIAL" ID.
             let usb_device_id = device_norm.unwrap_or("");
-            match self.build_appsink_usb(usb_device_id, driver_is_usb_rawlink_v2(driver)) {
+            match self.build_appsink_usb(usb_device_id, false) {
                 Ok((elem, configured_msg, usb_handle, usb_raw_sink, hw_clock)) => {
                     self.usb_raw_sink = usb_raw_sink;
                     self.usb_sink = usb_handle;
