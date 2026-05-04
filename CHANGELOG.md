@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.9.5 beta4 - 2026-05-03
+
+Beta build that follows up the isahc / HTTP/2 swap (beta3) with **parallel multi-segment prefetch**.  beta3 confirmed h2 negotiation and fast `setup_ms`, but a tester still hit ~10 s of stuttering mid-track — Tidal's CDN delivers each HTTP stream at roughly real-time per stream, so the previous 1-deep prefetch could never accumulate more than ~1 segment of head-room in the chunk channel and a 5 s network blip drained the entire pipeline.  This build opens up to 4 segments concurrently on the same h2 connection; nghttp2 multiplexes their bodies and the combined throughput is link-limited (Tidal will give you all 100 Mbps if you ask for 4 streams), so the chunk channel can actually pre-fill to several seconds of compressed FLAC ahead of the decoder.
+
+### Changed
+
+- **`SegmentSequenceReader` rewrite: 1-deep streaming prefetch → 4-deep parallel full-body prefetch.**  Each in-flight segment now downloads to a `Vec<u8>` in a worker thread; the consumer pops the FIFO and serves bytes from a `Cursor`, so by the time a segment is needed its body is already buffered in memory.  Tunable via `HIRESTI_PREFETCH_DEPTH=N` (1–16, default 4).  The startup-time cost for the first segment is hidden inside the existing ~600 ms pre-roll (FrameQueue + USB ring), so first-byte-to-sound latency is unchanged.
+- **New per-segment log fields**: `setup=Xms total=Yms (consumer wait=Zms) body_bytes=B prev_bytes=P pending_after_pop=Q`.  `consumer wait ≈ 0` means the worker pool is keeping up with playback; if it grows toward `total_ms` the network is slower than playback and bumping `HIRESTI_PREFETCH_DEPTH` won't help.
+
+## 1.9.5 beta3 - 2026-05-03
+
+Beta build that swaps the V2 native-transport HTTP layer to **isahc (libcurl + nghttp2)** for HTTP/2.  beta2 used `reqwest::blocking` and proved the concept (ALPN upgraded to h2 against the Tidal CDN, per-segment `setup_ms` dropped from ~160 ms to ~25 ms) but body delivery stalled after the ~0.4 s pre-roll drained — the prefetch thread and the consumer thread reading concurrent `reqwest::blocking::Response` instances apparently starved each other through reqwest's tokio-runtime jump.  isahc avoids that by keeping the HTTP/2 stack entirely in libcurl's C-layer multi loop with autonomous nghttp2 flow control, and exposing `Body` as a plain blocking `Read` with no async runtime jump per call.
+
+### Changed
+
+- **V2 native HTTP: `reqwest::blocking` → `isahc 1.8`** (`http2` feature, `version_negotiation = latest_compatible`, `connection_cache_size = 8`).  All four call sites — probe stream, direct-media stream, MPD manifest fetch, segment open — go through one shared `isahc::HttpClient`, with `response.into_body()` driving the `Read` directly.  libcurl is statically linked into `librust_audio_core.so` so there is no new system runtime dep; build-time still wants `libcurl-dev` for the curl-sys C compile but the produced `.so` ships its own libcurl + nghttp2.
+
+## 1.9.5 beta2 - 2026-05-03
+
+Beta build: switches the V2 native-transport HTTP layer from `ureq` (HTTP/1.1 only) to `reqwest` with HTTP/2 enabled. Targets the residual 96 kHz stutter symptom reported on a 100 Mbps / 12 ms-ping link where other Tidal clients play fine — the pre-existing `setup_ms` field in our segment-open log was sitting at ~160 ms median (with 300 ms+ outliers), an order of magnitude above the ~24 ms a single round-trip should cost. Other Tidal clients almost certainly use HTTP/2; on HTTP/1.1 our 1-deep prefetch could only overlap segment N+1's request with segment N's body via head-of-line-blocked keep-alive, paying full TCP+TLS reconnect latency whenever the pool churned.
+
+### Changed
+
+- **V2 native HTTP: `ureq` → `reqwest` (HTTP/2 via ALPN)**: all four HTTP call sites in `native_transport::controller` (probe stream, direct-media stream, MPD manifest fetch, segment open) now go through a shared `reqwest::blocking::Client` configured for `pool_max_idle_per_host=8`, `http2_adaptive_window`, and rustls TLS. The blocking response implements `Read` directly (no `into_reader()` adapter), and the `Read + Send + Sync` trait bound on `PrefetchResult` / `current_reader` / `open_segment_reader` is relaxed to `Read + Send` since `reqwest::blocking::Response` is `Send` but not `Sync` (it owns a tokio runtime handle); the existing single-threaded read pattern was never relying on `Sync`.
+- **`native-transport: negotiated HTTP/2.0 to <host>` once per (host, version) pair**: a new diagnostic confirms ALPN actually upgraded against the live Tidal CDN edge, so a beta tester's log will show whether they're on h2 or fell back to h1 — both setups produce the same `setup_ms` field but only h2 explains the latency drop.
+
 ## 1.9.4 - 2026-05-03
 
 This release consolidates the entire 1.9.3 beta cycle (beta1 → beta3.28) plus follow-up UI work.

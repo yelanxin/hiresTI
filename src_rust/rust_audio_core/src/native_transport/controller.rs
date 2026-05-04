@@ -13,7 +13,7 @@ use crate::usb_audio::{
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use std::collections::{HashSet, VecDeque};
 use std::fs;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -1874,7 +1874,16 @@ fn decode_direct_audio_stream(
                     // Notify Python layer that USB audio is configured so
                     // the hw-volume UI can sync with the actual DAC state.
                     queue_native_event(events, crate::EVT_STATE, "usb-audio configured");
-                    if snapshot_join.is_none() {
+                    // v2-poll snapshot: opt-in via HIRESTI_V2_POLL=1 so
+                    // the once-per-second telemetry line doesn't drown out
+                    // segment-open and HTTP-version diagnostics during
+                    // network-layer debugging.  Set the env var to bring
+                    // the line back when investigating drift / xruns.
+                    let v2_poll_enabled = std::env::var("HIRESTI_V2_POLL")
+                        .ok()
+                        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false);
+                    if v2_poll_enabled && snapshot_join.is_none() {
                         let snap_state =
                             Arc::clone(&output_session.as_ref().unwrap().state);
                         let snap_stop = Arc::clone(&snapshot_stop);
@@ -2759,21 +2768,26 @@ fn write_i24_le(value: i32, out: &mut Vec<u8>) {
 const DOWNLOAD_CHANNEL_CAP: usize = 256;
 const DOWNLOAD_CHUNK_SIZE: usize = 32 * 1024;
 
-/// Shared ureq Agent for all native_transport HTTP calls.  ureq's default
-/// global agent caps `max_idle_connections_per_host` at 1, which directly
-/// fights the 1-deep segment prefetch: while segment N's body is still
-/// streaming through one connection, opening segment N+1 has to spin up
-/// a fresh TCP+TLS handshake every time (~80–100 ms baseline observed
-/// with 12 ms ping, vs. ~25 ms on a reused connection).  Bumping the
-/// per-host cap to 8 keeps room for the prefetch + body-streaming pair
-/// plus the manifest/probe paths without thrashing the pool.
-fn http_agent() -> &'static ureq::Agent {
-    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
-    AGENT.get_or_init(|| {
-        ureq::AgentBuilder::new()
-            .max_idle_connections(64)
-            .max_idle_connections_per_host(8)
+/// Shared isahc HttpClient for all native_transport HTTP calls.
+/// isahc wraps libcurl + nghttp2, which gives us HTTP/2 via mature C-layer
+/// flow control and connection cache without the tokio-runtime jump that
+/// `reqwest::blocking` requires for every body read.  The `reqwest`
+/// experiment in 1.9.5 beta2 confirmed h2 negotiation against Tidal CDN
+/// and dropped per-segment `setup_ms` from ~160 ms to ~25 ms, but body
+/// delivery stalled after ~0.4 s (likely h2 stream-window starvation
+/// caused by the single-thread blocking runtime serializing concurrent
+/// reads of overlapping segment Responses).  libcurl's `multi` interface
+/// has handled exactly this pattern since 2014; nghttp2 manages WINDOW_-
+/// UPDATE timing autonomously.
+fn http_client() -> &'static isahc::HttpClient {
+    static CLIENT: OnceLock<isahc::HttpClient> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        use isahc::config::{Configurable, VersionNegotiation};
+        isahc::HttpClient::builder()
+            .version_negotiation(VersionNegotiation::latest_compatible())
+            .connection_cache_size(8)
             .build()
+            .expect("native-transport: isahc client build failed")
     })
 }
 
@@ -2913,6 +2927,19 @@ fn log_cdn_host_once(locator: &str) {
     }
 }
 
+/// Log the negotiated HTTP version per (host, version) pair, once each.
+/// Confirms whether ALPN actually upgraded to h2 against the Tidal CDN.
+fn log_http_version_once(host: &str, version: http::Version) {
+    static SEEN: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
+    let v = format!("{:?}", version);
+    let set = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    if let Ok(mut guard) = set.lock() {
+        if guard.insert((host.to_string(), v.clone())) {
+            eprintln!("native-transport: negotiated {} to {}", v, host);
+        }
+    }
+}
+
 /// Open a stream for short-lived probing (no download thread).
 fn open_locator_as_probe_stream(locator: &str) -> Result<MediaSourceStream, String> {
     let source: Box<dyn MediaSource> = if let Some(path) = file_uri_to_path(locator) {
@@ -2921,11 +2948,16 @@ fn open_locator_as_probe_stream(locator: &str) -> Result<MediaSourceStream, Stri
         )
     } else if locator.starts_with("http://") || locator.starts_with("https://") {
         log_cdn_host_once(locator);
-        let response = http_agent()
+        let response = http_client()
             .get(locator)
-            .call()
             .map_err(|e| format!("native transport: HTTP open failed: {e}"))?;
-        Box::new(ReadOnlySource::new(response.into_reader()))
+        if !response.status().is_success() {
+            return Err(format!(
+                "native transport: HTTP error {}",
+                response.status()
+            ));
+        }
+        Box::new(ReadOnlySource::new(response.into_body()))
     } else {
         return Err(format!("native transport: unsupported locator '{locator}'"));
     };
@@ -2946,11 +2978,16 @@ fn open_locator_as_media_source_stream(
         )
     } else if locator.starts_with("http://") || locator.starts_with("https://") {
         log_cdn_host_once(locator);
-        let response = http_agent()
+        let response = http_client()
             .get(locator)
-            .call()
             .map_err(|e| format!("native transport: HTTP open failed: {e}"))?;
-        let rx = spawn_download_thread(Box::new(response.into_reader()), Arc::clone(stop));
+        if !response.status().is_success() {
+            return Err(format!(
+                "native transport: HTTP error {}",
+                response.status()
+            ));
+        }
+        let rx = spawn_download_thread(Box::new(response.into_body()), Arc::clone(stop));
         Box::new(ReadOnlySource::new(ChannelReader::new(rx)))
     } else {
         return Err(format!("native transport: unsupported locator '{locator}'"));
@@ -3005,12 +3042,17 @@ fn read_locator_to_string(locator: &str) -> Result<String, String> {
             .map_err(|e| format!("native transport: manifest read failed: {e}"))?;
     } else if locator.starts_with("http://") || locator.starts_with("https://") {
         log_cdn_host_once(locator);
-        let response = http_agent()
+        let mut response = http_client()
             .get(locator)
-            .call()
             .map_err(|e| format!("native transport: manifest fetch failed: {e}"))?;
-        let mut reader = response.into_reader();
-        reader
+        if !response.status().is_success() {
+            return Err(format!(
+                "native transport: manifest HTTP error {}",
+                response.status()
+            ));
+        }
+        response
+            .body_mut()
             .read_to_string(&mut text)
             .map_err(|e| format!("native transport: manifest body read failed: {e}"))?;
     } else {
@@ -3111,137 +3153,159 @@ fn replace_number_token(template: &str, number: u64) -> Result<String, String> {
     Ok(template.to_string())
 }
 
-/// Result of an in-flight prefetched segment open: the open setup time
-/// and either the resulting reader or the io error.
-type PrefetchResult = (u128, std::io::Result<Box<dyn Read + Send + Sync + 'static>>);
+/// (setup_ms, total_ms, fully-downloaded body bytes) — what each parallel
+/// prefetch worker sends back when it finishes.
+type SegmentDownloadResult = std::io::Result<(u128, u128, Vec<u8>)>;
+
+/// One in-flight segment download.  The worker thread is reading the body
+/// to a local `Vec<u8>` and will deposit it on `rx` when done — so by the
+/// time the consumer pops this entry, the bytes are fully buffered in
+/// memory and serving them is just a `Cursor::read`.
+struct PendingSegment {
+    index: usize,
+    rx: crossbeam_channel::Receiver<SegmentDownloadResult>,
+}
+
+/// Default parallel prefetch depth.  Tidal CDN tends to deliver each
+/// HTTP/2 stream at roughly real-time per stream, so a 1-deep prefetch
+/// can never accumulate more than ~1 segment of compressed-FLAC head-room
+/// even on a 100 Mbps link.  Opening 4 streams concurrently lets the
+/// h2 connection multiplex their bodies — combined throughput becomes
+/// link-limited, not per-stream-limited, and the downstream chunk
+/// channel actually fills with several seconds of buffered audio that
+/// can absorb a 5–10 s network blip without underrunning the decoder.
+const PARALLEL_PREFETCH_DEFAULT: usize = 4;
+
+fn parallel_prefetch_depth() -> usize {
+    std::env::var("HIRESTI_PREFETCH_DEPTH")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| (1..=16).contains(&n))
+        .unwrap_or(PARALLEL_PREFETCH_DEFAULT)
+}
 
 struct SegmentSequenceReader {
     segments: Vec<String>,
-    current_index: usize,
-    current_reader: Option<Box<dyn Read + Send + Sync + 'static>>,
-    /// One-deep background prefetch: as soon as `ensure_reader` opens
-    /// segment N (synchronously the first time, then via the prefetch
-    /// channel below), it spawns a thread to open segment N+1.  By the
-    /// time N hits EOF, N+1's TCP+TLS handshake + HTTP response-headers
-    /// wait has already overlapped with N's body delivery, so the
-    /// SegmentSequenceReader::read() that triggers the swap returns
-    /// almost immediately instead of blocking for ~80–300 ms (typical)
-    /// or several seconds (transient CDN hiccups, observed up to 5 s).
-    next_rx: Option<crossbeam_channel::Receiver<PrefetchResult>>,
-    /// Bytes read from the current segment so far.  Logged at transition
-    /// boundaries to make it obvious how big each Tidal segment really is.
+    /// Cursor over the in-memory body of the segment currently being
+    /// served to the decoder.  None between segments / before the first.
+    current_reader: Option<Box<dyn Read + Send + 'static>>,
+    /// FIFO of in-flight segment downloads.  Each entry is a worker
+    /// thread reading the full body into memory; HTTP/2 multiplexes the
+    /// streams over a single TCP connection.
+    pending: VecDeque<PendingSegment>,
+    /// Index of the next segment to dispatch a worker for.
+    next_to_schedule: usize,
+    /// Configured parallelism (cached at construction so env override
+    /// is read once).
+    prefetch_depth: usize,
     bytes_in_current: u64,
-    /// Time spent inside `open_segment_reader()` for the current segment
-    /// (TCP+TLS handshake reuse, HTTP request, response-headers wait).
-    /// Logged so a long stall on the producer side can be attributed to
-    /// the segment-transition setup vs. mid-segment body delivery.
     last_setup_ms: u128,
 }
 
 impl SegmentSequenceReader {
     fn new(segments: Vec<String>) -> Self {
+        let depth = parallel_prefetch_depth();
+        eprintln!(
+            "native-transport: SegmentSequenceReader segments={} parallel_prefetch={}",
+            segments.len(),
+            depth,
+        );
         Self {
             segments,
-            current_index: 0,
             current_reader: None,
-            next_rx: None,
+            pending: VecDeque::with_capacity(depth),
+            next_to_schedule: 0,
+            prefetch_depth: depth,
             bytes_in_current: 0,
             last_setup_ms: 0,
         }
     }
 
-    /// Spawn a background thread to open `segments[idx]` if `idx` is in
-    /// range and no prefetch is already in flight.  Logs setup time
-    /// alongside the consumer-side log so the overlap is observable.
-    fn maybe_start_prefetch(&mut self) {
-        if self.next_rx.is_some() {
-            return;
+    /// Top up the in-flight worker pool to `prefetch_depth` while there
+    /// are still un-dispatched segments.  Cheap when nothing changes.
+    fn maintain_pending(&mut self) {
+        while self.pending.len() < self.prefetch_depth
+            && self.next_to_schedule < self.segments.len()
+        {
+            let idx = self.next_to_schedule;
+            self.next_to_schedule += 1;
+            self.spawn_prefetch(idx);
         }
-        let idx = self.current_index;
-        if idx >= self.segments.len() {
-            return;
-        }
+    }
+
+    fn spawn_prefetch(&mut self, idx: usize) {
         let locator = self.segments[idx].clone();
         let total = self.segments.len();
         let (tx, rx) = crossbeam_channel::bounded(1);
         thread::Builder::new()
-            .name("native-transport-segment-prefetch".to_string())
+            .name(format!("native-transport-prefetch-{}", idx + 1))
             .spawn(move || {
-                let setup_start = Instant::now();
-                let result = open_segment_reader(&locator);
-                let setup_ms = setup_start.elapsed().as_millis();
+                let started = Instant::now();
+                let result = (|| -> std::io::Result<(u128, u128, Vec<u8>)> {
+                    let mut reader = open_segment_reader(&locator)?;
+                    let setup_ms = started.elapsed().as_millis();
+                    let mut buf = Vec::with_capacity(1_500_000);
+                    reader.read_to_end(&mut buf)?;
+                    let total_ms = started.elapsed().as_millis();
+                    Ok((setup_ms, total_ms, buf))
+                })();
                 if let Err(ref e) = result {
                     eprintln!(
-                        "native-transport: segment #{}/{} prefetch open failed setup={}ms err={}",
+                        "native-transport: segment #{}/{} prefetch failed err={}",
                         idx + 1,
                         total,
-                        setup_ms,
                         e
                     );
                 }
-                let _ = tx.send((setup_ms, result));
+                let _ = tx.send(result);
             })
             .ok();
-        self.next_rx = Some(rx);
+        self.pending.push_back(PendingSegment { index: idx, rx });
     }
 
     fn ensure_reader(&mut self) -> Result<bool, std::io::Error> {
         while self.current_reader.is_none() {
-            if self.current_index >= self.segments.len() {
+            // Top up worker pool first so the parallelism budget is full
+            // by the time we wait on the next segment.
+            self.maintain_pending();
+
+            let Some(pending) = self.pending.pop_front() else {
+                // No more segments scheduled and none in flight → EOS.
                 return Ok(false);
-            }
-            let idx = self.current_index;
-            self.current_index += 1;
-            let (setup_ms, reader) = if let Some(rx) = self.next_rx.take() {
-                let wait_start = Instant::now();
-                match rx.recv() {
-                    Ok((bg_setup_ms, Ok(reader))) => {
-                        let wait_ms = wait_start.elapsed().as_millis();
-                        // bg_setup_ms is wall-time spent in the background
-                        // thread's open(); wait_ms is how much of that was
-                        // still in flight when the consumer asked for the
-                        // next reader.  wait_ms ≈ 0 → fully overlapped;
-                        // wait_ms ≈ bg_setup_ms → no overlap (segment
-                        // body finished before open responded).
-                        eprintln!(
-                            "native-transport: segment #{}/{} open setup={}ms (prefetch wait={}ms) prev_bytes={}",
-                            idx + 1,
-                            self.segments.len(),
-                            bg_setup_ms,
-                            wait_ms,
-                            self.bytes_in_current,
-                        );
-                        (bg_setup_ms, reader)
-                    }
-                    Ok((_, Err(e))) => return Err(e),
-                    Err(_) => {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            "segment prefetch worker dropped before producing a reader",
-                        ));
-                    }
-                }
-            } else {
-                let locator = self.segments[idx].clone();
-                let setup_start = Instant::now();
-                let reader = open_segment_reader(&locator)?;
-                let setup_ms = setup_start.elapsed().as_millis();
-                eprintln!(
-                    "native-transport: segment #{}/{} open setup={}ms prev_bytes={}",
-                    idx + 1,
-                    self.segments.len(),
-                    setup_ms,
-                    self.bytes_in_current,
-                );
-                (setup_ms, reader)
             };
+
+            let wait_start = Instant::now();
+            let result = pending.rx.recv().map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "segment prefetch worker dropped before producing bytes",
+                )
+            })?;
+            let (setup_ms, total_ms, body) = result?;
+            let wait_ms = wait_start.elapsed().as_millis();
+            // wait_ms ≈ 0 → worker finished ahead of demand (good).
+            // wait_ms ≈ total_ms → consumer outran the worker pool;
+            // bump HIRESTI_PREFETCH_DEPTH or accept network is slower
+            // than playback.
+            eprintln!(
+                "native-transport: segment #{}/{} ready setup={}ms total={}ms (consumer wait={}ms) body_bytes={} prev_bytes={} pending_after_pop={}",
+                pending.index + 1,
+                self.segments.len(),
+                setup_ms,
+                total_ms,
+                wait_ms,
+                body.len(),
+                self.bytes_in_current,
+                self.pending.len(),
+            );
+
             self.bytes_in_current = 0;
             self.last_setup_ms = setup_ms;
-            self.current_reader = Some(reader);
-            // Kick off the next-segment open in parallel with this segment's
-            // body delivery so the next ensure_reader() call doesn't block
-            // on a fresh HTTP setup.
-            self.maybe_start_prefetch();
+            self.current_reader = Some(Box::new(Cursor::new(body)));
+
+            // Pop drained one slot — schedule the replacement before we
+            // return so workers stay saturated even during short reads.
+            self.maintain_pending();
         }
         Ok(true)
     }
@@ -3277,17 +3341,25 @@ impl Seek for SegmentSequenceReader {
 
 fn open_segment_reader(
     locator: &str,
-) -> Result<Box<dyn Read + Send + Sync + 'static>, std::io::Error> {
+) -> Result<Box<dyn Read + Send + 'static>, std::io::Error> {
     if let Some(path) = file_uri_to_path(locator) {
         return Ok(Box::new(fs::File::open(path)?));
     }
     if locator.starts_with("http://") || locator.starts_with("https://") {
         log_cdn_host_once(locator);
-        let response = http_agent()
+        let response = http_client()
             .get(locator)
-            .call()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
-        return Ok(response.into_reader());
+        if !response.status().is_success() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("HTTP error {}", response.status()),
+            ));
+        }
+        if let Some(host) = extract_http_host(locator) {
+            log_http_version_once(&host, response.version());
+        }
+        return Ok(Box::new(response.into_body()));
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
