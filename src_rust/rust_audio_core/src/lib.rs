@@ -5149,6 +5149,28 @@ impl Engine {
 
         let custom_sink_enabled = (use_custom_sink || usb_audio_custom_sink_enabled()) && !is_dop;
 
+        // Collect every PCM / Float bit depth the device advertises across
+        // all alt-settings.  Native transport uses this set to decide if the
+        // source can be passed through verbatim (depth supported) or must be
+        // promoted to the device's chosen `bit_depth` (depth not supported,
+        // e.g. 16-bit source on a 32-bit-only DAC like Topping Monitor 09).
+        let supported_bit_depths: Vec<u8> = {
+            let mut depths: Vec<u8> = dev
+                .alts
+                .iter()
+                .filter(|a| {
+                    matches!(
+                        a.format,
+                        usb_audio::UacFormat::Pcm | usb_audio::UacFormat::Float32
+                    )
+                })
+                .map(|a| a.bit_depth)
+                .collect();
+            depths.sort_unstable();
+            depths.dedup();
+            depths
+        };
+
         if custom_sink_enabled {
             let sink = usb_audio::UsbRawSink::new(
                 Some("rust-usb-rawsink"),
@@ -5159,6 +5181,7 @@ impl Engine {
                     gst_format: gst_format.to_string(),
                     channels: alt.channels as usize,
                     clock_mode: self.usb_clock_mode,
+                    supported_bit_depths: supported_bit_depths.clone(),
                 },
             );
             sink.set_property("sync", true);

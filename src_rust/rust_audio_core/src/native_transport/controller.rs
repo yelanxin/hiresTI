@@ -30,7 +30,7 @@ use symphonia::core::io::{
 };
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
-use symphonia::core::sample::Sample;
+use symphonia::core::sample::{i24, Sample};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeTransportState {
@@ -1787,10 +1787,37 @@ fn decode_direct_audio_stream(
                 src_samples_accum = 0;
                 bitrate_emissions += 1;
             }
-            let target_format = output_config
-                .as_ref()
-                .map(|cfg| pcm_format_from_gst_format(cfg.gst_format.as_str()))
-                .transpose()?;
+            // Bit-perfect: keep the decoded slab in the source's native PCM
+            // format whenever the device has an alt-setting at that depth, so
+            // no width promotion happens (16-bit FLAC stays S16LE on the
+            // wire, etc.).  When the device only exposes wider alts (e.g.
+            // Topping Monitor 09 is 32-bit-only), promote to the device's
+            // chosen `cfg.bit_depth` so slab stride matches what the alt
+            // expects — feeding S16LE bytes into a 32-bit alt re-aligns
+            // every frame and produces white noise.
+            let target_format = if let Some(ref cfg) = output_config {
+                track.codec_params.bits_per_sample.map(|src_bits| {
+                    let target = pick_target_bit_depth(
+                        src_bits as u8,
+                        &cfg.supported_bit_depths,
+                        cfg.bit_depth,
+                    );
+                    if target == cfg.bit_depth {
+                        // Device-pref path: honor the alt's exact subframe
+                        // layout (S24_3LE vs S24LE etc.) via cfg.gst_format.
+                        pcm_format_from_gst_format(&cfg.gst_format)
+                            .unwrap_or_else(|_| bits_per_sample_to_pcm_format(target as u32))
+                    } else {
+                        // Pass-through path: canonical layout for that depth.
+                        bits_per_sample_to_pcm_format(target as u32)
+                    }
+                })
+            } else {
+                track
+                    .codec_params
+                    .bits_per_sample
+                    .map(bits_per_sample_to_pcm_format)
+            };
             let process_start = Instant::now();
             let mut slab = audio_buffer_ref_to_slab(decoded, target_format, &mut reuse_buf)?;
             if !chain_configured {
@@ -1814,18 +1841,25 @@ fn decode_direct_audio_stream(
                 if output_session.is_none() {
                     let session = if let Some(mut old) = reuse_sess.take() {
                         let old_rate = old.actual_rate;
+                        // The slab's format already reflects the device-aware
+                        // target bit depth (see target_format above) — pass
+                        // it straight to prepare_for_reuse so the alt-setting
+                        // and ring stride match. Using cfg.bit_depth here
+                        // would freeze us at the Auto-pick depth and miss
+                        // per-track changes (24→16 on a 24-bit-capable DAC).
+                        let source_bit_depth = pcm_format_to_bit_depth(slab.spec.format);
                         if old_rate == slab.spec.sample_rate {
                             eprintln!(
-                                "native-transport: reusing USB session (same rate={})",
-                                old_rate
+                                "native-transport: reusing USB session (same rate={} src_bits={})",
+                                old_rate, source_bit_depth
                             );
                         } else {
                             eprintln!(
-                                "native-transport: rate change {}→{}, reconfiguring live USB session",
-                                old_rate, slab.spec.sample_rate
+                                "native-transport: rate change {}→{}, reconfiguring live USB session (src_bits={})",
+                                old_rate, slab.spec.sample_rate, source_bit_depth
                             );
                         }
-                        match old.prepare_for_reuse(slab.spec.sample_rate, cfg.bit_depth) {
+                        match old.prepare_for_reuse(slab.spec.sample_rate, source_bit_depth) {
                             Ok(()) => {
                                 let clock_mode = configure_session_feed(&old, cfg);
                                 queue_native_event(
@@ -2055,19 +2089,40 @@ fn open_native_usb_output(
 ) -> Result<(UsbAudioSink, NativeUsbRuntime), String> {
     let feed = Arc::new(AlsaHwClockFeed::default());
 
+    // Bit-perfect: pick the alt-setting matching the source's bit depth, not
+    // the device's highest available.  cfg.bit_depth was chosen at device-open
+    // time from the user's "preferred output format" setting (highest bit
+    // depth in Auto mode), which doesn't know the per-track source format —
+    // mismatching it here would force the iso ring to read the slab bytes
+    // with the wrong stride and produce white noise.
+    let source_bit_depth = pcm_format_to_bit_depth(stream_spec.format);
+
+    // Drop the cached preferred_profile when the source bit depth differs
+    // from the device-open-time choice — `best_alt_for_profile` scopes to the
+    // profile first (channels + format + subframe + bit_depth) and only
+    // falls back to a fresh search when *no* candidate matches the profile.
+    // A 16-bit source with a 24-bit-packed cached profile would still match
+    // the 24-bit alt and ignore our bit_depth override, putting us back in
+    // the noise-on-format-mismatch state.
+    let preferred_profile = if source_bit_depth == cfg.bit_depth {
+        Some(cfg.alt_profile)
+    } else {
+        None
+    };
+
     // If we have a pre-claimed handle, use it directly — the interface is
     // already claimed so configure() will just set alt-setting + rate.
     if let Some(handle) = pre_claimed_handle {
         eprintln!(
-            "native-transport: opening USB output with pre-claimed handle (rate={})",
-            stream_spec.sample_rate
+            "native-transport: opening USB output with pre-claimed handle (rate={} src_bits={} cfg_bits={})",
+            stream_spec.sample_rate, source_bit_depth, cfg.bit_depth
         );
         let session = UsbAudioSink::open_with_handle(
             handle,
             stream_spec.sample_rate,
-            cfg.bit_depth,
+            source_bit_depth,
             Arc::clone(&feed),
-            Some(cfg.alt_profile),
+            preferred_profile,
             QueueMode::Bytes,
         )?;
         let pps = session.state.packets_per_sec as usize;
@@ -2115,10 +2170,10 @@ fn open_native_usb_output(
         match UsbAudioSink::open_with_feed_mode(
             &cfg.device_id,
             stream_spec.sample_rate,
-            cfg.bit_depth,
+            source_bit_depth,
             Arc::clone(&feed),
             None,
-            Some(cfg.alt_profile),
+            preferred_profile,
             QueueMode::Bytes,
         ) {
             Ok(s) => {
@@ -2477,6 +2532,44 @@ fn bits_per_sample_to_pcm_format(bits: u32) -> PcmSampleFormat {
     }
 }
 
+/// Maps the source PCM sample format to the bit depth we should request from
+/// the USB sink so the alt-setting matches the source — true bit-perfect.
+///
+/// Without this, V2's alt-picker defaults to the device's *highest* bit depth
+/// (e.g. 24-bit on a 24-bit-capable DAC) regardless of source, but the native
+/// transport pushes the decoded slab bytes verbatim into the USB ring with
+/// no format conversion.  Feeding S16LE bytes into a session configured for
+/// S24_3LE (3 bytes/sample) re-aligns every frame and produces white noise.
+fn pcm_format_to_bit_depth(format: PcmSampleFormat) -> u8 {
+    match format {
+        PcmSampleFormat::S16LE => 16,
+        PcmSampleFormat::S24_3LE | PcmSampleFormat::S24LE => 24,
+        PcmSampleFormat::S32LE | PcmSampleFormat::F32LE | PcmSampleFormat::F64LE => 32,
+    }
+}
+
+/// Pick the on-the-wire bit depth for the current source.
+///
+/// Prefer pass-through (target = source) when the device has an alt-setting
+/// at the source's bit depth.  Otherwise promote to the smallest supported
+/// depth ≥ source (e.g. 16-bit FLAC on a 32-bit-only Topping Monitor 09 → 32);
+/// if no alt is wider, fall back to the device's default (`cfg.bit_depth`).
+///
+/// `supported` may be empty for legacy/non-tuned configs — in that case we
+/// fall back to `cfg_bit_depth` to match the pre-Monitor-09 behavior.
+fn pick_target_bit_depth(source_bit_depth: u8, supported: &[u8], cfg_bit_depth: u8) -> u8 {
+    if supported.is_empty() {
+        return cfg_bit_depth;
+    }
+    if supported.contains(&source_bit_depth) {
+        return source_bit_depth;
+    }
+    if let Some(&promoted) = supported.iter().filter(|&&d| d > source_bit_depth).min() {
+        return promoted;
+    }
+    cfg_bit_depth
+}
+
 fn audio_buffer_ref_format(buffer: &AudioBufferRef<'_>) -> PcmSampleFormat {
     match buffer {
         AudioBufferRef::S16(_) => PcmSampleFormat::S16LE,
@@ -2560,45 +2653,54 @@ fn audio_buffer_ref_to_slab(
                 out.extend_from_slice(&value.to_le_bytes());
             }),
         },
+        // S24_3LE: convert through Symphonia's `i24` so the source value lands
+        // in the right magnitude.  Going via `i32` and truncating to the low
+        // 3 bytes corrupts every sample whose source bit depth ≠ 24:
+        // Symphonia's `i16 → i32` is `(s as i32) << 16`, putting the data in
+        // bits 16-31 — `write_i24_le` then writes bytes 0-2 (all zero or
+        // sign-junk) and produces white noise on the wire.  `i24` is in
+        // 24-bit range (-2^23 .. 2^23-1) regardless of source, so taking its
+        // inner i32 directly into the 3-byte LE layout is correct.
         PcmSampleFormat::S24_3LE => match buffer {
             AudioBufferRef::U8(buf) => interleave_into(&buf, 3, reuse_buf, |sample, out| {
-                let value: i32 = sample.into_sample();
-                write_i24_le(value, out);
+                let value: i24 = sample.into_sample();
+                write_i24_le(value.inner(), out);
             }),
             AudioBufferRef::U16(buf) => interleave_into(&buf, 3, reuse_buf, |sample, out| {
-                let value: i32 = sample.into_sample();
-                write_i24_le(value, out);
+                let value: i24 = sample.into_sample();
+                write_i24_le(value.inner(), out);
             }),
             AudioBufferRef::U24(buf) => interleave_into(&buf, 3, reuse_buf, |sample, out| {
-                let value: i32 = sample.into_sample();
-                write_i24_le(value, out);
+                let value: i24 = sample.into_sample();
+                write_i24_le(value.inner(), out);
             }),
             AudioBufferRef::U32(buf) => interleave_into(&buf, 3, reuse_buf, |sample, out| {
-                let value: i32 = sample.into_sample();
-                write_i24_le(value, out);
+                let value: i24 = sample.into_sample();
+                write_i24_le(value.inner(), out);
             }),
             AudioBufferRef::S8(buf) => interleave_into(&buf, 3, reuse_buf, |sample, out| {
-                let value: i32 = sample.into_sample();
-                write_i24_le(value, out);
+                let value: i24 = sample.into_sample();
+                write_i24_le(value.inner(), out);
             }),
             AudioBufferRef::S16(buf) => interleave_into(&buf, 3, reuse_buf, |sample, out| {
-                let value: i32 = sample.into_sample();
-                write_i24_le(value, out);
+                let value: i24 = sample.into_sample();
+                write_i24_le(value.inner(), out);
             }),
             AudioBufferRef::S24(buf) => interleave_into(&buf, 3, reuse_buf, |sample, out| {
+                // Already in i24 range — `sample.0` is the inner i32.
                 write_i24_le(sample.0, out);
             }),
             AudioBufferRef::S32(buf) => interleave_into(&buf, 3, reuse_buf, |sample, out| {
-                let value: i32 = sample.into_sample();
-                write_i24_le(value, out);
+                let value: i24 = sample.into_sample();
+                write_i24_le(value.inner(), out);
             }),
             AudioBufferRef::F32(buf) => interleave_into(&buf, 3, reuse_buf, |sample, out| {
-                let value: i32 = sample.into_sample();
-                write_i24_le(value, out);
+                let value: i24 = sample.into_sample();
+                write_i24_le(value.inner(), out);
             }),
             AudioBufferRef::F64(buf) => interleave_into(&buf, 3, reuse_buf, |sample, out| {
-                let value: i32 = sample.into_sample();
-                write_i24_le(value, out);
+                let value: i24 = sample.into_sample();
+                write_i24_le(value.inner(), out);
             }),
         },
         PcmSampleFormat::S24LE | PcmSampleFormat::S32LE => match buffer {
