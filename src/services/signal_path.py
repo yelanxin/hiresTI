@@ -35,7 +35,7 @@ class AudioSignalPathWindow(Adw.Window):
     .signal-terminal-root {
         background-image:
             linear-gradient(to bottom, alpha(#6eff81, 0.03), transparent 48px),
-            repeating-linear-gradient(to bottom, alpha(#6eff81, 0.018) 0 1px, transparent 1px 3px);
+            repeating-linear-gradient(to bottom, alpha(#6eff81, 0.018) 0, alpha(#6eff81, 0.018) 1px, transparent 1px, transparent 3px);
         padding: 8px 0 20px 0;
     }
     .signal-terminal-card {
@@ -114,7 +114,7 @@ class AudioSignalPathWindow(Adw.Window):
         border-radius: 0;
         background-image:
             linear-gradient(to bottom, alpha(#6eff81, 0.03), transparent 48px),
-            repeating-linear-gradient(to bottom, alpha(#6eff81, 0.018) 0 1px, transparent 1px 3px);
+            repeating-linear-gradient(to bottom, alpha(#6eff81, 0.018) 0, alpha(#6eff81, 0.018) 1px, transparent 1px, transparent 3px);
     }
     .signal-terminal-popover-rule {
         color: alpha(#6eff81, 0.22);
