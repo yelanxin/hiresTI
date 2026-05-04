@@ -15,26 +15,9 @@ use crate::alsa_clock::ClockMode;
 use crate::alsa_clock::{AlsaHwClock, AlsaHwClockFeed};
 use crate::usb_audio::transfer;
 
-use super::device::UacAltProfile;
 use super::queue::FrameQueue;
+use super::raw_config::UsbRawSinkConfig;
 use super::sink::{PushBufferError, UsbAudioSink};
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UsbRawSinkConfig {
-    pub device_id: String,
-    pub bit_depth: u8,
-    pub alt_profile: UacAltProfile,
-    pub gst_format: String,
-    pub channels: usize,
-    pub clock_mode: u8,
-    /// Unique sorted list of bit depths advertised by the device's PCM/Float
-    /// alt-settings. Native transport uses this to decide whether the source
-    /// bit depth can be passed through verbatim (e.g. 16-bit FLAC → S16LE on
-    /// the wire) or must be promoted to a depth the device actually supports
-    /// (e.g. Topping Monitor 09 only exposes 32-bit alts → S16LE source must
-    /// be promoted to S32LE before slab formatting).
-    pub supported_bit_depths: Vec<u8>,
-}
 
 struct RuntimeState {
     config: Option<UsbRawSinkConfig>,
