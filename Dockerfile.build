@@ -15,6 +15,7 @@ RUN if [ "$DISTRO_FAMILY" = "deb" ]; then \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
             libpulse-dev libpipewire-0.3-dev libusb-1.0-0-dev \
             libasound2-dev liblilv-dev libclang-dev clang dpkg-dev \
+            libssl-dev \
         && rm -rf /var/lib/apt/lists/*; \
     elif [ "$DISTRO_FAMILY" = "rpm" ]; then \
         dnf install -y --setopt=install_weak_deps=False \
@@ -23,6 +24,7 @@ RUN if [ "$DISTRO_FAMILY" = "deb" ]; then \
             gstreamer1-devel gstreamer1-plugins-base-devel \
             pulseaudio-libs-devel pipewire-devel libusb1-devel \
             alsa-lib-devel lilv-devel clang-devel clang rpm-build \
+            openssl-devel \
         && dnf clean all; \
     elif [ "$DISTRO_FAMILY" = "suse" ]; then \
         zypper --non-interactive refresh && \
@@ -32,6 +34,7 @@ RUN if [ "$DISTRO_FAMILY" = "deb" ]; then \
             gstreamer-devel gstreamer-plugins-base-devel \
             libpulse-devel pipewire-devel libusb-1_0-devel \
             alsa-devel liblilv-0-devel clang-devel clang rpm-build \
+            libopenssl-devel \
         && zypper clean --all; \
     elif [ "$DISTRO_FAMILY" = "arch" ]; then \
         pacman -Syu --noconfirm \
@@ -40,7 +43,7 @@ RUN if [ "$DISTRO_FAMILY" = "deb" ]; then \
             gstreamer gst-plugins-base \
             libpulse pipewire libusb \
             alsa-lib lilv clang \
-            zstd \
+            zstd openssl \
         && pacman -Scc --noconfirm; \
     fi
 
