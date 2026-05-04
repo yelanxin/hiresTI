@@ -3130,7 +3130,15 @@ def _update_volume_db_label(self, percent):
 
 
 def _update_volume_device_label(self):
-    """Show a hardware-volume hint and current output device when applicable."""
+    """Show a hardware-volume hint and current output device when applicable.
+
+    When the active DAC doesn't expose a UAC Feature Unit (or it advertises
+    no volume control), the master Gtk.Scale would either move software
+    volume or — in bit-perfect mode — silently snap back to 100, neither of
+    which is useful.  In that state we replace the popover content with a
+    clear "Hardware volume not supported" message so the user isn't fiddling
+    with a slider that has no audible effect.
+    """
     player = getattr(self, "player", None)
     hw_vol = (
         player is not None
@@ -3138,18 +3146,38 @@ def _update_volume_device_label(self):
         and player.usb_hw_volume_supported()
     )
     device_name = str(getattr(self, "current_device_name", "") or "").strip()
-    for attr in ("vol_device_label", "now_playing_vol_device_label"):
-        label = getattr(self, attr, None)
-        if label is None:
-            continue
+    for prefix in ("", "now_playing_"):
+        device_label = getattr(self, f"{prefix}vol_device_label", None)
+        unsupported_label = getattr(self, f"{prefix}vol_unsupported_label", None)
+        scale = getattr(self, f"{prefix}vol_scale", None)
+        db_label = getattr(self, f"{prefix}vol_db_label", None)
+        ch_box = getattr(self, f"{prefix}vol_ch_box", None)
         if hw_vol:
-            label.set_text(
-                f"Hardware Volume\n{device_name}" if device_name else "Hardware Volume"
-            )
-            label.set_visible(True)
+            if device_label is not None:
+                device_label.set_text(
+                    f"Hardware Volume\n{device_name}" if device_name else "Hardware Volume"
+                )
+                device_label.set_visible(True)
+            if unsupported_label is not None:
+                unsupported_label.set_visible(False)
+            # Restore scale/db visibility — _rebuild_hw_volume_ch_sliders
+            # will refine this once channel info arrives.
+            if scale is not None:
+                scale.set_visible(True)
+            if db_label is not None:
+                db_label.set_visible(True)
         else:
-            label.set_text("")
-            label.set_visible(False)
+            if device_label is not None:
+                device_label.set_text("")
+                device_label.set_visible(False)
+            if scale is not None:
+                scale.set_visible(False)
+            if db_label is not None:
+                db_label.set_visible(False)
+            if ch_box is not None:
+                ch_box.set_visible(False)
+            if unsupported_label is not None:
+                unsupported_label.set_visible(True)
 
 
 def _build_volume_popover(self, scale_attr="vol_scale"):
@@ -3182,6 +3210,19 @@ def _build_volume_popover(self, scale_attr="vol_scale"):
     ch_box.set_visible(False)
     setattr(self, ch_box_attr, ch_box)
     vbox.append(ch_box)
+
+    # Shown in place of all sliders when the active DAC has no UAC volume
+    # control. Toggled by `_update_volume_device_label`.
+    unsupported_label_attr = scale_attr.replace("vol_scale", "vol_unsupported_label")
+    unsupported_label = Gtk.Label(label="Hardware volume\nnot supported")
+    unsupported_label.add_css_class("dim-label")
+    unsupported_label.set_justify(Gtk.Justification.CENTER)
+    unsupported_label.set_xalign(0.5)
+    unsupported_label.set_margin_top(8)
+    unsupported_label.set_margin_bottom(8)
+    unsupported_label.set_visible(False)
+    setattr(self, unsupported_label_attr, unsupported_label)
+    vbox.append(unsupported_label)
 
     device_label_attr = scale_attr.replace("vol_scale", "vol_device_label")
     device_label = Gtk.Label(label="")
@@ -3240,18 +3281,15 @@ def _rebuild_hw_volume_ch_sliders(self):
     rng = player.usb_hw_volume_get_range() if hasattr(player, "usb_hw_volume_get_range") else None
     logger.info("hw volume channels=%s extra=%s range=%s", channels, extra_entries, rng)
     if not extra_entries:
+        # No per-channel sliders to build. Defer all visibility decisions
+        # (master scale vs. "not supported" placeholder) to
+        # `_update_volume_device_label`, which knows whether the active DAC
+        # exposes hardware volume at all.
         for attr in ("vol_ch_box", "now_playing_vol_ch_box"):
             box = getattr(self, attr, None)
             if box is not None:
                 box.set_visible(False)
-        for attr in ("vol_scale", "now_playing_vol_scale"):
-            scale = getattr(self, attr, None)
-            if scale is not None:
-                scale.set_visible(True)
-        for attr in ("vol_db_label", "now_playing_vol_db_label"):
-            lbl = getattr(self, attr, None)
-            if lbl is not None:
-                lbl.set_visible(True)
+        _update_volume_device_label(self)
         return
 
     for attr in ("vol_scale", "now_playing_vol_scale"):
