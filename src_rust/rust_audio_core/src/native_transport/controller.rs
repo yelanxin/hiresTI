@@ -1797,19 +1797,17 @@ fn decode_direct_audio_stream(
             // every frame and produces white noise.
             //
             // Lossy codecs (AAC, MP3) leave `bits_per_sample` unset because
-            // they decode to internal f32; falling through to None here would
-            // make the slab keep the buffer's native F32LE and the USB ring
-            // would interpret those float bytes as S16LE/S24_3LE → noise.
-            // For that case, honor the device's configured gst_format so the
-            // sample loop converts f32 → wire format.
+            // they decode to internal f32. We let the slab stay F32LE through
+            // the processor chain (so the spectrum/LUFS analyzers see correct
+            // float samples) and convert to wire format right before USB push.
             let target_format = if let Some(ref cfg) = output_config {
-                if let Some(src_bits) = track.codec_params.bits_per_sample {
+                track.codec_params.bits_per_sample.map(|src_bits| {
                     let target = pick_target_bit_depth(
                         src_bits as u8,
                         &cfg.supported_bit_depths,
                         cfg.bit_depth,
                     );
-                    Some(if target == cfg.bit_depth {
+                    if target == cfg.bit_depth {
                         // Device-pref path: honor the alt's exact subframe
                         // layout (S24_3LE vs S24LE etc.) via cfg.gst_format.
                         pcm_format_from_gst_format(&cfg.gst_format)
@@ -1817,13 +1815,8 @@ fn decode_direct_audio_stream(
                     } else {
                         // Pass-through path: canonical layout for that depth.
                         bits_per_sample_to_pcm_format(target as u32)
-                    })
-                } else {
-                    Some(
-                        pcm_format_from_gst_format(&cfg.gst_format)
-                            .unwrap_or_else(|_| bits_per_sample_to_pcm_format(cfg.bit_depth as u32)),
-                    )
-                }
+                    }
+                })
             } else {
                 track
                     .codec_params
@@ -1838,6 +1831,18 @@ fn decode_direct_audio_stream(
             }
             slab = processor_chain.process(slab)?;
             let process_ms = process_start.elapsed().as_millis();
+            // Lossy decoders (AAC, MP3) leave the slab in F32LE so the
+            // spectrum/LUFS analyzers see correct float samples. Convert to
+            // the device's wire format here, after the chain, so the USB
+            // ring stride matches what the alt-setting expects (otherwise
+            // the float bytes get re-aligned every frame → white noise).
+            if let Some(ref cfg) = output_config {
+                if let Ok(wire_format) = pcm_format_from_gst_format(&cfg.gst_format) {
+                    if slab.spec.format != wire_format {
+                        slab = convert_slab_to_wire_format(slab, wire_format)?;
+                    }
+                }
+            }
             record_decoded_slab(snapshot, generation, &slab);
             if let Some(ref cfg) = output_config {
                 let src_ch = slab.spec.channels;
@@ -2883,6 +2888,95 @@ fn write_i24_le(value: i32, out: &mut Vec<u8>) {
     out.push(value as u8);
     out.push((value >> 8) as u8);
     out.push((value >> 16) as u8);
+}
+
+/// Convert a slab's PCM payload from `slab.spec.format` to `dst_format` and
+/// return a new slab carrying the converted bytes.  Used by the native
+/// transport to keep the processor chain in float for lossy-codec sources
+/// while still pushing wire-format bytes into the USB ring.
+fn convert_slab_to_wire_format(
+    mut slab: PcmSlab,
+    dst_format: PcmSampleFormat,
+) -> Result<PcmSlab, String> {
+    if slab.spec.format == dst_format {
+        return Ok(slab);
+    }
+    let src_format = slab.spec.format;
+    let src_bytes = match src_format {
+        PcmSampleFormat::S16LE => 2,
+        PcmSampleFormat::S24_3LE => 3,
+        PcmSampleFormat::S24LE | PcmSampleFormat::S32LE => 4,
+        PcmSampleFormat::F32LE => 4,
+        PcmSampleFormat::F64LE => 8,
+    };
+    let dst_bytes = match dst_format {
+        PcmSampleFormat::S16LE => 2,
+        PcmSampleFormat::S24_3LE => 3,
+        PcmSampleFormat::S24LE | PcmSampleFormat::S32LE => 4,
+        PcmSampleFormat::F32LE => 4,
+        PcmSampleFormat::F64LE => 8,
+    };
+    let n_samples = slab.data.len() / src_bytes;
+    let mut out = Vec::with_capacity(n_samples * dst_bytes);
+    for chunk in slab.data.chunks_exact(src_bytes) {
+        let v = sample_bytes_to_f32(chunk, src_format);
+        write_f32_as(v, dst_format, &mut out);
+    }
+    slab.data = out;
+    slab.spec.format = dst_format;
+    Ok(slab)
+}
+
+#[inline]
+fn sample_bytes_to_f32(bytes: &[u8], format: PcmSampleFormat) -> f32 {
+    match format {
+        PcmSampleFormat::S16LE => {
+            i16::from_le_bytes([bytes[0], bytes[1]]) as f32 / 32768.0
+        }
+        PcmSampleFormat::S24_3LE => {
+            let raw = (bytes[0] as i32)
+                | ((bytes[1] as i32) << 8)
+                | ((bytes[2] as i8 as i32) << 16);
+            raw as f32 / 8388608.0
+        }
+        PcmSampleFormat::S24LE | PcmSampleFormat::S32LE => {
+            i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f32 / 2147483648.0
+        }
+        PcmSampleFormat::F32LE => {
+            f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+        }
+        PcmSampleFormat::F64LE => {
+            f64::from_le_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3],
+                bytes[4], bytes[5], bytes[6], bytes[7],
+            ]) as f32
+        }
+    }
+}
+
+#[inline]
+fn write_f32_as(v: f32, format: PcmSampleFormat, out: &mut Vec<u8>) {
+    let v = v.clamp(-1.0, 1.0);
+    match format {
+        PcmSampleFormat::S16LE => {
+            let s = (v * 32767.0).round() as i16;
+            out.extend_from_slice(&s.to_le_bytes());
+        }
+        PcmSampleFormat::S24_3LE => {
+            let s = (v * 8388607.0).round() as i32;
+            write_i24_le(s, out);
+        }
+        PcmSampleFormat::S24LE | PcmSampleFormat::S32LE => {
+            let s = (v * 2147483647.0).round() as i32;
+            out.extend_from_slice(&s.to_le_bytes());
+        }
+        PcmSampleFormat::F32LE => {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        PcmSampleFormat::F64LE => {
+            out.extend_from_slice(&(v as f64).to_le_bytes());
+        }
+    }
 }
 
 /// Download buffer capacity (number of channel slots).  Each slot holds one
