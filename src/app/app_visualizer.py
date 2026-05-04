@@ -388,7 +388,7 @@ def _linear_active_bands_value():
     raw = str(os.getenv("HIRESTI_VIZ_LINEAR_ACTIVE_BANDS", "") or "").strip()
     if raw:
         try:
-            return max(2, min(2048, int(raw)))
+            return max(2, min(4096, int(raw)))
         except Exception:
             pass
     return _LINEAR_ACTIVE_BANDS_DEFAULT
@@ -409,7 +409,9 @@ def _viz_analysis_bands_for_bar_count(count, frequency_scale_name=None):
         return 512
     if bars <= 64:
         return 1024
-    return 2048
+    if bars <= 128:
+        return 2048
+    return 4096
 
 
 def _apply_viz_frequency_scale_by_index(self, idx, update_dropdown=False):
@@ -938,7 +940,7 @@ def _start_viz_placeholder_if_needed(self):
         n = int(self.settings.get("viz_bar_count", 32) or 32)
     except Exception:
         n = 32
-    n = max(8, min(128, n))
+    n = max(8, min(256, n))
     if not self._viz_placeholder_frame or len(self._viz_placeholder_frame) != n:
         self._viz_placeholder_frame = [-80.0] * n
     self._viz_placeholder_phase = 0.0

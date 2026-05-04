@@ -844,7 +844,7 @@ fn build_log_bins_impl(input: &[f32], out: &mut [f32]) {
                 }
             }
             let rms = (sum_sq / (sample_count as f32)).sqrt();
-            ((rms * 0.50) + (peak * 0.50)) * log_display_eq_gain(center_f)
+            ((rms * 0.40) + (peak * 0.60)) * log_display_eq_gain(center_f)
         };
         out[i] = voiced.clamp(0.0, 1.0);
     }

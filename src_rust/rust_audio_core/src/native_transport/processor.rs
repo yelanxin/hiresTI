@@ -220,7 +220,7 @@ fn apply_gain_f64(data: &mut [u8], gain: f32) {
 // ---------------------------------------------------------------------------
 
 /// Maximum number of spectrum bands (matches lib.rs SPECTRUM_BANDS_MAX).
-pub const SPECTRUM_BANDS_MAX: usize = 2048;
+pub const SPECTRUM_BANDS_MAX: usize = 4096;
 
 /// A single spectrum analysis frame, ready for the engine's spectrum ring.
 impl std::fmt::Debug for SpectrumFrame {

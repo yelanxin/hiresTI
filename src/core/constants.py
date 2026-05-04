@@ -54,7 +54,7 @@ class AlsaMmapRealtimePriority:
 
 
 class VisualizerSettings:
-    BAR_OPTIONS = [4, 8, 16, 32, 48, 64, 128]
+    BAR_OPTIONS = [4, 8, 16, 32, 48, 64, 128, 256]
     BACKEND_POLICIES = ["Quality"]
 
 

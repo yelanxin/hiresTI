@@ -19,7 +19,7 @@ from core.viz_perf import VizPerfWindow
 logger = logging.getLogger(__name__)
 _NOOP_VIZ_PERF_AUDIO = VizPerfWindow("audio", logger, enabled=False)
 
-_MAX_SPECTRUM_BANDS = 2048
+_MAX_SPECTRUM_BANDS = 4096
 _LV2_HOST_MANAGED_PORT_SYMBOLS = {"enabled", "enable", "bypass"}
 
 DRIVER_ALSA_AUTO = "ALSA（auto）"

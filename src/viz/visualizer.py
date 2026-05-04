@@ -39,8 +39,8 @@ _FREQ_SCALE_LINEAR = "Linear"
 _FREQ_SCALE_LOG = "Log"
 _FREQ_SCALE_NAMES = [_FREQ_SCALE_LINEAR, _FREQ_SCALE_LOG]
 _SPECTRUM_HALF_RATE_HZ = 22050.0
-_DEFAULT_SPECTRUM_BANDS = 2048
-_LINEAR_ANALYSIS_BANDS = 2048
+_DEFAULT_SPECTRUM_BANDS = 4096
+_LINEAR_ANALYSIS_BANDS = 4096
 _LINEAR_DISPLAY_ZOOM = 1.0
 _LOG_DISPLAY_ANCHOR_FREQS_HZ = (200.0, 500.0, 1000.0, 4000.0, 8000.0, 12000.0)
 _LOG_DISPLAY_ANCHOR_FRACTIONS = (0.15, 0.32, 0.50, 0.70, 0.87, 0.95)
@@ -659,7 +659,7 @@ def _build_log_spectrum_bins(values, out_count, half_rate_hz=_SPECTRUM_HALF_RATE
                     if v > peak:
                         peak = v
                 rms = math.sqrt(sum_sq / float(sample_count))
-                voiced = ((rms * 0.50) + (peak * 0.50)) * _log_display_eq_gain(center_f)
+                voiced = ((rms * 0.40) + (peak * 0.60)) * _log_display_eq_gain(center_f)
             out[i] = max(0.0, min(1.0, voiced))
         return out
 
@@ -1136,15 +1136,23 @@ class SpectrumVisualizer(Gtk.DrawingArea):
         self._active = new_active
         if self._active:
             if self._anim_source is None:
-                self._anim_source = GLib.timeout_add(16, self._on_animation_tick)
+                # add_tick_callback fires once per GTK frame clock tick (vsync-
+                # locked, ~60 Hz on most monitors) and auto-pauses when the
+                # widget is hidden. timeout_add(16) was waiting 16 ms *after*
+                # the callback returned, so the effective rate dropped to
+                # ~45-50 FPS once the per-tick Python work was added in.
+                self._anim_source = self.add_tick_callback(self._on_tick_cb)
             self.queue_draw()
         else:
-            if self._anim_source:
+            if self._anim_source is not None:
                 try:
-                    GLib.source_remove(self._anim_source)
+                    self.remove_tick_callback(self._anim_source)
                 except Exception:
                     pass
                 self._anim_source = None
+
+    def _on_tick_cb(self, _widget, _frame_clock):
+        return self._on_animation_tick()
 
     def get_theme_names(self):
         return list(self.themes.keys())
@@ -3979,7 +3987,7 @@ _DOTS_FRAG_330 = """
 #version 330 core
 in vec2 vUV;
 out vec4 FragColor;
-const int MAX_BARS = 128;
+const int MAX_BARS = 256;
 uniform int   uNumBars;
 uniform float uHeights[MAX_BARS];
 uniform vec4  uColors[MAX_BARS];
@@ -4018,7 +4026,7 @@ _DOTS_FRAG_300ES = """
 precision mediump float;
 in vec2 vUV;
 out vec4 FragColor;
-const int MAX_BARS = 128;
+const int MAX_BARS = 256;
 uniform int   uNumBars;
 uniform float uHeights[MAX_BARS];
 uniform vec4  uColors[MAX_BARS];
@@ -4101,7 +4109,7 @@ class DotsGLVisualizer(Gtk.GLArea):
 
         # Pre-allocated ctypes arrays reused every frame to avoid GC churn
         self._h_arr = (ctypes.c_float * 512)(*([0.0] * 512))
-        self._c_arr = (ctypes.c_float * 2048)(*([0.0] * 2048))
+        self._c_arr = (ctypes.c_float * 4096)(*([0.0] * 4096))
 
         # Cached per-frame scalars — recomputed only on theme/profile change
         self._cached_gain    = 0.0
@@ -4235,7 +4243,7 @@ class DotsGLVisualizer(Gtk.GLArea):
             self._cached_h = h
             self._get_colors()   # rebuilds _c_arr if theme/bars changed
             GL.glUniform1i (self._u_num_bars,   self.num_bars)
-            GL.glUniform4fv(self._u_colors,     128, self._c_arr)
+            GL.glUniform4fv(self._u_colors,     self.num_bars, self._c_arr)
             GL.glUniform1f (self._u_gain,       self._cached_gain)
             GL.glUniform1f (self._u_spacing,    self._cached_spacing)
             GL.glUniform2f (self._u_resolution, float(w), float(h))
@@ -4243,8 +4251,8 @@ class DotsGLVisualizer(Gtk.GLArea):
 
         # Heights change every animated frame
         if self._rust_state_engine is None:
-            self._h_arr[:128] = self.current_heights[:128]
-        GL.glUniform1fv(self._u_heights, 128, self._h_arr)
+            self._h_arr[:self.num_bars] = self.current_heights[:self.num_bars]
+        GL.glUniform1fv(self._u_heights, self.num_bars, self._h_arr)
 
         GL.glBindVertexArray(self._vao)
         GL.glDrawArrays(GL.GL_TRIANGLE_STRIP, 0, 4)
@@ -4300,7 +4308,7 @@ class DotsGLVisualizer(Gtk.GLArea):
                 self._c_arr[off + 3] = a
                 off += 4
             # Zero-pad remaining slots
-            for i in range(off, 2048):
+            for i in range(off, 4096):
                 self._c_arr[i] = 0.0
         return self._color_cache
 
@@ -4327,15 +4335,18 @@ class DotsGLVisualizer(Gtk.GLArea):
         self._active = active
         if active:
             if self._anim_source is None:
-                self._anim_source = GLib.timeout_add(16, self._on_animation_tick)
+                self._anim_source = self.add_tick_callback(self._on_tick_cb)
             self.queue_render()
         else:
-            if self._anim_source:
+            if self._anim_source is not None:
                 try:
-                    GLib.source_remove(self._anim_source)
+                    self.remove_tick_callback(self._anim_source)
                 except Exception:
                     pass
                 self._anim_source = None
+
+    def _on_tick_cb(self, _widget, _frame_clock):
+        return self._on_animation_tick()
 
     def update_data(self, magnitudes):
         with _VIZ_UPDATE_PERF.track("dots_gl_update_data"):
@@ -4418,7 +4429,7 @@ class DotsGLVisualizer(Gtk.GLArea):
             return
         if n <= 0 or n == self.num_bars:
             return
-        self.num_bars = min(n, 128)
+        self.num_bars = min(n, 256)
         self.target_heights  = [0.0] * 512
         self.current_heights = [0.0] * 512
         self._reset_rust_state_engine()
@@ -4507,7 +4518,7 @@ _BARS_FRAG_330 = """
 #version 330 core
 in vec2 vUV;
 out vec4 FragColor;
-const int MAX_BARS = 128;
+const int MAX_BARS = 256;
 uniform int   uNumBars;
 uniform float uHeights[MAX_BARS];
 uniform float uPeakHeights[MAX_BARS];
@@ -4856,7 +4867,7 @@ _BARS_FRAG_300ES = """
 precision mediump float;
 in vec2 vUV;
 out vec4 FragColor;
-const int MAX_BARS = 128;
+const int MAX_BARS = 256;
 uniform int   uNumBars;
 uniform float uHeights[MAX_BARS];
 uniform float uPeakHeights[MAX_BARS];
@@ -5232,7 +5243,7 @@ class BarsGLVisualizer(Gtk.GLArea):
         self._tr_arr = (ctypes.c_float * 512)(*([0.0] * 512))
         self._lh_arr = (ctypes.c_float * 512)(*([0.0] * 512))
         self._rh_arr = (ctypes.c_float * 512)(*([0.0] * 512))
-        self._c_arr  = (ctypes.c_float * 2048)(*([0.0] * 2048))
+        self._c_arr  = (ctypes.c_float * 4096)(*([0.0] * 4096))
 
         self._program      = None
         self._vao          = None
@@ -5413,7 +5424,7 @@ class BarsGLVisualizer(Gtk.GLArea):
             bc = self._color_from_gradient(grad, 0.12)
             pc = self._color_from_gradient(grad, 0.0)
             GL.glUniform1i(self._u_num_bars,    self.num_bars)
-            GL.glUniform4fv(self._u_colors,     128, self._c_arr)
+            GL.glUniform4fv(self._u_colors,     self.num_bars, self._c_arr)
             GL.glUniform4f(self._u_top_color,   *tc)
             GL.glUniform4f(self._u_bottom_color,*bc)
             GL.glUniform4f(self._u_pulse_color, *pc)
@@ -5425,16 +5436,16 @@ class BarsGLVisualizer(Gtk.GLArea):
             self._cached_h     = ph
             self._dirty_static = False
         if self._should_use_python_render_state():
-            self._h_arr[:128]  = self.current_heights[:128]
-            self._ph_arr[:128] = self.peak_holds[:128]
-            self._tr_arr[:128] = self.trail_heights[:128]
-            self._lh_arr[:128] = self.left_heights[:128]
-            self._rh_arr[:128] = self.right_heights[:128]
-        GL.glUniform1fv(self._u_heights,        128, self._h_arr)
-        GL.glUniform1fv(self._u_peak_heights,   128, self._ph_arr)
-        GL.glUniform1fv(self._u_trail_heights,  128, self._tr_arr)
-        GL.glUniform1fv(self._u_left_heights,   128, self._lh_arr)
-        GL.glUniform1fv(self._u_right_heights,  128, self._rh_arr)
+            self._h_arr[:self.num_bars]  = self.current_heights[:self.num_bars]
+            self._ph_arr[:self.num_bars] = self.peak_holds[:self.num_bars]
+            self._tr_arr[:self.num_bars] = self.trail_heights[:self.num_bars]
+            self._lh_arr[:self.num_bars] = self.left_heights[:self.num_bars]
+            self._rh_arr[:self.num_bars] = self.right_heights[:self.num_bars]
+        GL.glUniform1fv(self._u_heights,        self.num_bars, self._h_arr)
+        GL.glUniform1fv(self._u_peak_heights,   self.num_bars, self._ph_arr)
+        GL.glUniform1fv(self._u_trail_heights,  self.num_bars, self._tr_arr)
+        GL.glUniform1fv(self._u_left_heights,   self.num_bars, self._lh_arr)
+        GL.glUniform1fv(self._u_right_heights,  self.num_bars, self._rh_arr)
         GL.glUniform1f(self._u_bass_level,      self.bass_level)
         GL.glUniform1f(self._u_balance,         self.balance)
         GL.glBindVertexArray(self._vao)
@@ -5517,15 +5528,18 @@ class BarsGLVisualizer(Gtk.GLArea):
         self._active = active
         if active:
             if self._anim_source is None:
-                self._anim_source = GLib.timeout_add(16, self._on_animation_tick)
+                self._anim_source = self.add_tick_callback(self._on_tick_cb)
             self.queue_render()
         else:
-            if self._anim_source:
+            if self._anim_source is not None:
                 try:
-                    GLib.source_remove(self._anim_source)
+                    self.remove_tick_callback(self._anim_source)
                 except Exception:
                     pass
             self._anim_source = None
+
+    def _on_tick_cb(self, _widget, _frame_clock):
+        return self._on_animation_tick()
 
     # ------------------------------------------------------------------
     # Data ingestion
@@ -5633,7 +5647,7 @@ class BarsGLVisualizer(Gtk.GLArea):
             return
         if n <= 0 or n == self.num_bars:
             return
-        self.num_bars        = min(n, 128)
+        self.num_bars        = min(n, 256)
         self.target_heights  = [0.0] * 512
         self.current_heights = [0.0] * 512
         self.peak_holds      = [0.0] * 512

@@ -42,7 +42,7 @@ use dsp::{
 static GST_INIT: Once = Once::new();
 static PW_INIT: Once = Once::new();
 static USB_ALLOCATION_HINT_COUNT: AtomicU64 = AtomicU64::new(0);
-const SPECTRUM_BANDS_MAX: usize = 2048;
+const SPECTRUM_BANDS_MAX: usize = 4096;
 const SPECTRUM_RING_CAP: usize = 512;
 const PIPEWIRE_CARD_PROFILE_TARGET_PREFIX: &str = "pwcardprofile:";
 
