@@ -3690,23 +3690,12 @@ def render_history_dashboard(app):
         track_id = getattr(tr, "id", None) or getattr(tr, "track_id", None)
         row_name_norm = _norm_text(track_name)
         row_artist_norm = _norm_text(artist_name)
-        is_playing = False
-        if _playing_id and track_id is not None and str(track_id).strip() == _playing_id:
-            is_playing = True
-        else:
-            name_match = bool(
-                _now_name
-                and row_name_norm
-                and (row_name_norm == _now_name or row_name_norm in _now_name or _now_name in row_name_norm)
-            )
-            if name_match:
-                if not _now_artist:
-                    is_playing = True
-                else:
-                    is_playing = bool(
-                        row_artist_norm
-                        and (row_artist_norm == _now_artist or row_artist_norm in _now_artist or _now_artist in row_artist_norm)
-                    )
+        # Strict ID-only match. The previous name+artist fallback caused
+        # every row sharing a title (e.g. two "別問我是誰" entries in Top 100)
+        # to highlight when one was played; tracks always carry a Tidal id.
+        is_playing = bool(
+            _playing_id and track_id is not None and str(track_id).strip() == _playing_id
+        )
 
         playing_icon = Gtk.Image(icon_name="media-playback-start-symbolic", pixel_size=14)
         playing_icon.set_halign(Gtk.Align.END)
@@ -5642,24 +5631,8 @@ def refresh_dashboard_playing_state(app):
             continue
 
         row_id = str(getattr(w, "_dashboard_track_id", "") or "").strip()
-        row_artist = str(getattr(w, "_dashboard_track_artist", "") or "")
-        is_playing = False
-        if playing_id and row_id and row_id == playing_id:
-            is_playing = True
-        else:
-            name_match = bool(
-                now_name
-                and row_name
-                and (row_name == now_name or row_name in now_name or now_name in row_name)
-            )
-            if name_match:
-                if not now_artist:
-                    is_playing = True
-                else:
-                    is_playing = bool(
-                        row_artist
-                        and (row_artist == now_artist or row_artist in now_artist or now_artist in row_artist)
-                    )
+        # Strict ID-only match — see _build_history_track_button.
+        is_playing = bool(playing_id and row_id and row_id == playing_id)
 
         if is_playing:
             w.add_css_class("track-row-playing")
