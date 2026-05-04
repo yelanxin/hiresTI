@@ -14,6 +14,20 @@ gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
 from gi.repository import Gtk, GLib
 
+# Optional embedded browser for the PKCE redirect-capture path.  When
+# WebKitGTK 6.0 introspection (`gir1.2-webkit-6.0` / `webkitgtk-6.0`)
+# is present we open the Tidal login page inside the app, intercept
+# the redirect to `tidal.com/android/login/auth?code=...` directly,
+# and skip the manual copy-paste step entirely.  When it's missing we
+# fall through to the paste-URL dialog so the auth flow still works.
+try:
+    gi.require_version('WebKit', '6.0')
+    from gi.repository import WebKit  # noqa: F401
+    _WEBKIT_AVAILABLE = True
+except (ValueError, ImportError):
+    WebKit = None
+    _WEBKIT_AVAILABLE = False
+
 from core.errors import classify_exception
 from core.executor import submit_daemon
 from ui import config as ui_config
@@ -206,8 +220,24 @@ def _show_login_method_dialog(self):
     qr_row.append(qr_text)
     qr_btn.set_child(qr_row)
 
+    pkce_btn = Gtk.Button(css_classes=["flat"])
+    pkce_row = Gtk.Box(spacing=10, margin_top=8, margin_bottom=8, margin_start=8, margin_end=8)
+    pkce_row.append(Gtk.Image.new_from_icon_name("audio-x-generic-symbolic"))
+    pkce_text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+    pkce_text.append(Gtk.Label(label="HiFi Login (PKCE)", xalign=0))
+    pkce_text.append(Gtk.Label(
+        label="Required for full LOSSLESS / HI-RES",
+        xalign=0,
+        css_classes=["dim-label"],
+        wrap=True,
+        max_width_chars=44,
+    ))
+    pkce_row.append(pkce_text)
+    pkce_btn.set_child(pkce_row)
+
     actions.append(web_btn)
     actions.append(qr_btn)
+    actions.append(pkce_btn)
     root.append(actions)
 
     cancel_btn = Gtk.Button(label="Cancel", css_classes=["flat"])
@@ -216,6 +246,7 @@ def _show_login_method_dialog(self):
 
     web_btn.connect("clicked", lambda _b: (dialog.close(), self._start_login_flow("web")))
     qr_btn.connect("clicked", lambda _b: (dialog.close(), self._start_login_flow("qr")))
+    pkce_btn.connect("clicked", lambda _b: (dialog.close(), self._start_pkce_login_flow()))
 
     dialog.set_child(root)
 
@@ -277,6 +308,309 @@ def _start_login_flow(self, mode):
             GLib.idle_add(self._on_login_failed_for_attempt, attempt_id, msg)
 
     submit_daemon(login_thread)
+
+
+def _start_pkce_login_flow(self):
+    """PKCE auth-code flow.  Opens the Tidal login URL in the browser,
+    then shows a dialog where the user pastes the redirect URL of the
+    'Oops' page they end up on after logging in.  PKCE is the only way
+    to get full LOSSLESS / HI_RES streams since Tidal closed the device-
+    code path for those qualities (python-tidal#404)."""
+    attempt_id = int(time.time() * 1000)
+    self._login_in_progress = True
+    self._login_attempt_id = attempt_id
+    self._login_mode = "pkce"
+    logger.info("Login start (id=%s mode=pkce).", attempt_id)
+    self.record_diag_event(f"AUTH START id={attempt_id} mode=pkce")
+
+    try:
+        info = self.backend.start_pkce_login()
+        login_url = str((info or {}).get("url", "") or "")
+        if not login_url:
+            raise RuntimeError("PKCE initialization did not return a login URL")
+    except Exception as e:
+        self._on_login_failed(attempt_id, e)
+        return
+
+    if _WEBKIT_AVAILABLE:
+        # Embedded browser path — fully automated, no copy-paste.
+        self.show_output_notice(
+            "Opening Tidal login in-app. Sign in to continue.",
+            "ok",
+            2400,
+        )
+        self._show_pkce_webview_dialog(login_url, attempt_id)
+        return
+
+    # Fallback: open external browser + paste-URL dialog.
+    browser_ok = self._open_login_url(login_url, attempt_id)
+    if browser_ok:
+        self.show_output_notice(
+            "Browser opened. Sign in, then copy the redirect URL back here.",
+            "ok",
+            3600,
+        )
+    else:
+        self.show_output_notice(
+            "Failed to open browser. Copy the URL from the dialog and open it manually.",
+            "warn",
+            3600,
+        )
+
+    self._show_pkce_paste_dialog(login_url, attempt_id)
+
+
+def _show_pkce_webview_dialog(self, login_url, attempt_id):
+    """Embedded-browser PKCE flow.  Opens Tidal's login page inside a
+    WebKit.WebView and intercepts the navigation to the Android redirect
+    URI to capture the auth code automatically — no copy-paste required.
+
+    Falls back to the paste dialog when the navigation interception fails
+    or the user closes the window without finishing login (covered by the
+    cancel path)."""
+    self._cleanup_login_dialog()
+
+    window = Gtk.Window(title="Sign in to TIDAL", transient_for=self.win, modal=True)
+    window.set_default_size(560, 760)
+
+    root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+
+    status_bar = Gtk.Box(spacing=8, margin_top=6, margin_bottom=6, margin_start=10, margin_end=10)
+    status_lbl = Gtk.Label(
+        label="Loading TIDAL login…",
+        xalign=0,
+        css_classes=["dim-label"],
+    )
+    status_lbl.set_hexpand(True)
+    status_bar.append(status_lbl)
+    cancel_btn = Gtk.Button(label="Cancel", css_classes=["flat"])
+    status_bar.append(cancel_btn)
+    root.append(status_bar)
+
+    # Ephemeral session so the previous user's cookies don't auto-skip
+    # the password screen — needed when switching accounts.
+    try:
+        net_session = WebKit.NetworkSession.new_ephemeral()
+        webview = WebKit.WebView.new_with_network_session(net_session)
+    except Exception as e:
+        logger.debug("Ephemeral WebKit session unavailable, falling back: %s", e)
+        webview = WebKit.WebView()
+
+    webview.set_hexpand(True)
+    webview.set_vexpand(True)
+    root.append(webview)
+
+    submitted_marker = {"done": False}
+
+    def _close_window():
+        try:
+            window.close()
+        except Exception:
+            pass
+
+    def _capture_redirect(redirect_url):
+        if submitted_marker["done"]:
+            return
+        submitted_marker["done"] = True
+        status_lbl.set_text("Authorization received — exchanging token…")
+
+        def _finish_thread():
+            ok = self.backend.finish_pkce_login(redirect_url)
+            if ok:
+                GLib.idle_add(self._on_login_success_for_attempt, attempt_id)
+                GLib.idle_add(_close_window)
+            else:
+                msg = "PKCE login failed"
+                try:
+                    detail = str(getattr(self.backend, "get_last_login_error", lambda: "")() or "").strip()
+                    if detail:
+                        msg = detail
+                except Exception:
+                    pass
+                GLib.idle_add(self._on_login_failed_for_attempt, attempt_id, msg)
+                GLib.idle_add(_close_window)
+
+        submit_daemon(_finish_thread)
+
+    def _on_decide_policy(_view, decision, decision_type):
+        # Only intercept top-level navigation; let sub-resources load freely.
+        try:
+            nav_types = (
+                WebKit.PolicyDecisionType.NAVIGATION_ACTION,
+                WebKit.PolicyDecisionType.NEW_WINDOW_ACTION,
+            )
+        except Exception:
+            nav_types = ()
+        if decision_type not in nav_types:
+            return False
+        try:
+            request = decision.get_navigation_action().get_request()
+            uri = request.get_uri() or ""
+        except Exception as e:
+            logger.debug("decide-policy: failed to read request URI: %s", e)
+            return False
+        # The Tidal Android client redirects to this URL with `?code=…&state=…`.
+        # That's exactly what `pkce_get_auth_token()` needs.  Stop the WebView
+        # before it loads the (404) target page and run the token exchange
+        # ourselves.
+        if "tidal.com/android/login/auth" in uri and "code=" in uri:
+            decision.ignore()
+            _capture_redirect(uri)
+            return True
+        return False
+
+    webview.connect("decide-policy", _on_decide_policy)
+
+    def _on_load_changed(_view, load_event):
+        try:
+            done = (load_event == WebKit.LoadEvent.FINISHED)
+        except Exception:
+            done = False
+        if done and not submitted_marker["done"]:
+            current = webview.get_uri() or ""
+            if "tidal.com/android/login/auth" in current and "code=" in current:
+                _capture_redirect(current)
+            else:
+                status_lbl.set_text("Sign in with your TIDAL credentials.")
+
+    webview.connect("load-changed", _on_load_changed)
+
+    cancel_btn.connect("clicked", lambda _b: _close_window())
+
+    def _on_close(_w):
+        if self._login_dialog is window:
+            self._login_dialog = None
+        if (
+            self._login_in_progress
+            and attempt_id == self._login_attempt_id
+            and not submitted_marker["done"]
+        ):
+            self._cancel_login_attempt(attempt_id, reason="user-cancel")
+
+    window.connect("close-request", lambda w: (False))
+    window.connect("destroy", _on_close)
+
+    window.set_child(root)
+    self._login_dialog = window
+    self._login_status_label = status_lbl
+    webview.load_uri(login_url)
+    window.present()
+
+
+def _show_pkce_paste_dialog(self, login_url, attempt_id):
+    self._cleanup_login_dialog()
+    dialog = Gtk.Dialog(title="Complete HiFi Login", transient_for=self.win, modal=True)
+    dialog.set_default_size(560, 360)
+    root = Gtk.Box(
+        orientation=Gtk.Orientation.VERTICAL,
+        spacing=10,
+        margin_top=12,
+        margin_bottom=12,
+        margin_start=14,
+        margin_end=14,
+    )
+
+    title = Gtk.Label(label="Paste the 'Oops' page URL", xalign=0, css_classes=["title-3"])
+    sub = Gtk.Label(
+        label=(
+            "1) Sign in to TIDAL in the browser tab that just opened.\n"
+            "2) After login, you'll land on a page that looks like \"Oops, something went wrong\". "
+            "That's expected.\n"
+            "3) Copy the entire URL from the browser address bar and paste it below."
+        ),
+        xalign=0,
+        wrap=True,
+        css_classes=["dim-label"],
+    )
+    root.append(title)
+    root.append(sub)
+
+    # Always-visible login URL so the user can re-open / copy it if the
+    # browser auto-open failed.
+    url_box = Gtk.Box(spacing=6)
+    url_entry = Gtk.Entry(hexpand=True)
+    url_entry.set_text(login_url)
+    url_entry.set_editable(False)
+    url_entry.set_can_focus(True)
+    copy_btn = Gtk.Button(label="Copy", css_classes=["flat"])
+
+    def _on_copy(_b):
+        try:
+            self.win.get_clipboard().set(login_url)
+            self.show_output_notice("Login URL copied to clipboard.", "ok", 1600)
+        except Exception as e:
+            logger.debug("Clipboard copy failed: %s", e)
+
+    copy_btn.connect("clicked", _on_copy)
+    url_box.append(url_entry)
+    url_box.append(copy_btn)
+    root.append(url_box)
+
+    paste_label = Gtk.Label(label="Redirect URL:", xalign=0)
+    root.append(paste_label)
+    paste_entry = Gtk.Entry(hexpand=True)
+    paste_entry.set_placeholder_text("https://tidal.com/android/login/auth?code=...")
+    root.append(paste_entry)
+
+    status_lbl = Gtk.Label(
+        label="Waiting for redirect URL...",
+        xalign=0,
+        wrap=True,
+        css_classes=["dim-label"],
+    )
+    root.append(status_lbl)
+    self._login_status_label = status_lbl
+
+    btn_row = Gtk.Box(spacing=8, halign=Gtk.Align.END)
+    cancel_btn = Gtk.Button(label="Cancel", css_classes=["flat"])
+    submit_btn = Gtk.Button(label="Sign In", css_classes=["suggested-action"])
+    btn_row.append(cancel_btn)
+    btn_row.append(submit_btn)
+    root.append(btn_row)
+
+    def _do_submit(_widget=None):
+        if attempt_id != self._login_attempt_id:
+            return
+        url_text = paste_entry.get_text().strip()
+        if not url_text or "code=" not in url_text:
+            status_lbl.set_text("That doesn't look like the redirect URL. It must contain '?code='.")
+            return
+        submit_btn.set_sensitive(False)
+        cancel_btn.set_sensitive(False)
+        status_lbl.set_text("Exchanging authorization code…")
+
+        def _finish_thread():
+            ok = self.backend.finish_pkce_login(url_text)
+            if ok:
+                GLib.idle_add(self._on_login_success_for_attempt, attempt_id)
+            else:
+                msg = "PKCE login failed"
+                try:
+                    detail = str(getattr(self.backend, "get_last_login_error", lambda: "")() or "").strip()
+                    if detail:
+                        msg = detail
+                except Exception:
+                    pass
+                GLib.idle_add(self._on_login_failed_for_attempt, attempt_id, msg)
+
+        submit_daemon(_finish_thread)
+
+    submit_btn.connect("clicked", _do_submit)
+    paste_entry.connect("activate", _do_submit)
+    cancel_btn.connect("clicked", lambda _b: dialog.close())
+
+    dialog.set_child(root)
+
+    def _on_close(d):
+        if self._login_dialog is d:
+            self._login_dialog = None
+        if self._login_in_progress and attempt_id == self._login_attempt_id:
+            self._cancel_login_attempt(attempt_id, reason="user-cancel")
+
+    dialog.connect("destroy", _on_close)
+    self._login_dialog = dialog
+    dialog.present()
+    paste_entry.grab_focus()
 
 
 def _open_login_url(self, url, attempt_id):

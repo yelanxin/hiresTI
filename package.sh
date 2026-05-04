@@ -459,7 +459,7 @@ Version: $PKG_VERSION
 Section: sound
 Priority: optional
 Architecture: $DEB_ARCH
-Depends: python3, python3-gi, python3-gi-cairo, python3-cairo, python3-opengl, python3-dateutil, python3-typing-extensions, python3-isodate, python3-setproctitle, gir1.2-gtk-4.0, gir1.2-adw-1, gir1.2-gtksource-4, qrencode, python3-gst-1.0, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-plugins-ugly, gstreamer1.0-pipewire, libpipewire-0.3-0, libpulse0, libasound2, libusb-1.0-0, libgl1, libegl1, libgl1-mesa-dri
+Depends: python3, python3-gi, python3-gi-cairo, python3-cairo, python3-opengl, python3-dateutil, python3-typing-extensions, python3-isodate, python3-setproctitle, gir1.2-gtk-4.0, gir1.2-adw-1, gir1.2-gtksource-4, gir1.2-webkit-6.0, qrencode, python3-gst-1.0, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-plugins-ugly, gstreamer1.0-pipewire, libpipewire-0.3-0, libpulse0, libasound2, libusb-1.0-0, libgl1, libegl1, libgl1-mesa-dri
 Maintainer: $MAINTAINER
 Description: $DESCRIPTION
  $DISPLAY_NAME is a desktop client for Tidal focusing on High-Res audio.
@@ -595,6 +595,7 @@ depend = alsa-lib
 depend = libusb
 depend = mesa
 depend = libglvnd
+depend = webkitgtk-6.0
 EOF
 
     cat <<'INSTALL_EOF' > "$pkg_root/.INSTALL"
@@ -621,9 +622,9 @@ INSTALL_EOF
 
 
 # ---- Dispatch local builds ----
-FEDORA_REQUIRES="python3, python3-gobject, python3-cairo, python3-pyopengl, python3-setproctitle, gtk4, libadwaita, gstreamer1-plugins-base, gstreamer1-plugins-good, gstreamer1-plugins-bad-free, gstreamer1-plugins-ugly-free, pipewire, pipewire-gstreamer, pulseaudio-libs, alsa-lib, libusb1, mesa-libGL, mesa-libEGL, mesa-dri-drivers, libglvnd-glx, libglvnd-egl"
+FEDORA_REQUIRES="python3, python3-gobject, python3-cairo, python3-pyopengl, python3-setproctitle, gtk4, libadwaita, webkitgtk6.0, gstreamer1-plugins-base, gstreamer1-plugins-good, gstreamer1-plugins-bad-free, gstreamer1-plugins-ugly-free, pipewire, pipewire-gstreamer, pulseaudio-libs, alsa-lib, libusb1, mesa-libGL, mesa-libEGL, mesa-dri-drivers, libglvnd-glx, libglvnd-egl"
 
-OPENSUSE_REQUIRES="python3, python3-gobject, python3-gobject-Gdk, python3-gobject-cairo, python3-cairo, python3-opengl, python3-setproctitle, python3-python-dateutil, python3-typing_extensions, python3-isodate, typelib-1_0-Gtk-4_0, typelib-1_0-Adw-1, typelib-1_0-GtkSource-5, gstreamer, gstreamer-plugins-base, gstreamer-plugins-good, gstreamer-plugins-bad, gstreamer-plugins-ugly, gstreamer-plugin-pipewire, pipewire, libpulse0, alsa, libasound2, libusb-1_0-0, Mesa-libGL1, Mesa-libEGL1, Mesa-dri, libglvnd"
+OPENSUSE_REQUIRES="python3, python3-gobject, python3-gobject-Gdk, python3-gobject-cairo, python3-cairo, python3-opengl, python3-setproctitle, python3-python-dateutil, python3-typing_extensions, python3-isodate, typelib-1_0-Gtk-4_0, typelib-1_0-Adw-1, typelib-1_0-GtkSource-5, typelib-1_0-WebKit-6_0, gstreamer, gstreamer-plugins-base, gstreamer-plugins-good, gstreamer-plugins-bad, gstreamer-plugins-ugly, gstreamer-plugin-pipewire, pipewire, libpulse0, alsa, libasound2, libusb-1_0-0, Mesa-libGL1, Mesa-libEGL1, Mesa-dri, libglvnd"
 
 case "$TYPE" in
     deb)

@@ -41,6 +41,7 @@ depends=(
   'libusb'
   'mesa'
   'libglvnd'
+  'webkitgtk-6.0'
 )
 makedepends=(
   'cargo'

@@ -341,6 +341,47 @@ class TidalBackend:
             logger.error("Login failed: %s", detail)
         return False
 
+    def start_pkce_login(self):
+        # PKCE auth-code flow.  Required for full LOSSLESS / HI_RES streams
+        # since around 2026-04 — Tidal closed the OAuth-device-code path
+        # for those qualities (python-tidal#404), so OAuth tokens now get
+        # silently downgraded to AAC 320 even when LOSSLESS is requested.
+        # The PKCE token carries a `cuk` (client unique key) claim that
+        # unlocks LOSSLESS at the legacy `playbackinfopostpaywall` endpoint.
+        self._normalize_tls_ca_env()
+        self._set_last_login_error("")
+        self.session = tidalapi.Session()
+        self._apply_global_config()
+        url = self.session.pkce_login_url()
+        logger.info("PKCE login URL prepared.")
+        return {"url": url}
+
+    def finish_pkce_login(self, redirect_url):
+        # Called once the user pastes the redirect URL of the Tidal "Oops"
+        # page back into our login dialog.  Extracts the auth code, swaps
+        # it for an access/refresh token pair, and marks the session as
+        # PKCE so save_session preserves the `is_pkce` flag.
+        try:
+            token_json = self.session.pkce_get_auth_token(redirect_url)
+            self.session.process_auth_token(token_json, is_pkce_token=True)
+            if self.session.check_login():
+                self.user = self.session.user
+                self._tune_http_pool()
+                self.save_session()
+                self.refresh_favorite_ids()
+                self._apply_global_config()
+                self._set_last_login_error("")
+                return True
+            self._set_last_login_error(
+                "PKCE token exchange succeeded but session is not logged in."
+            )
+            logger.warning("PKCE login failed: %s", self.get_last_login_error())
+        except Exception as e:
+            detail = self._format_login_error(e)
+            self._set_last_login_error(detail)
+            logger.error("PKCE login failed: %s", detail)
+        return False
+
     def check_login(self):
         return self.session.check_login()
 
@@ -378,6 +419,11 @@ class TidalBackend:
             'access_token': self.session.access_token,
             'refresh_token': self.session.refresh_token,
             'expiry_time': self._serialize_expiry(self.session.expiry_time),
+            # is_pkce determines whether tidalapi requests HiRes / LOSSLESS
+            # streams from the legacy endpoint, so it must round-trip
+            # through the saved-token file.  Default False keeps existing
+            # OAuth-token files working without re-login.
+            'is_pkce': bool(getattr(self.session, 'is_pkce', False)),
         }
         temp_file = f"{self.token_file}.tmp"
         with open(temp_file, 'w', encoding='utf-8') as f:
@@ -412,6 +458,7 @@ class TidalBackend:
                 data['access_token'],
                 data['refresh_token'],
                 self._deserialize_expiry(data['expiry_time']),
+                is_pkce=bool(data.get('is_pkce', False)),
             )
             if not new_session.check_login():
                 logger.warning("Session %s failed: check_login returned false.", reason)
