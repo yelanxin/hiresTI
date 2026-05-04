@@ -2924,6 +2924,11 @@ pub struct Engine {
     mmap_sink: Option<MmapSink>,
     usb_sink: Option<UsbSinkHandle>,
     usb_raw_sink: Option<usb_audio::UsbRawSink>,
+    /// USB output config for native transport (V2). Populated when the V2
+    /// driver is selected and consumed when a track is loaded so V2 can
+    /// open the USB device without going through the (V1, GStreamer)
+    /// `UsbRawSink` element.
+    native_usb_config: Option<usb_audio::UsbRawSinkConfig>,
     #[allow(dead_code)]
     native_transport: native_transport::NativeTransportController,
     /// USB rawlink clock alignment: 0 = push (default), 1 = pull (Level 3).
@@ -4684,6 +4689,7 @@ impl Engine {
             mmap_sink: None,
             usb_sink: None,
             usb_raw_sink: None,
+            native_usb_config: None,
             native_transport: native_transport::NativeTransportController::new(),
             usb_clock_mode: 0,
             output_mmap_realtime_priority: ALSA_MMAP_RT_PRIORITY_DEFAULT,
@@ -4763,7 +4769,7 @@ impl Engine {
                 ),
             );
         }
-        let usb_cfg = active_usb_raw_sink(self).and_then(|sink| sink.config());
+        let usb_cfg = self.native_usb_config.clone();
         eprintln!(
             "[native-transport] load: dsp_active={} bit_perfect={} usb_output_config={} master={} peq={} conv={} tape={} tube={} wid={} lim={} resamp={} lv2={}",
             dsp_active, !dsp_active, usb_cfg.is_some(),
@@ -5899,18 +5905,36 @@ impl Engine {
         self.output_exclusive = exclusive;
 
         // Pre-claim the USB device for native transport (v2) so PipeWire
-        // cannot reclaim it before the first track starts playing.
+        // cannot reclaim it before the first track starts playing. Native
+        // transport keeps its own copy of the config so it does not have to
+        // reach into the (V1, GStreamer) usb_raw_sink element.
         if driver_is_usb_rawlink_v2(driver) {
-            if let Some(ref raw_sink) = self.usb_raw_sink {
-                if let Some(cfg) = raw_sink.config() {
+            let pref_depth = preferred_format_to_bit_depth(&self.preferred_output_format);
+            let device_id = device_norm.unwrap_or("");
+            match usb_audio::raw_config::build_usb_raw_sink_config(
+                device_id,
+                pref_depth,
+                self.usb_clock_mode,
+            ) {
+                Ok(build) => {
+                    let cfg = build.config;
                     let _ = self.native_transport.claim_device(
                         &cfg.device_id,
                         cfg.bit_depth,
                         cfg.alt_profile,
                     );
+                    self.native_usb_config = Some(cfg);
+                }
+                Err(err) => {
+                    self.emit_event(
+                        EVT_STATE,
+                        &format!("native-transport config build failed: {err}"),
+                    );
+                    self.native_usb_config = None;
                 }
             }
         } else {
+            self.native_usb_config = None;
             // Already released by stop_and_release() at the top of
             // set_output_tuned — no extra release_device() needed.
         }
