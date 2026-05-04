@@ -38,6 +38,11 @@ def _hide_freq_axis_debug() -> bool:
 _FREQ_SCALE_LINEAR = "Linear"
 _FREQ_SCALE_LOG = "Log"
 _FREQ_SCALE_NAMES = [_FREQ_SCALE_LINEAR, _FREQ_SCALE_LOG]
+# Linear-scale EMA coefficient multiplier. Linear visuals look "twitchier"
+# than log at the same EMA rate because frequency bins are uniformly spaced
+# rather than perceptually warped — scaling the attack/release coefficients
+# down keeps the visible decay feel matched between the two scales.
+_LINEAR_EMA_SCALE = 0.85
 _SPECTRUM_HALF_RATE_HZ = 22050.0
 _DEFAULT_SPECTRUM_BANDS = 4096
 _LINEAR_ANALYSIS_BANDS = 4096
@@ -1213,7 +1218,7 @@ class SpectrumVisualizer(Gtk.DrawingArea):
         time-to-target) so its frame-to-frame response visually matches log."""
         smooth = float(self._profile_cfg["smooth"])
         if self.frequency_scale_name == _FREQ_SCALE_LINEAR:
-            smooth *= 0.85
+            smooth *= _LINEAR_EMA_SCALE
         return smooth
 
     def _scaled_release_smooth(self):
@@ -1222,7 +1227,7 @@ class SpectrumVisualizer(Gtk.DrawingArea):
         consistency with the attack-side scaling."""
         release = float(self._profile_cfg.get("release_smooth", self._profile_cfg["smooth"]))
         if self.frequency_scale_name == _FREQ_SCALE_LINEAR:
-            release *= 0.85
+            release *= _LINEAR_EMA_SCALE
         return release
 
     def _push_state_engine_params(self):
@@ -3973,13 +3978,13 @@ class DotsGLVisualizer(Gtk.GLArea):
     def _scaled_smooth(self):
         smooth = float(self._profile_cfg["smooth"])
         if self.frequency_scale_name == _FREQ_SCALE_LINEAR:
-            smooth *= 0.85
+            smooth *= _LINEAR_EMA_SCALE
         return smooth
 
     def _scaled_release_smooth(self):
         release = float(self._profile_cfg.get("release_smooth", self._profile_cfg["smooth"]))
         if self.frequency_scale_name == _FREQ_SCALE_LINEAR:
-            release *= 0.85
+            release *= _LINEAR_EMA_SCALE
         return release
 
     def _reset_rust_state_engine(self):
@@ -5555,13 +5560,13 @@ class BarsGLVisualizer(Gtk.GLArea):
     def _scaled_smooth(self):
         smooth = float(self._profile_cfg["smooth"])
         if self.frequency_scale_name == _FREQ_SCALE_LINEAR:
-            smooth *= 0.85
+            smooth *= _LINEAR_EMA_SCALE
         return smooth
 
     def _scaled_release_smooth(self):
         rel = float(self._profile_cfg.get("release_smooth", self._profile_cfg["smooth"]))
         if self.frequency_scale_name == _FREQ_SCALE_LINEAR:
-            rel *= 0.85
+            rel *= _LINEAR_EMA_SCALE
         return rel
 
     def _push_state_engine_params(self):
