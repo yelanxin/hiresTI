@@ -42,6 +42,7 @@ depends=(
   'mesa'
   'libglvnd'
   'webkitgtk-6.0'
+  'xdg-dbus-proxy'
 )
 makedepends=(
   'cargo'
