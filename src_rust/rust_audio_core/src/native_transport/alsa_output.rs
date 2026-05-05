@@ -127,7 +127,7 @@ impl AlsaMmapSession {
         }
         let frames = data.len() / frame_bytes;
         self.ctx
-            .mmap_write(data, frames, &self.stop)
-            .map_err(|rc| format!("alsa_mmap mmap_write rc={rc}"))
+            .write(data, frames, &self.stop)
+            .map_err(|rc| format!("alsa write rc={rc}"))
     }
 }

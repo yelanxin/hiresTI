@@ -4669,6 +4669,7 @@ mod tests {
             format_label: "S32_LE",
             anchored: false,
             feed: None,
+            access_mode: crate::alsa_pcm::AlsaAccessMode::Mmap,
         };
 
         assert!(AlsaMmapCtx::recover_requires_restart(-libc::EPIPE));
