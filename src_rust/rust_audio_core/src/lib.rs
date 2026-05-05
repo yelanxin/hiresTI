@@ -1,11 +1,9 @@
-use gstreamer as gst;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_double, c_int, c_uint, c_void};
 use std::path::Path;
 use std::ptr;
 use std::sync::atomic::Ordering;
-use std::sync::Once;
 
 mod alsa_clock;
 mod alsa_pcm;
@@ -18,7 +16,6 @@ pub mod usb_audio;
 use alsa_pcm::{AlsaCtx, AlsaHandle};
 use dsp::{DspGraphConfig, LufsValues, PEQ_BAND_COUNT, SPECTRUM_ACTIVE_BANDS_DEFAULT};
 
-static GST_INIT: Once = Once::new();
 const SPECTRUM_BANDS_MAX: usize = 4096;
 const SPECTRUM_RING_CAP: usize = 512;
 
@@ -932,141 +929,6 @@ impl Engine {
         }
     }
 
-    fn lv2_add_slot(&mut self, uri: &str) -> Result<String, c_int> {
-        let previous_config = self.dsp_config.clone();
-        let slot_id = self.dsp_config.add_lv2_slot(uri);
-        match self.rebuild_audio_filter_graph() {
-            Ok(()) => {
-                self.emit_event(
-                    EVT_STATE,
-                    &format!("dsp-lv2 add slot_id={slot_id} uri={uri}"),
-                );
-                Ok(slot_id)
-            }
-            Err(err) => {
-                self.dsp_config = previous_config;
-                self.set_error(err.clone());
-                self.emit_event(EVT_ERROR, &err);
-                Err(-2)
-            }
-        }
-    }
-
-    fn lv2_restore_slot(&mut self, slot_id: &str, uri: &str) -> c_int {
-        let previous_config = self.dsp_config.clone();
-        self.dsp_config.restore_lv2_slot(slot_id, uri);
-        match self.rebuild_audio_filter_graph() {
-            Ok(()) => {
-                self.emit_event(
-                    EVT_STATE,
-                    &format!("dsp-lv2 restore slot_id={slot_id} uri={uri}"),
-                );
-                0
-            }
-            Err(err) => {
-                self.dsp_config = previous_config;
-                self.set_error(err.clone());
-                self.emit_event(EVT_ERROR, &err);
-                -2
-            }
-        }
-    }
-
-    fn lv2_clear_slots_for_restore(&mut self) -> c_int {
-        self.dsp_config.lv2_slots.clear();
-        0
-    }
-
-    fn lv2_restore_slot_deferred(&mut self, slot_id: &str, uri: &str) -> c_int {
-        if self.dsp_config.lv2_slot(slot_id).is_some() {
-            return 0;
-        }
-        self.dsp_config.restore_lv2_slot(slot_id, uri);
-        0
-    }
-
-    fn lv2_finish_restore_slots(&mut self) -> c_int {
-        match self.rebuild_audio_filter_graph() {
-            Ok(()) => {
-                self.emit_event(EVT_STATE, "dsp-lv2 restore-batch");
-                0
-            }
-            Err(err) => {
-                self.set_error(err.clone());
-                self.emit_event(EVT_ERROR, &err);
-                -2
-            }
-        }
-    }
-
-    fn lv2_remove_slot(&mut self, slot_id: &str) -> c_int {
-        let previous_config = self.dsp_config.clone();
-        self.dsp_config.remove_lv2_slot(slot_id);
-        match self.rebuild_audio_filter_graph() {
-            Ok(()) => {
-                self.emit_event(EVT_STATE, &format!("dsp-lv2 remove slot_id={slot_id}"));
-                0
-            }
-            Err(err) => {
-                self.dsp_config = previous_config;
-                self.set_error(err.clone());
-                self.emit_event(EVT_ERROR, &err);
-                -2
-            }
-        }
-    }
-
-    fn lv2_set_slot_enabled(&mut self, slot_id: &str, enabled: bool) -> c_int {
-        let previous_config = self.dsp_config.clone();
-        if let Some(slot) = self.dsp_config.lv2_slot_mut(slot_id) {
-            slot.set_enabled(enabled);
-        } else {
-            return -2;
-        }
-        match self.rebuild_audio_filter_graph() {
-            Ok(()) => {
-                self.emit_event(
-                    EVT_STATE,
-                    &format!(
-                        "dsp-lv2 enabled slot_id={slot_id} enabled={enabled} active={}",
-                        self.dsp_config.has_active_processing()
-                    ),
-                );
-                0
-            }
-            Err(err) => {
-                self.dsp_config = previous_config;
-                self.set_error(err.clone());
-                self.emit_event(EVT_ERROR, &err);
-                -3
-            }
-        }
-    }
-
-    fn lv2_set_port_value(&mut self, slot_id: &str, symbol: &str, value: f32) -> c_int {
-        let previous_config = self.dsp_config.clone();
-        if let Some(slot) = self.dsp_config.lv2_slot_mut(slot_id) {
-            slot.set_port_value(symbol, value);
-        } else {
-            return -2;
-        }
-        match self.refresh_audio_filter_graph() {
-            Ok(()) => {
-                self.emit_event(
-                    EVT_STATE,
-                    &format!("dsp-lv2 port slot_id={slot_id} symbol={symbol} value={value}"),
-                );
-                0
-            }
-            Err(err) => {
-                self.dsp_config = previous_config;
-                self.set_error(err.clone());
-                self.emit_event(EVT_ERROR, &err);
-                -3
-            }
-        }
-    }
-
     fn load_convolver_ir(&mut self, path: &str) -> c_int {
         let mut updated = self.dsp_config.convolver.clone();
         if let Err(err) = updated.load_from_file(path) {
@@ -1111,14 +973,6 @@ impl Engine {
     }
 
     fn new() -> Result<Self, String> {
-        // gst::init() is still required for the LV2 plugin scanner
-        // (dsp/lv2.rs uses gst::Registry + gst::ElementFactory to enumerate
-        // plugin properties for the UI picker). The audio path is fully
-        // V2 native_transport — no playbin, no GStreamer pipeline.
-        GST_INIT.call_once(|| {
-            let _ = gst::init();
-        });
-
         let dsp_config = DspGraphConfig::default();
         let spectrum_enabled = false;
 
@@ -1233,7 +1087,7 @@ impl Engine {
             None
         };
         eprintln!(
-            "[native-transport] load: dsp_active={} bit_perfect={} output_target={} master={} peq={} conv={} tape={} tube={} wid={} lim={} resamp={} lv2={}",
+            "[native-transport] load: dsp_active={} bit_perfect={} output_target={} master={} peq={} conv={} tape={} tube={} wid={} lim={} resamp={}",
             dsp_active, !dsp_active, output_target.is_some(),
             self.dsp_config.enabled,
             self.dsp_config.peq.is_active(),
@@ -1243,7 +1097,6 @@ impl Engine {
             self.dsp_config.widener.is_active(),
             self.dsp_config.limiter.is_active(),
             self.dsp_config.resampler.is_active(),
-            self.dsp_config.lv2_slots.iter().any(|s| s.is_active()),
         );
         let request = native_transport::NativeTransportLoadRequest {
             source,
@@ -3208,192 +3061,6 @@ pub extern "C" fn rac_set_widener_bass_mono_amount(ptr: *mut Engine, amount: c_i
         return -1;
     };
     engine.set_widener_bass_mono_amount(amount)
-}
-
-/// Add a new LV2 slot. On success, writes the slot_id string into *out_slot_id_ptr
-/// (caller must free with rac_lv2_free_string). Returns 0 on success, negative on error.
-#[no_mangle]
-pub extern "C" fn rac_lv2_add_slot(
-    ptr: *mut Engine,
-    uri: *const c_char,
-    out_slot_id_ptr: *mut *mut c_char,
-) -> c_int {
-    let Some(engine) = as_mut_engine(ptr) else {
-        return -1;
-    };
-    if uri.is_null() || out_slot_id_ptr.is_null() {
-        return -1;
-    }
-    let uri_str = unsafe {
-        match std::ffi::CStr::from_ptr(uri).to_str() {
-            Ok(s) => s,
-            Err(_) => return -1,
-        }
-    };
-    match engine.lv2_add_slot(uri_str) {
-        Ok(slot_id) => {
-            let c_str = match std::ffi::CString::new(slot_id) {
-                Ok(s) => s,
-                Err(_) => return -2,
-            };
-            unsafe { *out_slot_id_ptr = c_str.into_raw() };
-            0
-        }
-        Err(rc) => rc,
-    }
-}
-
-/// Restore a previously saved LV2 slot (e.g., on startup).
-#[no_mangle]
-pub extern "C" fn rac_lv2_restore_slot(
-    ptr: *mut Engine,
-    slot_id: *const c_char,
-    uri: *const c_char,
-) -> c_int {
-    let Some(engine) = as_mut_engine(ptr) else {
-        return -1;
-    };
-    if slot_id.is_null() || uri.is_null() {
-        return -1;
-    }
-    let (slot_id_str, uri_str) = unsafe {
-        let s = match std::ffi::CStr::from_ptr(slot_id).to_str() {
-            Ok(s) => s,
-            Err(_) => return -1,
-        };
-        let u = match std::ffi::CStr::from_ptr(uri).to_str() {
-            Ok(u) => u,
-            Err(_) => return -1,
-        };
-        (s, u)
-    };
-    engine.lv2_restore_slot(slot_id_str, uri_str)
-}
-
-#[no_mangle]
-pub extern "C" fn rac_lv2_clear_slots_for_restore(ptr: *mut Engine) -> c_int {
-    let Some(engine) = as_mut_engine(ptr) else {
-        return -1;
-    };
-    engine.lv2_clear_slots_for_restore()
-}
-
-#[no_mangle]
-pub extern "C" fn rac_lv2_restore_slot_deferred(
-    ptr: *mut Engine,
-    slot_id: *const c_char,
-    uri: *const c_char,
-) -> c_int {
-    let Some(engine) = as_mut_engine(ptr) else {
-        return -1;
-    };
-    if slot_id.is_null() || uri.is_null() {
-        return -1;
-    }
-    let (slot_id_str, uri_str) = unsafe {
-        let s = match std::ffi::CStr::from_ptr(slot_id).to_str() {
-            Ok(s) => s,
-            Err(_) => return -1,
-        };
-        let u = match std::ffi::CStr::from_ptr(uri).to_str() {
-            Ok(u) => u,
-            Err(_) => return -1,
-        };
-        (s, u)
-    };
-    engine.lv2_restore_slot_deferred(slot_id_str, uri_str)
-}
-
-#[no_mangle]
-pub extern "C" fn rac_lv2_finish_restore_slots(ptr: *mut Engine) -> c_int {
-    let Some(engine) = as_mut_engine(ptr) else {
-        return -1;
-    };
-    engine.lv2_finish_restore_slots()
-}
-
-#[no_mangle]
-pub extern "C" fn rac_lv2_remove_slot(ptr: *mut Engine, slot_id: *const c_char) -> c_int {
-    let Some(engine) = as_mut_engine(ptr) else {
-        return -1;
-    };
-    if slot_id.is_null() {
-        return -1;
-    }
-    let slot_id_str = unsafe {
-        match std::ffi::CStr::from_ptr(slot_id).to_str() {
-            Ok(s) => s,
-            Err(_) => return -1,
-        }
-    };
-    engine.lv2_remove_slot(slot_id_str)
-}
-
-#[no_mangle]
-pub extern "C" fn rac_lv2_set_slot_enabled(
-    ptr: *mut Engine,
-    slot_id: *const c_char,
-    enabled: c_int,
-) -> c_int {
-    let Some(engine) = as_mut_engine(ptr) else {
-        return -1;
-    };
-    if slot_id.is_null() {
-        return -1;
-    }
-    let slot_id_str = unsafe {
-        match std::ffi::CStr::from_ptr(slot_id).to_str() {
-            Ok(s) => s,
-            Err(_) => return -1,
-        }
-    };
-    engine.lv2_set_slot_enabled(slot_id_str, enabled != 0)
-}
-
-#[no_mangle]
-pub extern "C" fn rac_lv2_set_port_value(
-    ptr: *mut Engine,
-    slot_id: *const c_char,
-    symbol: *const c_char,
-    value: f32,
-) -> c_int {
-    let Some(engine) = as_mut_engine(ptr) else {
-        return -1;
-    };
-    if slot_id.is_null() || symbol.is_null() {
-        return -1;
-    }
-    let (slot_id_str, symbol_str) = unsafe {
-        let s = match std::ffi::CStr::from_ptr(slot_id).to_str() {
-            Ok(s) => s,
-            Err(_) => return -1,
-        };
-        let sym = match std::ffi::CStr::from_ptr(symbol).to_str() {
-            Ok(s) => s,
-            Err(_) => return -1,
-        };
-        (s, sym)
-    };
-    engine.lv2_set_port_value(slot_id_str, symbol_str, value)
-}
-
-/// Scan all installed LV2 plugins. Returns a JSON string (caller must free with rac_lv2_free_string).
-#[no_mangle]
-pub extern "C" fn rac_lv2_scan_plugins(_ptr: *mut Engine) -> *mut c_char {
-    use crate::dsp::lv2_scan_plugins;
-    let json = lv2_scan_plugins();
-    match std::ffi::CString::new(json) {
-        Ok(c_str) => c_str.into_raw(),
-        Err(_) => std::ptr::null_mut(),
-    }
-}
-
-/// Free a string returned by rac_lv2_add_slot or rac_lv2_scan_plugins.
-#[no_mangle]
-pub extern "C" fn rac_lv2_free_string(ptr: *mut c_char) {
-    if !ptr.is_null() {
-        unsafe { drop(std::ffi::CString::from_raw(ptr)) };
-    }
 }
 
 #[no_mangle]

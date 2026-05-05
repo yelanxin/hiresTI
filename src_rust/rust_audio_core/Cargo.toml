@@ -29,7 +29,6 @@ pkg-config = "0.3"
 cc = "1"
 
 [dependencies]
-gstreamer = "0.23"
 libc = "0.2"
 rustfft = "6"
 rusb = "0.9"

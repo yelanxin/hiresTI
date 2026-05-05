@@ -1,7 +1,6 @@
 mod convolver;
 mod limiter;
 pub mod lufs;
-mod lv2;
 mod peq;
 mod resampler;
 mod tape;
@@ -11,7 +10,6 @@ mod widener;
 pub use convolver::ConvolverConfig;
 pub use limiter::LimiterConfig;
 pub use lufs::LufsValues;
-pub use lv2::{lv2_scan_plugins, Lv2SlotConfig};
 pub use peq::{PeqConfig, PEQ_BAND_COUNT};
 pub use resampler::ResamplerConfig;
 pub use tape::TapeConfig;
@@ -28,8 +26,7 @@ pub(crate) use widener::WidenerState;
 
 pub(crate) const SPECTRUM_ACTIVE_BANDS_DEFAULT: u32 = 512;
 /// Spectrum-frame emit cadence shared with native_transport's
-/// SpectrumPcmProcessor. Originally matched GStreamer's `spectrum` element
-/// interval; kept the same so V2 produces frames at a well-tested rate.
+/// SpectrumPcmProcessor.
 pub(crate) const SPECTRUM_ACTIVE_INTERVAL_NS: u64 = 16_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -74,32 +71,20 @@ impl DspReorderableModule {
     }
 }
 
-/// A single entry in the DSP processing order.
-/// Built-in modules are identified by their fixed ID; LV2 slots by a unique
-/// slot_id string (always prefixed with `"lv2_"`).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum DspOrderEntry {
     Builtin(DspReorderableModule),
-    Lv2Slot(String),
 }
 
 impl DspOrderEntry {
     pub fn id(&self) -> &str {
         match self {
             Self::Builtin(m) => m.id(),
-            Self::Lv2Slot(id) => id.as_str(),
         }
     }
 
     pub fn from_id(value: &str) -> Option<Self> {
-        let v = value.trim();
-        if let Some(m) = DspReorderableModule::from_id(v) {
-            Some(Self::Builtin(m))
-        } else if v.starts_with("lv2_") {
-            Some(Self::Lv2Slot(v.to_string()))
-        } else {
-            None
-        }
+        DspReorderableModule::from_id(value.trim()).map(Self::Builtin)
     }
 }
 
@@ -114,8 +99,6 @@ pub struct DspGraphConfig {
     pub widener: WidenerConfig,
     pub limiter: LimiterConfig,
     pub resampler: ResamplerConfig,
-    pub lv2_slots: Vec<Lv2SlotConfig>,
-    lv2_slot_counter: usize,
 }
 
 impl Default for DspGraphConfig {
@@ -133,19 +116,15 @@ impl Default for DspGraphConfig {
             widener: WidenerConfig::default(),
             limiter: LimiterConfig::default(),
             resampler: ResamplerConfig::default(),
-            lv2_slots: Vec::new(),
-            lv2_slot_counter: 0,
         }
     }
 }
 
 impl DspGraphConfig {
     /// Return a de-duplicated order ensuring all built-in modules appear exactly
-    /// once. LV2 slot entries are kept as-is (deduplicated) but never
-    /// auto-appended — they must be explicitly present.
+    /// once.
     pub fn sanitized_order(order: &[DspOrderEntry]) -> Vec<DspOrderEntry> {
         let mut seen_builtins = std::collections::HashSet::new();
-        let mut seen_lv2 = std::collections::HashSet::new();
         let mut out: Vec<DspOrderEntry> = Vec::new();
 
         for entry in order {
@@ -153,11 +132,6 @@ impl DspGraphConfig {
                 DspOrderEntry::Builtin(m) => {
                     if seen_builtins.insert(*m) {
                         out.push(DspOrderEntry::Builtin(*m));
-                    }
-                }
-                DspOrderEntry::Lv2Slot(id) => {
-                    if seen_lv2.insert(id.clone()) {
-                        out.push(DspOrderEntry::Lv2Slot(id.clone()));
                     }
                 }
             }
@@ -186,52 +160,6 @@ impl DspGraphConfig {
             .collect()
     }
 
-    // ── LV2 slot management ────────────────────────────────────────────────
-
-    pub fn lv2_slot(&self, slot_id: &str) -> Option<&Lv2SlotConfig> {
-        self.lv2_slots.iter().find(|s| s.slot_id == slot_id)
-    }
-
-    pub fn lv2_slot_mut(&mut self, slot_id: &str) -> Option<&mut Lv2SlotConfig> {
-        self.lv2_slots.iter_mut().find(|s| s.slot_id == slot_id)
-    }
-
-    /// Add a new LV2 plugin slot. Returns the generated slot_id.
-    pub fn add_lv2_slot(&mut self, uri: &str) -> String {
-        let slot_id = format!("lv2_{}", self.lv2_slot_counter);
-        self.lv2_slot_counter += 1;
-        self.lv2_slots
-            .push(Lv2SlotConfig::new(slot_id.clone(), uri));
-        self.order.push(DspOrderEntry::Lv2Slot(slot_id.clone()));
-        slot_id
-    }
-
-    /// Restore a slot with a specific slot_id (used during startup). Does NOT
-    /// modify the order (caller must have already set the order via
-    /// `set_order_from_ids`). Skips if a slot with that ID already exists.
-    pub fn restore_lv2_slot(&mut self, slot_id: &str, uri: &str) {
-        if self.lv2_slots.iter().any(|s| s.slot_id == slot_id) {
-            return;
-        }
-        let config = Lv2SlotConfig::new(slot_id, uri);
-        self.lv2_slots.push(config);
-        // Keep counter consistent.
-        if let Some(n) = slot_id
-            .strip_prefix("lv2_")
-            .and_then(|s| s.parse::<usize>().ok())
-        {
-            if n >= self.lv2_slot_counter {
-                self.lv2_slot_counter = n + 1;
-            }
-        }
-    }
-
-    pub fn remove_lv2_slot(&mut self, slot_id: &str) {
-        self.lv2_slots.retain(|s| s.slot_id != slot_id);
-        self.order
-            .retain(|e| !matches!(e, DspOrderEntry::Lv2Slot(id) if id == slot_id));
-    }
-
     pub fn has_active_processing(&self) -> bool {
         self.enabled
             && (self.peq.is_active()
@@ -240,8 +168,7 @@ impl DspGraphConfig {
                 || self.tube.is_active()
                 || self.widener.is_active()
                 || self.limiter.is_active()
-                || self.resampler.is_active()
-                || self.lv2_slots.iter().any(Lv2SlotConfig::is_active))
+                || self.resampler.is_active())
     }
 
     pub fn has_native_transport_processing(&self) -> bool {
@@ -255,8 +182,7 @@ impl DspGraphConfig {
     }
 
     pub fn has_native_transport_unsupported_processing(&self) -> bool {
-        self.enabled
-            && (self.resampler.is_active() || self.lv2_slots.iter().any(Lv2SlotConfig::is_active))
+        self.enabled && self.resampler.is_active()
     }
 
     pub fn native_transport_unsupported_modules(&self) -> Vec<&'static str> {
@@ -267,12 +193,8 @@ impl DspGraphConfig {
         if self.resampler.is_active() {
             modules.push("resampler");
         }
-        if self.lv2_slots.iter().any(Lv2SlotConfig::is_active) {
-            modules.push("lv2");
-        }
         modules
     }
-
 }
 
 // Generate `effective_X_config()` methods for DspGraphConfig: each clones the
@@ -335,28 +257,4 @@ mod tests {
             vec!["widener", "peq", "convolver", "tape", "tube"]
         );
     }
-
-    #[test]
-    fn lv2_slots_in_order() {
-        let mut config = DspGraphConfig::default();
-        config.set_order_from_ids(&["peq", "lv2_0", "tape"]);
-        config.restore_lv2_slot("lv2_0", "http://example.com/plugin");
-        let ids = config.order_ids();
-        assert!(ids.contains(&"lv2_0".to_string()));
-        let lv2_pos = ids.iter().position(|s| s == "lv2_0").unwrap();
-        let peq_pos = ids.iter().position(|s| s == "peq").unwrap();
-        let tape_pos = ids.iter().position(|s| s == "tape").unwrap();
-        assert!(peq_pos < lv2_pos && lv2_pos < tape_pos);
-    }
-
-    #[test]
-    fn disabled_lv2_slot_does_not_count_as_active_processing() {
-        let mut config = DspGraphConfig::default();
-        config.restore_lv2_slot("lv2_0", "http://example.com/plugin");
-        assert!(config.has_active_processing());
-
-        config.lv2_slot_mut("lv2_0").unwrap().set_enabled(false);
-        assert!(!config.has_active_processing());
-    }
-
 }

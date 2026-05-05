@@ -189,9 +189,6 @@ impl PcmProcessor for DspPcmProcessor {
                 DspOrderEntry::Builtin(DspReorderableModule::Widener) => {
                     self.widener.process(&mut self.f64_buf, channels);
                 }
-                DspOrderEntry::Lv2Slot(_) => {
-                    // LV2 plugins are GStreamer-only; skip in native transport.
-                }
             }
         }
         // Limiter always runs last (same as GStreamer graph).
