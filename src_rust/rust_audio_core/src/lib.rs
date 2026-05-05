@@ -6,8 +6,8 @@ use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_double, c_int, c_uint, c_void};
 use std::path::Path;
 use std::ptr;
-use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::{Arc, Once};
+use std::sync::atomic::Ordering;
+use std::sync::Once;
 
 mod alsa_clock;
 mod alsa_pcm;
@@ -96,6 +96,16 @@ fn driver_is_usb_rawlink_v2(driver: &str) -> bool {
 /// querying playbin.
 fn driver_uses_native_transport(driver: &str) -> bool {
     driver_is_usb_rawlink_v2(driver) || driver_routes_via_native_alsa(driver)
+}
+
+fn native_transport_format_depth(fmt: native_transport::PcmSampleFormat) -> Option<i32> {
+    use native_transport::PcmSampleFormat::*;
+    Some(match fmt {
+        S16LE => 16,
+        S24_3LE | S24LE => 24,
+        S32LE | F32LE => 32,
+        F64LE => 64,
+    })
 }
 
 struct UsbRuntimeInfo {
@@ -208,7 +218,6 @@ pub struct Engine {
     native_spectrum_pending: VecDeque<native_transport::SpectrumFrame>,
     /// Guards against emitting multiple EOS events for a single native transport track.
     native_eos_emitted: bool,
-    element_msg_seen: u64,
     fmt_probe_tick: u64,
     last_codec: String,
     last_bitrate: i32,
@@ -237,53 +246,9 @@ pub struct Engine {
     output_buffer_us: i32,
     output_latency_us: i32,
     output_exclusive: bool,
-    /// Latest GStreamer buffering percentage (0–100) from HTTP source.
-    /// Updated in `pump_events`, read by USB pusher thread for diagnostics.
-    buffering_pct: Arc<AtomicI32>,
 }
 
 impl Engine {
-    fn parse_tag_text_value(text: &str, key: &str) -> Option<String> {
-        let lower = text.to_ascii_lowercase();
-        let pat = format!("{key}=");
-        // GStreamer serialises a TagList as "taglist, k1=(type)v1, k2=(type)v2, ...".
-        // A bare find("bitrate=") would also hit "maximum-bitrate=" or
-        // "nominal-bitrate=" since they contain "bitrate=" as a substring.
-        // Anchor the search on the ", " field separator to match the exact key.
-        let boundary = format!(", {key}=");
-        let pos = lower
-            .find(&boundary)
-            .map(|p| p + 2) // skip leading ", "
-            .or_else(|| {
-                // Edge case: key is the very first field (no leading ", ").
-                // GStreamer always prepends "taglist, " so the byte before
-                // key= is a space; guard against substring matches anyway.
-                lower
-                    .find(&pat)
-                    .filter(|&p| p == 0 || lower.as_bytes().get(p.wrapping_sub(1)) == Some(&b' '))
-            })?;
-        let rest = &text[(pos + pat.len())..];
-        let mut out = String::new();
-        for ch in rest.chars() {
-            if ch == ',' || ch == ';' || ch == '}' || ch == '\n' {
-                break;
-            }
-            out.push(ch);
-        }
-        let mut v = out.trim().to_string();
-        if let Some(idx) = v.find(')') {
-            v = v[(idx + 1)..].trim().to_string();
-        }
-        if v.starts_with('"') && v.ends_with('"') && v.len() >= 2 {
-            v = v[1..(v.len() - 1)].to_string();
-        }
-        if v.is_empty() {
-            None
-        } else {
-            Some(v)
-        }
-    }
-
     fn parse_depth_from_format(fmt: &str) -> Option<i32> {
         let up = fmt.to_ascii_uppercase();
         if up.contains("S24_32") {
@@ -303,56 +268,8 @@ impl Engine {
         digits.parse::<i32>().ok().filter(|v| *v > 0)
     }
 
-    fn parse_source_rate_depth_from_codec_text(codec: &str) -> (Option<i32>, Option<i32>) {
-        let low = codec.to_ascii_lowercase();
-        let mut rate: Option<i32> = None;
-        let mut depth: Option<i32> = None;
-
-        // Example: "FLAC, 44100 Hz, 16-bit"
-        if let Some(pos) = low.find("hz") {
-            let pre = &low[..pos];
-            let mut digits_rev: Vec<char> = Vec::new();
-            for ch in pre.chars().rev() {
-                if ch.is_ascii_digit() {
-                    digits_rev.push(ch);
-                } else if !digits_rev.is_empty() {
-                    break;
-                }
-            }
-            if !digits_rev.is_empty() {
-                let s: String = digits_rev.into_iter().rev().collect();
-                if let Ok(v) = s.parse::<i32>() {
-                    if v > 0 {
-                        rate = Some(v);
-                    }
-                }
-            }
-        }
-
-        if let Some(pos) = low.find("-bit").or_else(|| low.find(" bit")) {
-            let pre = &low[..pos];
-            let mut digits_rev: Vec<char> = Vec::new();
-            for ch in pre.chars().rev() {
-                if ch.is_ascii_digit() {
-                    digits_rev.push(ch);
-                } else if !digits_rev.is_empty() {
-                    break;
-                }
-            }
-            if !digits_rev.is_empty() {
-                let s: String = digits_rev.into_iter().rev().collect();
-                if let Ok(v) = s.parse::<i32>() {
-                    if v > 0 {
-                        depth = Some(v);
-                    }
-                }
-            }
-        }
-
-        (rate, depth)
-    }
-
     fn query_output_format(&self) -> (Option<i32>, Option<i32>) {
+        // USB rawlink V2: read negotiated rate/depth from the ISO ring runtime.
         if let Some(runtime) = self.native_transport.runtime_info() {
             let rate = runtime.feed.rate.load(Ordering::Relaxed) as i32;
             let depth = runtime.bit_depth as i32;
@@ -362,28 +279,78 @@ impl Engine {
                 return (rate, depth);
             }
         }
-        let sink: Option<gst::Element> = self.playbin.property("audio-sink");
-        let Some(sink) = sink else {
-            return (None, None);
-        };
-        let Some(pad) = sink.static_pad("sink") else {
-            return (None, None);
-        };
-        let caps = pad.current_caps().or_else(|| pad.allowed_caps());
-        let Some(caps) = caps else {
-            return (None, None);
-        };
-        let Some(st) = caps.structure(0) else {
-            return (None, None);
-        };
+        // ALSA family: derive from native_transport's decoded stream spec.
+        let snap = self.native_transport.snapshot();
+        if let Some(spec) = snap.stream_spec.as_ref() {
+            let rate = if spec.sample_rate > 0 {
+                Some(spec.sample_rate as i32)
+            } else {
+                None
+            };
+            let depth = native_transport_format_depth(spec.format);
+            return (rate, depth);
+        }
+        (None, None)
+    }
 
-        let rate = st.get::<i32>("rate").ok().filter(|v| *v > 0);
-        let depth = st
-            .get::<String>("format")
-            .ok()
-            .as_deref()
-            .and_then(Self::parse_depth_from_format);
-        (rate, depth)
+    /// Update Engine's cached source/output format fields from a native_transport
+    /// EVT_TAG payload (format: `key=value;key=value;…`). The event is also
+    /// forwarded to the FFI consumer in drain_native_transport_events; this
+    /// only updates internal state used by JSON readouts and position tracking.
+    fn absorb_native_tag_event(&mut self, msg: &str) {
+        for part in msg.split(';') {
+            let Some((key, value)) = part.split_once('=') else {
+                continue;
+            };
+            let key = key.trim();
+            let value = value.trim();
+            if value.is_empty() {
+                continue;
+            }
+            match key {
+                "codec" => {
+                    if value != self.last_codec {
+                        self.last_codec = value.to_string();
+                    }
+                }
+                "bitrate" => {
+                    if let Ok(v) = value.parse::<i32>() {
+                        if v > 0 {
+                            self.last_bitrate = v;
+                        }
+                    }
+                }
+                "rate" => {
+                    if let Ok(v) = value.parse::<i32>() {
+                        if v > 0 {
+                            self.last_rate = v;
+                        }
+                    }
+                }
+                "depth" => {
+                    if let Ok(v) = value.parse::<i32>() {
+                        if v > 0 {
+                            self.last_depth = v;
+                        }
+                    }
+                }
+                "source_rate" => {
+                    if let Ok(v) = value.parse::<i32>() {
+                        if v > 0 {
+                            self.source_rate = v;
+                        }
+                    }
+                }
+                "source_depth" => {
+                    if let Ok(v) = value.parse::<i32>() {
+                        if v > 0 {
+                            self.source_depth = v;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     fn maybe_emit_tag_update(
@@ -1237,7 +1204,6 @@ impl Engine {
             spectrum_lead_ms: 0.0,
             native_spectrum_pending: VecDeque::new(),
             native_eos_emitted: false,
-            element_msg_seen: 0,
             fmt_probe_tick: 0,
             last_codec: String::new(),
             last_bitrate: 0,
@@ -1259,7 +1225,6 @@ impl Engine {
             output_buffer_us: 100_000,
             output_latency_us: 10_000,
             output_exclusive: false,
-            buffering_pct: Arc::new(AtomicI32::new(100)),
         })
     }
 
@@ -1371,6 +1336,9 @@ impl Engine {
             if evt == EVT_ERROR {
                 self.set_error(msg.clone());
             }
+            if evt == EVT_TAG {
+                self.absorb_native_tag_event(&msg);
+            }
             self.emit_event(evt, &msg);
         }
         if self.spectrum_enabled {
@@ -1459,98 +1427,16 @@ impl Engine {
 
     fn pump_events(&mut self) -> c_int {
         self.drain_native_transport_events();
-        let Some(bus) = self.playbin.bus() else {
-            return 0;
-        };
-        let mut count = 0;
-        let max_per_tick = 128;
-        while let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(0)) {
-            count += 1;
-            match msg.view() {
-                gst::MessageView::Eos(..) => {
-                    self.emit_event(EVT_EOS, "eos");
-                }
-                gst::MessageView::Error(err) => {
-                    let text = format!(
-                        "{} ({:?})",
-                        err.error(),
-                        err.debug().unwrap_or_else(|| "no-debug".into())
-                    );
-                    self.set_error(text.clone());
-                    self.emit_event(EVT_ERROR, &text);
-                }
-                gst::MessageView::StateChanged(sc) => {
-                    // Keep only playbin state-change noise.
-                    let is_self = msg
-                        .src()
-                        .map(|s| s.name() == self.playbin.name())
-                        .unwrap_or(false);
-                    if is_self {
-                        self.emit_event(EVT_STATE, &format!("{:?}", sc.current()));
-                    }
-                }
-                gst::MessageView::Element(elm) => {
-                    if let Some(st) = elm.structure() {
-                        self.element_msg_seen = self.element_msg_seen.wrapping_add(1);
-                        if self.element_msg_seen <= 4 || self.element_msg_seen % 240 == 0 {
-                            self.emit_event(EVT_STATE, &format!("elem-msg:{}", st.name()));
-                        }
-                    }
-                }
-                gst::MessageView::Buffering(b) => {
-                    let percent = b.percent();
-                    let prev_pct = self.buffering_pct.swap(percent, Ordering::Relaxed);
-                    if percent == 0 || percent == 100 || (prev_pct < 100 && percent >= 100) {
-                        eprintln!("usb-audio: network buffering {}%", percent,);
-                    }
-                    self.emit_event(EVT_STATE, &format!("buffering={}", percent));
-                }
-                gst::MessageView::Tag(t) => {
-                    let text = t.tags().to_string();
-                    let codec = Self::parse_tag_text_value(&text, "audio-codec")
-                        .or_else(|| Self::parse_tag_text_value(&text, "codec"));
-                    let bitrate = Self::parse_tag_text_value(&text, "bitrate")
-                        .and_then(|v| v.parse::<i32>().ok())
-                        .filter(|v| *v > 0);
-                    // Prefer extracting source format directly from full TAG payload.
-                    let (tr, td) = Self::parse_source_rate_depth_from_codec_text(&text);
-                    if let Some(v) = tr {
-                        if v > 0 {
-                            self.source_rate = v;
-                        }
-                    }
-                    if let Some(v) = td {
-                        if v > 0 {
-                            self.source_depth = v;
-                        }
-                    }
-                    if let Some(ref c) = codec {
-                        let (sr, sd) = Self::parse_source_rate_depth_from_codec_text(c);
-                        if let Some(v) = sr {
-                            if v > 0 {
-                                self.source_rate = v;
-                            }
-                        }
-                        if let Some(v) = sd {
-                            if v > 0 {
-                                self.source_depth = v;
-                            }
-                        }
-                    }
-                    self.maybe_emit_tag_update(codec, bitrate, None, None);
-                }
-                _ => {}
-            }
-            if count >= max_per_tick {
-                break;
-            }
-        }
+        // Periodic format-probe fallback: native_transport emits EVT_TAG once
+        // per track (handled in drain), but we still poll for late-arriving
+        // negotiated rate/depth (e.g. ALSA mmap session that hadn't published
+        // its stream_spec at decode-start time).
         self.fmt_probe_tick = self.fmt_probe_tick.wrapping_add(1);
         if self.fmt_probe_tick % 10 == 0 {
             let (rate, depth) = self.query_output_format();
             self.maybe_emit_tag_update(None, None, rate, depth);
         }
-        count
+        0
     }
 
     fn set_output_tuned(
