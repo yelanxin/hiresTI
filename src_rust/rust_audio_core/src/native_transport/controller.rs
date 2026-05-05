@@ -10,7 +10,7 @@ use super::source::{
     inspect_mpd_manifest, MpdManifestInfo, NativeDecoderKind, NativeTransportSource,
     NativeTransportSourceKind,
 };
-use super::output::NativeOutputTarget;
+use super::output::{NativeOutputTarget, OutputSession};
 use crate::alsa_clock::{AlsaHwClockFeed, ClockMode};
 use crate::usb_audio::{
     self, OpenUsbDevice, QueueMode, UacAltProfile, UsbAudioSink, UsbRawSinkConfig,
@@ -1696,7 +1696,7 @@ fn decode_direct_audio_stream(
         processor_chain.push(Box::new(LufsPcmProcessor::new(lufs_values)));
     }
     let mut chain_configured = false;
-    let mut output_session: Option<UsbAudioSink> = None;
+    let mut output_session: Option<OutputSession> = None;
     let mut reuse_sess = reuse_session;
     let mut pre_handle = pre_claimed_handle;
     let mut reuse_buf: Vec<u8> = Vec::new();
@@ -1932,7 +1932,7 @@ fn decode_direct_audio_stream(
                         control_device: session.control_device(),
                     };
                     set_native_runtime(runtime, Some(runtime_info));
-                    output_session = Some(session);
+                    output_session = Some(OutputSession::Usb(session));
                     // Notify Python layer that USB audio is configured so
                     // the hw-volume UI can sync with the actual DAC state.
                     queue_native_event(events, crate::EVT_STATE, "usb-audio configured");
@@ -1946,8 +1946,13 @@ fn decode_direct_audio_stream(
                         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                         .unwrap_or(false);
                     if v2_poll_enabled && snapshot_join.is_none() {
-                        let snap_state =
-                            Arc::clone(&output_session.as_ref().unwrap().state);
+                        let snap_state = Arc::clone(
+                            &output_session
+                                .as_ref()
+                                .and_then(|s| s.as_usb())
+                                .expect("usb session just inserted")
+                                .state,
+                        );
                         let snap_stop = Arc::clone(&snapshot_stop);
                         snapshot_join = thread::Builder::new()
                             .name("native-transport-snapshot".to_string())
@@ -2018,7 +2023,8 @@ fn decode_direct_audio_stream(
                 push_slab_to_usb_output(
                     output_session
                         .as_mut()
-                        .expect("output session just created"),
+                        .and_then(|s| s.as_usb_mut())
+                        .expect("usb output session just created"),
                     cfg,
                     slab.spec.sample_rate,
                     push_data,
@@ -2079,7 +2085,12 @@ fn decode_direct_audio_stream(
     // keep the interface claimed between track switches.
     // Prefer the active output_session; fall back to the unused reuse_sess
     // (happens when decode fails before the first slab opens a session).
-    let session_to_park = output_session.take().or(reuse_sess.take());
+    // Only USB sessions are parkable; ALSA sessions are dropped at end of
+    // playback because there is no equivalent inter-track claim to keep.
+    let session_to_park = output_session
+        .take()
+        .and_then(|s| s.into_usb())
+        .or(reuse_sess.take());
     if let Some(session) = session_to_park {
         if let Ok(mut slot) = session_slot.lock() {
             *slot = Some(session);

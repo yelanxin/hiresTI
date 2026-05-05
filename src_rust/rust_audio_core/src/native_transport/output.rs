@@ -6,7 +6,9 @@
 //! can drive ALSA mmap or other backends without duplicating the loader /
 //! decoder / DSP chain.
 
-use crate::usb_audio::UsbRawSinkConfig;
+use crate::usb_audio::{UsbAudioSink, UsbRawSinkConfig};
+
+use super::alsa_output::AlsaMmapSession;
 
 /// Configuration for the ALSA mmap output backend.
 ///
@@ -56,6 +58,44 @@ impl NativeOutputTarget {
     pub fn alsa_cfg(&self) -> Option<&AlsaMmapOutputConfig> {
         match self {
             Self::AlsaMmap(cfg) => Some(cfg),
+            _ => None,
+        }
+    }
+}
+
+/// Live output session owned by the V2 decode worker. Variants mirror
+/// `NativeOutputTarget`: the worker dispatches `push_bytes` (and a few
+/// state queries) to whichever backend is active for the current load.
+pub enum OutputSession {
+    Usb(UsbAudioSink),
+    AlsaMmap(AlsaMmapSession),
+}
+
+impl OutputSession {
+    pub fn as_usb(&self) -> Option<&UsbAudioSink> {
+        match self {
+            Self::Usb(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub fn as_usb_mut(&mut self) -> Option<&mut UsbAudioSink> {
+        match self {
+            Self::Usb(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub fn as_alsa_mut(&mut self) -> Option<&mut AlsaMmapSession> {
+        match self {
+            Self::AlsaMmap(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub fn into_usb(self) -> Option<UsbAudioSink> {
+        match self {
+            Self::Usb(s) => Some(s),
             _ => None,
         }
     }
