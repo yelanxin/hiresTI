@@ -1,4 +1,3 @@
-use gst::glib;
 use gst::prelude::*;
 use gstreamer as gst;
 use std::collections::{HashMap, VecDeque};
@@ -19,10 +18,7 @@ pub mod usb_audio;
 
 #[cfg(test)]
 use alsa_pcm::{AlsaCtx, AlsaHandle};
-use dsp::{
-    DspGraphConfig, DspGraphRuntime, LufsValues, PEQ_BAND_COUNT,
-    SPECTRUM_ACTIVE_BANDS_DEFAULT,
-};
+use dsp::{DspGraphConfig, LufsValues, PEQ_BAND_COUNT, SPECTRUM_ACTIVE_BANDS_DEFAULT};
 
 static GST_INIT: Once = Once::new();
 const SPECTRUM_BANDS_MAX: usize = 4096;
@@ -198,8 +194,6 @@ fn json_escape(v: &str) -> String {
 #[derive(Debug)]
 pub struct Engine {
     playbin: gst::Element,
-    audio_filter_graph: Option<DspGraphRuntime>,
-    audio_filter_rebuild_pending: bool,
     dsp_config: DspGraphConfig,
     uri: String,
     last_error: Option<String>,
@@ -221,8 +215,6 @@ pub struct Engine {
     spectrum_ring_seq: Vec<u64>,
     spectrum_ring_write: usize,
     spectrum_ring_count: usize,
-    spectrum_seen_msgs: u64,
-    spectrum_msg_count: u64,
     /// Smoothed delta (ms) between spectrum endtime and query_position.
     /// Positive means spectrum is ahead of the sink's consumption point.
     /// Used by `probe_latency` for USB rawlink delay compensation.
@@ -377,93 +369,6 @@ impl Engine {
         (rate, depth)
     }
 
-    fn clocktime_to_s(v: gst::ClockTime) -> Option<f64> {
-        let ns = v.nseconds();
-        if ns == 0 {
-            return None;
-        }
-        Some((ns as f64) / 1_000_000_000.0)
-    }
-
-    fn spectrum_time_from_structure(s: &gst::StructureRef) -> Option<(f64, &'static str)> {
-        // Prefer endtime/running-time style fields carried by spectrum element
-        // over pull-time query_position to avoid clock-domain skew.
-        for key in ["endtime", "running-time", "stream-time", "timestamp"] {
-            if let Ok(v) = s.get::<gst::ClockTime>(key) {
-                if let Some(sec) = Self::clocktime_to_s(v) {
-                    return Some((sec, key));
-                }
-            }
-            if let Ok(v) = s.get::<u64>(key) {
-                if v > 0 {
-                    return Some(((v as f64) / 1_000_000_000.0, key));
-                }
-            }
-            if let Ok(v) = s.get::<i64>(key) {
-                if v > 0 {
-                    return Some(((v as f64) / 1_000_000_000.0, key));
-                }
-            }
-        }
-        None
-    }
-
-    fn spectrum_scalar_from_value(v: &glib::SendValue) -> Option<f32> {
-        if let Ok(x) = v.get::<f32>() {
-            if x.is_finite() {
-                return Some(x);
-            }
-        }
-        if let Ok(x) = v.get::<f64>() {
-            if x.is_finite() {
-                return Some(x as f32);
-            }
-        }
-        None
-    }
-
-    fn spectrum_channels_from_value(v: &glib::SendValue) -> Option<Vec<Vec<f32>>> {
-        if let Ok(arr) = v.get::<gst::Array>() {
-            return Self::spectrum_channels_from_values(arr.as_slice());
-        }
-        if let Ok(list) = v.get::<gst::List>() {
-            return Self::spectrum_channels_from_values(list.as_slice());
-        }
-        Self::spectrum_scalar_from_value(v).map(|x| vec![vec![x]])
-    }
-
-    fn spectrum_channels_from_values(values: &[glib::SendValue]) -> Option<Vec<Vec<f32>>> {
-        if values.is_empty() {
-            return Some(Vec::new());
-        }
-
-        let mut scalar_channel = Vec::with_capacity(values.len());
-        let mut all_scalar = true;
-        for v in values {
-            if let Some(x) = Self::spectrum_scalar_from_value(v) {
-                scalar_channel.push(x);
-            } else {
-                all_scalar = false;
-                break;
-            }
-        }
-        if all_scalar {
-            return Some(vec![scalar_channel]);
-        }
-
-        let mut channels = Vec::new();
-        for v in values {
-            if let Some(mut nested) = Self::spectrum_channels_from_value(v) {
-                channels.append(&mut nested);
-            }
-        }
-        if channels.is_empty() {
-            None
-        } else {
-            Some(channels)
-        }
-    }
-
     fn query_output_format(&self) -> (Option<i32>, Option<i32>) {
         if let Some(runtime) = self.native_transport.runtime_info() {
             let rate = runtime.feed.rate.load(Ordering::Relaxed) as i32;
@@ -577,9 +482,8 @@ impl Engine {
         self.spectrum_ring_pos_s = new_spectrum_ring_pos_s();
         self.spectrum_ring_seq = new_spectrum_ring_seq();
         // Reset LUFS accumulators so integrated / LRA restart on each new track.
-        if let Some(ref graph) = self.audio_filter_graph {
-            graph.reset_lufs();
-        }
+        // V2 native_transport's LufsPcmProcessor handles the reset internally
+        // when load() resets per-track state.
     }
 
     fn set_spectrum_filter_enabled(&mut self, enabled: bool) {
@@ -601,49 +505,15 @@ impl Engine {
         let _ = self.sync_audio_filter_graph();
     }
 
-    /// Returns whether a DSP bin is currently attached as playbin's audio-filter.
-    /// Queries playbin directly, so it is always in sync with GStreamer's internal
-    /// state (e.g. after set_state(Null) resets the property automatically).
-    fn is_filter_attached(&self) -> bool {
-        self.playbin
-            .property::<Option<gst::Element>>("audio-filter")
-            .is_some()
-    }
-
+    /// Hot-push the current DSP config to V2 native_transport.
+    ///
+    /// Historically also rebuilt and re-attached a GStreamer audio-filter bin
+    /// to playbin; that bin became inert once every driver migrated to V2
+    /// (playbin no longer transitions to Playing for V2 paths, so no buffers
+    /// flow through audio-filter), so the attach side was removed in
+    /// commit-of-this-cleanup. The function name is kept to minimise churn at
+    /// the ~40 setter call sites that invoke it after a config change.
     fn sync_audio_filter_graph(&mut self) -> Result<(), String> {
-        if self.audio_filter_rebuild_pending && self.audio_filter_graph_rebuild_is_safe() {
-            self.audio_filter_graph = None;
-            self.playbin
-                .set_property("audio-filter", Option::<gst::Element>::None);
-            self.audio_filter_rebuild_pending = false;
-        }
-        if self.audio_filter_graph.is_none() {
-            self.audio_filter_graph = Some(DspGraphRuntime::build(&self.dsp_config)?);
-        }
-        // Snapshot attachment state *after* any rebuild-triggered detach but *before*
-        // taking a mutable borrow on the graph (Rust borrow checker limitation).
-        // is_filter_attached() queries playbin directly so this reflects true state.
-        let filter_attached = self.is_filter_attached();
-        let Some(graph) = self.audio_filter_graph.as_mut() else {
-            if filter_attached {
-                self.playbin
-                    .set_property("audio-filter", Option::<gst::Element>::None);
-            }
-            return Ok(());
-        };
-
-        graph.set_spectrum_runtime_enabled(
-            self.spectrum_enabled,
-            self.spectrum_stereo_enabled,
-            self.spectrum_active_bands,
-        );
-        graph.apply_config(&self.dsp_config)?;
-
-        if !filter_attached {
-            let elem = graph.bin_element();
-            self.playbin.set_property("audio-filter", &elem);
-        }
-        // Push DSP config to native transport for hot-update during playback.
         let _ = self.native_transport.update_dsp_config(&self.dsp_config);
         Ok(())
     }
@@ -652,22 +522,7 @@ impl Engine {
         self.sync_audio_filter_graph()
     }
 
-    fn audio_filter_graph_rebuild_is_safe(&self) -> bool {
-        let state = self.playbin.state(gst::ClockTime::from_mseconds(0)).1;
-        // Paused is also safe: no data is flowing, and a brief pipeline
-        // reconfiguration on the next resume is acceptable.
-        matches!(
-            state,
-            gst::State::Null | gst::State::Ready | gst::State::Paused
-        )
-    }
-
     fn rebuild_audio_filter_graph(&mut self) -> Result<(), String> {
-        self.audio_filter_graph = None;
-        // New bin element; detach so sync will re-attach with the new element.
-        self.playbin
-            .set_property("audio-filter", Option::<gst::Element>::None);
-        self.audio_filter_rebuild_pending = false;
         self.sync_audio_filter_graph()
     }
 
@@ -719,38 +574,24 @@ impl Engine {
     fn set_dsp_master_enabled(&mut self, enabled: bool) -> c_int {
         let previous_config = self.dsp_config.clone();
         self.dsp_config.enabled = enabled;
-        if self.audio_filter_graph_rebuild_is_safe() {
-            match self.rebuild_audio_filter_graph() {
-                Ok(()) => {
-                    self.emit_event(
-                        EVT_STATE,
-                        &format!(
-                            "dsp-master enabled={} active={} rebuild=1",
-                            self.dsp_config.enabled,
-                            self.dsp_config.has_active_processing()
-                        ),
-                    );
-                    0
-                }
-                Err(err) => {
-                    self.dsp_config = previous_config;
-                    self.set_error(err.clone());
-                    self.emit_event(EVT_ERROR, &err);
-                    -2
-                }
+        match self.rebuild_audio_filter_graph() {
+            Ok(()) => {
+                self.emit_event(
+                    EVT_STATE,
+                    &format!(
+                        "dsp-master enabled={} active={}",
+                        self.dsp_config.enabled,
+                        self.dsp_config.has_active_processing()
+                    ),
+                );
+                0
             }
-        } else {
-            self.audio_filter_rebuild_pending = true;
-            let _ = self.native_transport.update_dsp_config(&self.dsp_config);
-            self.emit_event(
-                EVT_STATE,
-                &format!(
-                    "dsp-master enabled={} active={} rebuild=0 deferred=1",
-                    self.dsp_config.enabled,
-                    self.dsp_config.has_active_processing()
-                ),
-            );
-            0
+            Err(err) => {
+                self.dsp_config = previous_config;
+                self.set_error(err.clone());
+                self.emit_event(EVT_ERROR, &err);
+                -2
+            }
         }
     }
 
@@ -762,36 +603,20 @@ impl Engine {
             .filter(|value| !value.is_empty())
             .collect();
         self.dsp_config.set_order_from_ids(&ids);
-        if self.audio_filter_graph_rebuild_is_safe() {
-            match self.rebuild_audio_filter_graph() {
-                Ok(()) => {
-                    self.emit_event(
-                        EVT_STATE,
-                        &format!(
-                            "dsp-order {} rebuild=1",
-                            self.dsp_config.order_ids().join(",")
-                        ),
-                    );
-                    0
-                }
-                Err(err) => {
-                    self.dsp_config = previous_config;
-                    self.set_error(err.clone());
-                    self.emit_event(EVT_ERROR, &err);
-                    -2
-                }
+        match self.rebuild_audio_filter_graph() {
+            Ok(()) => {
+                self.emit_event(
+                    EVT_STATE,
+                    &format!("dsp-order {}", self.dsp_config.order_ids().join(",")),
+                );
+                0
             }
-        } else {
-            self.audio_filter_rebuild_pending = true;
-            let _ = self.native_transport.update_dsp_config(&self.dsp_config);
-            self.emit_event(
-                EVT_STATE,
-                &format!(
-                    "dsp-order {} rebuild=0 deferred=1",
-                    self.dsp_config.order_ids().join(",")
-                ),
-            );
-            0
+            Err(err) => {
+                self.dsp_config = previous_config;
+                self.set_error(err.clone());
+                self.emit_event(EVT_ERROR, &err);
+                -2
+            }
         }
     }
 
@@ -1170,30 +995,20 @@ impl Engine {
     fn lv2_add_slot(&mut self, uri: &str) -> Result<String, c_int> {
         let previous_config = self.dsp_config.clone();
         let slot_id = self.dsp_config.add_lv2_slot(uri);
-        if self.audio_filter_graph_rebuild_is_safe() {
-            match self.rebuild_audio_filter_graph() {
-                Ok(()) => {
-                    self.emit_event(
-                        EVT_STATE,
-                        &format!("dsp-lv2 add slot_id={slot_id} uri={uri} rebuild=1"),
-                    );
-                    Ok(slot_id)
-                }
-                Err(err) => {
-                    self.dsp_config = previous_config;
-                    self.set_error(err.clone());
-                    self.emit_event(EVT_ERROR, &err);
-                    Err(-2)
-                }
+        match self.rebuild_audio_filter_graph() {
+            Ok(()) => {
+                self.emit_event(
+                    EVT_STATE,
+                    &format!("dsp-lv2 add slot_id={slot_id} uri={uri}"),
+                );
+                Ok(slot_id)
             }
-        } else {
-            self.audio_filter_rebuild_pending = true;
-            let _ = self.native_transport.update_dsp_config(&self.dsp_config);
-            self.emit_event(
-                EVT_STATE,
-                &format!("dsp-lv2 add slot_id={slot_id} uri={uri} rebuild=0 deferred=1"),
-            );
-            Ok(slot_id)
+            Err(err) => {
+                self.dsp_config = previous_config;
+                self.set_error(err.clone());
+                self.emit_event(EVT_ERROR, &err);
+                Err(-2)
+            }
         }
     }
 
@@ -1247,30 +1062,17 @@ impl Engine {
     fn lv2_remove_slot(&mut self, slot_id: &str) -> c_int {
         let previous_config = self.dsp_config.clone();
         self.dsp_config.remove_lv2_slot(slot_id);
-        if self.audio_filter_graph_rebuild_is_safe() {
-            match self.rebuild_audio_filter_graph() {
-                Ok(()) => {
-                    self.emit_event(
-                        EVT_STATE,
-                        &format!("dsp-lv2 remove slot_id={slot_id} rebuild=1"),
-                    );
-                    0
-                }
-                Err(err) => {
-                    self.dsp_config = previous_config;
-                    self.set_error(err.clone());
-                    self.emit_event(EVT_ERROR, &err);
-                    -2
-                }
+        match self.rebuild_audio_filter_graph() {
+            Ok(()) => {
+                self.emit_event(EVT_STATE, &format!("dsp-lv2 remove slot_id={slot_id}"));
+                0
             }
-        } else {
-            self.audio_filter_rebuild_pending = true;
-            let _ = self.native_transport.update_dsp_config(&self.dsp_config);
-            self.emit_event(
-                EVT_STATE,
-                &format!("dsp-lv2 remove slot_id={slot_id} rebuild=0 deferred=1"),
-            );
-            0
+            Err(err) => {
+                self.dsp_config = previous_config;
+                self.set_error(err.clone());
+                self.emit_event(EVT_ERROR, &err);
+                -2
+            }
         }
     }
 
@@ -1281,36 +1083,23 @@ impl Engine {
         } else {
             return -2;
         }
-        if self.audio_filter_graph_rebuild_is_safe() {
-            match self.rebuild_audio_filter_graph() {
-                Ok(()) => {
-                    self.emit_event(
-                        EVT_STATE,
-                        &format!(
-                            "dsp-lv2 enabled slot_id={slot_id} enabled={enabled} active={} rebuild=1",
-                            self.dsp_config.has_active_processing()
-                        ),
-                    );
-                    0
-                }
-                Err(err) => {
-                    self.dsp_config = previous_config;
-                    self.set_error(err.clone());
-                    self.emit_event(EVT_ERROR, &err);
-                    -3
-                }
+        match self.rebuild_audio_filter_graph() {
+            Ok(()) => {
+                self.emit_event(
+                    EVT_STATE,
+                    &format!(
+                        "dsp-lv2 enabled slot_id={slot_id} enabled={enabled} active={}",
+                        self.dsp_config.has_active_processing()
+                    ),
+                );
+                0
             }
-        } else {
-            self.audio_filter_rebuild_pending = true;
-            let _ = self.native_transport.update_dsp_config(&self.dsp_config);
-            self.emit_event(
-                EVT_STATE,
-                &format!(
-                    "dsp-lv2 enabled slot_id={slot_id} enabled={enabled} active={} rebuild=0 deferred=1",
-                    self.dsp_config.has_active_processing()
-                ),
-            );
-            0
+            Err(err) => {
+                self.dsp_config = previous_config;
+                self.set_error(err.clone());
+                self.emit_event(EVT_ERROR, &err);
+                -3
+            }
         }
     }
 
@@ -1381,137 +1170,6 @@ impl Engine {
         }
     }
 
-    fn parse_spectrum_structure(&mut self, s: &gst::StructureRef, msg_ts_s: Option<f64>) {
-        if !self.spectrum_enabled {
-            return;
-        }
-        let sname = s.name().to_ascii_lowercase();
-        if !sname.contains("spectrum") {
-            return;
-        }
-        self.spectrum_seen_msgs = self.spectrum_seen_msgs.wrapping_add(1);
-        let channels = s
-            .value("magnitude")
-            .ok()
-            .and_then(Self::spectrum_channels_from_value);
-        let mut mono = [0.0f32; SPECTRUM_BANDS_MAX];
-        let mut left = [0.0f32; SPECTRUM_BANDS_MAX];
-        let mut right = [0.0f32; SPECTRUM_BANDS_MAX];
-        let mut n = 0usize;
-        if let Some(channels) = channels {
-            let channel_count = channels.len().max(1);
-            n = channels
-                .iter()
-                .map(|ch| ch.len())
-                .max()
-                .unwrap_or(0)
-                .min(SPECTRUM_BANDS_MAX);
-            for i in 0..n {
-                let mut sum = 0.0f32;
-                let mut present = 0usize;
-                for ch in &channels {
-                    if i < ch.len() {
-                        sum += ch[i];
-                        present += 1;
-                    }
-                }
-                if present > 0 {
-                    mono[i] = sum / (present as f32);
-                }
-                if let Some(ch0) = channels.get(0) {
-                    if i < ch0.len() {
-                        left[i] = ch0[i];
-                    }
-                }
-                if let Some(ch1) = channels.get(1) {
-                    if i < ch1.len() {
-                        right[i] = ch1[i];
-                    } else {
-                        right[i] = left[i];
-                    }
-                } else {
-                    right[i] = left[i];
-                }
-            }
-            let _ = channel_count;
-        }
-
-        if n == 0 {
-            if self.spectrum_seen_msgs % 120 == 0 {
-                self.emit_event(
-                    EVT_STATE,
-                    &format!(
-                        "spectrum-msgs={} parsed={}",
-                        self.spectrum_seen_msgs, self.spectrum_msg_count
-                    ),
-                );
-            }
-            return;
-        }
-        // Prefer spectrum-structure carried timeline. Fallback to message ts, then
-        // to pull-time query_position.
-        let mut frame_pos_s = self.spectrum_pos_s;
-        if let Some((ts, _src)) = Self::spectrum_time_from_structure(s) {
-            frame_pos_s = ts;
-        } else if let Some(ts) = msg_ts_s {
-            if ts.is_finite() && ts >= 0.0 {
-                frame_pos_s = ts;
-            }
-        } else if let Some(pos) = self.playbin.query_position::<gst::ClockTime>() {
-            frame_pos_s = (pos.nseconds() as f64) / 1_000_000_000.0;
-        }
-        // New track / backward seek can leave a few stale spectrum messages in the
-        // bus after the caller has already reset its local cursor. Drop the old
-        // ring immediately so `get_spectrum_frames_since(0)` does not replay the
-        // previous timeline on every recovery tick.
-        if self.spectrum_len > 0 && frame_pos_s.is_finite() && frame_pos_s >= 0.0 {
-            let prev_pos_s = self.spectrum_pos_s;
-            if prev_pos_s.is_finite() && frame_pos_s < (prev_pos_s - 0.25) {
-                self.reset_spectrum_timeline();
-            }
-        }
-        self.spectrum_pos_s = frame_pos_s;
-
-        self.spectrum_vals[..n].copy_from_slice(&mono[..n]);
-        self.spectrum_left_vals[..n].copy_from_slice(&left[..n]);
-        self.spectrum_right_vals[..n].copy_from_slice(&right[..n]);
-        self.spectrum_len = n;
-        self.spectrum_seq = self.spectrum_seq.wrapping_add(1);
-        let ridx = self.spectrum_ring_write;
-        self.spectrum_ring_vals[ridx] = [0.0; SPECTRUM_BANDS_MAX];
-        self.spectrum_ring_left_vals[ridx] = [0.0; SPECTRUM_BANDS_MAX];
-        self.spectrum_ring_right_vals[ridx] = [0.0; SPECTRUM_BANDS_MAX];
-        self.spectrum_ring_vals[ridx][..n].copy_from_slice(&mono[..n]);
-        self.spectrum_ring_left_vals[ridx][..n].copy_from_slice(&left[..n]);
-        self.spectrum_ring_right_vals[ridx][..n].copy_from_slice(&right[..n]);
-        self.spectrum_ring_len[ridx] = n as u16;
-        self.spectrum_ring_pos_s[ridx] = frame_pos_s;
-        self.spectrum_ring_seq[ridx] = self.spectrum_seq;
-        self.spectrum_ring_write = (self.spectrum_ring_write + 1) % SPECTRUM_RING_CAP;
-        self.spectrum_ring_count = (self.spectrum_ring_count + 1).min(SPECTRUM_RING_CAP);
-        self.spectrum_msg_count = self.spectrum_msg_count.wrapping_add(1);
-        // Track how far ahead the spectrum endtime is vs. query_position.
-        // This captures the pipeline-internal buffering (playbin multiqueue)
-        // that separates the spectrum tap from the appsink consumption point.
-        if let Some(q_pos) = self
-            .playbin
-            .query_position::<gst::ClockTime>()
-            .map(|p| (p.nseconds() as f64) / 1_000_000_000.0)
-        {
-            if q_pos >= 0.0 && frame_pos_s >= 0.0 {
-                let lead_ms = (frame_pos_s - q_pos) * 1000.0;
-                if lead_ms > 0.0 {
-                    // EMA smooth (α=0.1) to avoid jitter
-                    if self.spectrum_lead_ms <= 0.0 {
-                        self.spectrum_lead_ms = lead_ms;
-                    } else {
-                        self.spectrum_lead_ms = self.spectrum_lead_ms * 0.9 + lead_ms * 0.1;
-                    }
-                }
-            }
-        }
-    }
-
     fn new() -> Result<Self, String> {
         GST_INIT.call_once(|| {
             let _ = gst::init();
@@ -1570,18 +1228,9 @@ impl Engine {
 
         let dsp_config = DspGraphConfig::default();
         let spectrum_enabled = false;
-        let mut audio_filter_graph = DspGraphRuntime::build(&dsp_config).ok();
-        if let Some(ref mut graph) = audio_filter_graph {
-            graph.set_spectrum_runtime_enabled(spectrum_enabled, false, SPECTRUM_ACTIVE_BANDS_DEFAULT);
-            let _ = graph.apply_config(&dsp_config);
-            let elem = graph.bin_element();
-            playbin.set_property("audio-filter", &elem);
-        }
 
         Ok(Self {
             playbin,
-            audio_filter_graph,
-            audio_filter_rebuild_pending: false,
             dsp_config,
             uri: String::new(),
             last_error: None,
@@ -1603,8 +1252,6 @@ impl Engine {
             spectrum_ring_seq: new_spectrum_ring_seq(),
             spectrum_ring_write: 0,
             spectrum_ring_count: 0,
-            spectrum_seen_msgs: 0,
-            spectrum_msg_count: 0,
             spectrum_lead_ms: 0.0,
             native_spectrum_pending: VecDeque::new(),
             native_eos_emitted: false,
@@ -1826,7 +1473,6 @@ impl Engine {
         self.spectrum_ring_seq[ridx] = self.spectrum_seq;
         self.spectrum_ring_write = (self.spectrum_ring_write + 1) % SPECTRUM_RING_CAP;
         self.spectrum_ring_count = (self.spectrum_ring_count + 1).min(SPECTRUM_RING_CAP);
-        self.spectrum_msg_count = self.spectrum_msg_count.wrapping_add(1);
     }
 
     fn pump_events(&mut self) -> c_int {
@@ -1859,12 +1505,6 @@ impl Engine {
                         .unwrap_or(false);
                     if is_self {
                         self.emit_event(EVT_STATE, &format!("{:?}", sc.current()));
-                        // Opportunistically consume a pending DSP rebuild on any
-                        // state transition. sync_audio_filter_graph checks is_safe()
-                        // internally and no-ops if the new state is not suitable.
-                        if self.audio_filter_rebuild_pending {
-                            let _ = self.sync_audio_filter_graph();
-                        }
                     }
                 }
                 gst::MessageView::Element(elm) => {
@@ -1873,7 +1513,6 @@ impl Engine {
                         if self.element_msg_seen <= 4 || self.element_msg_seen % 240 == 0 {
                             self.emit_event(EVT_STATE, &format!("elem-msg:{}", st.name()));
                         }
-                        self.parse_spectrum_structure(st, None);
                     }
                 }
                 gst::MessageView::Buffering(b) => {
@@ -2289,15 +1928,7 @@ pub extern "C" fn rac_get_lufs(
     {
         return -2;
     }
-    let vals: LufsValues = if driver_uses_native_transport(&engine.output_driver) {
-        engine.native_transport.lufs_values()
-    } else {
-        engine
-            .audio_filter_graph
-            .as_ref()
-            .map(|g| g.lufs_values())
-            .unwrap_or_default()
-    };
+    let vals: LufsValues = engine.native_transport.lufs_values();
     unsafe {
         *out_m = vals.momentary;
         *out_s = vals.short_term;
@@ -2970,12 +2601,7 @@ pub extern "C" fn rac_pause(ptr: *mut Engine) -> c_int {
             }
         }
     }
-    let rc = engine.set_state(gst::State::Paused);
-    // Apply any pending DSP structural rebuild now that the pipeline is paused.
-    if engine.audio_filter_rebuild_pending {
-        let _ = engine.sync_audio_filter_graph();
-    }
-    rc
+    engine.set_state(gst::State::Paused)
 }
 
 #[no_mangle]

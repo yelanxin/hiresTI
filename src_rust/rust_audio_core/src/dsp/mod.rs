@@ -1,7 +1,3 @@
-use gst::prelude::*;
-use gstreamer as gst;
-use std::collections::HashMap;
-
 mod convolver;
 mod limiter;
 pub mod lufs;
@@ -12,15 +8,15 @@ mod tape;
 mod tube;
 mod widener;
 
-pub use convolver::{ConvolverConfig, ConvolverNode};
-pub use limiter::{LimiterConfig, LimiterNode};
-pub use lufs::{LufsNode, LufsValues};
-pub use lv2::{lv2_scan_plugins, Lv2Node, Lv2SlotConfig};
-pub use peq::{PeqConfig, PeqNode, PEQ_BAND_COUNT};
-pub use resampler::{ResamplerConfig, ResamplerNode};
-pub use tape::{TapeConfig, TapeNode};
-pub use tube::{TubeConfig, TubeNode};
-pub use widener::{WidenerConfig, WidenerNode};
+pub use convolver::ConvolverConfig;
+pub use limiter::LimiterConfig;
+pub use lufs::LufsValues;
+pub use lv2::{lv2_scan_plugins, Lv2SlotConfig};
+pub use peq::{PeqConfig, PEQ_BAND_COUNT};
+pub use resampler::ResamplerConfig;
+pub use tape::TapeConfig;
+pub use tube::TubeConfig;
+pub use widener::WidenerConfig;
 
 // Pure-Rust DSP states for native transport (no GStreamer dependency).
 pub(crate) use convolver::ConvolverState;
@@ -31,13 +27,10 @@ pub(crate) use tube::TubeState;
 pub(crate) use widener::WidenerState;
 
 pub(crate) const SPECTRUM_ACTIVE_BANDS_DEFAULT: u32 = 512;
-pub(crate) const SPECTRUM_ACTIVE_BANDS_MAX: u32 = 2048;
-const SPECTRUM_IDLE_BANDS: u32 = 16;
-/// Spectrum-frame emit cadence (matches GStreamer's `spectrum` element).
-/// Shared by V1 (GStreamer pipeline) and V2 (native_transport processor)
-/// so both paths produce frames at the same rate.
+/// Spectrum-frame emit cadence shared with native_transport's
+/// SpectrumPcmProcessor. Originally matched GStreamer's `spectrum` element
+/// interval; kept the same so V2 produces frames at a well-tested rate.
 pub(crate) const SPECTRUM_ACTIVE_INTERVAL_NS: u64 = 16_000_000;
-const SPECTRUM_IDLE_INTERVAL_NS: u64 = 10_000_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DspReorderableModule {
@@ -280,18 +273,6 @@ impl DspGraphConfig {
         modules
     }
 
-    pub fn effective_lv2_slots(&self) -> Vec<Lv2SlotConfig> {
-        self.lv2_slots
-            .iter()
-            .cloned()
-            .map(|mut slot| {
-                if !self.enabled {
-                    slot.set_enabled(false);
-                }
-                slot
-            })
-            .collect()
-    }
 }
 
 // Generate `effective_X_config()` methods for DspGraphConfig: each clones the
@@ -319,450 +300,12 @@ impl_effective_config!(
     effective_tape_config,      tape,      TapeConfig;
     effective_tube_config,      tube,      TubeConfig;
     effective_widener_config,   widener,   WidenerConfig;
-    effective_resampler_config, resampler, ResamplerConfig;
 );
 
-#[derive(Debug)]
-pub struct DspGraphRuntime {
-    bin: gst::Bin,
-    peq: Option<PeqNode>,
-    convolver: Option<ConvolverNode>,
-    tape: Option<TapeNode>,
-    tube: Option<TubeNode>,
-    widener: Option<WidenerNode>,
-    limiter: Option<LimiterNode>,
-    resampler: Option<ResamplerNode>,
-    lv2_slots: HashMap<String, Lv2Node>,
-    spectrum: Option<gst::Element>,
-    lufs: Option<LufsNode>,
-}
-
-impl DspGraphRuntime {
-    pub fn build(config: &DspGraphConfig) -> Result<Self, String> {
-        let bin = gst::Bin::new();
-        let internal_caps = gst::Caps::builder("audio/x-raw")
-            .field("format", "F64LE")
-            .field("layout", "interleaved")
-            .build();
-
-        let in_convert = gst::ElementFactory::make("audioconvert")
-            .name("rust-dsp-in-convert")
-            .build()
-            .map_err(|e| format!("audioconvert unavailable: {e}"))?;
-        let in_capsfilter = gst::ElementFactory::make("capsfilter")
-            .name("rust-dsp-in-caps")
-            .build()
-            .map_err(|e| format!("capsfilter unavailable: {e}"))?;
-        in_capsfilter.set_property("caps", &internal_caps);
-        let out_convert = gst::ElementFactory::make("audioconvert")
-            .name("rust-dsp-out-convert")
-            .build()
-            .map_err(|e| format!("audioconvert unavailable: {e}"))?;
-        let out_capsfilter = gst::ElementFactory::make("capsfilter")
-            .name("rust-dsp-out-caps")
-            .build()
-            .map_err(|e| format!("capsfilter unavailable: {e}"))?;
-        out_capsfilter.set_property("caps", &internal_caps);
-
-        let peq = match PeqNode::new() {
-            Ok(mut node) => {
-                node.apply_config(&config.peq)?;
-                Some(node)
-            }
-            Err(_) if !config.has_active_processing() => None,
-            Err(err) => return Err(err),
-        };
-        let convolver = match ConvolverNode::new() {
-            Ok(mut node) => {
-                node.apply_config(&config.effective_convolver_config())?;
-                Some(node)
-            }
-            Err(_) if !config.convolver.is_active() => None,
-            Err(err) => return Err(err),
-        };
-        let tape = match TapeNode::new() {
-            Ok(mut node) => {
-                node.apply_config(&config.effective_tape_config())?;
-                Some(node)
-            }
-            Err(_) if !config.tape.is_active() => None,
-            Err(err) => return Err(err),
-        };
-        let tube = match TubeNode::new() {
-            Ok(mut node) => {
-                node.apply_config(&config.effective_tube_config())?;
-                Some(node)
-            }
-            Err(_) if !config.tube.is_active() => None,
-            Err(err) => return Err(err),
-        };
-        let widener = match WidenerNode::new() {
-            Ok(mut node) => {
-                node.apply_config(&config.effective_widener_config())?;
-                Some(node)
-            }
-            Err(_) if !config.widener.is_active() => None,
-            Err(err) => return Err(err),
-        };
-        let limiter = match LimiterNode::new() {
-            Ok(mut node) => {
-                node.apply_config(&config.effective_limiter_config())?;
-                Some(node)
-            }
-            Err(_) if !config.limiter.is_active() => None,
-            Err(err) => return Err(err),
-        };
-        let resampler = match ResamplerNode::new() {
-            Ok(mut node) => {
-                node.apply_config(&config.effective_resampler_config())?;
-                Some(node)
-            }
-            Err(_) if !config.resampler.is_active() => None,
-            Err(err) => return Err(err),
-        };
-
-        let spectrum = Self::build_spectrum_element()?;
-
-        let lufs = match LufsNode::new() {
-            Ok(node) => Some(node),
-            Err(err) => {
-                eprintln!("[dsp] lufs meter unavailable: {err}");
-                None
-            }
-        };
-
-        // Refresh the GStreamer registry once per graph build so that newly
-        // installed LV2 plugins are visible.  Calling this once here (rather than
-        // once per Lv2Node::new) avoids redundant filesystem scans when multiple
-        // LV2 slots are active, and keeps the main-loop blocking time short.
-        let active_lv2_slots: Vec<_> = config
-            .effective_lv2_slots()
-            .into_iter()
-            .filter(|s| s.is_active())
-            .collect();
-        if !active_lv2_slots.is_empty() {
-            crate::dsp::lv2::refresh_gstreamer_registry();
-        }
-
-        // Detect URI → factory-name collisions before attempting to load.
-        // Two different URIs can produce the same GStreamer factory name (all
-        // non-alphanumeric chars become '-'), causing one plugin to silently fail.
-        {
-            let mut seen: HashMap<String, &str> = HashMap::new();
-            for slot in &active_lv2_slots {
-                let factory = crate::dsp::lv2::uri_to_gst_factory_name(&slot.uri);
-                if let Some(prev_uri) = seen.get(&factory) {
-                    eprintln!(
-                        "[dsp] lv2 factory-name collision: '{}' and '{}' both map to '{}'; \
-                         one plugin will fail to load",
-                        prev_uri, slot.uri, factory
-                    );
-                } else {
-                    seen.insert(factory, &slot.uri);
-                }
-            }
-        }
-
-        // Build LV2 nodes only for enabled slots. Some plugins do not implement
-        // bypass/passthrough reliably, so a disabled slot must be excluded from
-        // the live DSP chain rather than left in place with a best-effort bypass.
-        let mut lv2_slots: HashMap<String, Lv2Node> = HashMap::new();
-        for slot_config in active_lv2_slots.iter() {
-            match Lv2Node::new(slot_config) {
-                Ok(node) => {
-                    lv2_slots.insert(slot_config.slot_id.clone(), node);
-                }
-                Err(e) => {
-                    eprintln!("[dsp] lv2 slot {} failed to load: {e}", slot_config.slot_id);
-                    // Non-fatal: skip this slot rather than failing the whole graph.
-                }
-            }
-        }
-
-        bin.add(&in_convert)
-            .map_err(|_| "failed to add dsp input convert".to_string())?;
-        bin.add(&in_capsfilter)
-            .map_err(|_| "failed to add dsp input caps".to_string())?;
-        if let Some(ref node) = peq {
-            bin.add(node.element())
-                .map_err(|_| "failed to add dsp peq".to_string())?;
-        }
-        if let Some(ref node) = convolver {
-            bin.add(node.element())
-                .map_err(|_| "failed to add dsp convolver".to_string())?;
-        }
-        if let Some(ref node) = tape {
-            bin.add(node.element())
-                .map_err(|_| "failed to add dsp tape".to_string())?;
-        }
-        if let Some(ref node) = tube {
-            bin.add(node.element())
-                .map_err(|_| "failed to add dsp tube".to_string())?;
-        }
-        if let Some(ref node) = widener {
-            bin.add(node.element())
-                .map_err(|_| "failed to add dsp widener".to_string())?;
-        }
-        if let Some(ref node) = limiter {
-            bin.add(node.element())
-                .map_err(|_| "failed to add dsp limiter".to_string())?;
-        }
-        if let Some(ref node) = resampler {
-            bin.add(node.element())
-                .map_err(|_| "failed to add dsp resampler".to_string())?;
-        }
-        for (slot_id, node) in &lv2_slots {
-            bin.add(&node.element())
-                .map_err(|_| format!("failed to add lv2 slot {slot_id}"))?;
-        }
-        if let Some(ref spectrum_elem) = spectrum {
-            bin.add(spectrum_elem)
-                .map_err(|_| "failed to add dsp spectrum".to_string())?;
-        }
-        if let Some(ref node) = lufs {
-            bin.add(node.element())
-                .map_err(|_| "failed to add dsp lufs meter".to_string())?;
-        }
-        bin.add(&out_capsfilter)
-            .map_err(|_| "failed to add dsp output caps".to_string())?;
-        bin.add(&out_convert)
-            .map_err(|_| "failed to add dsp output convert".to_string())?;
-
-        let mut chain: Vec<gst::Element> = vec![in_convert.clone(), in_capsfilter.clone()];
-        for entry in DspGraphConfig::sanitized_order(&config.order) {
-            match entry {
-                DspOrderEntry::Builtin(DspReorderableModule::Peq) => {
-                    if let Some(ref node) = peq {
-                        chain.push(node.element().clone());
-                    }
-                }
-                DspOrderEntry::Builtin(DspReorderableModule::Convolver) => {
-                    if let Some(ref node) = convolver {
-                        chain.push(node.element().clone());
-                    }
-                }
-                DspOrderEntry::Builtin(DspReorderableModule::Tape) => {
-                    if let Some(ref node) = tape {
-                        chain.push(node.element().clone());
-                    }
-                }
-                DspOrderEntry::Builtin(DspReorderableModule::Tube) => {
-                    if let Some(ref node) = tube {
-                        chain.push(node.element().clone());
-                    }
-                }
-                DspOrderEntry::Builtin(DspReorderableModule::Widener) => {
-                    if let Some(ref node) = widener {
-                        chain.push(node.element().clone());
-                    }
-                }
-                DspOrderEntry::Lv2Slot(ref slot_id) => {
-                    if let Some(node) = lv2_slots.get(slot_id) {
-                        chain.push(node.element());
-                    }
-                }
-            }
-        }
-        if let Some(ref node) = limiter {
-            chain.push(node.element().clone());
-        }
-        if let Some(ref spectrum_elem) = spectrum {
-            chain.push(spectrum_elem.clone());
-        }
-        // LUFS meter tap: placed after spectrum (and limiter) so it measures
-        // the final processed loudness, before the output resampler so that
-        // K-weighting coefficients match the source sample rate.
-        if let Some(ref node) = lufs {
-            chain.push(node.element().clone());
-        }
-        // Keep the analyzer tap before the output resampler so FFT bin spacing
-        // follows the decoded/DSP-processed content bandwidth rather than the
-        // post-upsampling Nyquist range. Otherwise high-rate resampling makes
-        // the same musical content collapse toward the left side of the graph.
-        if let Some(ref node) = resampler {
-            chain.push(node.element().clone());
-        }
-        chain.push(out_capsfilter.clone());
-        chain.push(out_convert.clone());
-
-        for pair in chain.windows(2) {
-            if pair[0].link(&pair[1]).is_err() {
-                return Err(format!(
-                    "failed to link dsp graph: {} -> {}",
-                    pair[0].name(),
-                    pair[1].name()
-                ));
-            }
-        }
-
-        let sink_pad = chain
-            .first()
-            .and_then(|elem| elem.static_pad("sink"))
-            .ok_or_else(|| "dsp graph missing sink pad".to_string())?;
-        let src_pad = chain
-            .last()
-            .and_then(|elem| elem.static_pad("src"))
-            .ok_or_else(|| "dsp graph missing src pad".to_string())?;
-        let ghost_sink = gst::GhostPad::with_target(&sink_pad)
-            .map_err(|_| "failed to create dsp ghost sink pad".to_string())?;
-        let ghost_src = gst::GhostPad::with_target(&src_pad)
-            .map_err(|_| "failed to create dsp ghost src pad".to_string())?;
-        bin.add_pad(&ghost_sink)
-            .map_err(|_| "failed to add dsp ghost sink pad".to_string())?;
-        bin.add_pad(&ghost_src)
-            .map_err(|_| "failed to add dsp ghost src pad".to_string())?;
-
-        Ok(Self {
-            bin,
-            peq,
-            convolver,
-            tape,
-            tube,
-            widener,
-            limiter,
-            resampler,
-            lv2_slots,
-            spectrum,
-            lufs,
-        })
-    }
-
-    pub fn bin_element(&self) -> gst::Element {
-        self.bin.clone().upcast()
-    }
-
-    #[cfg(test)]
-    pub fn has_spectrum(&self) -> bool {
-        self.spectrum.is_some()
-    }
-
-    pub fn apply_config(&mut self, config: &DspGraphConfig) -> Result<(), String> {
-        if let Some(ref mut peq) = self.peq {
-            peq.apply_config(&config.effective_peq_config())?;
-        } else if config.effective_peq_config().is_active() {
-            return Err("dsp peq unavailable".to_string());
-        }
-        if let Some(ref mut convolver) = self.convolver {
-            convolver.apply_config(&config.effective_convolver_config())?;
-        } else if config.effective_convolver_config().is_active() {
-            return Err("dsp convolver unavailable".to_string());
-        }
-        if let Some(ref mut tape) = self.tape {
-            tape.apply_config(&config.effective_tape_config())?;
-        } else if config.effective_tape_config().is_active() {
-            return Err("dsp tape unavailable".to_string());
-        }
-        if let Some(ref mut limiter) = self.limiter {
-            limiter.apply_config(&config.effective_limiter_config())?;
-        } else if config.effective_limiter_config().is_active() {
-            return Err("dsp limiter unavailable".to_string());
-        }
-        if let Some(ref mut tube) = self.tube {
-            tube.apply_config(&config.effective_tube_config())?;
-        } else if config.effective_tube_config().is_active() {
-            return Err("dsp tube unavailable".to_string());
-        }
-        if let Some(ref mut widener) = self.widener {
-            widener.apply_config(&config.effective_widener_config())?;
-        } else if config.effective_widener_config().is_active() {
-            return Err("dsp widener unavailable".to_string());
-        }
-        if let Some(ref mut resampler) = self.resampler {
-            resampler.apply_config(&config.effective_resampler_config())?;
-        } else if config.effective_resampler_config().is_active() {
-            return Err("dsp resampler unavailable".to_string());
-        }
-        // Hot-update LV2 port values for currently active nodes. Slot
-        // enable/disable rebuilds the graph, so inactive slots are absent here
-        // by design and their stored values will be applied on next enable.
-        for slot_config in &config.effective_lv2_slots() {
-            if let Some(node) = self.lv2_slots.get(&slot_config.slot_id) {
-                node.apply_config(slot_config);
-            }
-        }
-        Ok(())
-    }
-
-    pub fn set_spectrum_runtime_enabled(&self, enabled: bool, stereo_enabled: bool, active_bands: u32) {
-        let Some(ref spectrum) = self.spectrum else {
-            return;
-        };
-        for p in spectrum.list_properties() {
-            let pn = p.name();
-            if pn == "message" {
-                let _ = spectrum.set_property("message", enabled);
-            } else if pn == "post-messages" {
-                let _ = spectrum.set_property("post-messages", enabled);
-            } else if pn == "message-magnitude" {
-                let _ = spectrum.set_property("message-magnitude", enabled);
-            } else if pn == "message-phase" {
-                let _ = spectrum.set_property("message-phase", false);
-            } else if pn == "multi-channel" {
-                let _ = spectrum.set_property("multi-channel", enabled && stereo_enabled);
-            } else if pn == "bands" {
-                let bands = if enabled {
-                    active_bands.clamp(2, SPECTRUM_ACTIVE_BANDS_MAX)
-                } else {
-                    SPECTRUM_IDLE_BANDS
-                };
-                let _ = spectrum.set_property("bands", bands);
-            } else if pn == "interval" {
-                let interval_ns = if enabled {
-                    SPECTRUM_ACTIVE_INTERVAL_NS
-                } else {
-                    SPECTRUM_IDLE_INTERVAL_NS
-                };
-                let _ = spectrum.set_property("interval", interval_ns);
-            }
-        }
-    }
-
-    /// Read the latest K-weighted LUFS values.  Non-blocking; returns defaults on contention.
-    pub fn lufs_values(&self) -> LufsValues {
-        self.lufs
-            .as_ref()
-            .map(|n| n.get_values())
-            .unwrap_or_default()
-    }
-
-    /// Reset LUFS accumulators (call on track change).
-    pub fn reset_lufs(&self) {
-        if let Some(ref node) = self.lufs {
-            node.reset();
-        }
-    }
-
-    fn build_spectrum_element() -> Result<Option<gst::Element>, String> {
-        let spectrum = match gst::ElementFactory::make("spectrum")
-            .name("rust-spectrum")
-            .build()
-        {
-            Ok(elem) => elem,
-            Err(_) => return Ok(None),
-        };
-        for p in spectrum.list_properties() {
-            let pn = p.name();
-            if pn == "bands" {
-                let _ = spectrum.set_property("bands", SPECTRUM_ACTIVE_BANDS_DEFAULT);
-            } else if pn == "multi-channel" {
-                let _ = spectrum.set_property("multi-channel", true);
-            } else if pn == "interval" {
-                let _ = spectrum.set_property("interval", SPECTRUM_ACTIVE_INTERVAL_NS);
-            } else if pn == "threshold" {
-                // Match our Python db_min so silent bands are reported as -80
-                // instead of the default -60, which would otherwise appear as
-                // ~12 % bar height after normalization.
-                spectrum.set_property_from_str("threshold", "-80");
-            }
-        }
-        Ok(Some(spectrum))
-    }
-}
 
 #[cfg(test)]
 mod tests {
-    use super::{DspGraphConfig, DspGraphRuntime, DspOrderEntry, DspReorderableModule};
-    use gstreamer as gst;
+    use super::{DspGraphConfig, DspOrderEntry, DspReorderableModule};
 
     #[test]
     fn sanitized_order_deduplicates_and_appends_missing_modules() {
@@ -816,11 +359,4 @@ mod tests {
         assert!(!config.has_active_processing());
     }
 
-    #[test]
-    fn build_graph_includes_spectrum_node() {
-        let _ = gst::init();
-        let config = DspGraphConfig::default();
-        let graph = DspGraphRuntime::build(&config).unwrap();
-        assert!(graph.has_spectrum());
-    }
 }
