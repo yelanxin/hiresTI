@@ -2,6 +2,7 @@
 
 import logging
 import os
+import shutil
 import subprocess
 import time
 import webbrowser
@@ -14,16 +15,40 @@ gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
 from gi.repository import Gtk, GLib
 
+logger = logging.getLogger(__name__)
+
+
+def _webkit_runtime_usable():
+    """WebKitGTK 6.0 spawns `xdg-dbus-proxy` to sandbox its network process.
+    When the binary is missing (or the user has explicitly opted out)
+    the WebView constructor aborts with SIGTRAP after printing
+    `Failed to fully launch dbus-proxy: Child process exited with code 1`,
+    which crashes the whole app — Python can't intercept that signal.
+    Probe at module load so we can fall through to the paste-URL flow
+    cleanly instead of trying and dying."""
+    if os.environ.get("HIRESTI_DISABLE_WEBKIT", "").strip() in ("1", "true", "yes"):
+        logger.info("Embedded WebKit login disabled via HIRESTI_DISABLE_WEBKIT.")
+        return False
+    if shutil.which("xdg-dbus-proxy") is None:
+        logger.info(
+            "xdg-dbus-proxy not on PATH — WebKit login disabled, "
+            "falling back to paste-URL flow."
+        )
+        return False
+    return True
+
+
 # Optional embedded browser for the PKCE redirect-capture path.  When
 # WebKitGTK 6.0 introspection (`gir1.2-webkit-6.0` / `webkitgtk-6.0`)
-# is present we open the Tidal login page inside the app, intercept
-# the redirect to `tidal.com/android/login/auth?code=...` directly,
-# and skip the manual copy-paste step entirely.  When it's missing we
-# fall through to the paste-URL dialog so the auth flow still works.
+# is present AND the runtime sandbox helper is available we open the
+# Tidal login page inside the app, intercept the redirect to
+# `tidal.com/android/login/auth?code=...` directly, and skip the manual
+# copy-paste step entirely.  When either piece is missing we fall
+# through to the paste-URL dialog so the auth flow still works.
 try:
     gi.require_version('WebKit', '6.0')
     from gi.repository import WebKit  # noqa: F401
-    _WEBKIT_AVAILABLE = True
+    _WEBKIT_AVAILABLE = _webkit_runtime_usable()
 except (ValueError, ImportError):
     WebKit = None
     _WEBKIT_AVAILABLE = False
@@ -42,8 +67,6 @@ try:
 except Exception:
     qrcode = None
     qrcode_svg = None
-
-logger = logging.getLogger(__name__)
 
 
 def on_login_clicked(self, btn):
@@ -370,6 +393,22 @@ def _show_pkce_webview_dialog(self, login_url, attempt_id):
     cancel path)."""
     self._cleanup_login_dialog()
 
+    # Belt-and-suspenders: even with the xdg-dbus-proxy probe at module
+    # load, a misconfigured runtime can still abort during WebView
+    # construction (e.g. SECCOMP rejecting a syscall, sandbox setup
+    # failing partway). Catch what we can, fall through to paste-URL
+    # for everything else by never reaching WebKit when in doubt.
+    try:
+        webview = WebKit.WebView()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "WebKit.WebView() failed (%s: %s); falling back to paste-URL flow.",
+            type(e).__name__, e,
+        )
+        self._open_login_url(login_url, attempt_id)
+        self._show_pkce_paste_dialog(login_url, attempt_id)
+        return
+
     window = Gtk.Window(title="Sign in to TIDAL", transient_for=self.win, modal=True)
     window.set_default_size(560, 760)
 
@@ -393,7 +432,6 @@ def _show_pkce_webview_dialog(self, login_url, attempt_id):
     # from the previous teardown and rendered a blank page.  The
     # default session is shared across WebViews and survives open /
     # close cycles cleanly.
-    webview = WebKit.WebView()
 
     # Tidal's bot challenge flags WebKitGTK's default Safari UA on Linux.
     # Spoof a recent stable Chrome string so the login page loads without
