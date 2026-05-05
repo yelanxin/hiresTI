@@ -73,6 +73,13 @@ fn driver_is_alsa_family(driver: &str) -> bool {
     driver_is_alsa_auto(driver) || driver_is_alsa_mmap(driver)
 }
 
+/// True for any driver routed through V2 native_transport's ALSA backend:
+/// Auto(Default), ALSA(auto), and ALSA(mmap).
+fn driver_routes_via_native_alsa(driver: &str) -> bool {
+    let norm = normalized_driver_label(driver);
+    norm.is_empty() || norm.starts_with("auto") || driver_is_alsa_family(driver)
+}
+
 
 // ---------------------------------------------------------------------------
 // USB output format helpers
@@ -86,12 +93,21 @@ fn driver_is_usb_rawlink_v2(driver: &str) -> bool {
         || norm.starts_with("usbrawlinkv2(")
 }
 
+/// True for any driver whose audio path goes through V2 native_transport
+/// (USB Rawlink v2 or any ALSA family driver). The GStreamer pipeline only
+/// holds a fakesink placeholder for these drivers; rac_set_uri / rac_play /
+/// rac_get_position must take the native_transport branch instead of
+/// querying playbin.
+fn driver_uses_native_transport(driver: &str) -> bool {
+    driver_is_usb_rawlink_v2(driver) || driver_routes_via_native_alsa(driver)
+}
+
 fn transport_reports_playing(
     output_driver: &str,
     native_state: native_transport::NativeTransportState,
     gst_state: gst::State,
 ) -> bool {
-    if driver_is_usb_rawlink_v2(output_driver) || driver_is_alsa_mmap(output_driver) {
+    if driver_uses_native_transport(output_driver) {
         native_state == native_transport::NativeTransportState::Playing
     } else {
         gst_state == gst::State::Playing
@@ -1648,8 +1664,8 @@ impl Engine {
 
     fn maybe_load_native_transport_for_uri(&mut self, uri: &str) {
         let is_v2_usb = driver_is_usb_rawlink_v2(&self.output_driver);
-        let is_alsa_mmap = driver_is_alsa_mmap(&self.output_driver);
-        if !(is_v2_usb || is_alsa_mmap) {
+        let is_native_alsa = driver_routes_via_native_alsa(&self.output_driver);
+        if !(is_v2_usb || is_native_alsa) {
             let _ = self.native_transport.stop();
             return;
         }
@@ -1687,7 +1703,7 @@ impl Engine {
             self.native_usb_config
                 .clone()
                 .map(native_transport::NativeOutputTarget::Usb)
-        } else if is_alsa_mmap {
+        } else if is_native_alsa {
             self.native_alsa_config
                 .clone()
                 .map(native_transport::NativeOutputTarget::Alsa)
@@ -1763,8 +1779,7 @@ impl Engine {
         // (decode_completed=true, runtime cleared) → emit EOS so Python
         // triggers next-track.
         if !self.native_eos_emitted
-            && (driver_is_usb_rawlink_v2(&self.output_driver)
-                || driver_is_alsa_mmap(&self.output_driver))
+            && driver_uses_native_transport(&self.output_driver)
         {
             let snap = self.native_transport.snapshot();
             if snap.decode_completed && snap.decoded_frame_count > 0 {
@@ -1926,8 +1941,8 @@ impl Engine {
         exclusive: bool,
     ) -> c_int {
         let had_v2_usb = driver_is_usb_rawlink_v2(&self.output_driver);
-        let had_v2_alsa = driver_is_alsa_mmap(&self.output_driver);
-        let had_native_transport = had_v2_usb || had_v2_alsa;
+        let had_native_alsa = driver_routes_via_native_alsa(&self.output_driver);
+        let had_native_transport = had_v2_usb || had_native_alsa;
         if had_v2_usb {
             let _ = self.native_transport.stop_and_release();
         } else {
@@ -1964,51 +1979,20 @@ impl Engine {
             .filter(|d| !d.is_empty());
         let device_norm = resolved_device.as_deref();
 
-        let (sink, auto_caps_format) = if driver_norm.is_empty() || driver_norm.starts_with("auto")
-        {
-            (
-                gst::ElementFactory::make("autoaudiosink")
-                    .name("rust-auto-sink")
-                    .build()
-                    .ok(),
-                None,
-            )
-        } else if driver_norm.contains("pulse") {
-            let s = gst::ElementFactory::make("pulsesink")
-                .name("rust-pa-sink")
-                .build()
-                .ok();
-            match s {
-                Some(ref elem) => {
-                    if let Some(dev) = device_norm {
-                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            elem.set_property("device", dev);
-                        }));
-                    }
-                    let target_buffer = if buffer_us > 0 { buffer_us } else { 100_000 };
-                    let target_latency = if latency_us > 0 { latency_us } else { 10_000 };
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        elem.set_property("buffer-time", i64::from(target_buffer));
-                    }));
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        elem.set_property("latency-time", i64::from(target_latency));
-                    }));
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        elem.set_property("provide-clock", true);
-                    }));
-                    (s, None)
-                }
-                None => {
-                    self.set_error("pulsesink unavailable");
-                    self.emit_event(EVT_ERROR, "pulsesink unavailable");
-                    return -12;
-                }
-            }
-        } else if driver_is_alsa_mmap(driver) {
-            // V2 native_transport drives the ALSA mmap ring directly. The
-            // GStreamer pipeline gets a fakesink placeholder so playbin has
-            // something wired, but rac_set_uri / rac_play route through V2
-            // for actual audio.
+        // Three drivers route audio through V2 native_transport's ALSA
+        // backend: Auto(Default), ALSA(auto), and ALSA(mmap). They all get a
+        // fakesink placeholder on playbin so the GStreamer pipeline has
+        // something wired; rac_set_uri / rac_play take the V2 path. Auto and
+        // ALSA(auto) default to the ALSA `default` device (which goes through
+        // the PipeWire/PulseAudio ALSA bridge on most desktops); ALSA(mmap)
+        // defaults to `hw:0,0` because users picking mmap typically want raw
+        // hardware.
+        let route_via_native_alsa = driver_norm.is_empty()
+            || driver_norm.starts_with("auto")
+            || driver_is_alsa_family(driver);
+        let route_via_native_usb = driver_is_usb_rawlink_v2(driver);
+
+        let sink = if route_via_native_alsa {
             let elem = gst::ElementFactory::make("fakesink")
                 .name("rust-v2-alsa-placeholder-sink")
                 .property("sync", false)
@@ -2017,14 +2001,19 @@ impl Engine {
                 .build();
             match elem {
                 Ok(elem) => {
+                    let default_device = if driver_is_alsa_mmap(driver) {
+                        "hw:0,0"
+                    } else {
+                        "default"
+                    };
                     self.emit_event(
                         EVT_STATE,
                         &format!(
-                            "alsa-mmap placeholder configured device={}",
-                            device_norm.unwrap_or("hw:0,0")
+                            "alsa placeholder configured driver={driver} device={}",
+                            device_norm.unwrap_or(default_device)
                         ),
                     );
-                    (Some(elem), None::<String>)
+                    Some(elem)
                 }
                 Err(e) => {
                     self.set_error(format!("fakesink unavailable: {e}"));
@@ -2032,24 +2021,9 @@ impl Engine {
                     return -17;
                 }
             }
-        } else if driver_norm.contains("alsa") {
-            match build_alsa_sink_element(device_norm, buffer_us, latency_us, exclusive) {
-                Ok((elem, forced_caps_format)) => (Some(elem), forced_caps_format),
-                Err(-13) => {
-                    self.set_error("alsasink unavailable");
-                    self.emit_event(EVT_ERROR, "alsasink unavailable");
-                    return -13;
-                }
-                Err(_) => {
-                    self.set_error("failed to create ALSA sink bin");
-                    self.emit_event(EVT_ERROR, "failed to create ALSA sink bin");
-                    return -15;
-                }
-            }
-        } else if driver_is_usb_rawlink_v2(driver) {
-            // V2 native_transport bypasses GStreamer entirely (rac_set_uri
-            // never drives the pipeline to Playing for V2). All we need is
-            // a placeholder sink so playbin has something wired up.
+        } else if route_via_native_usb {
+            // V2 native_transport bypasses GStreamer entirely; the placeholder
+            // just satisfies playbin's audio-sink slot.
             let elem = gst::ElementFactory::make("fakesink")
                 .name("rust-v2-placeholder-sink")
                 .property("sync", false)
@@ -2065,7 +2039,7 @@ impl Engine {
                             device_norm.unwrap_or("")
                         ),
                     );
-                    (Some(elem), None::<String>)
+                    Some(elem)
                 }
                 Err(e) => {
                     self.set_error(format!("fakesink unavailable: {e}"));
@@ -2079,58 +2053,10 @@ impl Engine {
             return -14;
         };
 
-        let Some(sink_elem) = sink else {
+        let Some(final_sink) = sink else {
             self.set_error("failed to create audio sink");
             self.emit_event(EVT_ERROR, "failed to create audio sink");
             return -15;
-        };
-
-        let preferred_caps_format = self.preferred_output_format.trim().to_string();
-        // For alsa_mmap and usb-rawlink-v2 the sink already has caps set on the
-        // element itself; wrapping it inside an audioconvert+capsfilter bin
-        // would conflict.
-        let is_mmap = driver_is_alsa_mmap(driver);
-        let is_usb = driver_is_usb_rawlink_v2(driver);
-        let selected_caps_format = if is_mmap || is_usb {
-            None
-        } else if !preferred_caps_format.is_empty() {
-            Some(preferred_caps_format.as_str())
-        } else {
-            auto_caps_format.as_deref()
-        };
-        let final_sink = if let Some(fmt) = selected_caps_format {
-            match wrap_sink_with_caps(sink_elem, fmt, "rust-output-convert", "rust-output-caps") {
-                Ok(wrapped) => {
-                    if preferred_caps_format.is_empty() {
-                        self.emit_event(
-                            EVT_STATE,
-                            &format!(
-                                "alsa-exclusive container-adapter format={} device={}",
-                                fmt,
-                                device_norm.unwrap_or("default")
-                            ),
-                        );
-                    } else {
-                        self.emit_event(
-                            EVT_STATE,
-                            &format!(
-                                "output-format preference={} driver={} device={}",
-                                fmt,
-                                driver,
-                                device_norm.unwrap_or("default")
-                            ),
-                        );
-                    }
-                    wrapped
-                }
-                Err(_) => {
-                    self.set_error(format!("failed to apply output format {fmt}"));
-                    self.emit_event(EVT_ERROR, &format!("failed to apply output format {fmt}"));
-                    return -15;
-                }
-            }
-        } else {
-            sink_elem
         };
 
         self.output_driver = driver.to_string();
@@ -2174,9 +2100,14 @@ impl Engine {
             // set_output_tuned — no extra release_device() needed.
         }
 
-        if driver_is_alsa_mmap(driver) {
+        if route_via_native_alsa {
+            let default_device = if driver_is_alsa_mmap(driver) {
+                "hw:0,0"
+            } else {
+                "default"
+            };
             self.native_alsa_config = Some(native_transport::AlsaOutputConfig {
-                device: device_norm.unwrap_or("hw:0,0").to_string(),
+                device: device_norm.unwrap_or(default_device).to_string(),
                 buffer_us: if buffer_us > 0 { buffer_us as u32 } else { 100_000 },
                 latency_us: if latency_us > 0 { latency_us as u32 } else { 10_000 },
                 realtime_priority: self.output_mmap_realtime_priority,
@@ -2358,9 +2289,7 @@ pub extern "C" fn rac_get_lufs(
     {
         return -2;
     }
-    let vals: LufsValues = if driver_is_usb_rawlink_v2(&engine.output_driver)
-        || driver_is_alsa_mmap(&engine.output_driver)
-    {
+    let vals: LufsValues = if driver_uses_native_transport(&engine.output_driver) {
         engine.native_transport.lufs_values()
     } else {
         engine
@@ -2683,35 +2612,6 @@ fn read_alsa_card_playback_formats_from_proc_root(proc_root: &Path, card_idx: &s
     out
 }
 
-fn normalize_alsa_caps_container_format(playback_format: &str) -> Option<&'static str> {
-    match playback_format.trim().to_ascii_uppercase().as_str() {
-        "S32_LE" => Some("S32LE"),
-        "S24_32_LE" => Some("S24_32LE"),
-        _ => None,
-    }
-}
-
-fn detect_alsa_exclusive_caps_format_from_proc_root(
-    proc_root: &Path,
-    device_id: &str,
-) -> Option<String> {
-    let (card_idx, _pcm_idx) = parse_alsa_hw_device_id(device_id)?;
-    let formats = read_alsa_card_playback_formats_from_proc_root(proc_root, &card_idx);
-    if formats.is_empty() {
-        return None;
-    }
-    let mut forced: Option<&'static str> = None;
-    for fmt in formats {
-        let normalized = normalize_alsa_caps_container_format(&fmt)?;
-        match forced {
-            Some(cur) if cur != normalized => return None,
-            Some(_) => {}
-            None => forced = Some(normalized),
-        }
-    }
-    forced.map(str::to_string)
-}
-
 fn gst_output_format_from_playback_format(playback_format: &str) -> Option<&'static str> {
     match playback_format.trim().to_ascii_uppercase().as_str() {
         "S16_LE" | "S16LE" => Some("S16LE"),
@@ -2747,43 +2647,6 @@ fn supported_output_depths_from_formats(formats: &[String]) -> Vec<i32> {
     }
     out.sort_unstable();
     out
-}
-
-fn wrap_sink_with_caps(
-    sink_elem: gst::Element,
-    format_name: &str,
-    convert_name: &str,
-    caps_name: &str,
-) -> Result<gst::Element, c_int> {
-    let convert = gst::ElementFactory::make("audioconvert")
-        .name(convert_name)
-        .build()
-        .map_err(|_| -15)?;
-    let capsfilter = gst::ElementFactory::make("capsfilter")
-        .name(caps_name)
-        .build()
-        .map_err(|_| -15)?;
-    let caps = gst::Caps::builder("audio/x-raw")
-        .field("format", format_name)
-        .field("layout", "interleaved")
-        .build();
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        capsfilter.set_property("caps", &caps);
-    }));
-
-    let bin = gst::Bin::new();
-    if bin.add(&convert).is_err() || bin.add(&capsfilter).is_err() || bin.add(&sink_elem).is_err() {
-        return Err(-15);
-    }
-    if convert.link(&capsfilter).is_err() || capsfilter.link(&sink_elem).is_err() {
-        return Err(-15);
-    }
-    let sink_pad = convert.static_pad("sink").ok_or(-15)?;
-    let ghost_sink = gst::GhostPad::with_target(&sink_pad).map_err(|_| -15)?;
-    if bin.add_pad(&ghost_sink).is_err() {
-        return Err(-15);
-    }
-    Ok(bin.upcast::<gst::Element>())
 }
 
 fn read_alsa_pcm_label(info_path: &Path) -> Option<String> {
@@ -2884,54 +2747,6 @@ fn list_alsa_cards_from_proc_root(proc_root: &Path) -> Vec<(String, Option<Strin
 
 fn list_alsa_cards() -> Vec<(String, Option<String>)> {
     list_alsa_cards_from_proc_root(Path::new("/proc/asound"))
-}
-
-fn build_alsa_sink_element(
-    device: Option<&str>,
-    buffer_us: i32,
-    latency_us: i32,
-    exclusive: bool,
-) -> Result<(gst::Element, Option<String>), c_int> {
-    let alsa_sink = gst::ElementFactory::make("alsasink")
-        .name("rust-alsa-sink")
-        .build()
-        .map_err(|_| -13)?;
-
-    if let Some(dev) = device {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            alsa_sink.set_property("device", dev);
-        }));
-    }
-    let target_buffer = if buffer_us > 0 { buffer_us } else { 100_000 };
-    let target_latency = if latency_us > 0 { latency_us } else { 10_000 };
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        alsa_sink.set_property("buffer-time", i64::from(target_buffer));
-    }));
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        alsa_sink.set_property("latency-time", i64::from(target_latency));
-    }));
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        alsa_sink.set_property("provide-clock", true);
-    }));
-    if exclusive {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            // `slave-method` is an enum property on GstAlsaSink.
-            // Setting it as integer can panic in Rust bindings
-            // (type mismatch). Use enum nick string instead.
-            if alsa_sink.find_property("slave-method").is_some() {
-                alsa_sink.set_property_from_str("slave-method", "none");
-            }
-        }));
-    }
-
-    let forced_caps_format = if exclusive {
-        device.and_then(|dev| {
-            detect_alsa_exclusive_caps_format_from_proc_root(Path::new("/proc/asound"), dev)
-        })
-    } else {
-        None
-    };
-    Ok((alsa_sink, forced_caps_format))
 }
 
 /// Enumerate USB audio devices for the USB Rawlink driver device picker.
@@ -3065,9 +2880,7 @@ pub extern "C" fn rac_set_uri(ptr: *mut Engine, uri: *const c_char) -> c_int {
     // For USB Rawlink v2 and ALSA mmap, the GStreamer pipeline is NOT used
     // for audio playback — native transport handles everything.  Skip all
     // GStreamer pipeline manipulation; just load via native transport.
-    if driver_is_usb_rawlink_v2(&engine.output_driver)
-        || driver_is_alsa_mmap(&engine.output_driver)
-    {
+    if driver_uses_native_transport(&engine.output_driver) {
         engine.uri = s.to_string();
         engine.maybe_load_native_transport_for_uri(s);
         engine.reset_spectrum_timeline();
@@ -3119,9 +2932,7 @@ pub extern "C" fn rac_play(ptr: *mut Engine) -> c_int {
     // For USB Rawlink v2 and ALSA mmap, ONLY use native transport — never
     // start the GStreamer pipeline, which would claim the device and block
     // native transport from accessing it.
-    if driver_is_usb_rawlink_v2(&engine.output_driver)
-        || driver_is_alsa_mmap(&engine.output_driver)
-    {
+    if driver_uses_native_transport(&engine.output_driver) {
         match engine.native_transport.play() {
             Ok(()) => {
                 engine.emit_event(EVT_STATE, "Playing");
@@ -3146,9 +2957,7 @@ pub extern "C" fn rac_pause(ptr: *mut Engine) -> c_int {
     let Some(engine) = as_mut_engine(ptr) else {
         return -1;
     };
-    if driver_is_usb_rawlink_v2(&engine.output_driver)
-        || driver_is_alsa_mmap(&engine.output_driver)
-    {
+    if driver_uses_native_transport(&engine.output_driver) {
         match engine.native_transport.pause() {
             Ok(()) => {
                 engine.emit_event(EVT_STATE, "Paused");
@@ -3175,9 +2984,7 @@ pub extern "C" fn rac_stop(ptr: *mut Engine) -> c_int {
         return -1;
     };
     engine.reset_spectrum_timeline();
-    if driver_is_usb_rawlink_v2(&engine.output_driver)
-        || driver_is_alsa_mmap(&engine.output_driver)
-    {
+    if driver_uses_native_transport(&engine.output_driver) {
         match engine.native_transport.stop() {
             Ok(()) => {
                 engine.emit_event(EVT_STATE, "Null");
@@ -3200,12 +3007,9 @@ pub extern "C" fn rac_release_output(ptr: *mut Engine) -> c_int {
         return -1;
     };
     let had_v2_usb = driver_is_usb_rawlink_v2(&engine.output_driver);
-    let had_v2_alsa = driver_is_alsa_mmap(&engine.output_driver);
     engine.reset_spectrum_timeline();
     if had_v2_usb {
         let _ = engine.native_transport.stop_and_release();
-    } else if had_v2_alsa {
-        let _ = engine.native_transport.stop();
     } else {
         let _ = engine.native_transport.stop();
     }
@@ -3228,9 +3032,7 @@ pub extern "C" fn rac_seek(ptr: *mut Engine, pos_s: c_double) -> c_int {
         0.0
     };
 
-    if driver_is_usb_rawlink_v2(&engine.output_driver)
-        || driver_is_alsa_mmap(&engine.output_driver)
-    {
+    if driver_uses_native_transport(&engine.output_driver) {
         let ms = (clamped * 1000.0) as u64;
         match engine.native_transport.seek_ms(ms) {
             Ok(()) => {
@@ -3437,9 +3239,7 @@ pub extern "C" fn rac_get_position(ptr: *const Engine, pos_out: *mut c_double) -
         return -2;
     }
 
-    let pos = if driver_is_usb_rawlink_v2(&engine.output_driver)
-        || driver_is_alsa_mmap(&engine.output_driver)
-    {
+    let pos = if driver_uses_native_transport(&engine.output_driver) {
         // After EOS but before next track loads, return 0 so the UI doesn't
         // show stale position from the finished track.
         if engine.native_eos_emitted {
@@ -3503,9 +3303,7 @@ pub extern "C" fn rac_get_duration(ptr: *const Engine, dur_out: *mut c_double) -
         return -2;
     }
 
-    let dur = if driver_is_usb_rawlink_v2(&engine.output_driver)
-        || driver_is_alsa_mmap(&engine.output_driver)
-    {
+    let dur = if driver_uses_native_transport(&engine.output_driver) {
         if engine.native_eos_emitted {
             0.0
         } else {
@@ -4780,51 +4578,6 @@ Capture:
     }
 
     #[test]
-    fn alsa_exclusive_caps_format_detects_s32_only_device() {
-        let proc_root = TempProcRoot::new("alsa_stream_caps_s32");
-        proc_root.write(
-            "card2/stream0",
-            r#"USB DAC at usb-1, high speed : USB Audio
-
-Playback:
-  Interface 1
-    Altset 1
-    Format: S32_LE
-    Channels: 2
-    Rates: 44100, 48000
-"#,
-        );
-
-        let fmt = detect_alsa_exclusive_caps_format_from_proc_root(proc_root.path(), "hw:2,0");
-
-        assert_eq!(fmt, Some("S32LE".to_string()));
-    }
-
-    #[test]
-    fn alsa_exclusive_caps_format_skips_mixed_format_device() {
-        let proc_root = TempProcRoot::new("alsa_stream_caps_mixed");
-        proc_root.write(
-            "card2/stream0",
-            r#"USB DAC at usb-1, high speed : USB Audio
-
-Playback:
-  Interface 1
-    Altset 1
-    Format: S16_LE
-    Channels: 2
-  Interface 1
-    Altset 2
-    Format: S32_LE
-    Channels: 2
-"#,
-        );
-
-        let fmt = detect_alsa_exclusive_caps_format_from_proc_root(proc_root.path(), "hw:2,0");
-
-        assert_eq!(fmt, None);
-    }
-
-    #[test]
     fn supported_output_formats_map_known_alsa_formats() {
         let formats = supported_output_formats_from_playback_formats(&vec![
             "S16_LE".to_string(),
@@ -4871,14 +4624,22 @@ Playback:
     }
 
     #[test]
-    fn transport_reports_playing_uses_gst_state_for_non_native_drivers() {
+    fn transport_reports_playing_prefers_native_state_for_alsa_auto() {
+        // ALSA(auto), Auto(Default), and ALSA(mmap) all route through V2
+        // native_transport, so the GStreamer playbin sits at Paused with a
+        // fakesink while the real audio path advances. Trust native state.
         assert!(transport_reports_playing(
+            "ALSA（auto）",
+            native_transport::NativeTransportState::Playing,
+            gst::State::Paused,
+        ));
+        assert!(!transport_reports_playing(
             "ALSA（auto）",
             native_transport::NativeTransportState::Paused,
             gst::State::Playing,
         ));
-        assert!(!transport_reports_playing(
-            "ALSA（auto）",
+        assert!(transport_reports_playing(
+            "Auto (Default)",
             native_transport::NativeTransportState::Playing,
             gst::State::Paused,
         ));
