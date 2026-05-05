@@ -10,6 +10,7 @@ use super::source::{
     inspect_mpd_manifest, MpdManifestInfo, NativeDecoderKind, NativeTransportSource,
     NativeTransportSourceKind,
 };
+use super::output::NativeOutputTarget;
 use crate::alsa_clock::{AlsaHwClockFeed, ClockMode};
 use crate::usb_audio::{
     self, OpenUsbDevice, QueueMode, UacAltProfile, UsbAudioSink, UsbRawSinkConfig,
@@ -53,7 +54,7 @@ pub struct NativeTransportLoadRequest {
     pub source: NativeTransportSource,
     pub target_driver: String,
     pub bit_perfect: bool,
-    pub usb_output_config: Option<UsbRawSinkConfig>,
+    pub output_target: Option<NativeOutputTarget>,
     pub dsp_config: Option<crate::dsp::DspGraphConfig>,
 }
 
@@ -684,7 +685,7 @@ fn transport_worker(
                     state.supports_seek = plan.supports_seek;
                     state.duration_s = None;
                     state.source_locator = Some(request.source.locator().to_string());
-                    state.output_configured = request.usb_output_config.is_some();
+                    state.output_configured = request.output_target.is_some();
                     state.stream_spec = None;
                     state.bits_per_sample = None;
                     state.first_packet_frames = None;
@@ -699,7 +700,10 @@ fn transport_worker(
                 }
 
                 current_source = Some(request.source.clone());
-                current_output_config = request.usb_output_config.clone();
+                current_output_config = request
+                    .output_target
+                    .as_ref()
+                    .and_then(|t| t.usb_cfg().cloned());
                 current_dsp_config = request.dsp_config.clone();
 
                 // ── Eager decode ─────────────────────────────────────────
@@ -719,7 +723,10 @@ fn transport_worker(
                     request.source.clone(),
                     Arc::clone(&snapshot),
                     Arc::clone(&events),
-                    request.usb_output_config.clone(),
+                    request
+                        .output_target
+                        .as_ref()
+                        .and_then(|t| t.usb_cfg().cloned()),
                     Arc::clone(&runtime),
                     gen,
                     None,
@@ -3626,7 +3633,7 @@ mod tests {
             },
             target_driver: "USB Rawlink v2".to_string(),
             bit_perfect: true,
-            usb_output_config: None,
+            output_target: None,
             dsp_config: None,
         };
         controller.load(request).unwrap();
@@ -3660,7 +3667,7 @@ mod tests {
             },
             target_driver: "USB Rawlink v2".to_string(),
             bit_perfect: true,
-            usb_output_config: None,
+            output_target: None,
             dsp_config: None,
         };
         controller.load(request).unwrap();
@@ -3698,7 +3705,7 @@ mod tests {
             },
             target_driver: "USB Rawlink v2".to_string(),
             bit_perfect: true,
-            usb_output_config: None,
+            output_target: None,
             dsp_config: None,
         };
         controller.load(request).unwrap();
@@ -3734,7 +3741,7 @@ mod tests {
             },
             target_driver: "USB Rawlink v2".to_string(),
             bit_perfect: true,
-            usb_output_config: None,
+            output_target: None,
             dsp_config: None,
         };
         controller.load(request).unwrap();
@@ -3777,7 +3784,7 @@ mod tests {
             },
             target_driver: "USB Rawlink v2".to_string(),
             bit_perfect: true,
-            usb_output_config: None,
+            output_target: None,
             dsp_config: None,
         };
         controller.load(request).unwrap();
@@ -3812,7 +3819,7 @@ mod tests {
             },
             target_driver: "USB Rawlink v2".to_string(),
             bit_perfect: true,
-            usb_output_config: None,
+            output_target: None,
             dsp_config: None,
         };
         controller.load(request).unwrap();
@@ -3851,7 +3858,7 @@ mod tests {
             },
             target_driver: "USB Rawlink v2".to_string(),
             bit_perfect: true,
-            usb_output_config: None,
+            output_target: None,
             dsp_config: None,
         };
         controller.load(request).unwrap();

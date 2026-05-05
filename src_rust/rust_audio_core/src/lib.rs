@@ -3212,9 +3212,12 @@ impl Engine {
             );
         }
         let usb_cfg = self.native_usb_config.clone();
+        let output_target = usb_cfg
+            .clone()
+            .map(native_transport::NativeOutputTarget::Usb);
         eprintln!(
-            "[native-transport] load: dsp_active={} bit_perfect={} usb_output_config={} master={} peq={} conv={} tape={} tube={} wid={} lim={} resamp={} lv2={}",
-            dsp_active, !dsp_active, usb_cfg.is_some(),
+            "[native-transport] load: dsp_active={} bit_perfect={} output_target={} master={} peq={} conv={} tape={} tube={} wid={} lim={} resamp={} lv2={}",
+            dsp_active, !dsp_active, output_target.is_some(),
             self.dsp_config.enabled,
             self.dsp_config.peq.is_active(),
             self.dsp_config.convolver.is_active(),
@@ -3229,7 +3232,7 @@ impl Engine {
             source,
             target_driver: self.output_driver.clone(),
             bit_perfect: !dsp_active,
-            usb_output_config: usb_cfg,
+            output_target,
             dsp_config: if dsp_active { Some(self.dsp_config.clone()) } else { None },
         };
         self.native_eos_emitted = false;
