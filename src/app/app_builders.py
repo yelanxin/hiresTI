@@ -102,22 +102,6 @@ _DSP_MODULE_TITLES = {
 }
 _DSP_WORKSPACE_MIN_HEIGHT = 300
 _DSP_WORKSPACE_MAX_HEIGHT = max(420, int(ui_config.WINDOW_HEIGHT * 0.48))
-_LV2_HOST_MANAGED_PORT_SYMBOLS = {"enabled", "enable", "bypass"}
-_LV2_DEFAULT_SEARCH_DIRS = [
-    "~/.lv2",
-    "~/.local/share/lv2",
-    "~/.local/lib/lv2",
-    "/usr/local/lib/lv2",
-    "/usr/lib/lv2",
-    "/usr/share/lv2",
-]
-_LV2_INSTALL_HELP_TEXT = (
-    "This dialog shows LV2 plugins that are already installed on your system.\n\n"
-    "Fedora example:\n"
-    "sudo dnf install gstreamer1-plugins-bad-free-lv2 "
-    "lsp-plugins-lv2 lv2-x42-plugins lv2-calf-plugins lv2-zam-plugins\n\n"
-    "After installing packages, reopen this dialog or click Add LV2 Plugin again."
-)
 
 
 def _configure_dsp_scale(scale, digits=0, value_pos=Gtk.PositionType.RIGHT):
@@ -162,7 +146,7 @@ def _build_dsp_control_label(self, text):
 
 def _is_dsp_reorderable_module(module_id):
     module_id = str(module_id or "").strip()
-    return bool(module_id in _DSP_REORDERABLE_MODULE_IDS or module_id.startswith("lv2_"))
+    return bool(module_id in _DSP_REORDERABLE_MODULE_IDS)
 
 
 def _normalize_dsp_order(order=None):
@@ -208,17 +192,6 @@ def _dsp_overview_module_title(self, module_id):
     module_id = str(module_id or "").strip()
     if module_id in _DSP_MODULE_TITLES:
         return _DSP_MODULE_TITLES[module_id]
-    if module_id.startswith("lv2_"):
-        meta = self._lv2_get_plugin_meta(module_id) if hasattr(self, "_lv2_get_plugin_meta") else None
-        if meta:
-            name = str(meta.get("name", "") or "").strip()
-            if name:
-                return name
-        player = getattr(self, "player", None)
-        slot = (getattr(player, "lv2_slots", {}) or {}).get(module_id, {}) if player else {}
-        uri = str(slot.get("uri", "") or "").strip()
-        if uri:
-            return uri.rsplit("/", 1)[-1] or module_id
     return module_id.title()
 
 
@@ -612,11 +585,10 @@ def _show_dsp_module(self, module_id, select_row=True):
     module_id = str(module_id or "peq")
     self._dsp_selected_module = module_id
     logger.info(
-        "DSP show module request module_id=%s select_row=%s main_rows=%s lv2_rows=%s",
+        "DSP show module request module_id=%s select_row=%s rows=%s",
         module_id,
         bool(select_row),
         _listbox_debug_rows(getattr(self, "dsp_module_list", None)),
-        _listbox_debug_rows(getattr(self, "dsp_lv2_module_list", None)),
     )
     if getattr(self, "dsp_module_stack", None) is not None:
         get_child_by_name = getattr(self.dsp_module_stack, "get_child_by_name", None)
@@ -634,45 +606,24 @@ def _show_dsp_module(self, module_id, select_row=True):
     if not select_row:
         return
     primary_list = getattr(self, "dsp_module_list", None)
-    lv2_list = getattr(self, "dsp_lv2_module_list", None)
-    target_list = None
-    target_row = None
-    for listbox in (primary_list, lv2_list):
-        if listbox is None:
-            continue
-        row = listbox.get_first_child()
-        while row is not None:
-            if getattr(row, "dsp_module_id", None) == module_id:
-                target_list = listbox
-                target_row = row
-                break
-            row = row.get_next_sibling()
-        if target_row is not None:
-            break
-    if target_list is None or target_row is None:
+    if primary_list is None:
         return
-    for listbox in (primary_list, lv2_list):
-        if listbox is None or listbox is target_list:
-            continue
-        try:
-            listbox.unselect_all()
-        except Exception:
-            pass
-    target_list.select_row(target_row)
+    target_row = None
+    row = primary_list.get_first_child()
+    while row is not None:
+        if getattr(row, "dsp_module_id", None) == module_id:
+            target_row = row
+            break
+        row = row.get_next_sibling()
+    if target_row is None:
+        return
+    primary_list.select_row(target_row)
 
 
 def _on_dsp_module_selected(self, _listbox, row):
     if row is None:
         return
     module_id = getattr(row, "dsp_module_id", "peq")
-    current_list = _listbox
-    for listbox in (getattr(self, "dsp_module_list", None), getattr(self, "dsp_lv2_module_list", None)):
-        if listbox is None or listbox is current_list:
-            continue
-        try:
-            listbox.unselect_all()
-        except Exception:
-            pass
     self._show_dsp_module(module_id, select_row=False)
 
 
@@ -870,17 +821,6 @@ def _update_dsp_ui_state(self):
             else "DSP master is bypassing the chain"
         ),
     }
-    player_lv2_slots = dict(getattr(player, "lv2_slots", {}) or {}) if player is not None else {}
-    for slot_id, slot_info in player_lv2_slots.items():
-        plugin_title = _dsp_overview_module_title(self, slot_id)
-        if bit_perfect_locked:
-            overview_status_text[slot_id] = f"{plugin_title}: disabled while Bit-Perfect mode is enabled"
-        elif not dsp_enabled:
-            overview_status_text[slot_id] = f"{plugin_title}: DSP master off"
-        elif bool(slot_info.get("enabled", True)):
-            overview_status_text[slot_id] = f"{plugin_title}: active"
-        else:
-            overview_status_text[slot_id] = f"{plugin_title}: bypassed"
     overview_enabled_state = {
         "decode": bool(dsp_enabled and not bit_perfect_locked),
         "peq": bool(dsp_enabled and peq_enabled and not bit_perfect_locked),
@@ -893,10 +833,6 @@ def _update_dsp_ui_state(self):
         "output_driver": bool(driver_available and dsp_enabled and not bit_perfect_locked),
         "output": bool(output_available and dsp_enabled and not bit_perfect_locked),
     }
-    for slot_id, slot_info in player_lv2_slots.items():
-        overview_enabled_state[slot_id] = bool(
-            dsp_enabled and bool(slot_info.get("enabled", True)) and not bit_perfect_locked
-        )
     if getattr(self, "dsp_master_switch", None) is not None:
         self._dsp_ui_syncing = True
         try:
@@ -1184,44 +1120,6 @@ def _update_dsp_ui_state(self):
             switch.set_tooltip_text("Enable or bypass tape simulation" if dsp_enabled else "Enable DSP master first")
         else:
             switch.set_sensitive(False)
-    lv2_row_refs = dict(getattr(self, "dsp_lv2_slot_rows", {}) or {})
-    lv2_scales = dict(getattr(self, "dsp_lv2_slot_scales", {}) or {})
-    player_lv2_slots = dict(getattr(player, "lv2_slots", {}) or {}) if player is not None else {}
-    lv2_controls_sensitive = bool(dsp_enabled and not bit_perfect_locked)
-    for slot_id, refs in lv2_row_refs.items():
-        slot_enabled = bool((player_lv2_slots.get(slot_id) or {}).get("enabled", True))
-        switch = (refs or {}).get("switch")
-        remove_btn = (refs or {}).get("remove_btn")
-        if switch is not None:
-            self._dsp_ui_syncing = True
-            try:
-                if bool(switch.get_active()) != slot_enabled:
-                    switch.set_active(slot_enabled)
-            finally:
-                self._dsp_ui_syncing = False
-            switch.set_sensitive(lv2_controls_sensitive)
-            if bit_perfect_locked:
-                switch.set_tooltip_text("LV2 bypassed in Bit-Perfect mode")
-            elif not dsp_enabled:
-                switch.set_tooltip_text("Enable DSP master first")
-            else:
-                switch.set_tooltip_text("Enable or bypass LV2 plugin")
-        if remove_btn is not None:
-            remove_btn.set_sensitive(lv2_controls_sensitive)
-            if bit_perfect_locked:
-                remove_btn.set_tooltip_text("Unavailable while Bit-Perfect mode is enabled")
-            elif not dsp_enabled:
-                remove_btn.set_tooltip_text("Enable DSP master first")
-            else:
-                remove_btn.set_tooltip_text("Remove LV2 plugin")
-    for slot_id, widgets in lv2_scales.items():
-        slot_enabled = bool((player_lv2_slots.get(slot_id) or {}).get("enabled", True))
-        controls_enabled = bool(lv2_controls_sensitive and slot_enabled)
-        for widget in dict(widgets or {}).values():
-            try:
-                widget.set_sensitive(controls_enabled)
-            except Exception:
-                pass
     for btn in (getattr(self, "dsp_btn", None), getattr(self, "now_playing_dsp_btn", None)):
         if btn is None:
             continue
@@ -1259,14 +1157,10 @@ def _on_dsp_master_toggled(self, switch, state):
     state = bool(state)
     player = getattr(self, "player", None)
     logger.info(
-        "DSP master toggle request state=%s current_dsp_enabled=%s bit_perfect=%s lv2_slots=%s",
+        "DSP master toggle request state=%s current_dsp_enabled=%s bit_perfect=%s",
         state,
         bool(getattr(player, "dsp_enabled", False)),
         bool(getattr(self, "settings", {}).get("bit_perfect", False)),
-        [
-            (sid, bool((info or {}).get("enabled", True)))
-            for sid, info in dict(getattr(player, "lv2_slots", {}) or {}).items()
-        ] if player is not None else [],
     )
     if state and (not self._release_bit_perfect_for_dsp()):
         self._update_dsp_ui_state()
@@ -1288,18 +1182,6 @@ def _on_dsp_master_toggled(self, switch, state):
         bool(getattr(player, "dsp_enabled", False)),
     )
     self._update_dsp_ui_state()
-    logger.info(
-        "DSP master toggle rebind hook available=%s",
-        hasattr(self, "_lv2_restart_playback_for_graph_rebind"),
-    )
-    if _player_uses_usb_rawlink_family(player):
-        logger.info("DSP master toggle playback rebind skipped: rawlink-native")
-    elif hasattr(self, "_lv2_restart_playback_for_graph_rebind"):
-        try:
-            logger.info("DSP master toggle invoking playback rebind")
-            self._lv2_restart_playback_for_graph_rebind(reason="dsp-master-toggle")
-        except Exception:
-            logger.debug("dsp master rebind failed", exc_info=True)
     return False
 
 
@@ -1830,7 +1712,7 @@ def _refresh_dsp_order_edit_ui(self):
     hint = getattr(self, "dsp_chain_hint_label", None)
     if hint is not None:
         hint.set_text(
-            "Drag PEQ / Convolution / Tape / Tube / Stereo Widener and LV2 slots to reorder them, then save once to rebuild the chain."
+            "Drag PEQ / Convolution / Tape / Tube / Stereo Widener to reorder them, then save once to rebuild the chain."
             if editing
             else "Enter edit mode to reorder the middle DSP stages. Limiter and Resampler stay fixed at the tail."
         )
@@ -1991,7 +1873,6 @@ def _save_dsp_order_edit(self, _btn=None):
     self._refresh_dsp_order_edit_ui()
     if hasattr(self, "_update_dsp_ui_state"):
         self._update_dsp_ui_state()
-    _lv2_restart_playback_for_graph_rebind(self)
     if hasattr(self, "show_output_notice"):
         self.show_output_notice("DSP chain order saved", "ok", 2200)
 
@@ -2277,11 +2158,6 @@ def _build_dsp_workspace(self):
     self.dsp_master_switch = Gtk.Switch(valign=Gtk.Align.CENTER)
     self.dsp_master_switch.connect("state-set", self._on_dsp_master_toggled)
     right_ctrl.append(self.dsp_master_switch)
-    dsp_help_btn = Gtk.MenuButton(css_classes=["flat", "circular"], valign=Gtk.Align.CENTER)
-    dsp_help_btn.set_icon_name("dialog-question-symbolic")
-    dsp_help_btn.set_tooltip_text("LV2 Plugin Compatibility")
-    dsp_help_btn.set_popover(self._build_dsp_lv2_help_popover())
-    right_ctrl.append(dsp_help_btn)
     right_ctrl.set_margin_end(52)
     switcher_row.append(right_ctrl)
     root.append(switcher_row)
@@ -2471,28 +2347,6 @@ def _build_dsp_workspace(self):
         self.dsp_module_switches[module_id] = switch
     sidebar.append(module_list)
 
-    # LV2 dynamic slot rows
-    lv2_module_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE, css_classes=["dsp-module-list"])
-    lv2_module_list.set_margin_top(4)
-    lv2_module_list.connect("row-selected", self._on_dsp_module_selected)
-    lv2_module_list.set_visible(False)
-    self.dsp_lv2_module_list = lv2_module_list
-    logger.info("DSP workspace created lv2 listbox id=%s", hex(id(lv2_module_list)))
-    sidebar.append(lv2_module_list)
-
-    add_lv2_btn = Gtk.Button(
-        label="Add LV2 Plugin",
-        icon_name="list-add-symbolic",
-        css_classes=["flat"],
-        margin_top=4,
-        margin_bottom=4,
-        margin_start=8,
-        margin_end=8,
-    )
-    self.add_lv2_plugin_btn = add_lv2_btn
-    add_lv2_btn.connect("clicked", self._open_lv2_plugin_browser)
-    _lv2_update_browser_action_state(self)
-    sidebar.append(add_lv2_btn)
     sidebar_scroll = _build_dsp_scroll_area(sidebar)
 
     effects_page.attach(sidebar_scroll, 0, 0, 1, 1)
@@ -2966,7 +2820,6 @@ def _build_dsp_workspace(self):
     self._show_dsp_module(getattr(self, "_dsp_selected_module", "peq"), select_row=True)
     self._sync_dsp_preset_dropdown()
     self._update_dsp_ui_state()
-    self._lv2_rebuild_sidebar_rows()
     return root
 
 
@@ -3762,1014 +3615,6 @@ def _build_help_popover(self):
     pop.set_child(vbox)
     return pop
 
-
-def _build_dsp_lv2_help_popover(self):
-    pop = Gtk.Popover()
-    vbox = Gtk.Box(
-        orientation=Gtk.Orientation.VERTICAL,
-        spacing=8,
-        margin_top=10,
-        margin_bottom=10,
-        margin_start=12,
-        margin_end=12,
-    )
-    vbox.set_size_request(300, -1)
-    title = Gtk.Label(label="LV2 Plugin Compatibility", xalign=0, css_classes=["title-5"])
-    body = Gtk.Label(
-        label=(
-            "Some LV2 plugins may not work correctly in this player.\n\n"
-            "If a plugin causes problems, please remove it."
-        ),
-        xalign=0,
-        wrap=True,
-        css_classes=["dim-label"],
-    )
-    vbox.append(title)
-    vbox.append(body)
-    pop.set_child(vbox)
-    return pop
-
-
-def _lv2_save_slots(self):
-    """Sync player.lv2_slots state into settings and schedule save."""
-    player = getattr(self, "player", None)
-    if player is None or not hasattr(player, "lv2_slots"):
-        return
-    slots_list = [
-        {
-            "slot_id": sid,
-            "uri": info.get("uri", ""),
-            "enabled": info.get("enabled", True),
-            "port_values": _lv2_filter_persisted_port_values(info.get("port_values", {})),
-        }
-        for sid, info in player.lv2_slots.items()
-    ]
-    self.settings["dsp_lv2_slots"] = slots_list
-    if hasattr(self, "schedule_save_settings"):
-        self.schedule_save_settings()
-
-
-def _lv2_is_host_managed_symbol(symbol):
-    return str(symbol or "").strip().lower() in _LV2_HOST_MANAGED_PORT_SYMBOLS
-
-
-def _lv2_filter_persisted_port_values(port_values):
-    clean = {}
-    for symbol, value in dict(port_values or {}).items():
-        if _lv2_is_host_managed_symbol(symbol):
-            continue
-        clean[symbol] = value
-    return clean
-
-
-def _lv2_host_managed_port_value(symbol, enabled):
-    normalized = str(symbol or "").strip().lower()
-    if normalized == "bypass":
-        return 0.0 if enabled else 1.0
-    return 1.0 if enabled else 0.0
-
-
-def _lv2_install_help_text():
-    return _LV2_INSTALL_HELP_TEXT
-
-
-def _player_uses_usb_rawlink_family(player):
-    driver = (
-        getattr(player, "current_driver", None)
-        or getattr(player, "requested_driver", None)
-        or ""
-    )
-    return str(driver or "") == "USB Rawlink v2"
-
-
-def _lv2_restart_playback_for_graph_rebind(self, reason="unspecified"):
-    player = getattr(self, "player", None)
-    if player is None:
-        logger.info("LV2 playback rebind skipped: reason=%s cause=no-player", reason)
-        return False
-    if _player_uses_usb_rawlink_family(player):
-        logger.info("LV2 playback rebind skipped: reason=%s cause=rawlink-native", reason)
-        return False
-    if bool(getattr(self, "_playback_rebind_inflight", False)):
-        self._playback_rebind_pending = True
-        logger.info("LV2 playback rebind coalesced: inflight=1 reason=%s", reason)
-        return False
-    try:
-        uri = str(getattr(player, "_last_loaded_uri", "") or "").strip()
-    except Exception:
-        uri = ""
-    if not uri:
-        logger.info("LV2 playback rebind skipped: reason=%s cause=no-uri", reason)
-        return False
-
-    try:
-        pos, dur = player.get_position()
-    except Exception:
-        pos = 0.0
-        dur = 0.0
-    try:
-        was_playing = bool(player.is_playing())
-    except Exception:
-        was_playing = True
-
-    seek_delay_ms = 700 if was_playing else 180
-    now_s = GLib.get_monotonic_time() / 1_000_000.0
-    self._playback_rebind_inflight = True
-    self._playback_rebind_pending = False
-    self._playback_rebind_hold_position_s = float(pos or 0.0)
-    self._playback_rebind_hold_duration_s = float(dur or 0.0)
-    self._playback_rebind_hold_until_s = now_s + (float(seek_delay_ms) / 1000.0) + 0.8
-    restore_volume = max(0.0, min(1.0, float(getattr(self, "settings", {}).get("volume", 80) or 80) / 100.0))
-    logger.info(
-        "LV2 playback rebind start reason=%s pos=%.3f dur=%.3f was_playing=%s dsp_enabled=%s bit_perfect=%s lv2_slots=%s",
-        reason,
-        float(pos or 0.0),
-        float(dur or 0.0),
-        was_playing,
-        bool(getattr(player, "dsp_enabled", False)),
-        bool(getattr(self, "settings", {}).get("bit_perfect", False)),
-        [
-            (sid, bool((info or {}).get("enabled", True)))
-            for sid, info in dict(getattr(player, "lv2_slots", {}) or {}).items()
-        ],
-    )
-
-    def restart():
-        try:
-            if was_playing and hasattr(player, "set_volume"):
-                player.set_volume(0.0)
-            player.stop()
-            player.load(uri)
-            if was_playing:
-                player.play()
-            GLib.timeout_add(
-                seek_delay_ms,
-                lambda: _lv2_finish_playback_rebind(
-                    self,
-                    player,
-                    float(pos or 0.0),
-                    was_playing,
-                    restore_volume,
-                    reason,
-                ),
-            )
-        except Exception:
-            logger.debug("lv2 playback restart failed", exc_info=True)
-            self._playback_rebind_inflight = False
-            self._playback_rebind_hold_until_s = 0.0
-            self._playback_rebind_hold_position_s = None
-            self._playback_rebind_hold_duration_s = 0.0
-            return False
-        return False
-
-    GLib.idle_add(restart)
-    return True
-
-
-def _lv2_finish_playback_rebind(self, player, pos, was_playing, restore_volume=0.8, reason="unspecified"):
-    try:
-        player.seek(float(pos or 0.0))
-        if was_playing and hasattr(player, "set_volume"):
-            GLib.timeout_add(180, lambda: (player.set_volume(float(restore_volume)), False)[1])
-    except Exception:
-        logger.debug("lv2 playback finish-rebind failed", exc_info=True)
-    pending = bool(getattr(self, "_playback_rebind_pending", False))
-    self._playback_rebind_inflight = False
-    logger.info(
-        "LV2 playback rebind finish reason=%s pos=%.3f was_playing=%s pending=%s dsp_enabled=%s bit_perfect=%s",
-        reason,
-        float(pos or 0.0),
-        was_playing,
-        pending,
-        bool(getattr(player, "dsp_enabled", False)),
-        bool(getattr(self, "settings", {}).get("bit_perfect", False)),
-    )
-    if pending:
-        self._playback_rebind_pending = False
-        GLib.idle_add(lambda: (_lv2_restart_playback_for_graph_rebind(self, reason="coalesced"), False)[1])
-    return False
-
-
-def _lv2_add_slot(self, uri):
-    """Add a new LV2 plugin slot. Returns slot_id or None."""
-    player = getattr(self, "player", None)
-    if player is None or not hasattr(player, "lv2_add_slot"):
-        return None
-    normalized_uri = str(uri or "").strip()
-    existing_slots = dict(getattr(player, "lv2_slots", {}) or {})
-    logger.info(
-        "LV2 add request uri=%s existing_slots=%s",
-        normalized_uri,
-        [(sid, str((info or {}).get("uri", "") or "")) for sid, info in existing_slots.items()],
-    )
-    for slot_id, info in existing_slots.items():
-        if str((info or {}).get("uri", "") or "").strip() == normalized_uri:
-            logger.info("LV2 add skipped: existing slot_id=%s uri=%s", slot_id, normalized_uri)
-            return slot_id
-    slot_id = player.lv2_add_slot(uri)
-    if slot_id:
-        logger.info(
-            "LV2 add created slot_id=%s uri=%s slots_now=%s",
-            slot_id,
-            normalized_uri,
-            [
-                (sid, str((info or {}).get("uri", "") or ""))
-                for sid, info in dict(getattr(player, "lv2_slots", {}) or {}).items()
-            ],
-        )
-        # Ensure the plugin's "enabled" port starts at 1.0 (active).
-        # Some plugins default the port to 0 (bypass), so we set it explicitly.
-        self._lv2_sync_enabled_port(slot_id, True)
-        order = list(getattr(self, "settings", {}).get("dsp_order", []))
-        if slot_id not in order:
-            order.append(slot_id)
-        self._apply_dsp_order(order, save=False)
-        self._lv2_save_slots()
-        _lv2_restart_playback_for_graph_rebind(self)
-    return slot_id
-
-
-def _lv2_remove_slot(self, slot_id):
-    """Remove an LV2 plugin slot."""
-    player = getattr(self, "player", None)
-    if player is None or not hasattr(player, "lv2_remove_slot"):
-        return False
-    ok = player.lv2_remove_slot(slot_id)
-    if ok:
-        order = [m for m in list(getattr(self, "settings", {}).get("dsp_order", [])) if m != slot_id]
-        self._apply_dsp_order(order, save=False)
-        self._lv2_save_slots()
-        _lv2_restart_playback_for_graph_rebind(self)
-    return ok
-
-
-def _lv2_sync_enabled_port(self, slot_id, enabled):
-    """Sync the plugin's lv2:toggled 'enabled' port value and widget to match slot state.
-
-    When our slot-level switch is toggled, this keeps the plugin's own bypass
-    control in lockstep so they never contradict each other.
-    """
-    meta = self._lv2_get_plugin_meta(slot_id)
-    if not meta:
-        return
-    # Find the conventional bypass port: lv2:toggled with symbol "enabled".
-    sym = next(
-        (
-            c["symbol"]
-            for c in meta.get("controls", [])
-            if c.get("toggled") and _lv2_is_host_managed_symbol(c.get("symbol"))
-        ),
-        None,
-    )
-    if sym is None:
-        logger.info(
-            "LV2 sync-enabled-port skipped: slot_id=%s enabled=%s reason=no-host-managed-control",
-            slot_id,
-            bool(enabled),
-        )
-        return
-    value = _lv2_host_managed_port_value(sym, enabled)
-    logger.info(
-        "LV2 sync-enabled-port slot_id=%s enabled=%s symbol=%s value=%s",
-        slot_id,
-        bool(enabled),
-        sym,
-        value,
-    )
-    player = getattr(self, "player", None)
-    if player and hasattr(player, "lv2_set_port_value"):
-        player.lv2_set_port_value(slot_id, sym, value)
-    # Update the parameter-page widget without firing another callback.
-    scales = getattr(self, "dsp_lv2_slot_scales", {})
-    widget = (scales.get(slot_id) or {}).get(sym)
-    if isinstance(widget, Gtk.Switch):
-        self._dsp_ui_syncing = True
-        try:
-            widget.set_active(bool(enabled))
-        finally:
-            self._dsp_ui_syncing = False
-
-
-def _lv2_get_plugin_meta(self, slot_id):
-    """Return cached plugin metadata dict for a slot, or None."""
-    cache = getattr(self, "_lv2_plugin_cache", None)
-    if cache is None:
-        return None
-    player = getattr(self, "player", None)
-    slot_info = (getattr(player, "lv2_slots", {}) or {}).get(slot_id, {}) if player else {}
-    uri = slot_info.get("uri", "")
-    return cache.get(uri)
-
-
-def _lv2_persistent_cache_file(self):
-    path = str(getattr(self, "_lv2_plugin_cache_file", "") or "").strip()
-    if path:
-        return path
-    cache_root = str(getattr(self, "_cache_root", "") or "").strip()
-    if not cache_root:
-        return ""
-    return os.path.join(cache_root, "lv2_plugins.json")
-
-
-def _lv2_persistent_scan_meta_file(self):
-    path = _lv2_persistent_cache_file(self)
-    if not path:
-        return ""
-    return f"{path}.meta"
-
-
-def _lv2_update_browser_action_state(self):
-    btn = getattr(self, "add_lv2_plugin_btn", None)
-    if btn is None:
-        return
-    inflight = bool(getattr(self, "_lv2_scan_inflight", False))
-    btn.set_sensitive(not inflight)
-    btn.set_tooltip_text("Scanning installed LV2 plugins..." if inflight else "Browse installed LV2 plugins")
-
-
-def _lv2_scan_search_roots():
-    roots = []
-    env_raw = str(os.environ.get("LV2_PATH", "") or "").strip()
-    if env_raw:
-        roots.extend([part.strip() for part in env_raw.split(os.pathsep) if part.strip()])
-    roots.extend(_LV2_DEFAULT_SEARCH_DIRS)
-    out = []
-    seen = set()
-    for raw in roots:
-        path = os.path.abspath(os.path.expanduser(str(raw or "").strip()))
-        if not path or path in seen:
-            continue
-        seen.add(path)
-        out.append(path)
-    return out
-
-
-def _lv2_scan_source_signature():
-    roots = _lv2_scan_search_roots()
-    bundle_tokens = []
-    for root in roots:
-        if not os.path.isdir(root):
-            continue
-        try:
-            with os.scandir(root) as entries:
-                for entry in entries:
-                    if not entry.name.endswith(".lv2"):
-                        continue
-                    try:
-                        stat = entry.stat(follow_symlinks=False)
-                        token = f"{entry.path}|{int(getattr(stat, 'st_mtime_ns', 0) or 0)}"
-                    except Exception:
-                        token = entry.path
-                    bundle_tokens.append(token)
-        except Exception:
-            logger.debug("lv2 source signature scan failed for root=%s", root, exc_info=True)
-    bundle_tokens.sort()
-    digest = hashlib.sha256("\n".join(bundle_tokens).encode("utf-8")).hexdigest()
-    return {
-        "version": 1,
-        "roots": roots,
-        "bundle_count": len(bundle_tokens),
-        "digest": digest,
-    }
-
-
-def _lv2_load_persistent_scan_cache(self):
-    path = _lv2_persistent_cache_file(self)
-    if not path:
-        return False
-    meta_path = _lv2_persistent_scan_meta_file(self)
-    meta = read_json(meta_path, default=None) if meta_path else None
-    current_sig = _lv2_scan_source_signature()
-    if not isinstance(meta, dict) or meta.get("digest") != current_sig.get("digest"):
-        logger.info(
-            "LV2 scan cache invalidated: path=%s reason=%s",
-            path,
-            "missing-meta" if not isinstance(meta, dict) else "source-changed",
-        )
-        return False
-    raw = read_json(path, default=None)
-    if not isinstance(raw, list):
-        return False
-    cache_map = {}
-    for item in raw:
-        if not isinstance(item, dict):
-            continue
-        uri = str(item.get("uri", "") or "").strip()
-        if not uri:
-            continue
-        cache_map[uri] = dict(item)
-    if not cache_map:
-        return False
-    self._lv2_plugin_cache = cache_map
-    logger.info("LV2 scan cache restored from disk: plugins=%d path=%s", len(cache_map), path)
-    return True
-
-
-def _lv2_store_persistent_scan_cache(self, cache_map):
-    path = _lv2_persistent_cache_file(self)
-    if not path:
-        return
-    try:
-        payload = sorted(
-            [dict(plugin) for plugin in dict(cache_map or {}).values() if isinstance(plugin, dict)],
-            key=lambda item: str(item.get("name", "") or "").lower(),
-        )
-        write_json(path, payload, indent=2)
-        meta_path = _lv2_persistent_scan_meta_file(self)
-        if meta_path:
-            write_json(meta_path, _lv2_scan_source_signature(), indent=2)
-        logger.info("LV2 scan cache saved: plugins=%d path=%s", len(payload), path)
-    except Exception:
-        logger.debug("lv2 scan cache save failed", exc_info=True)
-
-
-def _lv2_ensure_scan_cache(self):
-    """Ensure an LV2 scan is scheduled; returns True if cache is already ready."""
-    if getattr(self, "_lv2_plugin_cache", None) is not None:
-        return True
-    self._lv2_schedule_scan_cache(refresh_ui=False)
-    return False
-
-
-def _lv2_refresh_ui_after_scan(self):
-    player = getattr(self, "player", None)
-    slots = dict(getattr(player, "lv2_slots", {}) or {}) if player else {}
-    slot_ids = list(slots.keys())
-    stack = getattr(self, "dsp_module_stack", None)
-    if stack is not None:
-        for slot_id in slot_ids:
-            child = stack.get_child_by_name(slot_id)
-            if child is not None:
-                stack.remove(child)
-    scales = getattr(self, "dsp_lv2_slot_scales", None)
-    if isinstance(scales, dict):
-        for slot_id in slot_ids:
-            scales.pop(slot_id, None)
-    self._lv2_rebuild_sidebar_rows()
-    if hasattr(self, "_rebuild_dsp_overview_chain"):
-        self._rebuild_dsp_overview_chain()
-    if hasattr(self, "_update_dsp_ui_state"):
-        try:
-            self._update_dsp_ui_state()
-        except Exception:
-            logger.debug("dsp ui state refresh after lv2 scan failed", exc_info=True)
-    selected = str(getattr(self, "_dsp_selected_module", "") or "")
-    if selected in slot_ids:
-        # Defer via idle_add so any coalesced (pending) sidebar rebuild runs first
-        # and adds the module page to the stack before we try to show it.
-        # GLib idle callbacks are FIFO, so the rebuild idle (queued by the
-        # coalesced guard) always fires before this one.
-        GLib.idle_add(lambda: self._show_dsp_module(selected, select_row=True))
-
-
-def _lv2_schedule_scan_cache(self, refresh_ui=False, on_ready=None, force=False):
-    callbacks = getattr(self, "_lv2_scan_ready_callbacks", None)
-    if callbacks is None:
-        callbacks = []
-        self._lv2_scan_ready_callbacks = callbacks
-    if callable(on_ready):
-        callbacks.append(on_ready)
-
-    if force:
-        self._lv2_plugin_cache = None
-    cache = getattr(self, "_lv2_plugin_cache", None)
-    if cache is not None:
-        if refresh_ui:
-            _lv2_refresh_ui_after_scan(self)
-        ready_callbacks = list(getattr(self, "_lv2_scan_ready_callbacks", []) or [])
-        self._lv2_scan_ready_callbacks = []
-        for cb in ready_callbacks:
-            try:
-                cb()
-            except Exception:
-                logger.debug("lv2 scan ready callback failed", exc_info=True)
-        return
-    if not force and _lv2_load_persistent_scan_cache(self):
-        if refresh_ui:
-            _lv2_refresh_ui_after_scan(self)
-        ready_callbacks = list(getattr(self, "_lv2_scan_ready_callbacks", []) or [])
-        self._lv2_scan_ready_callbacks = []
-        for cb in ready_callbacks:
-            try:
-                cb()
-            except Exception:
-                logger.debug("lv2 scan ready callback failed", exc_info=True)
-        return
-
-    if refresh_ui:
-        self._lv2_scan_refresh_ui_pending = True
-    if bool(getattr(self, "_lv2_scan_inflight", False)):
-        return
-
-    player = getattr(self, "player", None)
-    if player is None or not hasattr(player, "lv2_scan_plugins"):
-        self._lv2_plugin_cache = {}
-        self._lv2_scan_inflight = False
-        if bool(getattr(self, "_lv2_scan_refresh_ui_pending", False)):
-            self._lv2_scan_refresh_ui_pending = False
-            _lv2_refresh_ui_after_scan(self)
-        ready_callbacks = list(getattr(self, "_lv2_scan_ready_callbacks", []) or [])
-        self._lv2_scan_ready_callbacks = []
-        for cb in ready_callbacks:
-            try:
-                cb()
-            except Exception:
-                logger.debug("lv2 scan ready callback failed", exc_info=True)
-        return
-
-    self._lv2_scan_inflight = True
-    _lv2_update_browser_action_state(self)
-    logger.info("LV2 scan scheduled")
-
-    def task():
-        try:
-            plugins = player.lv2_scan_plugins()
-            cache_map = {p["uri"]: p for p in (plugins or [])}
-        except Exception:
-            logger.debug("lv2 scan failed", exc_info=True)
-            cache_map = {}
-
-        def apply():
-            self._lv2_plugin_cache = cache_map
-            self._lv2_scan_inflight = False
-            _lv2_update_browser_action_state(self)
-            _lv2_store_persistent_scan_cache(self, cache_map)
-            logger.info("LV2 scan complete: plugins=%d", len(cache_map))
-            if bool(getattr(self, "_lv2_scan_refresh_ui_pending", False)):
-                self._lv2_scan_refresh_ui_pending = False
-                _lv2_refresh_ui_after_scan(self)
-            ready_callbacks = list(getattr(self, "_lv2_scan_ready_callbacks", []) or [])
-            self._lv2_scan_ready_callbacks = []
-            for cb in ready_callbacks:
-                try:
-                    cb()
-                except Exception:
-                    logger.debug("lv2 scan ready callback failed", exc_info=True)
-            return False
-
-        GLib.idle_add(apply)
-
-    submit_daemon(task)
-
-
-def _lv2_build_slot_page(self, slot_id):
-    """Build and register the detail page for an LV2 slot. No-op if page already exists."""
-    stack = getattr(self, "dsp_module_stack", None)
-    if stack is None:
-        return
-    # Already built?
-    if stack.get_child_by_name(slot_id) is not None:
-        return
-
-    player = getattr(self, "player", None)
-    slot_info = (getattr(player, "lv2_slots", {}) or {}).get(slot_id, {}) if player else {}
-    meta = self._lv2_get_plugin_meta(slot_id)
-    plugin_name = (meta or {}).get("name", slot_id)
-    controls = (meta or {}).get("controls", [])
-    port_values = slot_info.get("port_values", {})
-
-    page = Gtk.Box(
-        orientation=Gtk.Orientation.VERTICAL,
-        spacing=10,
-        margin_top=12,
-        margin_bottom=12,
-        margin_start=12,
-        margin_end=12,
-        valign=Gtk.Align.START,
-        css_classes=["dsp-detail-card"],
-    )
-    page.set_vexpand(False)
-
-    # Header
-    title_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
-    title_box.append(Gtk.Label(label=plugin_name, xalign=0, css_classes=["title-4"]))
-    uri = slot_info.get("uri", "")
-    if uri:
-        uri_label = Gtk.Label(label=uri, xalign=0, wrap=True, css_classes=["dim-label"])
-        uri_label.set_selectable(True)
-        title_box.append(uri_label)
-    page.append(title_box)
-
-    if controls:
-        scales_dict = getattr(self, "dsp_lv2_slot_scales", None)
-        if scales_dict is None:
-            self.dsp_lv2_slot_scales = {}
-            scales_dict = self.dsp_lv2_slot_scales
-        if slot_id not in scales_dict:
-            scales_dict[slot_id] = {}
-
-        controls_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        rendered_controls = 0
-        for ctrl in controls:
-            symbol = ctrl.get("symbol", "")
-            if _lv2_is_host_managed_symbol(symbol):
-                continue
-            name = ctrl.get("name", symbol)
-            is_toggled = ctrl.get("toggled", False)
-            is_integer = ctrl.get("integer", False)
-            mn = float(ctrl.get("min", 0.0))
-            mx = float(ctrl.get("max", 1.0))
-            default = float(ctrl.get("default", mn))
-            current = float(port_values.get(symbol, default))
-
-            row = Gtk.Box(spacing=12)
-            row.set_valign(Gtk.Align.CENTER)
-            row.append(_build_dsp_control_label(self, name))
-
-            if is_toggled:
-                widget = Gtk.Switch()
-                widget.set_valign(Gtk.Align.CENTER)
-                widget.set_halign(Gtk.Align.END)
-                widget.set_hexpand(True)
-                widget.set_active(current != 0.0)
-                widget.connect(
-                    "notify::active",
-                    lambda sw, _param, sid=slot_id, sym=symbol: self._on_lv2_port_scale_changed(
-                        sid, sym, sw
-                    ),
-                )
-            else:
-                if mx <= mn:
-                    mx = mn + 1.0
-                if is_integer:
-                    step = 1.0
-                    digits = 0
-                else:
-                    step = (mx - mn) / 100.0
-                    digits = 2
-                current = max(mn, min(mx, current))
-                widget = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, mn, mx, step)
-                widget.set_digits(digits)
-                widget.set_draw_value(True)
-                widget.set_value_pos(Gtk.PositionType.RIGHT)
-                widget.set_hexpand(True)
-                widget.set_valign(Gtk.Align.CENTER)
-                widget.set_value(current)
-                widget.connect(
-                    "value-changed",
-                    lambda sc, sid=slot_id, sym=symbol: self._on_lv2_port_scale_changed(
-                        sid, sym, sc
-                    ),
-                )
-
-            row.append(widget)
-            controls_box.append(row)
-            scales_dict[slot_id][symbol] = widget
-            rendered_controls += 1
-        if rendered_controls > 0:
-            page.append(controls_box)
-        else:
-            page.append(
-                Gtk.Label(
-                    label="No controllable parameters for this plugin.",
-                    xalign=0,
-                    wrap=True,
-                    css_classes=["dim-label"],
-                )
-            )
-    else:
-        page.append(
-            Gtk.Label(
-                label="No controllable parameters for this plugin.",
-                xalign=0,
-                wrap=True,
-                css_classes=["dim-label"],
-            )
-        )
-
-    stack.add_titled(_build_dsp_detail_page(page), slot_id, plugin_name)
-    if hasattr(self, "_update_dsp_ui_state"):
-        try:
-            self._update_dsp_ui_state()
-        except Exception:
-            logger.debug("dsp ui state refresh after lv2 page build failed", exc_info=True)
-
-
-def _on_lv2_port_scale_changed(self, slot_id, symbol, widget):
-    if getattr(self, "_dsp_ui_syncing", False):
-        return
-    if _lv2_is_host_managed_symbol(symbol):
-        return
-    if isinstance(widget, Gtk.Switch):
-        value = 1.0 if widget.get_active() else 0.0
-    else:
-        value = float(widget.get_value())
-    player = getattr(self, "player", None)
-    if player and hasattr(player, "lv2_set_port_value"):
-        player.lv2_set_port_value(slot_id, symbol, value)
-    self._lv2_save_slots()
-
-
-def _lv2_rebuild_sidebar_rows(self):
-    """Add/remove LV2 sidebar rows to match current player.lv2_slots."""
-    lv2_list = getattr(self, "dsp_lv2_module_list", None)
-    if lv2_list is None:
-        return
-    if bool(getattr(self, "_lv2_sidebar_rebuild_inflight", False)):
-        self._lv2_sidebar_rebuild_pending = True
-        logger.info("LV2 sidebar rebuild coalesced: inflight=1")
-        return
-    self._lv2_sidebar_rebuild_inflight = True
-    self._lv2_sidebar_rebuild_pending = False
-    logger.info(
-        "LV2 sidebar rebuild start listbox_id=%s existing_rows=%s",
-        hex(id(lv2_list)),
-        _listbox_debug_rows(lv2_list),
-    )
-    try:
-        # Remove all existing rows
-        while True:
-            child = lv2_list.get_first_child()
-            if child is None:
-                break
-            lv2_list.remove(child)
-        logger.info(
-            "LV2 sidebar rebuild cleared listbox_id=%s rows=%s",
-            hex(id(lv2_list)),
-            _listbox_debug_rows(lv2_list),
-        )
-
-        player = getattr(self, "player", None)
-        slots = dict(getattr(player, "lv2_slots", {}) or {}) if player else {}
-        self.dsp_lv2_slot_rows = {}
-        logger.info(
-            "LV2 sidebar rebuild slots=%s",
-            [(sid, str((info or {}).get("uri", "") or "")) for sid, info in slots.items()],
-        )
-
-        if not slots:
-            lv2_list.set_visible(False)
-            return
-
-        if getattr(self, "_lv2_plugin_cache", None) is None:
-            self._lv2_schedule_scan_cache(refresh_ui=True)
-
-        lv2_list.set_visible(True)
-        for slot_id, info in slots.items():
-            meta = self._lv2_get_plugin_meta(slot_id)
-            plugin_name = (meta or {}).get("name", slot_id)
-            row = Gtk.ListBoxRow()
-            row.dsp_module_id = slot_id
-            row.set_activatable(True)
-            row.set_margin_top(4)
-            row.set_margin_bottom(4)
-            box = Gtk.Box(spacing=8, margin_top=8, margin_bottom=8, margin_start=12, margin_end=8, valign=Gtk.Align.CENTER)
-            name_label = Gtk.Label(label=plugin_name, xalign=0, hexpand=True, ellipsize=3)  # PANGO_ELLIPSIZE_END=3
-            name_label.set_max_width_chars(18)
-            name_label.add_css_class("settings-label")
-            box.append(name_label)
-            switch = Gtk.Switch(valign=Gtk.Align.CENTER)
-            switch.set_active(bool(info.get("enabled", True)))
-            switch.connect("state-set", lambda sw, state, sid=slot_id: self._on_lv2_slot_toggled(sid, sw, state))
-            box.append(switch)
-            remove_btn = Gtk.Button(icon_name="list-remove-symbolic", css_classes=["flat", "circular"], valign=Gtk.Align.CENTER)
-            remove_btn.connect("clicked", lambda _b, sid=slot_id: self._on_lv2_slot_remove(sid))
-            box.append(remove_btn)
-            select_click = Gtk.GestureClick()
-            select_click.set_button(Gdk.BUTTON_PRIMARY)
-            select_click.connect(
-                "released",
-                lambda _gesture, _n, _x, _y, sid=slot_id: self._show_dsp_module(sid, select_row=True),
-            )
-            box.add_controller(select_click)
-            row.set_child(box)
-            lv2_list.append(row)
-            self.dsp_lv2_slot_rows[slot_id] = {
-                "row": row,
-                "switch": switch,
-                "remove_btn": remove_btn,
-            }
-            logger.info(
-                "LV2 sidebar append listbox_id=%s row_id=%s slot_id=%s plugin_name=%s uri=%s",
-                hex(id(lv2_list)),
-                hex(id(row)),
-                slot_id,
-                plugin_name,
-                str((info or {}).get("uri", "") or ""),
-            )
-            # Build detail page if not yet built
-            self._lv2_build_slot_page(slot_id)
-        logger.info(
-            "LV2 sidebar rebuild finish listbox_id=%s rows=%s",
-            hex(id(lv2_list)),
-            _listbox_debug_rows(lv2_list),
-        )
-    finally:
-        pending = bool(getattr(self, "_lv2_sidebar_rebuild_pending", False))
-        self._lv2_sidebar_rebuild_inflight = False
-        if pending:
-            self._lv2_sidebar_rebuild_pending = False
-            GLib.idle_add(lambda: (_lv2_rebuild_sidebar_rows(self), False)[1])
-
-
-def _on_lv2_slot_toggled(self, slot_id, switch, state):
-    if getattr(self, "_dsp_ui_syncing", False):
-        return True
-    logger.info("LV2 toggle request slot_id=%s state=%s", slot_id, bool(state))
-    player = getattr(self, "player", None)
-    if player and hasattr(player, "lv2_set_slot_enabled"):
-        ok = player.lv2_set_slot_enabled(slot_id, bool(state))
-        if not ok:
-            logger.warning("LV2 toggle failed slot_id=%s state=%s", slot_id, bool(state))
-            self._dsp_ui_syncing = True
-            try:
-                switch.set_active(not state)
-            finally:
-                self._dsp_ui_syncing = False
-            return True
-        # Keep the plugin's own "enabled" port in sync with the slot switch.
-        self._lv2_sync_enabled_port(slot_id, bool(state))
-        logger.info("LV2 toggle applied slot_id=%s state=%s", slot_id, bool(state))
-    self._lv2_save_slots()
-    if hasattr(self, "_update_dsp_ui_state"):
-        try:
-            self._update_dsp_ui_state()
-        except Exception:
-            logger.debug("dsp ui state refresh after lv2 toggle failed", exc_info=True)
-    _lv2_restart_playback_for_graph_rebind(self)
-    return False
-
-
-def _on_lv2_slot_remove(self, slot_id):
-    # Remove the detail page if present
-    stack = getattr(self, "dsp_module_stack", None)
-    if stack is not None:
-        child_page = stack.get_child_by_name(slot_id)
-        if child_page is not None:
-            stack.remove(child_page)
-    # Remove scale dict entry
-    scales = getattr(self, "dsp_lv2_slot_scales", {})
-    scales.pop(slot_id, None)
-    self._lv2_remove_slot(slot_id)
-    self._lv2_rebuild_sidebar_rows()
-    self._show_dsp_module("peq", select_row=True)
-
-
-def _present_lv2_plugin_browser(self, plugins):
-    win = getattr(self, "win", None)
-    dialog = Gtk.Dialog(title="Add LV2 Plugin", transient_for=win, modal=True)
-    dialog.set_default_size(520, 480)
-
-    root = Gtk.Box(
-        orientation=Gtk.Orientation.VERTICAL,
-        spacing=8,
-        margin_top=8,
-        margin_bottom=8,
-        margin_start=12,
-        margin_end=12,
-    )
-
-    help_row = Gtk.Box(spacing=8)
-    help_label = Gtk.Label(
-        label="This list shows installed LV2 plugins. Install packages first if you need more plugins.",
-        xalign=0,
-        wrap=True,
-        hexpand=True,
-        css_classes=["dim-label"],
-    )
-    help_row.append(help_label)
-    help_btn = Gtk.Button(label="Install Help", css_classes=["flat"])
-    help_btn.connect(
-        "clicked",
-        lambda _b: self._show_simple_dialog("LV2 Install Help", _lv2_install_help_text()),
-    )
-    help_row.append(help_btn)
-    root.append(help_row)
-
-    search_entry = Gtk.SearchEntry(placeholder_text="Search plugins\u2026")
-    root.append(search_entry)
-
-    scroll = Gtk.ScrolledWindow(vexpand=True)
-    scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-    plugin_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE, css_classes=["boxed-list"])
-    plugin_list.set_filter_func(
-        lambda row: search_entry.get_text().lower() in (getattr(row, "_plugin_search_str", ""))
-    )
-    scroll.set_child(plugin_list)
-
-    if not plugins:
-        plugin_list.append(
-            Gtk.Label(
-                label=(
-                    "No LV2 plugins found.\n\n"
-                    "Use Install Help for Fedora package examples, then reopen this dialog."
-                ),
-                wrap=True,
-                margin_top=12,
-                margin_bottom=12,
-                margin_start=8,
-                margin_end=8,
-            )
-        )
-    else:
-        for p in plugins:
-            row = Gtk.ListBoxRow()
-            row._plugin_uri = p.get("uri", "")
-            row._plugin_search_str = (p.get("name", "") + " " + row._plugin_uri).lower()
-            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, margin_top=8, margin_bottom=8, margin_start=8, margin_end=8)
-            box.append(Gtk.Label(label=p.get("name", row._plugin_uri), xalign=0))
-            box.append(Gtk.Label(label=row._plugin_uri, xalign=0, css_classes=["dim-label", "caption"]))
-            row.set_child(box)
-            plugin_list.append(row)
-
-    search_entry.connect("search-changed", lambda _e: plugin_list.invalidate_filter())
-    root.append(scroll)
-
-    btn_row = Gtk.Box(spacing=8, halign=Gtk.Align.END)
-    cancel_btn = Gtk.Button(label="Cancel")
-    cancel_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.CANCEL))
-    btn_row.append(cancel_btn)
-    add_btn = Gtk.Button(label="Add", css_classes=["suggested-action"])
-    add_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.OK))
-    btn_row.append(add_btn)
-    root.append(btn_row)
-
-    dialog.set_child(root)
-    dialog.connect("response", lambda d, resp: self._on_lv2_plugin_browser_response(d, resp, plugin_list))
-    dialog.present()
-
-
-def _open_lv2_plugin_browser(self, _btn=None, force_refresh=False):
-    """Open a plugin browser dialog."""
-    if bool(getattr(self, "_lv2_scan_inflight", False)):
-        if not bool(getattr(self, "_lv2_browser_open_pending", False)):
-            self._lv2_browser_open_pending = True
-            self._lv2_schedule_scan_cache(
-                refresh_ui=True,
-                on_ready=lambda: self._open_lv2_plugin_browser(force_refresh=False),
-                force=bool(force_refresh),
-            )
-        if hasattr(self, "show_output_notice"):
-            self.show_output_notice("Scanning LV2 plugins...", "info", 2200)
-        return
-
-    if force_refresh:
-        self._lv2_browser_open_pending = True
-        self._lv2_schedule_scan_cache(
-            refresh_ui=True,
-            on_ready=lambda: self._open_lv2_plugin_browser(force_refresh=False),
-            force=True,
-        )
-        if hasattr(self, "show_output_notice"):
-            self.show_output_notice("Scanning LV2 plugins...", "info", 2200)
-        return
-
-    cache = getattr(self, "_lv2_plugin_cache", None)
-    if cache is None:
-        self._lv2_browser_open_pending = True
-        self._lv2_schedule_scan_cache(
-            refresh_ui=True,
-            on_ready=lambda: self._open_lv2_plugin_browser(force_refresh=False),
-        )
-        if hasattr(self, "show_output_notice"):
-            self.show_output_notice("Scanning LV2 plugins...", "info", 2200)
-        return
-    self._lv2_browser_open_pending = False
-    cache = cache or {}
-    plugins = sorted(cache.values(), key=lambda p: p.get("name", "").lower())
-    self._present_lv2_plugin_browser(plugins)
-
-
-def _on_lv2_plugin_browser_response(self, dialog, response, plugin_list):
-    dialog.destroy()
-    if response != Gtk.ResponseType.OK:
-        return
-    selected_row = plugin_list.get_selected_row()
-    if selected_row is None:
-        return
-    uri = getattr(selected_row, "_plugin_uri", "")
-    if not uri:
-        return
-    player = getattr(self, "player", None)
-    existing_slot_id = None
-    existing_slots = dict(getattr(player, "lv2_slots", {}) or {}) if player else {}
-    for slot_id, info in existing_slots.items():
-        if str((info or {}).get("uri", "") or "").strip() == str(uri or "").strip():
-            existing_slot_id = slot_id
-            break
-    logger.info(
-        "LV2 browser response uri=%s existing_slot_id=%s existing_slots=%s",
-        str(uri or ""),
-        existing_slot_id,
-        [
-            (sid, str((info or {}).get("uri", "") or ""))
-            for sid, info in existing_slots.items()
-        ],
-    )
-    slot_id = self._lv2_add_slot(uri)
-    if slot_id:
-        self._lv2_rebuild_sidebar_rows()
-        self._show_dsp_module(slot_id, select_row=True)
-        if hasattr(self, "show_output_notice"):
-            meta = self._lv2_get_plugin_meta(slot_id)
-            name = (meta or {}).get("name", slot_id)
-            if existing_slot_id is not None:
-                self.show_output_notice(f"LV2 already added: {name}", "info", 2200)
-            else:
-                self.show_output_notice(f"Added LV2: {name}", "ok", 2500)
-    else:
-        if hasattr(self, "show_output_notice"):
-            self.show_output_notice("Failed to load LV2 plugin", "error", 3000)
 
 
 def _show_simple_dialog(self, title, message):
