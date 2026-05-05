@@ -1477,9 +1477,9 @@ def on_output_state_transition(self, prev_state, state, detail=None):
         return
     if state == "active" and prev_state in ("switching", "fallback", "error"):
         self.show_output_notice("Audio output reconnected", "ok", 2200)
-        # USB Rawlink: the USB sink was rebuilt by set_output but the GStreamer
-        # pipeline was stopped during the disconnect.  Resume automatically if a
-        # track was loaded and the player is not already playing.
+        # USB Rawlink: the USB sink was rebuilt by set_output but the native
+        # transport was stopped during the disconnect.  Resume automatically if
+        # a track was loaded and the player is not already playing.
         if _driver_is_usb_rawlink_family(getattr(player, "requested_driver", "")):
             uri = str(getattr(player, "_last_loaded_uri", "") or "")
             if uri and not player.is_playing():
@@ -1650,10 +1650,10 @@ def update_tech_label(self, info):
 
     bitrate = int(info.get("bitrate", 0) or 0)
     if bitrate > 0:
-        # GStreamer's bitrate estimate for lossless streams (FLAC) starts very
-        # low and converges upward over several TAG events.  Only display the
-        # value once two consecutive TAG events agree within ±40%, which means
-        # the estimate has stabilised.  Until then keep the last stable value
+        # The bitrate estimate for lossless streams (FLAC) starts very low and
+        # converges upward over several TAG events.  Only display the value
+        # once two consecutive TAG events agree within ±40%, which means the
+        # estimate has stabilised.  Until then keep the last stable value
         # (or show nothing if this is the very first track).
         pending = int(getattr(self, "_bitrate_pending", 0) or 0)
         shown   = int(getattr(self, "_bitrate_shown",   0) or 0)

@@ -549,7 +549,7 @@ class AudioSignalPathWindow(Adw.Window):
             return f"{pw_latency_ms:.1f} ms (PipeWire Node)", float(pw_latency_ms)
         if driver == "PipeWire" and latency_sec > 0:
             latency_ms = latency_sec * 1000.0
-            return f"{latency_ms:.1f} ms (GStreamer)", latency_ms
+            return f"{latency_ms:.1f} ms", latency_ms
         if latency_sec > 0:
             latency_ms = latency_sec * 1000.0
             return f"{latency_ms:.1f} ms", latency_ms

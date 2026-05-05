@@ -1069,7 +1069,7 @@ class _RustAudioCore:
                     pass
 
     def get_last_error(self):
-        """Return the last GStreamer error string from the Rust engine, or empty string."""
+        """Return the last error string from the Rust engine, or empty string."""
         if (not self.available) or self._closed:
             return ""
         fn = getattr(self.lib, "rac_get_last_error", None)
@@ -1299,9 +1299,9 @@ class RustAudioPlayerAdapter:
     mirroring core transport state into Rust audio core for progressive migration.
     """
     # Keywords that unambiguously indicate a physical device disconnect.
-    # Note: "alsa" is intentionally NOT here — the GStreamer element name
-    # "rust-alsa-sink" contains "alsa" and would cause false positives.
-    # ALSA-specific disconnect detection is handled in _classify_rust_error.
+    # Note: "alsa" is intentionally NOT here — sink names like "rust-alsa-sink"
+    # contain "alsa" and would cause false positives.  ALSA-specific disconnect
+    # detection is handled in _classify_rust_error.
     _ERR_DEVICE_KEYS = (
         "disconnected",
         "no such device",
@@ -1609,7 +1609,7 @@ class RustAudioPlayerAdapter:
         text = str(raw or "").strip()
         if not text:
             return ""
-        # GStreamer tag strings may contain escaped separators/spaces.
+        # Tag strings may contain escaped separators/spaces.
         cleaned = text.replace("\\", " ").replace("_", " ")
         lowered = cleaned.lower()
         if "flac" in lowered:
@@ -1907,8 +1907,8 @@ class RustAudioPlayerAdapter:
                 info["depth"] = dv
                 changed = True
 
-        # source_rate / source_depth: parsed by Rust from the GStreamer TAG codec
-        # text (e.g. "FLAC, 192000 Hz, 24-bit").  These reflect the original media
+        # source_rate / source_depth: parsed by Rust from the TAG codec text
+        # (e.g. "FLAC, 192000 Hz, 24-bit").  These reflect the original media
         # resolution and take precedence over the output container format (S32LE)
         # for display purposes.
         src_rate = fields.get("source_rate")
@@ -2304,9 +2304,9 @@ class RustAudioPlayerAdapter:
         t = str(text or "").lower()
         if any(k in t for k in self._ERR_DEVICE_KEYS):
             return "device"
-        # "alsa" alone matches the GStreamer element name "rust-alsa-sink" and
-        # produces false positives.  Only classify as device error when the
-        # message also contains a specific hardware fault keyword.
+        # "alsa" alone matches sink names like "rust-alsa-sink" and produces
+        # false positives.  Only classify as a device error when the message
+        # also contains a specific hardware fault keyword.
         if "alsa" in t and any(k in t for k in self._ERR_ALSA_FAULT_KEYS):
             return "device"
         if any(k in t for k in self._ERR_NETWORK_KEYS):
@@ -2455,7 +2455,7 @@ class RustAudioPlayerAdapter:
         self.exclusive_lock_mode = bool(exclusive_lock)
         self.active_rate_switch = bool(enabled) and (not bool(exclusive_lock))
         if enabled:
-            # Reset GStreamer pipeline volume to 1.0 (unity gain / bypass).
+            # Reset engine volume to 1.0 (unity gain / bypass).
             # Call _rust directly to skip the bit_perfect_mode guard in
             # RustAdapter.set_volume — this covers all entry paths including
             # on_exclusive_toggled which does not go through _lock_volume_controls.
@@ -3416,8 +3416,8 @@ class RustAudioPlayerAdapter:
     def hint_source_format(self, bit_depth, sample_rate):
         """Store source format from the TIDAL API to inject on next load().
 
-        GStreamer TAG messages for FLAC do not carry Hz/-bit info, so the
-        values must be supplied externally before load() is called.
+        TAG messages for FLAC do not carry Hz/-bit info, so the values must
+        be supplied externally before load() is called.
         """
         self._pending_source_depth = int(bit_depth or 0)
         self._pending_source_rate = int(sample_rate or 0)
@@ -3677,7 +3677,7 @@ class RustAudioPlayerAdapter:
             chs = self.usb_hw_volume_channels()
             if chs and (len(chs) <= 1 or 0 in chs):
                 self.usb_hw_volume_set_percent(vol * 100.0)
-            # Keep GStreamer volume at unity so PCM data is untouched.
+            # Keep engine volume at unity so PCM data is untouched.
             self._rust.set_volume(1.0)
             self.output_error = None
             return
