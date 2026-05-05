@@ -1,3 +1,4 @@
+pub mod alsa_output;
 pub mod controller;
 pub mod format_util;
 pub mod native_dsp;
