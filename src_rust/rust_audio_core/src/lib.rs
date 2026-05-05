@@ -98,22 +98,8 @@ fn driver_uses_native_transport(driver: &str) -> bool {
     driver_is_usb_rawlink_v2(driver) || driver_routes_via_native_alsa(driver)
 }
 
-fn transport_reports_playing(
-    output_driver: &str,
-    native_state: native_transport::NativeTransportState,
-    gst_state: gst::State,
-) -> bool {
-    if driver_uses_native_transport(output_driver) {
-        native_state == native_transport::NativeTransportState::Playing
-    } else {
-        gst_state == gst::State::Playing
-    }
-}
-
 struct UsbRuntimeInfo {
     rate: u32,
-    total_frames: u64,
-    anchor_stream_pos_ns: u64,
     bit_depth: u8,
     device_name: String,
 }
@@ -122,8 +108,6 @@ fn active_usb_runtime_info(engine: &Engine) -> Option<UsbRuntimeInfo> {
     let runtime = engine.native_transport.runtime_info()?;
     Some(UsbRuntimeInfo {
         rate: runtime.feed.rate.load(Ordering::Relaxed),
-        total_frames: runtime.feed.total_frames.load(Ordering::Relaxed),
-        anchor_stream_pos_ns: 0,
         bit_depth: runtime.bit_depth,
         device_name: runtime.device_name,
     })
@@ -199,7 +183,6 @@ pub struct Engine {
     last_error: Option<String>,
     event_cb: Option<EventCallback>,
     event_user_data: *mut c_void,
-    playback_rate: f64,
     pitch_semitones: f64,
     spectrum_seq: u64,
     spectrum_pos_s: f64,
@@ -1236,7 +1219,6 @@ impl Engine {
             last_error: None,
             event_cb: None,
             event_user_data: ptr::null_mut(),
-            playback_rate: 1.0,
             pitch_semitones: 0.0,
             spectrum_seq: 0,
             spectrum_pos_s: 0.0,
@@ -1783,12 +1765,6 @@ impl Engine {
 
     fn set_mmap_realtime_priority(&mut self, priority: i32) -> c_int {
         self.output_mmap_realtime_priority = priority.max(0);
-        0
-    }
-
-    fn apply_playback_rate(&mut self) -> c_int {
-        // HiFi mode: do not alter transport rate in Rust path.
-        self.emit_event(EVT_STATE, "playback-rate=1.000 (hifi-locked)");
         0
     }
 }
@@ -2508,45 +2484,15 @@ pub extern "C" fn rac_set_uri(ptr: *mut Engine, uri: *const c_char) -> c_int {
         }
     };
 
-    // For USB Rawlink v2 and ALSA mmap, the GStreamer pipeline is NOT used
-    // for audio playback — native transport handles everything.  Skip all
-    // GStreamer pipeline manipulation; just load via native transport.
-    if driver_uses_native_transport(&engine.output_driver) {
-        engine.uri = s.to_string();
-        engine.maybe_load_native_transport_for_uri(s);
-        engine.reset_spectrum_timeline();
-        engine.last_codec.clear();
-        engine.last_bitrate = 0;
-        engine.last_rate = 0;
-        engine.last_depth = 0;
-        engine.source_rate = 0;
-        engine.source_depth = 0;
-        return 0;
-    }
-
-    let _ = engine.playbin.set_state(gst::State::Null);
-    engine.reset_spectrum_timeline();
-    engine.playbin.set_property("uri", s);
     engine.uri = s.to_string();
     engine.maybe_load_native_transport_for_uri(s);
+    engine.reset_spectrum_timeline();
     engine.last_codec.clear();
     engine.last_bitrate = 0;
     engine.last_rate = 0;
     engine.last_depth = 0;
     engine.source_rate = 0;
     engine.source_depth = 0;
-    // Re-attach the DSP bin while still in Null state so it is ready when
-    // rac_play transitions the pipeline to Playing.
-    if let Err(err) = engine.sync_audio_filter_graph() {
-        // A failure here means the audio-filter (including the spectrum element)
-        // will not be attached when the pipeline transitions to Playing.  Emit an
-        // error event so the Python layer can detect the stall and recover.
-        engine.set_error(format!("audio-filter sync failed after set_uri: {err}"));
-        engine.emit_event(
-            EVT_ERROR,
-            &format!("audio-filter sync failed after set_uri: {err}"),
-        );
-    }
     0
 }
 
@@ -2560,27 +2506,17 @@ pub extern "C" fn rac_play(ptr: *mut Engine) -> c_int {
         engine.emit_event(EVT_ERROR, "rac_play: empty uri");
         return -2;
     }
-    // For USB Rawlink v2 and ALSA mmap, ONLY use native transport — never
-    // start the GStreamer pipeline, which would claim the device and block
-    // native transport from accessing it.
-    if driver_uses_native_transport(&engine.output_driver) {
-        match engine.native_transport.play() {
-            Ok(()) => {
-                engine.emit_event(EVT_STATE, "Playing");
-                return 0;
-            }
-            Err(err) => {
-                engine.set_error(format!("native transport play failed: {err}"));
-                engine.emit_event(EVT_ERROR, &format!("native transport play failed: {err}"));
-                return -4;
-            }
+    match engine.native_transport.play() {
+        Ok(()) => {
+            engine.emit_event(EVT_STATE, "Playing");
+            0
+        }
+        Err(err) => {
+            engine.set_error(format!("native transport play failed: {err}"));
+            engine.emit_event(EVT_ERROR, &format!("native transport play failed: {err}"));
+            -4
         }
     }
-    let rc = engine.set_state(gst::State::Playing);
-    if rc == 0 && (engine.playback_rate - 1.0).abs() > f64::EPSILON {
-        let _ = engine.apply_playback_rate();
-    }
-    rc
 }
 
 #[no_mangle]
@@ -2588,20 +2524,17 @@ pub extern "C" fn rac_pause(ptr: *mut Engine) -> c_int {
     let Some(engine) = as_mut_engine(ptr) else {
         return -1;
     };
-    if driver_uses_native_transport(&engine.output_driver) {
-        match engine.native_transport.pause() {
-            Ok(()) => {
-                engine.emit_event(EVT_STATE, "Paused");
-                return 0;
-            }
-            Err(err) => {
-                engine.set_error(format!("native transport pause failed: {err}"));
-                engine.emit_event(EVT_ERROR, &format!("native transport pause failed: {err}"));
-                return -4;
-            }
+    match engine.native_transport.pause() {
+        Ok(()) => {
+            engine.emit_event(EVT_STATE, "Paused");
+            0
+        }
+        Err(err) => {
+            engine.set_error(format!("native transport pause failed: {err}"));
+            engine.emit_event(EVT_ERROR, &format!("native transport pause failed: {err}"));
+            -4
         }
     }
-    engine.set_state(gst::State::Paused)
 }
 
 #[no_mangle]
@@ -2610,21 +2543,17 @@ pub extern "C" fn rac_stop(ptr: *mut Engine) -> c_int {
         return -1;
     };
     engine.reset_spectrum_timeline();
-    if driver_uses_native_transport(&engine.output_driver) {
-        match engine.native_transport.stop() {
-            Ok(()) => {
-                engine.emit_event(EVT_STATE, "Null");
-                return 0;
-            }
-            Err(err) => {
-                engine.set_error(format!("native transport stop failed: {err}"));
-                engine.emit_event(EVT_ERROR, &format!("native transport stop failed: {err}"));
-                return -4;
-            }
+    match engine.native_transport.stop() {
+        Ok(()) => {
+            engine.emit_event(EVT_STATE, "Null");
+            0
+        }
+        Err(err) => {
+            engine.set_error(format!("native transport stop failed: {err}"));
+            engine.emit_event(EVT_ERROR, &format!("native transport stop failed: {err}"));
+            -4
         }
     }
-    let rc = engine.set_state(gst::State::Null);
-    rc
 }
 
 #[no_mangle]
@@ -2658,34 +2587,17 @@ pub extern "C" fn rac_seek(ptr: *mut Engine, pos_s: c_double) -> c_int {
         0.0
     };
 
-    if driver_uses_native_transport(&engine.output_driver) {
-        let ms = (clamped * 1000.0) as u64;
-        match engine.native_transport.seek_ms(ms) {
-            Ok(()) => {
-                engine.reset_spectrum_timeline();
-                return 0;
-            }
-            Err(err) => {
-                engine.set_error(&err);
-                engine.emit_event(EVT_ERROR, &err);
-                return -3;
-            }
+    let ms = (clamped * 1000.0) as u64;
+    match engine.native_transport.seek_ms(ms) {
+        Ok(()) => {
+            engine.reset_spectrum_timeline();
+            0
         }
-    }
-
-    let rc = engine.playbin.seek_simple(
-        // Keep FLUSH for responsiveness/stability across sinks; UI side handles
-        // brief position rebound after flush-seek.
-        gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
-        gst::ClockTime::from_nseconds((clamped * 1_000_000_000.0) as u64),
-    );
-    if rc.is_ok() {
-        engine.reset_spectrum_timeline();
-        0
-    } else {
-        engine.set_error("seek failed");
-        engine.emit_event(EVT_ERROR, "seek failed");
-        -3
+        Err(err) => {
+            engine.set_error(&err);
+            engine.emit_event(EVT_ERROR, &err);
+            -3
+        }
     }
 }
 
@@ -2699,7 +2611,6 @@ pub extern "C" fn rac_set_volume(ptr: *mut Engine, vol: c_double) -> c_int {
     } else {
         1.0
     };
-    engine.playbin.set_property("volume", v);
     engine.native_transport.set_volume(v as f32);
     0
 }
@@ -2865,51 +2776,44 @@ pub extern "C" fn rac_get_position(ptr: *const Engine, pos_out: *mut c_double) -
         return -2;
     }
 
-    let pos = if driver_uses_native_transport(&engine.output_driver) {
-        // After EOS but before next track loads, return 0 so the UI doesn't
-        // show stale position from the finished track.
-        if engine.native_eos_emitted {
-            0.0
-        } else {
-            let snap = engine.native_transport.snapshot();
-            let seek_offset = snap.seek_offset_s;
-            // Use the USB write-head for transport progress so the UI keeps
-            // moving even while the stricter play-head estimate is waiting for
-            // the in-flight ISO ring to drain. Spectrum release uses
-            // playback_elapsed_s() above for DAC-aligned visuals.
-            // ALSA mmap path doesn't populate runtime info, so it falls
-            // through to the decoded-frame-count branch.
-            if let Some(runtime) = engine.native_transport.runtime_info() {
-                let write_pos = runtime.feed.write_elapsed_s().unwrap_or(0.0);
-                if write_pos > 0.0 || snap.state != native_transport::NativeTransportState::Playing
-                {
-                    seek_offset + write_pos
-                } else {
-                    let rate = snap
-                        .stream_spec
-                        .as_ref()
-                        .map(|s| s.sample_rate as f64)
-                        .unwrap_or(0.0);
-                    if rate > 0.0 && snap.decoded_frame_count > 0 {
-                        seek_offset + snap.decoded_frame_count as f64 / rate
-                    } else {
-                        seek_offset
-                    }
-                }
+    // After EOS but before next track loads, return 0 so the UI doesn't
+    // show stale position from the finished track.
+    let pos = if engine.native_eos_emitted {
+        0.0
+    } else {
+        let snap = engine.native_transport.snapshot();
+        let seek_offset = snap.seek_offset_s;
+        // Use the USB write-head for transport progress so the UI keeps
+        // moving even while the stricter play-head estimate is waiting for
+        // the in-flight ISO ring to drain. ALSA mmap path doesn't populate
+        // runtime info, so it falls through to the decoded-frame-count branch.
+        if let Some(runtime) = engine.native_transport.runtime_info() {
+            let write_pos = runtime.feed.write_elapsed_s().unwrap_or(0.0);
+            if write_pos > 0.0 || snap.state != native_transport::NativeTransportState::Playing {
+                seek_offset + write_pos
             } else {
-                // Fallback: decoded frame count (ahead of actual playback).
-                let rate = snap.stream_spec.as_ref().map(|s| s.sample_rate as f64).unwrap_or(0.0);
-                if rate > 0.0 {
+                let rate = snap
+                    .stream_spec
+                    .as_ref()
+                    .map(|s| s.sample_rate as f64)
+                    .unwrap_or(0.0);
+                if rate > 0.0 && snap.decoded_frame_count > 0 {
                     seek_offset + snap.decoded_frame_count as f64 / rate
                 } else {
                     seek_offset
                 }
             }
-        }
-    } else {
-        match engine.playbin.query_position::<gst::ClockTime>() {
-            Some(p) => (p.nseconds() as f64) / 1_000_000_000.0,
-            None => 0.0,
+        } else {
+            let rate = snap
+                .stream_spec
+                .as_ref()
+                .map(|s| s.sample_rate as f64)
+                .unwrap_or(0.0);
+            if rate > 0.0 {
+                seek_offset + snap.decoded_frame_count as f64 / rate
+            } else {
+                seek_offset
+            }
         }
     };
 
@@ -2929,17 +2833,10 @@ pub extern "C" fn rac_get_duration(ptr: *const Engine, dur_out: *mut c_double) -
         return -2;
     }
 
-    let dur = if driver_uses_native_transport(&engine.output_driver) {
-        if engine.native_eos_emitted {
-            0.0
-        } else {
-            engine.native_transport.snapshot().duration_s.unwrap_or(0.0)
-        }
+    let dur = if engine.native_eos_emitted {
+        0.0
     } else {
-        match engine.playbin.query_duration::<gst::ClockTime>() {
-            Some(d) => (d.nseconds() as f64) / 1_000_000_000.0,
-            None => 0.0,
-        }
+        engine.native_transport.snapshot().duration_s.unwrap_or(0.0)
     };
 
     // SAFETY: dur_out is a valid output pointer from caller.
@@ -2950,72 +2847,16 @@ pub extern "C" fn rac_get_duration(ptr: *const Engine, dur_out: *mut c_double) -
 }
 
 fn probe_latency(engine: &Engine) -> (f64, &'static str) {
-    // USB rawlink: appsink does not participate in GStreamer latency queries,
-    // so the pipeline always reports 0.  Instead, measure the real gap between
-    // query_position (pipeline decode head) and the DAC play position derived
-    // from frame counting: dac_pos = anchor_stream_pos + total_frames / rate.
-    if let Some(info) = active_usb_runtime_info(engine) {
-        let rate = info.rate as u64;
-        if rate > 0 {
-            let total_frames = info.total_frames;
-            let anchor_pos_ns = info.anchor_stream_pos_ns;
-            // DAC has played total_frames since anchor — convert to stream ns.
-            let dac_played_ns = total_frames.saturating_mul(1_000_000_000) / rate;
-            let dac_stream_ns = anchor_pos_ns.saturating_add(dac_played_ns);
-
-            if let Some(q_pos_ns) = engine
-                .playbin
-                .query_position::<gst::ClockTime>()
-                .map(|p| p.nseconds())
-            {
-                if q_pos_ns > dac_stream_ns {
-                    let delta_s = (q_pos_ns - dac_stream_ns) as f64 / 1_000_000_000.0;
-                    if delta_s > 0.0 && delta_s < 5.0 {
-                        return (delta_s, "usb-rawlink-measured");
-                    }
-                }
-            }
-        }
-        // Fallback before clock is anchored (first samples not yet sent):
-        // use the ISO ring depth as a conservative estimate.
+    // USB rawlink V2: estimate from the ISO transfer ring depth. Pre-anchor
+    // (first samples not yet on the wire) and post-anchor share this estimate
+    // since the playbin no longer participates in latency under V2.
+    if active_usb_runtime_info(engine).is_some() {
         let ring_ms =
             (usb_audio::transfer::N_TRANSFERS * usb_audio::transfer::N_PACKETS_TARGET_MS) as f64;
         return (ring_ms / 1000.0, "usb-rawlink-ring-fallback");
     }
-
-    // Primary path: standard GStreamer latency query.
-    let mut q = gst::query::Latency::new();
-    if engine.playbin.query(&mut q) {
-        let (_live, min_lat, max_lat) = q.result();
-        let min_ns = min_lat.nseconds();
-        let max_ns = max_lat.map(|v| v.nseconds()).unwrap_or(0);
-        // For A/V sync, prefer the effective upper bound when available.
-        // Many pipelines (network + decode + queue + sink) report a much more
-        // realistic playout delay in max-latency than in min-latency.
-        if max_ns > 0 && max_ns < 5_000_000_000 {
-            return ((max_ns as f64) / 1_000_000_000.0, "gst-query-max");
-        }
-        if min_ns > 0 && min_ns < 5_000_000_000 {
-            return ((min_ns as f64) / 1_000_000_000.0, "gst-query-min");
-        }
-    }
-
-    // Fallback: read sink latency/buffer properties when query reports 0.
-    let sink: Option<gst::Element> = engine.playbin.property("audio-sink");
-    if let Some(sink) = sink {
-        if sink.find_property("latency-time").is_some() {
-            let v: i64 = sink.property("latency-time");
-            if v > 0 {
-                return ((v as f64) / 1_000_000.0, "sink-latency-time");
-            }
-        }
-        if sink.find_property("buffer-time").is_some() {
-            let v: i64 = sink.property("buffer-time");
-            if v > 0 {
-                return ((v as f64) / 1_000_000.0, "sink-buffer-time");
-            }
-        }
-    }
+    // ALSA family: native_transport does not surface its mmap buffer depth
+    // here yet; report 0 so callers know latency is unknown.
     (0.0, "none")
 }
 
@@ -3065,9 +2906,8 @@ pub extern "C" fn rac_is_playing(ptr: *const Engine) -> c_int {
     let Some(engine) = as_engine(ptr) else {
         return 0;
     };
-    let native_state = engine.native_transport.snapshot().state;
-    let (_, state, _) = engine.playbin.state(gst::ClockTime::from_mseconds(50));
-    if transport_reports_playing(&engine.output_driver, native_state, state) {
+    if engine.native_transport.snapshot().state == native_transport::NativeTransportState::Playing
+    {
         1
     } else {
         0
@@ -3867,7 +3707,6 @@ pub extern "C" fn rac_set_speed(ptr: *mut Engine, speed: c_double) -> c_int {
         engine.emit_event(EVT_ERROR, "rac_set_speed: non-finite value");
         return -2;
     }
-    engine.playback_rate = 1.0;
     let _ = speed; // API kept for compatibility; disabled in HiFi mode.
     engine.emit_event(EVT_STATE, "playback-rate request ignored (hifi-locked)");
     0
@@ -4235,39 +4074,4 @@ Capture:
         assert_eq!(depths, vec![16, 24, 32]);
     }
 
-    #[test]
-    fn transport_reports_playing_prefers_native_state_for_usb_rawlink_v2() {
-        assert!(transport_reports_playing(
-            "USB Rawlink v2",
-            native_transport::NativeTransportState::Playing,
-            gst::State::Paused,
-        ));
-        assert!(!transport_reports_playing(
-            "USB Rawlink v2",
-            native_transport::NativeTransportState::Paused,
-            gst::State::Playing,
-        ));
-    }
-
-    #[test]
-    fn transport_reports_playing_prefers_native_state_for_alsa_auto() {
-        // ALSA(auto), Auto(Default), and ALSA(mmap) all route through V2
-        // native_transport, so the GStreamer playbin sits at Paused with a
-        // fakesink while the real audio path advances. Trust native state.
-        assert!(transport_reports_playing(
-            "ALSA（auto）",
-            native_transport::NativeTransportState::Playing,
-            gst::State::Paused,
-        ));
-        assert!(!transport_reports_playing(
-            "ALSA（auto）",
-            native_transport::NativeTransportState::Paused,
-            gst::State::Playing,
-        ));
-        assert!(transport_reports_playing(
-            "Auto (Default)",
-            native_transport::NativeTransportState::Playing,
-            gst::State::Paused,
-        ));
-    }
 }
