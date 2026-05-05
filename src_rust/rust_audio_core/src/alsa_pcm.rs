@@ -167,6 +167,7 @@ pub struct AlsaMmapCtx {
     pub(crate) started: bool,
     /// Consecutive snd_pcm_start failures since last successful start.
     pub(crate) start_fail_count: u32,
+    #[allow(dead_code)]
     pub(crate) format_label: &'static str,
     /// True once `feed.anchor()` has been called for this playback session.
     pub(crate) anchored: bool,

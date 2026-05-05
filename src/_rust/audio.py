@@ -24,7 +24,6 @@ _LV2_HOST_MANAGED_PORT_SYMBOLS = {"enabled", "enable", "bypass"}
 
 DRIVER_ALSA_AUTO = "ALSA（auto）"
 DRIVER_ALSA_MMAP = "ALSA（mmap）"
-DRIVER_USB_RAWLINK = "USB Rawlink"
 DRIVER_USB_RAWLINK_V2 = "USB Rawlink v2"
 
 # Matches the fallback label emitted by Rust when device.open() fails (no permission).
@@ -46,15 +45,14 @@ def _driver_key(driver_name):
         return "pipewire"
     if compact in ("auto", "auto(default)"):
         return "auto"
-    if compact in ("usbrawlinkv2", "usb_rawlink_v2"):
+    if compact in ("usbrawlinkv2", "usb_rawlink_v2", "usbrawlink", "usb_rawlink"):
+        # Legacy "USB Rawlink" labels migrate to V2 transparently — V1 is gone.
         return "usb_rawlink_v2"
-    if compact in ("usbrawlink", "usb_rawlink"):
-        return "usb_rawlink"
     return compact
 
 
 def _is_usb_rawlink_family(driver_name):
-    return _driver_key(driver_name) in ("usb_rawlink", "usb_rawlink_v2")
+    return _driver_key(driver_name) == "usb_rawlink_v2"
 
 
 class _RustAudioCore:
@@ -3149,10 +3147,8 @@ class RustAudioPlayerAdapter:
     def get_drivers(self):
         return [
             "Auto (Default)",
-            "PipeWire",
             DRIVER_ALSA_AUTO,
             DRIVER_ALSA_MMAP,
-            DRIVER_USB_RAWLINK,
             DRIVER_USB_RAWLINK_V2,
         ]
 

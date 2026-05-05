@@ -23,7 +23,6 @@ _OUTPUT_BIT_DEPTH_GUESS_FORMATS = {
 
 DRIVER_ALSA_AUTO = "ALSA（auto）"
 DRIVER_ALSA_MMAP = "ALSA（mmap）"
-DRIVER_USB_RAWLINK = "USB Rawlink"
 DRIVER_USB_RAWLINK_V2 = "USB Rawlink v2"
 
 USB_CLOCK_OPTIONS = ["Push", "Pull"]
@@ -234,7 +233,8 @@ def _driver_key(driver_name):
     text = str(driver_name or "").strip().lower()
     text = text.replace("（", "(").replace("）", ")")
     compact = text.replace(" ", "")
-    if compact in ("usbrawlinkv2", "usb_rawlink_v2"):
+    if compact in ("usbrawlinkv2", "usb_rawlink_v2", "usbrawlink", "usb_rawlink"):
+        # Legacy "USB Rawlink" labels migrate to V2 transparently — V1 is gone.
         return "usb_rawlink_v2"
     if compact in ("alsa_mmap", "alsa(mmap)"):
         return "alsa_mmap"
@@ -252,7 +252,7 @@ def _driver_is_alsa_family(driver_name):
 
 
 def _driver_is_usb_rawlink_family(driver_name):
-    return _driver_key(driver_name) in ("usbrawlink", "usb_rawlink_v2")
+    return _driver_key(driver_name) == "usb_rawlink_v2"
 
 
 def _is_usb_rawlink_to_alsa_switch(previous_driver_name, target_driver_name):
@@ -695,7 +695,7 @@ def setup_device_dropdown_refresh_gesture(app):
                 return
             driver_name = drv_item.get_string()
             if _driver_key(driver_name) not in (
-                "alsa_auto", "alsa_mmap", "pipewire", "usbrawlink", "usb_rawlink_v2"
+                "alsa_auto", "alsa_mmap", "pipewire", "usb_rawlink_v2"
             ):
                 return
             if getattr(app, "ignore_device_change", False):
@@ -1164,7 +1164,7 @@ def on_driver_changed(app, dd, p):
         app._force_driver_selection(DRIVER_ALSA_AUTO)
         if hasattr(app, "show_output_notice"):
             app.show_output_notice(
-                f"Exclusive mode requires {DRIVER_ALSA_AUTO}, {DRIVER_ALSA_MMAP}, {DRIVER_USB_RAWLINK}, or {DRIVER_USB_RAWLINK_V2}.",
+                f"Exclusive mode requires {DRIVER_ALSA_AUTO}, {DRIVER_ALSA_MMAP}, or {DRIVER_USB_RAWLINK_V2}.",
                 "warn",
                 3200,
             )

@@ -3839,7 +3839,7 @@ def _player_uses_usb_rawlink_family(player):
         or getattr(player, "requested_driver", None)
         or ""
     )
-    return str(driver or "") in ("USB Rawlink", "USB Rawlink v2")
+    return str(driver or "") == "USB Rawlink v2"
 
 
 def _lv2_restart_playback_for_graph_rebind(self, reason="unspecified"):

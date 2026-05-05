@@ -1,30 +1,14 @@
 use gst::glib;
 use gst::prelude::*;
 use gstreamer as gst;
-use libpulse_binding as pulse;
-use pipewire as pw;
-use pulse::callbacks::ListResult;
-use pulse::context::{Context as PaContext, FlagSet as PaContextFlagSet, State as PaContextState};
-use pulse::mainloop::standard::Mainloop as PaMainloop;
-use pulse::operation::State as PaOperationState;
-use pulse::proplist::properties as pa_props;
-use pw::{
-    context::ContextRc as PwContext, keys, main_loop::MainLoopRc as PwMainLoop,
-    metadata::Metadata as PwMetadata, registry::GlobalObject, types::ObjectType,
-};
-use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::ffi::{CStr, CString};
-use std::io;
 use std::os::raw::{c_char, c_double, c_int, c_uint, c_void};
 use std::path::Path;
 use std::ptr;
-use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::{Arc, Mutex, Once};
-use std::thread;
-use std::time::Duration;
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::{Arc, Once};
 
 mod alsa_clock;
 mod alsa_pcm;
@@ -33,27 +17,18 @@ mod dsp;
 mod native_transport;
 pub mod usb_audio;
 
-use alsa_clock::{AlsaHwClock, AlsaHwClockFeed};
-use alsa_pcm::{mmap_audio_format_from_preference, AlsaMmapCtx, MmapAudioFormat};
 #[cfg(test)]
-use alsa_pcm::AlsaHandle;
+use alsa_pcm::{AlsaHandle, AlsaMmapCtx};
 use dsp::{
     DspGraphConfig, DspGraphRuntime, LufsValues, PEQ_BAND_COUNT,
     SPECTRUM_ACTIVE_BANDS_DEFAULT,
 };
 
 static GST_INIT: Once = Once::new();
-static PW_INIT: Once = Once::new();
 const SPECTRUM_BANDS_MAX: usize = 4096;
 const SPECTRUM_RING_CAP: usize = 512;
-const PIPEWIRE_CARD_PROFILE_TARGET_PREFIX: &str = "pwcardprofile:";
-
-type ThreadEventQueue = Arc<Mutex<VecDeque<(c_int, String)>>>;
-type MmapThreadDiagnosticsHandle = Arc<Mutex<MmapThreadDiagnostics>>;
 
 const ALSA_MMAP_RT_PRIORITY_DEFAULT: i32 = 60;
-const ALSA_MMAP_MEMLOCK_MODE: &str = "current";
-const ALSA_MMAP_ACCUM_RATE_BUDGET_HZ: u32 = 192_000;
 
 fn new_spectrum_ring_values() -> Vec<[f32; SPECTRUM_BANDS_MAX]> {
     vec![[0.0; SPECTRUM_BANDS_MAX]; SPECTRUM_RING_CAP]
@@ -69,232 +44,6 @@ fn new_spectrum_ring_pos_s() -> Vec<f64> {
 
 fn new_spectrum_ring_seq() -> Vec<u64> {
     vec![0; SPECTRUM_RING_CAP]
-}
-
-#[derive(Debug, Clone, Default)]
-struct MmapThreadDiagnostics {
-    running: bool,
-    realtime_attempted: bool,
-    realtime_enabled: bool,
-    realtime_policy: String,
-    realtime_priority: i32,
-    realtime_error: String,
-    memlock_attempted: bool,
-    memlock_enabled: bool,
-    memlock_mode: String,
-    memlock_error: String,
-    negotiated_rate: u32,
-    period_frames: usize,
-    buffer_frames: usize,
-    open_failures: u32,
-    device_resets: u32,
-}
-
-fn push_thread_event(queue: &ThreadEventQueue, evt: c_int, msg: impl Into<String>) {
-    if let Ok(mut pending) = queue.lock() {
-        if pending.len() >= 32 {
-            pending.pop_front();
-        }
-        pending.push_back((evt, msg.into()));
-    }
-}
-
-fn update_mmap_thread_diagnostics(
-    diagnostics: &MmapThreadDiagnosticsHandle,
-    update: impl FnOnce(&mut MmapThreadDiagnostics),
-) {
-    if let Ok(mut state) = diagnostics.lock() {
-        update(&mut state);
-    }
-}
-
-fn format_errno(code: i32) -> String {
-    format!("{code}: {}", io::Error::from_raw_os_error(code))
-}
-
-#[cfg(target_os = "linux")]
-fn configure_mmap_thread_memlock(diagnostics: &MmapThreadDiagnosticsHandle) {
-    update_mmap_thread_diagnostics(diagnostics, |state| {
-        state.memlock_attempted = true;
-        state.memlock_mode = ALSA_MMAP_MEMLOCK_MODE.to_string();
-        state.memlock_enabled = false;
-        state.memlock_error.clear();
-    });
-
-    let rc = unsafe { libc::mlockall(libc::MCL_CURRENT) };
-    if rc == 0 {
-        update_mmap_thread_diagnostics(diagnostics, |state| {
-            state.memlock_enabled = true;
-        });
-        return;
-    }
-
-    let err = io::Error::last_os_error();
-    let err_msg = err
-        .raw_os_error()
-        .map(format_errno)
-        .unwrap_or_else(|| err.to_string());
-    update_mmap_thread_diagnostics(diagnostics, |state| {
-        state.memlock_error = err_msg;
-    });
-}
-
-#[cfg(not(target_os = "linux"))]
-fn configure_mmap_thread_memlock(diagnostics: &MmapThreadDiagnosticsHandle) {
-    update_mmap_thread_diagnostics(diagnostics, |state| {
-        state.memlock_attempted = false;
-        state.memlock_enabled = false;
-        state.memlock_mode = "unsupported".to_string();
-        state.memlock_error = "unsupported-platform".to_string();
-    });
-}
-
-#[cfg(target_os = "linux")]
-fn clamp_mmap_thread_realtime_priority(requested_priority: i32) -> i32 {
-    if requested_priority <= 0 {
-        return 0;
-    }
-    unsafe {
-        let min = libc::sched_get_priority_min(libc::SCHED_FIFO);
-        let max = libc::sched_get_priority_max(libc::SCHED_FIFO);
-        if min >= 0 && max >= 0 && min <= max {
-            requested_priority.clamp(min, max)
-        } else {
-            requested_priority
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn configure_mmap_thread_realtime(
-    diagnostics: &MmapThreadDiagnosticsHandle,
-    requested_priority: i32,
-) {
-    let priority = clamp_mmap_thread_realtime_priority(requested_priority);
-    if priority <= 0 {
-        update_mmap_thread_diagnostics(diagnostics, |state| {
-            state.realtime_attempted = false;
-            state.realtime_enabled = false;
-            state.realtime_policy = "SCHED_FIFO".to_string();
-            state.realtime_priority = 0;
-            state.realtime_error = "config".to_string();
-        });
-        return;
-    }
-
-    update_mmap_thread_diagnostics(diagnostics, |state| {
-        state.realtime_attempted = true;
-        state.realtime_enabled = false;
-        state.realtime_policy = "SCHED_FIFO".to_string();
-        state.realtime_priority = priority;
-        state.realtime_error.clear();
-    });
-
-    let param = libc::sched_param {
-        sched_priority: priority,
-    };
-    let rc = unsafe { libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &param) };
-    if rc == 0 {
-        update_mmap_thread_diagnostics(diagnostics, |state| {
-            state.realtime_enabled = true;
-        });
-        return;
-    }
-
-    update_mmap_thread_diagnostics(diagnostics, |state| {
-        state.realtime_error = format_errno(rc);
-    });
-}
-
-#[cfg(not(target_os = "linux"))]
-fn configure_mmap_thread_realtime(
-    diagnostics: &MmapThreadDiagnosticsHandle,
-    requested_priority: i32,
-) {
-    if requested_priority <= 0 {
-        update_mmap_thread_diagnostics(diagnostics, |state| {
-            state.realtime_attempted = false;
-            state.realtime_enabled = false;
-            state.realtime_policy = "SCHED_FIFO".to_string();
-            state.realtime_priority = 0;
-            state.realtime_error = "config".to_string();
-        });
-        return;
-    }
-    update_mmap_thread_diagnostics(diagnostics, |state| {
-        state.realtime_attempted = false;
-        state.realtime_enabled = false;
-        state.realtime_policy = "unsupported".to_string();
-        state.realtime_priority = 0;
-        state.realtime_error = "unsupported-platform".to_string();
-    });
-}
-
-fn format_mmap_thread_config_state(diagnostics: &MmapThreadDiagnosticsHandle) -> String {
-    let state = diagnostics
-        .lock()
-        .map(|state| state.clone())
-        .unwrap_or_default();
-
-    let realtime = if state.realtime_enabled {
-        format!("fifo:{}", state.realtime_priority)
-    } else if state.realtime_attempted {
-        format!(
-            "off({})",
-            if state.realtime_error.is_empty() {
-                "unavailable"
-            } else {
-                state.realtime_error.as_str()
-            }
-        )
-    } else if !state.realtime_error.is_empty() {
-        format!("off({})", state.realtime_error)
-    } else {
-        "off".to_string()
-    };
-
-    let memlock = if state.memlock_enabled {
-        state.memlock_mode.clone()
-    } else if state.memlock_attempted {
-        format!(
-            "off({})",
-            if state.memlock_error.is_empty() {
-                "unavailable"
-            } else {
-                state.memlock_error.as_str()
-            }
-        )
-    } else {
-        "off".to_string()
-    };
-
-    format!("alsa-mmap thread-config realtime={realtime} memlock={memlock}")
-}
-
-fn configure_mmap_thread_runtime(
-    diagnostics: &MmapThreadDiagnosticsHandle,
-    events: &ThreadEventQueue,
-    realtime_priority: i32,
-) {
-    configure_mmap_thread_memlock(diagnostics);
-    configure_mmap_thread_realtime(diagnostics, realtime_priority);
-    push_thread_event(
-        events,
-        EVT_STATE,
-        format_mmap_thread_config_state(diagnostics),
-    );
-}
-
-fn frames_for_duration_us(
-    duration_us: i32,
-    sample_rate: u32,
-    min_frames: usize,
-    max_frames: usize,
-) -> usize {
-    let duration_us = duration_us.max(0) as u64;
-    let sample_rate = sample_rate.max(1) as u64;
-    let frames = duration_us.saturating_mul(sample_rate) / 1_000_000;
-    (frames as usize).clamp(min_frames, max_frames)
 }
 
 fn normalized_driver_label(driver: &str) -> String {
@@ -325,21 +74,6 @@ fn driver_is_alsa_family(driver: &str) -> bool {
 }
 
 
-/// Handle held by Engine to manage the mmap writer thread.
-struct MmapSink {
-    stop: Arc<AtomicBool>,
-    events: ThreadEventQueue,
-    diagnostics: MmapThreadDiagnosticsHandle,
-    thread: Option<thread::JoinHandle<()>>,
-}
-
-impl std::fmt::Debug for MmapSink {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "MmapSink(running={})", self.thread.is_some())
-    }
-}
-
-
 // ---------------------------------------------------------------------------
 // USB output format helpers
 // ---------------------------------------------------------------------------
@@ -357,7 +91,7 @@ fn transport_reports_playing(
     native_state: native_transport::NativeTransportState,
     gst_state: gst::State,
 ) -> bool {
-    if driver_is_usb_rawlink_v2(output_driver) {
+    if driver_is_usb_rawlink_v2(output_driver) || driver_is_alsa_mmap(output_driver) {
         native_state == native_transport::NativeTransportState::Playing
     } else {
         gst_state == gst::State::Playing
@@ -420,406 +154,6 @@ fn preferred_format_to_bit_depth(preferred: &str) -> u8 {
     }
 }
 
-/// Preallocated byte window for decoded PCM.
-///
-/// Unlike `Vec::drain(..period_bytes)`, this keeps a read offset and only
-/// compacts when the stale prefix grows large enough to matter, removing the
-/// per-period memmove from the mmap writer hot path.
-#[derive(Debug)]
-struct AudioByteWindow {
-    buf: Vec<u8>,
-    start: usize,
-}
-
-impl AudioByteWindow {
-    fn with_capacity(capacity: usize) -> Self {
-        let cap = capacity.max(1);
-        let mut buf = Vec::with_capacity(cap);
-        // Pre-fault all pages so that a subsequent mlockall(MCL_CURRENT) can
-        // pin them.  Vec::with_capacity only reserves virtual address space;
-        // the OS does not back the pages with physical memory until they are
-        // first written.
-        buf.resize(cap, 0u8);
-        buf.clear(); // reset len to 0, capacity is preserved
-        Self { buf, start: 0 }
-    }
-
-    fn clear(&mut self) {
-        self.buf.clear();
-        self.start = 0;
-    }
-
-    fn len(&self) -> usize {
-        self.buf.len().saturating_sub(self.start)
-    }
-
-    fn append(&mut self, src: &[u8]) {
-        if src.is_empty() {
-            return;
-        }
-        self.make_room(src.len());
-        self.buf.extend_from_slice(src);
-    }
-
-    fn peek_prefix(&self, len: usize) -> Option<&[u8]> {
-        if self.len() < len {
-            return None;
-        }
-        Some(&self.buf[self.start..self.start + len])
-    }
-
-    fn consume(&mut self, len: usize) {
-        if len == 0 {
-            return;
-        }
-        self.start = self.start.saturating_add(len).min(self.buf.len());
-        if self.start >= self.buf.len() {
-            self.clear();
-            return;
-        }
-
-        // Compact only when the stale prefix is at least as large as the live
-        // tail, or it has grown to a sizeable chunk.
-        let live_len = self.buf.len() - self.start;
-        if self.start >= live_len || self.start >= 65_536 {
-            self.compact();
-        }
-    }
-
-    fn make_room(&mut self, incoming_len: usize) {
-        let free_tail = self.buf.capacity().saturating_sub(self.buf.len());
-        if free_tail >= incoming_len {
-            return;
-        }
-
-        self.compact();
-        let free_tail = self.buf.capacity().saturating_sub(self.buf.len());
-        if free_tail < incoming_len {
-            self.buf.reserve(incoming_len - free_tail);
-        }
-    }
-
-    fn compact(&mut self) {
-        if self.start == 0 {
-            return;
-        }
-        if self.start >= self.buf.len() {
-            self.clear();
-            return;
-        }
-
-        self.buf.copy_within(self.start.., 0);
-        let live_len = self.buf.len() - self.start;
-        self.buf.truncate(live_len);
-        self.start = 0;
-    }
-}
-
-/// Background thread: pulls decoded PCM from appsink, writes to ALSA via mmap.
-///
-/// Design notes:
-/// - `appsink` has caps `audio/x-raw,format=S32LE,layout=interleaved` so GStreamer
-///   converts the format upstream.  Rate is left unconstrained; we derive ALSA
-///   period/buffer frame counts from the actual sample rate and reopen only if
-///   it changes.
-/// - `snd_pcm_wait()` inside mmap_write() provides natural back-pressure: the thread
-///   blocks until the hardware consumes one period, pacing the GStreamer pull rate.
-/// - `try-pull-sample` keeps the thread responsive to stop/flush transitions.
-///   Pipeline set_state(NULL) is treated as a transient reset unless `stop` is
-///   set, so URI changes can reuse the same sink.
-/// - Decoded PCM accumulates in a preallocated sliding window so appends stay
-///   cheap without `Vec::drain(..)` memmoves on every period commit.
-fn alsa_mmap_writer_thread(
-    appsink: gst::Element,
-    device: String,
-    period_us: i32,
-    target_buffer_us: i32,
-    mut accum: AudioByteWindow,
-    audio_format: MmapAudioFormat,
-    stop: Arc<AtomicBool>,
-    events: ThreadEventQueue,
-    diagnostics: MmapThreadDiagnosticsHandle,
-    feed: Arc<AlsaHwClockFeed>,
-) {
-    // Prevent the CPU from entering deep C-states (C2+) during playback.
-    // Deep C-states have wakeup latencies of 100–300 µs; keeping the CPU in
-    // C0/C1 ensures snd_pcm_wait() wake-ups are serviced promptly.
-    // Writing 0 (latency budget = 0 µs) to /dev/cpu_dma_latency is the
-    // standard mechanism used by PipeWire, JACK, and rtkit.
-    // The file descriptor is held until this thread exits (drop closes it).
-    let _cpu_dma_latency_guard: Option<std::fs::File> = {
-        use std::io::Write;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open("/dev/cpu_dma_latency")
-            .ok()
-            .and_then(|mut f| f.write_all(&0i32.to_ne_bytes()).ok().map(|_| f))
-    };
-
-    let mut ctx: Option<AlsaMmapCtx> = None;
-    let mut last_rate: u32 = 0;
-    let mut open_fail_count: u32 = 0;
-    // Tracks idle pre-warm attempts (separate from open_fail_count which is
-    // used only when samples are flowing).
-    let mut idle_open_attempts: u32 = 0;
-    // True once the first PCM sample has been received.  Used to decide
-    // whether to release the ALSA handle on pipeline-NULL transitions: we
-    // hold the pre-warmed handle until actual playback begins so the device
-    // is already open when the user clicks play.
-    let mut ever_playing = false;
-    let mut dma_locked = false;
-
-    loop {
-        if stop.load(Ordering::Relaxed) {
-            break;
-        }
-
-        // Use a timed pull so track switches and app shutdown do not strand the
-        // writer thread inside an uninterruptible appsink wait.
-        let sample =
-            appsink.emit_by_name::<Option<gst::Sample>>("try-pull-sample", &[&100_000_000u64]);
-        let sample = match sample {
-            None => {
-                // Release the ALSA handle only once we have been actively
-                // playing.  Before the first play, keep a pre-warmed handle
-                // open so the device is ready immediately when play starts.
-                if ever_playing {
-                    ctx = None;
-                }
-                accum.clear();
-                if stop.load(Ordering::Relaxed) {
-                    break;
-                }
-                // Pre-warm: while the pipeline is idle (NULL/READY) and before
-                // the first play, open the ALSA device in the background.  This
-                // is especially important after switching away from the PipeWire
-                // driver: PipeWire releases its hold on the ALSA device
-                // asynchronously, so retrying here (with backoff) ensures the
-                // device is free before the user clicks play.
-                // Once ever_playing is set, do NOT pre-warm: the device will be
-                // opened on demand when the next sample arrives (line ~1000).
-                // Pre-warming after ever_playing would create an open/close
-                // tight-loop because ctx is dropped unconditionally above
-                // (line 908) on every no-sample iteration.
-                if ctx.is_none() && idle_open_attempts < 50 && !ever_playing {
-                    let rate = if last_rate > 0 { last_rate } else { 44100 };
-                    let pf = frames_for_duration_us(period_us, rate, 64, 4096);
-                    let bf = frames_for_duration_us(
-                        target_buffer_us,
-                        rate,
-                        pf.saturating_mul(2),
-                        16_384,
-                    );
-                    match AlsaMmapCtx::open(
-                        &device,
-                        rate,
-                        pf as u32,
-                        bf as u32,
-                        audio_format.alsa_format,
-                        audio_format.frame_bytes,
-                        audio_format.log_label,
-                    ) {
-                        Ok(c) => {
-                            eprintln!(
-                                "[alsa-mmap] pre-warmed {} format={} rate={}",
-                                device, c.format_label, c.rate
-                            );
-                            update_mmap_thread_diagnostics(&diagnostics, |state| {
-                                state.negotiated_rate = c.rate;
-                                state.period_frames = c.period_frames;
-                                state.buffer_frames = c.buffer_frames;
-                            });
-                            // Clear any earlier open-failure error shown in the UI.
-                            if idle_open_attempts > 0 {
-                                push_thread_event(&events, EVT_STATE, "alsa-mmap device ready");
-                            }
-                            last_rate = rate;
-                            idle_open_attempts = 0;
-                            if !dma_locked {
-                                unsafe { libc::mlockall(libc::MCL_CURRENT) };
-                                dma_locked = true;
-                            }
-                            let mut c = c;
-                            c.feed = Some(Arc::clone(&feed));
-                            ctx = Some(c);
-                        }
-                        Err(e) => {
-                            idle_open_attempts += 1;
-                            eprintln!(
-                                "[alsa-mmap] pre-warm attempt {}: {} \
-                                 — device busy (snd-usb-audio re-attaching?)",
-                                idle_open_attempts, e
-                            );
-                            // Only report to the UI after all retries are exhausted,
-                            // because switching from USB rawlink causes snd-usb-audio to
-                            // re-attach asynchronously — early retries are expected.
-                            if idle_open_attempts >= 50 {
-                                push_thread_event(
-                                    &events,
-                                    EVT_ERROR,
-                                    format!(
-                                        "alsa-mmap open failed after {} attempts: {}",
-                                        idle_open_attempts, e
-                                    ),
-                                );
-                            }
-                            let backoff_ms = if idle_open_attempts <= 5 { 200 } else { 300 };
-                            thread::sleep(Duration::from_millis(backoff_ms));
-                            continue;
-                        }
-                    }
-                }
-                // In NULL/READY or during short route rebuild gaps, appsink can
-                // return immediately without blocking. Back off a little here so
-                // the realtime thread does not busy-spin while no PCM is flowing.
-                thread::sleep(Duration::from_millis(10));
-                continue;
-            }
-            Some(s) => s,
-        };
-
-        // First sample received — switch to active-playback mode.
-        ever_playing = true;
-        idle_open_attempts = 0;
-
-        // Detect sample rate; (re)open ALSA when it changes.
-        let rate = sample
-            .caps()
-            .and_then(|c| c.structure(0))
-            .and_then(|s| s.get::<i32>("rate").ok())
-            .unwrap_or(44100) as u32;
-
-        if ctx.is_none() || rate != last_rate {
-            ctx = None; // Drop old ctx → closes ALSA via Drop
-            accum.clear();
-            let period_frames = frames_for_duration_us(period_us, rate, 64, 4096);
-            let buffer_frames = frames_for_duration_us(
-                target_buffer_us,
-                rate,
-                period_frames.saturating_mul(2),
-                16_384,
-            );
-            match AlsaMmapCtx::open(
-                &device,
-                rate,
-                period_frames as u32,
-                buffer_frames as u32,
-                audio_format.alsa_format,
-                audio_format.frame_bytes,
-                audio_format.log_label,
-            ) {
-                Ok(c) => {
-                    eprintln!(
-                        "[alsa-mmap] opened {} format={} rate={} period={} buffer={} frames",
-                        device, c.format_label, c.rate, c.period_frames, c.buffer_frames
-                    );
-                    update_mmap_thread_diagnostics(&diagnostics, |state| {
-                        state.negotiated_rate = c.rate;
-                        state.period_frames = c.period_frames;
-                        state.buffer_frames = c.buffer_frames;
-                    });
-                    // Clear any earlier open-failure error shown in the UI.
-                    if open_fail_count > 0 {
-                        push_thread_event(&events, EVT_STATE, "alsa-mmap device ready");
-                    }
-                    last_rate = rate;
-                    open_fail_count = 0;
-                    if !dma_locked {
-                        // Re-lock now that ALSA DMA pages are mapped.
-                        unsafe { libc::mlockall(libc::MCL_CURRENT) };
-                        dma_locked = true;
-                    }
-                    let mut c = c;
-                    c.feed = Some(Arc::clone(&feed));
-                    ctx = Some(c);
-                }
-                Err(e) => {
-                    update_mmap_thread_diagnostics(&diagnostics, |state| {
-                        state.open_failures = state.open_failures.saturating_add(1);
-                    });
-                    open_fail_count += 1;
-                    eprintln!(
-                        "[alsa-mmap] open failed (attempt {}): {}  \
-                         — device busy (snd-usb-audio re-attaching / PipeWire releasing?)",
-                        open_fail_count, e
-                    );
-                    // Only report to the UI after all retries are exhausted.
-                    // Early failures are expected after switching from USB rawlink
-                    // (snd-usb-audio re-attaches asynchronously) or PipeWire.
-                    if open_fail_count >= 50 {
-                        push_thread_event(
-                            &events,
-                            EVT_ERROR,
-                            format!(
-                                "alsa-mmap open failed after {} attempts: {}",
-                                open_fail_count, e
-                            ),
-                        );
-                    }
-                    // Give up only after a sustained run of failures (~50 × backoff ≈ 10 s).
-                    if open_fail_count >= 50 {
-                        eprintln!(
-                            "[alsa-mmap] giving up after {} failures, stopping mmap thread",
-                            open_fail_count
-                        );
-                        break;
-                    }
-                    // Back off between open attempts so PipeWire/WirePlumber has time
-                    // to release the ALSA device after the previous driver disconnects.
-                    // Early attempts: 200 ms; later attempts: 300 ms.
-                    let backoff_ms = if open_fail_count <= 5 { 200 } else { 300 };
-                    thread::sleep(Duration::from_millis(backoff_ms));
-                    continue;
-                }
-            }
-        }
-
-        let period_bytes = {
-            let ctx = ctx.as_ref().unwrap();
-            ctx.period_frames * ctx.frame_bytes
-        };
-
-        // Accumulate incoming PCM bytes.
-        if let Some(buf) = sample.buffer() {
-            if let Ok(map) = buf.map_readable() {
-                accum.append(map.as_slice());
-            }
-        }
-
-        // Write complete periods to ALSA.
-        let mut write_failed = None;
-        while accum.len() >= period_bytes {
-            let frames = ctx.as_ref().map(|c| c.period_frames).unwrap_or(0);
-            let rc = {
-                let ctx = ctx.as_mut().unwrap();
-                let src = accum.peek_prefix(period_bytes).unwrap_or(&[]);
-                ctx.mmap_write(src, frames, &stop)
-            };
-            if let Err(rc) = rc {
-                write_failed = Some(rc);
-                break;
-            }
-            accum.consume(period_bytes);
-        }
-        if let Some(rc) = write_failed {
-            if stop.load(Ordering::Relaxed) || rc == -125 {
-                break;
-            }
-            update_mmap_thread_diagnostics(&diagnostics, |state| {
-                state.device_resets = state.device_resets.saturating_add(1);
-            });
-            push_thread_event(
-                &events,
-                EVT_ERROR,
-                format!("alsa-mmap write failed rc={rc}; resetting device"),
-            );
-            ctx = None;
-            last_rate = 0;
-            accum.clear();
-        }
-    }
-    // ctx drops here → snd_pcm_drop + snd_pcm_close via AlsaMmapCtx::drop
-}
 
 // ---------------------------------------------------------------------------
 
@@ -843,26 +177,6 @@ fn json_escape(v: &str) -> String {
         }
     }
     out
-}
-
-fn build_pipewire_card_profile_target(card: &str, profile: &str) -> String {
-    format!(
-        "{PIPEWIRE_CARD_PROFILE_TARGET_PREFIX}{}|{}",
-        card.trim(),
-        profile.trim()
-    )
-}
-
-fn parse_pipewire_card_profile_target(device_id: &str) -> Option<(String, String)> {
-    let raw = device_id.trim();
-    let tail = raw.strip_prefix(PIPEWIRE_CARD_PROFILE_TARGET_PREFIX)?;
-    let (card, profile) = tail.split_once('|')?;
-    let card = card.trim();
-    let profile = profile.trim();
-    if card.is_empty() || profile.is_empty() {
-        return None;
-    }
-    Some((card.to_string(), profile.to_string()))
 }
 
 #[derive(Debug)]
@@ -915,10 +229,13 @@ pub struct Engine {
     spectrum_enabled: bool,
     spectrum_stereo_enabled: bool,
     spectrum_active_bands: u32,
-    mmap_sink: Option<MmapSink>,
     /// USB output config for native transport (V2). Populated when the V2
     /// driver is selected and consumed when a track is loaded.
     native_usb_config: Option<usb_audio::UsbRawSinkConfig>,
+    /// ALSA mmap output config for native transport (V2). Populated when the
+    /// alsa_mmap driver is selected; consumed when a track is loaded so V2
+    /// can drive the ALSA mmap sink directly without going through GStreamer.
+    native_alsa_config: Option<native_transport::AlsaMmapOutputConfig>,
     #[allow(dead_code)]
     native_transport: native_transport::NativeTransportController,
     /// USB rawlink clock alignment: 0 = push (default), 1 = pull (Level 3).
@@ -935,386 +252,6 @@ pub struct Engine {
 }
 
 impl Engine {
-    fn ensure_pw_init() {
-        PW_INIT.call_once(|| {
-            pw::init();
-        });
-    }
-
-    fn pipewire_set_settings_metadata(
-        key: &str,
-        value: &str,
-        value_type: Option<&str>,
-    ) -> Result<(), String> {
-        Self::ensure_pw_init();
-        let result = (|| -> Result<(), String> {
-            let mainloop = PwMainLoop::new(None).map_err(|e| format!("pw mainloop: {e}"))?;
-            let context =
-                PwContext::new(&mainloop, None).map_err(|e| format!("pw context: {e}"))?;
-            let core = context
-                .connect(None)
-                .map_err(|e| format!("pw connect: {e}"))?;
-            let registry = core
-                .get_registry()
-                .map_err(|e| format!("pw registry: {e}"))?;
-
-            use std::{cell::Cell, rc::Rc};
-            let done = Rc::new(Cell::new(false));
-            let found_meta_id = Rc::new(Cell::new(u32::MAX));
-
-            let done_clone = done.clone();
-            let ml_quit = mainloop.clone();
-            let found_clone = found_meta_id.clone();
-
-            let _listener_reg = registry
-                .add_listener_local()
-                .global(move |global| {
-                    if global.type_ != ObjectType::Metadata {
-                        return;
-                    }
-                    let Some(props) = global.props else {
-                        return;
-                    };
-                    let name = props.get("metadata.name");
-                    if name == Some("settings") {
-                        found_clone.set(global.id);
-                    }
-                })
-                .register();
-
-            let pending = core.sync(0).map_err(|e| format!("pw sync: {e}"))?;
-            let _listener_core = core
-                .add_listener_local()
-                .done(move |id, seq| {
-                    if id == pw::core::PW_ID_CORE && seq == pending {
-                        done_clone.set(true);
-                        ml_quit.quit();
-                    }
-                })
-                .register();
-
-            while !done.get() {
-                mainloop.run();
-            }
-
-            let meta_id = found_meta_id.get();
-            if meta_id == u32::MAX {
-                return Err("pw metadata 'settings' not found".to_string());
-            }
-
-            let obj = GlobalObject {
-                id: meta_id,
-                permissions: pw::permissions::PermissionFlags::all(),
-                type_: ObjectType::Metadata,
-                version: pw::sys::PW_VERSION_METADATA,
-                props: Option::<pw::properties::Properties>::None,
-            };
-            let metadata: PwMetadata = registry
-                .bind(&obj)
-                .map_err(|e| format!("pw bind metadata: {e}"))?;
-            metadata.set_property(0, key, value_type, Some(value));
-            // set_property is asynchronous. Wait for a core sync round-trip so
-            // subsequent readers are less likely to observe stale metadata.
-            let done3 = Rc::new(Cell::new(false));
-            let done3_clone = done3.clone();
-            let ml_quit3 = mainloop.clone();
-            let pending3 = core.sync(0).map_err(|e| format!("pw sync3: {e}"))?;
-            let _listener_core3 = core
-                .add_listener_local()
-                .done(move |id, seq| {
-                    if id == pw::core::PW_ID_CORE && seq == pending3 {
-                        done3_clone.set(true);
-                        ml_quit3.quit();
-                    }
-                })
-                .register();
-            while !done3.get() {
-                mainloop.run();
-            }
-            Ok(())
-        })();
-        result
-    }
-
-    fn pipewire_set_clock_force_rate(rate: i32) -> Result<(), String> {
-        let value = if rate <= 0 {
-            "0".to_string()
-        } else {
-            rate.to_string()
-        };
-        Self::pipewire_set_settings_metadata("clock.force-rate", &value, Some("Spa:Int"))
-    }
-
-    fn pipewire_set_clock_allowed_rates_csv(csv: &str) -> Result<(), String> {
-        let mut vals: Vec<i32> = Vec::new();
-        for p in csv.split(',') {
-            let t = p.trim();
-            if t.is_empty() {
-                continue;
-            }
-            if let Ok(v) = t.parse::<i32>() {
-                if v > 0 {
-                    vals.push(v);
-                }
-            }
-        }
-        if vals.is_empty() {
-            return Err("empty allowed-rates".to_string());
-        }
-        vals.sort_unstable();
-        vals.dedup();
-        let arr = format!(
-            "[ {} ]",
-            vals.iter()
-                .map(|v| v.to_string())
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
-        // Keep type empty for array-like values.
-        Self::pipewire_set_settings_metadata("clock.allowed-rates", &arr, None)
-    }
-
-    fn pipewire_read_settings_metadata() -> Result<(i32, String, i32, i32), String> {
-        Self::ensure_pw_init();
-        let result = (|| -> Result<(i32, String, i32, i32), String> {
-            let mainloop = PwMainLoop::new(None).map_err(|e| format!("pw mainloop: {e}"))?;
-            let context =
-                PwContext::new(&mainloop, None).map_err(|e| format!("pw context: {e}"))?;
-            let core = context
-                .connect(None)
-                .map_err(|e| format!("pw connect: {e}"))?;
-            let registry = core
-                .get_registry()
-                .map_err(|e| format!("pw registry: {e}"))?;
-
-            let done = Rc::new(Cell::new(false));
-            let found_meta_id = Rc::new(Cell::new(u32::MAX));
-            let force_rate = Rc::new(Cell::new(0i32));
-            let allowed_raw = Rc::new(RefCell::new(String::new()));
-            let clock_quantum = Rc::new(Cell::new(0i32));
-            let clock_rate = Rc::new(Cell::new(0i32));
-
-            let done_clone = done.clone();
-            let ml_quit = mainloop.clone();
-            let found_clone = found_meta_id.clone();
-
-            let _listener_reg = registry
-                .add_listener_local()
-                .global(move |global| {
-                    if global.type_ != ObjectType::Metadata {
-                        return;
-                    }
-                    let Some(props) = global.props else {
-                        return;
-                    };
-                    let name = props.get("metadata.name");
-                    if name == Some("settings") {
-                        found_clone.set(global.id);
-                    }
-                })
-                .register();
-
-            let pending = core.sync(0).map_err(|e| format!("pw sync: {e}"))?;
-            let _listener_core = core
-                .add_listener_local()
-                .done(move |id, seq| {
-                    if id == pw::core::PW_ID_CORE && seq == pending {
-                        done_clone.set(true);
-                        ml_quit.quit();
-                    }
-                })
-                .register();
-
-            while !done.get() {
-                mainloop.run();
-            }
-
-            let meta_id = found_meta_id.get();
-            if meta_id == u32::MAX {
-                return Err("pw metadata 'settings' not found".to_string());
-            }
-
-            let obj = GlobalObject {
-                id: meta_id,
-                permissions: pw::permissions::PermissionFlags::all(),
-                type_: ObjectType::Metadata,
-                version: pw::sys::PW_VERSION_METADATA,
-                props: Option::<pw::properties::Properties>::None,
-            };
-            let metadata: PwMetadata = registry
-                .bind(&obj)
-                .map_err(|e| format!("pw bind metadata: {e}"))?;
-
-            let fr = force_rate.clone();
-            let ar = allowed_raw.clone();
-            let cq = clock_quantum.clone();
-            let cr = clock_rate.clone();
-            let _listener_meta = metadata
-                .add_listener_local()
-                .property(move |_subject, key, _ty, value| {
-                    let Some(k) = key else {
-                        return 0;
-                    };
-                    let v = value.unwrap_or("").trim().to_string();
-                    if k == "clock.force-rate" {
-                        if let Ok(parsed) = v.parse::<i32>() {
-                            fr.set(parsed.max(0));
-                        }
-                    } else if k == "clock.allowed-rates" {
-                        *ar.borrow_mut() = v;
-                    } else if k == "clock.quantum" {
-                        if let Ok(parsed) = v.parse::<i32>() {
-                            cq.set(parsed.max(0));
-                        }
-                    } else if k == "clock.rate" {
-                        if let Ok(parsed) = v.parse::<i32>() {
-                            cr.set(parsed.max(0));
-                        }
-                    }
-                    0
-                })
-                .register();
-
-            // Trigger one more sync to flush current metadata properties into listener.
-            let done2 = Rc::new(Cell::new(false));
-            let done2_clone = done2.clone();
-            let ml_quit2 = mainloop.clone();
-            let pending2 = core.sync(0).map_err(|e| format!("pw sync2: {e}"))?;
-            let _listener_core2 = core
-                .add_listener_local()
-                .done(move |id, seq| {
-                    if id == pw::core::PW_ID_CORE && seq == pending2 {
-                        done2_clone.set(true);
-                        ml_quit2.quit();
-                    }
-                })
-                .register();
-            while !done2.get() {
-                mainloop.run();
-            }
-
-            let allowed = allowed_raw.borrow().clone();
-            Ok((
-                force_rate.get(),
-                allowed,
-                clock_quantum.get(),
-                clock_rate.get(),
-            ))
-        })();
-        result
-    }
-
-    fn parse_fraction_ms(txt: &str) -> Option<f64> {
-        let s = txt.trim();
-        if s.is_empty() {
-            return None;
-        }
-        if let Some((a, b)) = s.split_once('/') {
-            let num = a.trim().parse::<f64>().ok()?;
-            let den = b.trim().parse::<f64>().ok()?;
-            if den > 0.0 {
-                return Some((num / den) * 1000.0);
-            }
-            return None;
-        }
-        let v = s.parse::<f64>().ok()?;
-        if v.is_finite() && v >= 0.0 {
-            // Fallback: treat plain number as milliseconds.
-            return Some(v);
-        }
-        None
-    }
-
-    fn pipewire_query_app_node_latency_ms() -> Option<f64> {
-        Self::ensure_pw_init();
-        let result = (|| -> Option<f64> {
-            let mainloop = PwMainLoop::new(None).ok()?;
-            let context = PwContext::new(&mainloop, None).ok()?;
-            let core = context.connect(None).ok()?;
-            let registry = core.get_registry().ok()?;
-
-            let done = Rc::new(Cell::new(false));
-            let found_ms = Rc::new(Cell::new(-1.0f64));
-
-            let done_clone = done.clone();
-            let ml_quit = mainloop.clone();
-            let found_clone = found_ms.clone();
-
-            let pid_str = std::process::id().to_string();
-            let mut_fallback = Rc::new(Cell::new(-1.0f64));
-            let fallback_clone = mut_fallback.clone();
-            let _listener_reg = registry
-                .add_listener_local()
-                .global(move |global| {
-                    if global.type_ != ObjectType::Node {
-                        return;
-                    }
-                    let Some(props) = global.props else {
-                        return;
-                    };
-                    let media = props.get(*keys::MEDIA_CLASS).unwrap_or("");
-                    // App stream node usually appears as Stream/Output/Audio.
-                    if !media.contains("Stream/Output/Audio") {
-                        return;
-                    }
-                    let app_pid = props.get(*keys::APP_PROCESS_ID).unwrap_or("");
-                    let app_bin = props.get(*keys::APP_PROCESS_BINARY).unwrap_or("");
-                    let app_name = props.get(*keys::APP_NAME).unwrap_or("");
-                    let lat = props
-                        .get(*keys::NODE_LATENCY)
-                        .or_else(|| props.get(*keys::NODE_MAX_LATENCY))
-                        .unwrap_or("");
-                    if let Some(ms) = Self::parse_fraction_ms(lat) {
-                        // Exact match: current process id.
-                        if app_pid == pid_str {
-                            found_clone.set(ms);
-                            return;
-                        }
-                        // Fallback heuristic for wrapped python runtimes.
-                        if app_bin.contains("python")
-                            || app_name.to_ascii_lowercase().contains("hiresti")
-                        {
-                            found_clone.set(ms);
-                            return;
-                        }
-                        // Last fallback: keep first stream latency candidate.
-                        if fallback_clone.get() < 0.0 {
-                            fallback_clone.set(ms);
-                        }
-                    }
-                })
-                .register();
-
-            let pending = core.sync(0).ok()?;
-            let _listener_core = core
-                .add_listener_local()
-                .done(move |id, seq| {
-                    if id == pw::core::PW_ID_CORE && seq == pending {
-                        done_clone.set(true);
-                        ml_quit.quit();
-                    }
-                })
-                .register();
-
-            while !done.get() {
-                mainloop.run();
-            }
-
-            let v = found_ms.get();
-            if v >= 0.0 {
-                Some(v)
-            } else {
-                let fb = mut_fallback.get();
-                if fb >= 0.0 {
-                    Some(fb)
-                } else {
-                    None
-                }
-            }
-        })();
-        result
-    }
-
     fn parse_tag_text_value(text: &str, key: &str) -> Option<String> {
         let lower = text.to_ascii_lowercase();
         let pat = format!("{key}=");
@@ -2667,8 +1604,8 @@ impl Engine {
             spectrum_enabled,
             spectrum_stereo_enabled: false,
             spectrum_active_bands: SPECTRUM_ACTIVE_BANDS_DEFAULT,
-            mmap_sink: None,
             native_usb_config: None,
+            native_alsa_config: None,
             native_transport: native_transport::NativeTransportController::new(),
             usb_clock_mode: 0,
             output_mmap_realtime_priority: ALSA_MMAP_RT_PRIORITY_DEFAULT,
@@ -2683,10 +1620,6 @@ impl Engine {
 
     fn set_error(&mut self, msg: impl Into<String>) {
         self.last_error = Some(msg.into());
-    }
-
-    fn output_driver_is_mmap(&self) -> bool {
-        driver_is_alsa_mmap(&self.output_driver)
     }
 
     fn set_state(&mut self, state: gst::State) -> c_int {
@@ -2714,7 +1647,9 @@ impl Engine {
     }
 
     fn maybe_load_native_transport_for_uri(&mut self, uri: &str) {
-        if !driver_is_usb_rawlink_v2(&self.output_driver) {
+        let is_v2_usb = driver_is_usb_rawlink_v2(&self.output_driver);
+        let is_alsa_mmap = driver_is_alsa_mmap(&self.output_driver);
+        if !(is_v2_usb || is_alsa_mmap) {
             let _ = self.native_transport.stop();
             return;
         }
@@ -2748,10 +1683,17 @@ impl Engine {
                 ),
             );
         }
-        let usb_cfg = self.native_usb_config.clone();
-        let output_target = usb_cfg
-            .clone()
-            .map(native_transport::NativeOutputTarget::Usb);
+        let output_target = if is_v2_usb {
+            self.native_usb_config
+                .clone()
+                .map(native_transport::NativeOutputTarget::Usb)
+        } else if is_alsa_mmap {
+            self.native_alsa_config
+                .clone()
+                .map(native_transport::NativeOutputTarget::AlsaMmap)
+        } else {
+            None
+        };
         eprintln!(
             "[native-transport] load: dsp_active={} bit_perfect={} output_target={} master={} peq={} conv={} tape={} tube={} wid={} lim={} resamp={} lv2={}",
             dsp_active, !dsp_active, output_target.is_some(),
@@ -2776,22 +1718,6 @@ impl Engine {
         match self.native_transport.load(request) {
             Ok(()) => self.emit_event(EVT_STATE, &summary),
             Err(err) => self.emit_event(EVT_ERROR, &format!("native-transport load failed: {err}")),
-        }
-    }
-
-    fn drain_mmap_events(&mut self) {
-        let Some(events) = self.mmap_sink.as_ref().map(|ms| ms.events.clone()) else {
-            return;
-        };
-        let drained: Vec<(c_int, String)> = match events.lock() {
-            Ok(mut pending) => pending.drain(..).collect(),
-            Err(_) => return,
-        };
-        for (evt, msg) in drained {
-            if evt == EVT_ERROR {
-                self.set_error(msg.clone());
-            }
-            self.emit_event(evt, &msg);
         }
     }
 
@@ -2836,7 +1762,10 @@ impl Engine {
         // Detect end-of-stream for native transport: decode worker finished
         // (decode_completed=true, runtime cleared) → emit EOS so Python
         // triggers next-track.
-        if !self.native_eos_emitted && driver_is_usb_rawlink_v2(&self.output_driver) {
+        if !self.native_eos_emitted
+            && (driver_is_usb_rawlink_v2(&self.output_driver)
+                || driver_is_alsa_mmap(&self.output_driver))
+        {
             let snap = self.native_transport.snapshot();
             if snap.decode_completed && snap.decoded_frame_count > 0 {
                 self.native_eos_emitted = true;
@@ -2886,7 +1815,6 @@ impl Engine {
     }
 
     fn pump_events(&mut self) -> c_int {
-        self.drain_mmap_events();
         self.drain_native_transport_events();
         let Some(bus) = self.playbin.bus() else {
             return 0;
@@ -2989,179 +1917,6 @@ impl Engine {
         count
     }
 
-    /// Stop the mmap writer thread (if running) and wait for it to exit.
-    /// Must be called after playbin is set to NULL so the appsink sees EOS
-    /// and the thread can unblock from pull-sample.
-    fn stop_mmap_sink(&mut self) {
-        if let Some(mut ms) = self.mmap_sink.take() {
-            ms.stop.store(true, Ordering::Relaxed);
-            if let Some(t) = ms.thread.take() {
-                let _ = t.join();
-            }
-        }
-    }
-
-    /// Build an `appsink` element whose output is consumed by a background
-    /// thread that writes to ALSA via mmap (zero kernel-copy path).
-    ///
-    /// Caps are fixed to `audio/x-raw, format=S32LE, layout=interleaved`
-    /// (rate unconstrained — the thread opens ALSA with the actual source rate).
-    /// GStreamer's internal `audioconvert` will handle format conversion upstream.
-    ///
-    /// Returns `(appsink_element, MmapSink, AlsaHwClock)` on success.
-    fn build_appsink_mmap(
-        &self,
-        device: Option<&str>,
-        buffer_us: i32,
-        latency_us: i32,
-        preferred_output_format: &str,
-        realtime_priority: i32,
-    ) -> Result<(gst::Element, MmapSink, AlsaHwClock), String> {
-        let dev = device.unwrap_or("hw:0,0").to_string();
-        let audio_format = mmap_audio_format_from_preference(preferred_output_format);
-
-        let period_us = if latency_us > 0 { latency_us } else { 10_000 };
-        let target_buffer_us = if buffer_us > 0 { buffer_us } else { 100_000 };
-        let queue_buffers = if target_buffer_us <= 20_000 {
-            4u32
-        } else {
-            8u32
-        };
-        let queue_time_ns =
-            (u64::try_from(target_buffer_us.max(period_us * 2)).unwrap_or(20_000)) * 1_000;
-        let accum_capacity_bytes = frames_for_duration_us(
-            target_buffer_us.max(period_us * 2),
-            ALSA_MMAP_ACCUM_RATE_BUDGET_HZ,
-            64,
-            192_000,
-        )
-        .saturating_mul(audio_format.frame_bytes)
-        .saturating_mul((queue_buffers as usize).max(4))
-        .saturating_mul(2)
-        .clamp(256 * 1024, 2 * 1024 * 1024);
-
-        // Build appsink — format is pinned so the mmap writer can copy frames
-        // directly into the ALSA ring without an extra repack step.
-        let appsink = gst::ElementFactory::make("appsink")
-            .name("rust-mmap-appsink")
-            .build()
-            .map_err(|e| format!("appsink unavailable: {e}"))?;
-
-        let caps = gst::Caps::builder("audio/x-raw")
-            .field("format", audio_format.gst_format)
-            .field("layout", "interleaved")
-            .field("channels", 2i32)
-            .build();
-        appsink.set_property("caps", &caps);
-        // Enable clock-based sync: buffers are released when AlsaHwClock says
-        // it is time, giving explicit hardware clock control of the pipeline.
-        appsink.set_property("sync", true);
-        // Timed pull mode: the writer thread polls appsink directly so it can
-        // react promptly to URI changes and shutdown.
-        appsink.set_property("emit-signals", false);
-        // Keep bounded headroom so short ALSA hiccups do not stall upstream
-        // spectrum/filter production immediately.
-        appsink.set_property("max-buffers", queue_buffers);
-        // max-time was added in GStreamer 1.20; skip silently on older runtimes
-        // (e.g. Debian/Ubuntu with GStreamer 1.18) to avoid a panic across the
-        // FFI boundary that would abort the process.
-        if appsink.find_property("max-time").is_some() {
-            appsink.set_property("max-time", queue_time_ns);
-        }
-        appsink.set_property("drop", false);
-        appsink.set_property("wait-on-eos", false);
-
-        // Wrap appsink with audiobuffersplit so that large decoder buffers (e.g.
-        // FLAC default block size of 4096 samples ≈ 93 ms at 44100 Hz) are split
-        // into uniform ~16 ms chunks matching the spectrum element's interval.
-        // Without this, spectrum messages arrive in batches separated by long gaps,
-        // causing the waveform visualisation to appear over-smoothed.
-        // Falls back to bare appsink when the plugin is not available.
-        let sink_element: gst::Element = 'build_sink: {
-            let Ok(splitter) = gst::ElementFactory::make("audiobuffersplit")
-                .name("rust-mmap-bufsplit")
-                .build()
-            else {
-                eprintln!(
-                    "[alsa-mmap] audiobuffersplit unavailable; spectrum detail may be reduced"
-                );
-                break 'build_sink appsink.clone();
-            };
-            // 16 ms matches the spectrum element's interval property.
-            let _ = splitter.set_property_from_str("output-buffer-duration", "16/1000");
-            let bin = gst::Bin::new();
-            // add_many only fails if elements are already in another bin — safe to
-            // fall back to bare appsink if so.
-            if bin.add_many([&splitter, &appsink]).is_err() {
-                eprintln!("[alsa-mmap] audiobuffersplit: bin.add_many failed");
-                break 'build_sink appsink.clone();
-            }
-            // After add_many succeeds, appsink belongs to the bin; always return
-            // the bin from this point to avoid orphaning the element.
-            let _ = splitter.link(&appsink);
-            if let Some(pad) = splitter.static_pad("sink") {
-                if let Ok(ghost) = gst::GhostPad::with_target(&pad) {
-                    let _ = bin.add_pad(&ghost);
-                }
-            }
-            eprintln!("[alsa-mmap] using audiobuffersplit for uniform 16 ms buffers");
-            bin.upcast::<gst::Element>()
-        };
-
-        // Create the shared feed and the hardware-backed GStreamer clock.
-        // The feed is written by the RT writer thread (lock-free atomics) and
-        // read by AlsaHwClock::internal_time() from any GStreamer thread.
-        let feed = Arc::new(AlsaHwClockFeed::default());
-        let hw_clock = AlsaHwClock::new(Arc::clone(&feed));
-
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_clone = stop.clone();
-        let events: ThreadEventQueue = Arc::new(Mutex::new(VecDeque::new()));
-        let events_clone = events.clone();
-        let diagnostics: MmapThreadDiagnosticsHandle =
-            Arc::new(Mutex::new(MmapThreadDiagnostics::default()));
-        let diagnostics_clone = diagnostics.clone();
-        let appsink_clone = appsink.clone();
-        let dev_clone = dev.clone();
-        let feed_clone = Arc::clone(&feed);
-
-        let t = thread::spawn(move || {
-            // Allocate the decoded PCM window before `mlockall(MCL_CURRENT)` so
-            // the hot audio buffer is part of the pages we try to pin.
-            let accum = AudioByteWindow::with_capacity(accum_capacity_bytes);
-            update_mmap_thread_diagnostics(&diagnostics_clone, |state| {
-                state.running = true;
-            });
-            configure_mmap_thread_runtime(&diagnostics_clone, &events_clone, realtime_priority);
-            alsa_mmap_writer_thread(
-                appsink_clone,
-                dev_clone,
-                period_us,
-                target_buffer_us,
-                accum,
-                audio_format,
-                stop_clone,
-                events_clone,
-                diagnostics_clone.clone(),
-                feed_clone,
-            );
-            update_mmap_thread_diagnostics(&diagnostics_clone, |state| {
-                state.running = false;
-            });
-        });
-
-        Ok((
-            sink_element,
-            MmapSink {
-                stop,
-                events,
-                diagnostics,
-                thread: Some(t),
-            },
-            hw_clock,
-        ))
-    }
-
     fn set_output_tuned(
         &mut self,
         driver: &str,
@@ -3170,28 +1925,26 @@ impl Engine {
         latency_us: i32,
         exclusive: bool,
     ) -> c_int {
-        let had_native_transport = driver_is_usb_rawlink_v2(&self.output_driver);
-        if had_native_transport {
+        let had_v2_usb = driver_is_usb_rawlink_v2(&self.output_driver);
+        let had_v2_alsa = driver_is_alsa_mmap(&self.output_driver);
+        let had_native_transport = had_v2_usb || had_v2_alsa;
+        if had_v2_usb {
             let _ = self.native_transport.stop_and_release();
         } else {
             let _ = self.native_transport.stop();
         }
         let cur_state = self.playbin.state(gst::ClockTime::from_mseconds(50)).1;
         let _ = self.playbin.set_state(gst::State::Null);
-        // Stop any running output sink threads *after* set_state(Null) so the
-        // appsink sees EOS and pull-sample unblocks cleanly.
-        self.stop_mmap_sink();
-        let had_usb_rawlink = had_native_transport;
-
         // After releasing a USB rawlink session, snd-usb-audio re-attaches
         // asynchronously.  libusb_release_interface() returns before the kernel
         // driver finishes its probe and creates the ALSA device nodes.  Without
         // this wait, switching to an ALSA/auto driver immediately after rawlink
         // finds no ALSA device.  300 ms is enough for snd-usb-audio to complete
         // its initialisation on all tested hardware.
-        if had_usb_rawlink {
+        if had_v2_usb {
             std::thread::sleep(std::time::Duration::from_millis(300));
         }
+        let _ = had_native_transport;
 
         let driver_norm = normalized_driver_label(driver);
         if let Err(err) = self.sync_audio_filter_graph() {
@@ -3206,36 +1959,9 @@ impl Engine {
                 "spectrum-path=disabled"
             },
         );
-        let original_device = device
+        let resolved_device = device
             .map(|d| d.trim().to_string())
             .filter(|d| !d.is_empty());
-        let mut resolved_device = original_device.clone();
-        if driver_norm.contains("pipewire") {
-            if let Some(device_id) = original_device.as_deref() {
-                if let Some((card, profile)) = parse_pipewire_card_profile_target(device_id) {
-                    match activate_pipewire_card_profile_target(&card, &profile) {
-                        Ok(target_sink) => {
-                            self.emit_event(
-                                EVT_STATE,
-                                &format!(
-                                    "pipewire-card-profile resolved card={} profile={} sink={}",
-                                    card, profile, target_sink
-                                ),
-                            );
-                            resolved_device = Some(target_sink);
-                        }
-                        Err(e) => {
-                            self.set_error(format!("pipewire profile activation failed: {e}"));
-                            self.emit_event(
-                                EVT_ERROR,
-                                &format!("pipewire profile activation failed: {e}"),
-                            );
-                            return -16;
-                        }
-                    }
-                }
-            }
-        }
         let device_norm = resolved_device.as_deref();
 
         let (sink, auto_caps_format) = if driver_norm.is_empty() || driver_norm.starts_with("auto")
@@ -3247,61 +1973,6 @@ impl Engine {
                     .ok(),
                 None,
             )
-        } else if driver_norm.contains("pipewire") {
-            let s = gst::ElementFactory::make("pipewiresink")
-                .name("rust-pw-sink")
-                .build()
-                .ok();
-            match s {
-                Some(ref elem) => {
-                    if let Some(dev) = device_norm {
-                        // Best effort: property presence varies by plugin/runtime.
-                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            elem.set_property("target-object", dev);
-                        }));
-                    }
-                    let target_buffer_us = if buffer_us > 0 { buffer_us } else { 100_000 };
-                    let base_quantum = ((target_buffer_us as f64 / 1_000_000.0) * 48_000.0) as i32;
-                    let mut quantum = 1024i32;
-                    for p in [256i32, 512, 1024, 2048, 4096, 8192] {
-                        if (p - base_quantum).abs() < (quantum - base_quantum).abs() {
-                            quantum = p;
-                        }
-                    }
-                    quantum = quantum.clamp(512, 8192);
-                    // Do not pin sample-rate in stream properties (e.g. ".../48000"),
-                    // otherwise PipeWire may keep stream at 48k and defeat auto rate switching.
-                    let latency_node = quantum.to_string();
-                    // Keep autoconnect enabled even with explicit target-object.
-                    // Some PipeWire/WirePlumber setups may not auto-link when this is false,
-                    // resulting in "pipeline running + spectrum active but no audible output".
-                    let auto_connect = "true";
-                    let props = gst::Structure::builder("props")
-                        .field("node.latency", &latency_node)
-                        .field("node.autoconnect", &auto_connect)
-                        .field("media.role", &"Music")
-                        .field("resample.quality", &12i32)
-                        .build();
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        elem.set_property("stream-properties", &props);
-                    }));
-                    self.emit_event(
-                        EVT_STATE,
-                        &format!(
-                            "pipewire-sink configured target={} autoconnect={} latency={}",
-                            device_norm.unwrap_or("default"),
-                            auto_connect,
-                            latency_node
-                        ),
-                    );
-                    (s, None)
-                }
-                None => {
-                    self.set_error("pipewiresink unavailable");
-                    self.emit_event(EVT_ERROR, "pipewiresink unavailable");
-                    return -11;
-                }
-            }
         } else if driver_norm.contains("pulse") {
             let s = gst::ElementFactory::make("pulsesink")
                 .name("rust-pa-sink")
@@ -3334,40 +2005,30 @@ impl Engine {
                 }
             }
         } else if driver_is_alsa_mmap(driver) {
-            // Zero-copy mmap path: appsink + background writer thread.
-            // Caps wrapping is handled by setting caps on the appsink directly.
-            match self.build_appsink_mmap(
-                device_norm,
-                buffer_us,
-                latency_us,
-                &self.preferred_output_format,
-                self.output_mmap_realtime_priority,
-            ) {
-                Ok((elem, mmap, hw_clock)) => {
-                    self.mmap_sink = Some(mmap);
-                    // Inject the hardware clock into the pipeline so that
-                    // appsink.sync=true gates buffers against the DAC timeline.
-                    if let Ok(pipeline) = self.playbin.clone().dynamic_cast::<gst::Pipeline>() {
-                        pipeline.use_clock(Some(hw_clock.upcast_ref::<gst::Clock>()));
-                    }
-                    let audio_format =
-                        mmap_audio_format_from_preference(&self.preferred_output_format);
+            // V2 native_transport drives the ALSA mmap ring directly. The
+            // GStreamer pipeline gets a fakesink placeholder so playbin has
+            // something wired, but rac_set_uri / rac_play route through V2
+            // for actual audio.
+            let elem = gst::ElementFactory::make("fakesink")
+                .name("rust-v2-alsa-placeholder-sink")
+                .property("sync", false)
+                .property("async", false)
+                .property("enable-last-sample", false)
+                .build();
+            match elem {
+                Ok(elem) => {
                     self.emit_event(
                         EVT_STATE,
                         &format!(
-                            "alsa-mmap configured device={} format={} clock=hw",
-                            device_norm.unwrap_or("hw:0,0"),
-                            audio_format.gst_format
+                            "alsa-mmap placeholder configured device={}",
+                            device_norm.unwrap_or("hw:0,0")
                         ),
                     );
-                    // Return None for auto_caps_format: caps are already set on
-                    // the appsink element itself, so wrap_sink_with_caps must not
-                    // be called (it would conflict with the element-level caps).
                     (Some(elem), None::<String>)
                 }
                 Err(e) => {
-                    self.set_error(format!("alsa-mmap setup failed: {e}"));
-                    self.emit_event(EVT_ERROR, &format!("alsa-mmap setup failed: {e}"));
+                    self.set_error(format!("fakesink unavailable: {e}"));
+                    self.emit_event(EVT_ERROR, &format!("fakesink unavailable: {e}"));
                     return -17;
                 }
             }
@@ -3511,6 +2172,19 @@ impl Engine {
             self.native_usb_config = None;
             // Already released by stop_and_release() at the top of
             // set_output_tuned — no extra release_device() needed.
+        }
+
+        if driver_is_alsa_mmap(driver) {
+            self.native_alsa_config = Some(native_transport::AlsaMmapOutputConfig {
+                device: device_norm.unwrap_or("hw:0,0").to_string(),
+                buffer_us: if buffer_us > 0 { buffer_us as u32 } else { 100_000 },
+                latency_us: if latency_us > 0 { latency_us as u32 } else { 10_000 },
+                realtime_priority: self.output_mmap_realtime_priority,
+                preferred_format: self.preferred_output_format.clone(),
+                exclusive,
+            });
+        } else {
+            self.native_alsa_config = None;
         }
 
         self.playbin.set_property("audio-sink", &final_sink);
@@ -3684,7 +2358,9 @@ pub extern "C" fn rac_get_lufs(
     {
         return -2;
     }
-    let vals: LufsValues = if driver_is_usb_rawlink_v2(&engine.output_driver) {
+    let vals: LufsValues = if driver_is_usb_rawlink_v2(&engine.output_driver)
+        || driver_is_alsa_mmap(&engine.output_driver)
+    {
         engine.native_transport.lufs_values()
     } else {
         engine
@@ -3906,752 +2582,6 @@ pub extern "C" fn rac_set_spectrum_active_bands(ptr: *mut Engine, bands: c_uint)
     0
 }
 
-fn list_pulseaudio_sinks_detailed() -> Vec<(String, Option<String>, Option<u32>)> {
-    fn str_opt_to_string(v: Option<std::borrow::Cow<'_, str>>) -> String {
-        v.map(|x| x.into_owned()).unwrap_or_default()
-    }
-
-    let Ok((mut mainloop, context)) = pa_connect() else {
-        return Vec::new();
-    };
-
-    let mut out: Vec<(String, Option<String>, Option<u32>)> = Vec::new();
-    let shared: Rc<RefCell<Vec<(String, Option<String>, Option<u32>)>>> =
-        Rc::new(RefCell::new(Vec::new()));
-    let done = Rc::new(Cell::new(false));
-
-    let shared_cb = Rc::clone(&shared);
-    let done_cb = Rc::clone(&done);
-    let mut op = context
-        .introspect()
-        .get_sink_info_list(move |res| match res {
-            ListResult::Item(info) => {
-                let dev = str_opt_to_string(info.name.as_ref().cloned());
-                if dev.is_empty() || dev.ends_with(".monitor") {
-                    return;
-                }
-                let desc = str_opt_to_string(info.description.as_ref().cloned());
-                let name = if desc.is_empty() { dev.clone() } else { desc };
-                shared_cb.borrow_mut().push((name, Some(dev), info.card));
-            }
-            ListResult::End | ListResult::Error => {
-                done_cb.set(true);
-            }
-        });
-
-    pa_wait_for_list(&mut mainloop, &context, &done, &mut op);
-    out.extend(shared.borrow().iter().cloned());
-    out
-}
-
-fn list_pulseaudio_sinks() -> Vec<(String, Option<String>)> {
-    list_pulseaudio_sinks_detailed()
-        .into_iter()
-        .map(|(name, dev_id, _card)| (name, dev_id))
-        .collect()
-}
-
-fn pulseaudio_alsa_card_index_from_sink_name(sink_name: &str) -> Option<String> {
-    fn str_opt_to_string(v: Option<std::borrow::Cow<'_, str>>) -> String {
-        v.map(|x| x.into_owned()).unwrap_or_default()
-    }
-
-    let Ok((mut mainloop, context)) = pa_connect() else {
-        return None;
-    };
-    let target = sink_name.trim().to_string();
-    if target.is_empty() {
-        return None;
-    }
-
-    let found = Rc::new(RefCell::new(String::new()));
-    let done = Rc::new(Cell::new(false));
-
-    let found_cb = Rc::clone(&found);
-    let done_cb = Rc::clone(&done);
-    let mut op = context
-        .introspect()
-        .get_sink_info_list(move |res| match res {
-            ListResult::Item(info) => {
-                let name = str_opt_to_string(info.name.as_ref().cloned());
-                if name != target {
-                    return;
-                }
-                let alsa_card = info.proplist.get_str("alsa.card").unwrap_or_default();
-                let alsa_card = alsa_card.trim();
-                if !alsa_card.is_empty() {
-                    *found_cb.borrow_mut() = alsa_card.to_string();
-                }
-            }
-            ListResult::End | ListResult::Error => {
-                done_cb.set(true);
-            }
-        });
-    pa_wait_for_list(&mut mainloop, &context, &done, &mut op);
-    let out = found.borrow().clone();
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
-}
-
-fn pulseaudio_alsa_card_index_from_card_name(card: &str) -> Option<String> {
-    fn str_opt_to_string(v: Option<std::borrow::Cow<'_, str>>) -> String {
-        v.map(|x| x.into_owned()).unwrap_or_default()
-    }
-
-    let Ok((mut mainloop, context)) = pa_connect() else {
-        return None;
-    };
-    let target = card.trim().to_string();
-    if target.is_empty() {
-        return None;
-    }
-
-    let found = Rc::new(RefCell::new(String::new()));
-    let done = Rc::new(Cell::new(false));
-
-    let found_cb = Rc::clone(&found);
-    let done_cb = Rc::clone(&done);
-    let mut op = context
-        .introspect()
-        .get_card_info_list(move |res| match res {
-            ListResult::Item(info) => {
-                let name = str_opt_to_string(info.name.as_ref().cloned());
-                if name != target {
-                    return;
-                }
-                let alsa_card = info.proplist.get_str("alsa.card").unwrap_or_default();
-                let alsa_card = alsa_card.trim();
-                if !alsa_card.is_empty() {
-                    *found_cb.borrow_mut() = alsa_card.to_string();
-                }
-            }
-            ListResult::End | ListResult::Error => {
-                done_cb.set(true);
-            }
-        });
-    pa_wait_for_list(&mut mainloop, &context, &done, &mut op);
-    let out = found.borrow().clone();
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
-}
-
-fn pa_connect() -> Result<(PaMainloop, PaContext), String> {
-    let mut mainloop =
-        PaMainloop::new().ok_or_else(|| "pulseaudio mainloop init failed".to_string())?;
-    let mut context = PaContext::new(&mainloop, "hiresTI")
-        .ok_or_else(|| "pulseaudio context init failed".to_string())?;
-    context
-        .connect(None, PaContextFlagSet::NOFLAGS, None)
-        .map_err(|e| format!("pulseaudio connect failed: {e}"))?;
-    loop {
-        match context.get_state() {
-            PaContextState::Ready => return Ok((mainloop, context)),
-            PaContextState::Failed | PaContextState::Terminated => {
-                return Err(format!(
-                    "pulseaudio context state: {:?}",
-                    context.get_state()
-                ));
-            }
-            _ => {
-                let _ = mainloop.iterate(false);
-            }
-        }
-    }
-}
-
-fn pa_wait_for_list<T: ?Sized>(
-    mainloop: &mut PaMainloop,
-    context: &PaContext,
-    done: &Rc<Cell<bool>>,
-    op: &mut pulse::operation::Operation<T>,
-) {
-    while !done.get() {
-        match context.get_state() {
-            PaContextState::Failed | PaContextState::Terminated => break,
-            _ => {}
-        }
-        if op.get_state() != PaOperationState::Running {
-            break;
-        }
-        let _ = mainloop.iterate(false);
-    }
-}
-
-fn list_pipewire_sinks() -> Vec<(String, Option<String>)> {
-    Engine::ensure_pw_init();
-    let result = (|| -> Result<Vec<(String, Option<String>)>, String> {
-        let mainloop = PwMainLoop::new(None).map_err(|e| format!("pw mainloop: {e}"))?;
-        let context = PwContext::new(&mainloop, None).map_err(|e| format!("pw context: {e}"))?;
-        let core = context
-            .connect(None)
-            .map_err(|e| format!("pw connect: {e}"))?;
-        let registry = core
-            .get_registry()
-            .map_err(|e| format!("pw registry: {e}"))?;
-
-        let done = Rc::new(Cell::new(false));
-        let sinks: Rc<RefCell<Vec<(String, Option<String>)>>> = Rc::new(RefCell::new(Vec::new()));
-
-        let done_clone = done.clone();
-        let loop_clone = mainloop.clone();
-        let sinks_clone = sinks.clone();
-
-        let _listener_reg = registry
-            .add_listener_local()
-            .global(move |global| {
-                if global.type_ != ObjectType::Node {
-                    return;
-                }
-                let Some(props) = global.props else {
-                    return;
-                };
-                let media_class = props.get("media.class").unwrap_or("");
-                // Only output sink nodes are valid target-object candidates.
-                if !media_class.starts_with("Audio/Sink") {
-                    return;
-                }
-                let node_name = props.get("node.name").unwrap_or("");
-                // Skip monitor endpoints from sink list.
-                if !node_name.is_empty() && node_name.contains(".monitor") {
-                    return;
-                }
-                let object_serial = props.get("object.serial").unwrap_or("");
-                let Some(target_id) = pipewire_target_id_from_props(node_name, object_serial)
-                else {
-                    return;
-                };
-                let name = pipewire_display_name_from_strings(
-                    props
-                        .get("node.description")
-                        .or_else(|| props.get("device.description"))
-                        .unwrap_or(""),
-                    props.get("node.nick").unwrap_or(""),
-                    props
-                        .get("node.name")
-                        .or_else(|| props.get("object.serial"))
-                        .unwrap_or("Audio Sink"),
-                );
-                let dev_id = Some(target_id);
-                sinks_clone.borrow_mut().push((name, dev_id));
-            })
-            .register();
-
-        let pending = core.sync(0).map_err(|e| format!("pw sync: {e}"))?;
-        let _listener_core = core
-            .add_listener_local()
-            .done(move |id, seq| {
-                if id == pw::core::PW_ID_CORE && seq == pending {
-                    done_clone.set(true);
-                    loop_clone.quit();
-                }
-            })
-            .register();
-
-        while !done.get() {
-            mainloop.run();
-        }
-
-        let mut out = sinks.borrow().clone();
-        out.sort_by_key(|(n, dev)| {
-            let hay = format!(
-                "{} {}",
-                n.to_ascii_uppercase(),
-                dev.clone().unwrap_or_default().to_ascii_uppercase()
-            );
-            if hay.contains("USB") {
-                0
-            } else {
-                1
-            }
-        });
-        out.dedup_by(|a, b| a.1 == b.1 && a.0 == b.0);
-        Ok(out)
-    })();
-    result.unwrap_or_default()
-}
-
-fn pipewire_target_id_from_props(node_name: &str, object_serial: &str) -> Option<String> {
-    let node = node_name.trim();
-    if !node.is_empty() {
-        if node.contains(".monitor") {
-            return None;
-        }
-        return Some(node.to_string());
-    }
-    let serial = object_serial.trim();
-    if serial.is_empty() {
-        return None;
-    }
-    Some(serial.to_string())
-}
-
-fn merge_output_device_lists(
-    primary: Vec<(String, Option<String>)>,
-    extras: Vec<(String, Option<String>)>,
-) -> Vec<(String, Option<String>)> {
-    let mut out: Vec<(String, Option<String>)> = Vec::new();
-    let mut seen_ids: HashSet<String> = HashSet::new();
-    let mut seen_names_without_id: HashSet<String> = HashSet::new();
-
-    for (name, dev_id) in primary.into_iter().chain(extras.into_iter()) {
-        let clean_name = name.trim().to_string();
-        if clean_name.is_empty() {
-            continue;
-        }
-        let clean_id = dev_id.and_then(|v| {
-            let s = v.trim().to_string();
-            if s.is_empty() {
-                None
-            } else {
-                Some(s)
-            }
-        });
-        if let Some(ref id) = clean_id {
-            if !seen_ids.insert(id.clone()) {
-                continue;
-            }
-        } else {
-            let key = clean_name.to_ascii_uppercase();
-            if !seen_names_without_id.insert(key) {
-                continue;
-            }
-        }
-        out.push((clean_name, clean_id));
-    }
-
-    out
-}
-
-fn pulseaudio_sink_card_indices() -> HashSet<u32> {
-    list_pulseaudio_sinks_detailed()
-        .into_iter()
-        .filter_map(|(_name, _dev_id, card)| card)
-        .collect()
-}
-
-fn pipewire_display_name_from_strings(description: &str, nick: &str, fallback: &str) -> String {
-    fn normalize_ws(text: &str) -> String {
-        text.split_whitespace().collect::<Vec<_>>().join(" ")
-    }
-
-    fn is_generic_pipewire_name(text: &str) -> bool {
-        let clean = normalize_ws(text);
-        if clean.is_empty() {
-            return true;
-        }
-        let lower = clean.to_ascii_lowercase();
-        if lower == "analog stereo" || lower == "digital stereo" {
-            return true;
-        }
-        if lower == "built-in audio"
-            || lower == "built-in pro audio"
-            || lower == "built-in audio pro"
-        {
-            return true;
-        }
-        if let Some(rest) = lower.strip_prefix("built-in audio pro ") {
-            return !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit());
-        }
-        false
-    }
-
-    fn profile_label_from_node_name(node_name: &str) -> Option<String> {
-        let node = node_name.trim();
-        if !node.starts_with("alsa_output.") {
-            return None;
-        }
-        let (_base, profile) = node["alsa_output.".len()..].rsplit_once('.')?;
-        let label = match profile {
-            "analog-stereo" => "Analog",
-            "iec958-stereo" => "Digital",
-            "hdmi-stereo" => "HDMI 0",
-            p if p.starts_with("hdmi-stereo-extra") => {
-                let idx = p["hdmi-stereo-extra".len()..].trim();
-                if idx.is_empty() || !idx.chars().all(|c| c.is_ascii_digit()) {
-                    return None;
-                }
-                return Some(format!("HDMI {idx}"));
-            }
-            p if p.starts_with("pro-output-") => {
-                let idx = p["pro-output-".len()..].trim();
-                if idx == "0" {
-                    "Analog"
-                } else if !idx.is_empty() && idx.chars().all(|c| c.is_ascii_digit()) {
-                    return Some(format!("Output {idx}"));
-                } else {
-                    return None;
-                }
-            }
-            _ => return None,
-        };
-        Some(label.to_string())
-    }
-
-    fn card_label_from_node_name(node_name: &str) -> Option<String> {
-        let node = node_name.trim();
-        let Some(rest) = node.strip_prefix("alsa_output.") else {
-            return None;
-        };
-        let (base, _profile) = rest.rsplit_once('.')?;
-        let usb = base.strip_prefix("usb-")?;
-        // Strip only the trailing USB bus index "-NN" (last hyphen + all-digit suffix).
-        let usb = if let Some(pos) = usb.rfind('-') {
-            let suffix = &usb[pos + 1..];
-            if !suffix.is_empty() && suffix.chars().all(|c: char| c.is_ascii_digit()) {
-                &usb[..pos]
-            } else {
-                usb
-            }
-        } else {
-            usb
-        };
-        if usb.is_empty() {
-            return None;
-        }
-        let spaced = usb.replace(['_', '.'], " ");
-        let clean = normalize_ws(&spaced);
-        if clean.is_empty() {
-            return None;
-        }
-        if let Some(prefix) = clean.strip_suffix(" USB Audio") {
-            let prefix = prefix.trim();
-            if !prefix.is_empty() {
-                return Some(format!("{prefix} / USB Audio"));
-            }
-        }
-        Some(clean)
-    }
-
-    let desc = normalize_ws(description.trim());
-    let nick = normalize_ws(nick.trim());
-    let fallback = fallback.trim();
-    let fallback_card = card_label_from_node_name(fallback);
-    let fallback_profile = profile_label_from_node_name(fallback);
-
-    if let Some(card) = fallback_card.as_ref() {
-        if desc.to_ascii_lowercase().ends_with("analog stereo") || is_generic_pipewire_name(&desc) {
-            // Prefer nick when it carries the real model name (e.g. "Monitor 09"),
-            // rather than returning a fallback derived from the node path.
-            if desc.to_ascii_lowercase().ends_with("analog stereo")
-                && !nick.is_empty()
-                && !is_generic_pipewire_name(&nick)
-            {
-                return nick.clone();
-            }
-            return card.clone();
-        }
-    }
-
-    if !desc.is_empty() && !nick.is_empty() {
-        if desc.eq_ignore_ascii_case(&nick) {
-            if is_generic_pipewire_name(&desc) {
-                if let Some(card) = fallback_card {
-                    return card;
-                }
-                if let Some(profile) = fallback_profile {
-                    return format!("Built-in Audio / {profile}");
-                }
-            }
-            return desc;
-        }
-        if is_generic_pipewire_name(&desc) && !is_generic_pipewire_name(&nick) {
-            let base = fallback_card.unwrap_or_else(|| "Built-in Audio".to_string());
-            return format!("{base} / {nick}");
-        }
-        return format!("{desc} / {nick}");
-    }
-    if !desc.is_empty() {
-        if is_generic_pipewire_name(&desc) {
-            if let Some(card) = fallback_card {
-                return card;
-            }
-            if let Some(profile) = fallback_profile {
-                return format!("Built-in Audio / {profile}");
-            }
-        }
-        return desc;
-    }
-    if !nick.is_empty() {
-        if let Some(card) = fallback_card {
-            if !is_generic_pipewire_name(&nick) {
-                return format!("{card} / {nick}");
-            }
-            return card;
-        }
-        return nick;
-    }
-    if let Some(card) = fallback_card {
-        return card;
-    }
-    if let Some(profile) = fallback_profile {
-        return format!("Built-in Audio / {profile}");
-    }
-    fallback.to_string()
-}
-
-fn choose_pipewire_output_profile_from_entries(
-    active_profile: Option<&str>,
-    profiles: &[(String, u32, u32, bool)],
-) -> Option<String> {
-    if let Some(active) = active_profile {
-        let active_trim = active.trim();
-        if !active_trim.is_empty()
-            && profiles
-                .iter()
-                .any(|(name, sinks, _priority, _available)| *sinks > 0 && name == active_trim)
-        {
-            return Some(active_trim.to_string());
-        }
-    }
-
-    let mut best_available: Option<(String, u32)> = None;
-    let mut best_any: Option<(String, u32)> = None;
-    for (name, sinks, priority, available) in profiles {
-        let profile_name = name.trim();
-        if *sinks == 0 || profile_name.is_empty() {
-            continue;
-        }
-        if *available {
-            let replace = best_available
-                .as_ref()
-                .map(|(_, prio)| *prio < *priority)
-                .unwrap_or(true);
-            if replace {
-                best_available = Some((profile_name.to_string(), *priority));
-            }
-        }
-        let replace_any = best_any
-            .as_ref()
-            .map(|(_, prio)| *prio < *priority)
-            .unwrap_or(true);
-        if replace_any {
-            best_any = Some((profile_name.to_string(), *priority));
-        }
-    }
-
-    best_available.or(best_any).map(|(name, _)| name)
-}
-
-fn list_pipewire_card_fallbacks() -> Vec<(String, Option<String>)> {
-    let active_cards = pulseaudio_sink_card_indices();
-    let Ok((mut mainloop, context)) = pa_connect() else {
-        return Vec::new();
-    };
-
-    let shared: Rc<RefCell<Vec<(String, Option<String>)>>> = Rc::new(RefCell::new(Vec::new()));
-    let done = Rc::new(Cell::new(false));
-
-    let shared_cb = Rc::clone(&shared);
-    let done_cb = Rc::clone(&done);
-    let mut op = context
-        .introspect()
-        .get_card_info_list(move |res| match res {
-            ListResult::Item(info) => {
-                if active_cards.contains(&info.index) {
-                    return;
-                }
-                let card_name = info
-                    .name
-                    .as_ref()
-                    .map(|v| v.to_string())
-                    .unwrap_or_default();
-                if card_name.trim().is_empty() {
-                    return;
-                }
-                let active_profile = info
-                    .active_profile
-                    .as_ref()
-                    .and_then(|p| p.name.as_ref().map(|v| v.to_string()));
-                let profiles: Vec<(String, u32, u32, bool)> = info
-                    .profiles
-                    .iter()
-                    .filter_map(|p| {
-                        let name = p.name.as_ref()?.to_string();
-                        Some((name, p.n_sinks, p.priority, p.available))
-                    })
-                    .collect();
-                let preferred_profile =
-                    profiles
-                        .iter()
-                        .find_map(|(name, sinks, _priority, available)| {
-                            if name.trim() == "pro-audio" && *sinks > 0 && *available {
-                                return Some(name.trim().to_string());
-                            }
-                            None
-                        });
-                let Some(profile_name) = preferred_profile.or_else(|| {
-                    choose_pipewire_output_profile_from_entries(
-                        active_profile.as_deref(),
-                        &profiles,
-                    )
-                }) else {
-                    return;
-                };
-                let label = pipewire_display_name_from_strings(
-                    &info
-                        .proplist
-                        .get_str(pa_props::DEVICE_DESCRIPTION)
-                        .unwrap_or_default(),
-                    &info.proplist.get_str("device.nick").unwrap_or_default(),
-                    &card_name,
-                );
-                if label.trim().is_empty() {
-                    return;
-                }
-                shared_cb.borrow_mut().push((
-                    label,
-                    Some(build_pipewire_card_profile_target(
-                        &card_name,
-                        &profile_name,
-                    )),
-                ));
-            }
-            ListResult::End | ListResult::Error => {
-                done_cb.set(true);
-            }
-        });
-
-    pa_wait_for_list(&mut mainloop, &context, &done, &mut op);
-    let mut out = shared.borrow().clone();
-    out.sort_by_key(|(name, dev)| {
-        let hay = format!(
-            "{} {}",
-            name.to_ascii_uppercase(),
-            dev.clone().unwrap_or_default().to_ascii_uppercase()
-        );
-        (
-            if hay.contains("USB") { 0 } else { 1 },
-            name.to_ascii_uppercase(),
-            dev.clone().unwrap_or_default(),
-        )
-    });
-    out.dedup_by(|a, b| a.1 == b.1);
-    out
-}
-
-fn pulseaudio_card_index(card: &str) -> Option<u32> {
-    let Ok((mut mainloop, context)) = pa_connect() else {
-        return None;
-    };
-    let target = card.trim().to_string();
-    if target.is_empty() {
-        return None;
-    }
-
-    let found = Rc::new(Cell::new(u32::MAX));
-    let done = Rc::new(Cell::new(false));
-
-    let found_cb = Rc::clone(&found);
-    let done_cb = Rc::clone(&done);
-    let mut op = context
-        .introspect()
-        .get_card_info_list(move |res| match res {
-            ListResult::Item(info) => {
-                let name = info
-                    .name
-                    .as_ref()
-                    .map(|v| v.to_string())
-                    .unwrap_or_default();
-                if name == target {
-                    found_cb.set(info.index);
-                }
-            }
-            ListResult::End | ListResult::Error => {
-                done_cb.set(true);
-            }
-        });
-    pa_wait_for_list(&mut mainloop, &context, &done, &mut op);
-    match found.get() {
-        u32::MAX => None,
-        idx => Some(idx),
-    }
-}
-
-fn pulseaudio_resolve_sink_name_for_card(
-    card: &str,
-    prefer_profile: Option<&str>,
-) -> Option<String> {
-    let card_index = pulseaudio_card_index(card)?;
-    let Ok((mut mainloop, context)) = pa_connect() else {
-        return None;
-    };
-    let preferred = prefer_profile.unwrap_or("").trim().to_string();
-    let matches: Rc<RefCell<Vec<(u8, String)>>> = Rc::new(RefCell::new(Vec::new()));
-    let done = Rc::new(Cell::new(false));
-
-    let matches_cb = Rc::clone(&matches);
-    let done_cb = Rc::clone(&done);
-    let mut op = context
-        .introspect()
-        .get_sink_info_list(move |res| match res {
-            ListResult::Item(info) => {
-                if info.card != Some(card_index) {
-                    return;
-                }
-                let sink_name = info
-                    .name
-                    .as_ref()
-                    .map(|v| v.to_string())
-                    .unwrap_or_default();
-                if sink_name.trim().is_empty() || sink_name.ends_with(".monitor") {
-                    return;
-                }
-                let sink_profile = info
-                    .proplist
-                    .get_str(pa_props::DEVICE_PROFILE_NAME)
-                    .unwrap_or_default();
-                let score = if !preferred.is_empty() && sink_profile == preferred {
-                    2
-                } else if preferred.is_empty() || sink_profile.is_empty() {
-                    1
-                } else {
-                    0
-                };
-                matches_cb.borrow_mut().push((score, sink_name));
-            }
-            ListResult::End | ListResult::Error => {
-                done_cb.set(true);
-            }
-        });
-    pa_wait_for_list(&mut mainloop, &context, &done, &mut op);
-    let mut found = matches.borrow().clone();
-    found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-    found.into_iter().next().map(|(_, sink_name)| sink_name)
-}
-
-fn activate_pipewire_card_profile_target(card: &str, profile: &str) -> Result<String, String> {
-    let card_name = card.trim();
-    let profile_name = profile.trim();
-    if card_name.is_empty() || profile_name.is_empty() {
-        return Err("invalid PipeWire card/profile target".to_string());
-    }
-
-    let active = pulseaudio_card_active_profile(card_name).unwrap_or_default();
-    if active != profile_name {
-        pulseaudio_set_card_profile(card_name, profile_name)?;
-        thread::sleep(Duration::from_millis(120));
-    }
-
-    for _attempt in 0..8 {
-        if let Some(sink_name) =
-            pulseaudio_resolve_sink_name_for_card(card_name, Some(profile_name))
-        {
-            return Ok(sink_name);
-        }
-        thread::sleep(Duration::from_millis(80));
-    }
-
-    Err(format!(
-        "no sink node became available for card={} profile={}",
-        card_name, profile_name
-    ))
-}
 
 fn parse_alsa_card_labels(content: &str) -> HashMap<String, String> {
     let mut out = HashMap::new();
@@ -5038,23 +2968,6 @@ fn devices_for_driver(driver: &str) -> Vec<(String, Option<String>)> {
     if d == "auto(default)" || d == "auto" {
         return vec![("Default Output".to_string(), None)];
     }
-    if d == "pipewire" {
-        let mut out = vec![("Default System Output".to_string(), None)];
-        // Merge raw PipeWire sink nodes with the PulseAudio-compat compatibility
-        // view. Some WirePlumber/PipeWire setups expose a fuller sink list via the
-        // pulse server even though the selectable target remains the same node name.
-        let merged = merge_output_device_lists(
-            merge_output_device_lists(list_pipewire_sinks(), list_pulseaudio_sinks()),
-            list_pipewire_card_fallbacks(),
-        );
-        out.extend(merged);
-        return out;
-    }
-    if d == "pulseaudio" {
-        let mut out = vec![("Default System Output".to_string(), None)];
-        out.extend(list_pulseaudio_sinks());
-        return out;
-    }
     if driver_is_alsa_family(driver) {
         return list_alsa_cards();
     }
@@ -5062,37 +2975,6 @@ fn devices_for_driver(driver: &str) -> Vec<(String, Option<String>)> {
         return list_usb_rawlink_devices();
     }
     Vec::new()
-}
-
-fn card_from_pipewire_output_node(device_id: &str) -> Option<String> {
-    let dev = device_id.trim();
-    if !dev.starts_with("alsa_output.") {
-        return None;
-    }
-    let mut core = dev["alsa_output.".len()..].to_string();
-    let suffixes = [".analog-stereo", ".multichannel-output", ".iec958-stereo"];
-    for sx in suffixes {
-        if core.ends_with(sx) {
-            let len = core.len() - sx.len();
-            core.truncate(len);
-            break;
-        }
-    }
-    // Strip .pro-output-N or .pro-output-N.M (e.g. .pro-output-0.2)
-    if let Some(pos) = core.rfind(".pro-output-") {
-        let rest = &core[pos + ".pro-output-".len()..];
-        let valid = !rest.is_empty()
-            && rest
-                .split('.')
-                .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
-        if valid {
-            core.truncate(pos);
-        }
-    }
-    if core.is_empty() {
-        return None;
-    }
-    Some(format!("alsa_card.{core}"))
 }
 
 fn supported_output_formats_for_driver_device(
@@ -5105,18 +2987,9 @@ fn supported_output_formats_for_driver_device(
         return Vec::new();
     }
 
+    let _ = drv;
     let alsa_card_idx = if driver_is_alsa_family(driver) {
         parse_alsa_hw_device_id(dev).map(|(card_idx, _)| card_idx)
-    } else if drv == "pipewire" {
-        parse_pipewire_card_profile_target(dev)
-            .and_then(|(card, _)| pulseaudio_alsa_card_index_from_card_name(&card))
-            .or_else(|| {
-                card_from_pipewire_output_node(dev)
-                    .and_then(|card| pulseaudio_alsa_card_index_from_card_name(&card))
-            })
-            .or_else(|| pulseaudio_alsa_card_index_from_sink_name(dev))
-    } else if drv == "pulseaudio" {
-        pulseaudio_alsa_card_index_from_sink_name(dev)
     } else {
         None
     };
@@ -5129,110 +3002,6 @@ fn supported_output_formats_for_driver_device(
     supported_output_formats_from_playback_formats(&playback_formats)
 }
 
-fn pulseaudio_card_active_profile(card: &str) -> Option<String> {
-    fn str_opt_to_string(v: Option<std::borrow::Cow<'_, str>>) -> String {
-        v.map(|x| x.into_owned()).unwrap_or_default()
-    }
-
-    let Ok((mut mainloop, context)) = pa_connect() else {
-        return None;
-    };
-
-    let target = card.trim().to_string();
-    if target.is_empty() {
-        return None;
-    }
-
-    let found = Rc::new(RefCell::new(None::<String>));
-    let done = Rc::new(Cell::new(false));
-
-    let found_cb = Rc::clone(&found);
-    let done_cb = Rc::clone(&done);
-    let mut op = context
-        .introspect()
-        .get_card_info_list(move |res| match res {
-            ListResult::Item(info) => {
-                let name = str_opt_to_string(info.name.as_ref().cloned());
-                if name != target {
-                    return;
-                }
-                let profile = info
-                    .active_profile
-                    .as_ref()
-                    .map(|p| str_opt_to_string(p.name.as_ref().cloned()))
-                    .unwrap_or_default();
-                if !profile.is_empty() {
-                    *found_cb.borrow_mut() = Some(profile);
-                }
-            }
-            ListResult::End | ListResult::Error => {
-                done_cb.set(true);
-            }
-        });
-    pa_wait_for_list(&mut mainloop, &context, &done, &mut op);
-    let result = found.borrow().clone();
-    result
-}
-
-fn pulseaudio_set_card_profile(card: &str, profile: &str) -> Result<(), String> {
-    let (mut mainloop, context) = pa_connect()?;
-    let done = Rc::new(Cell::new(false));
-    let ok = Rc::new(Cell::new(false));
-
-    let done_cb = Rc::clone(&done);
-    let ok_cb = Rc::clone(&ok);
-    let op = context.introspect().set_card_profile_by_name(
-        card,
-        profile,
-        Some(Box::new(move |success| {
-            ok_cb.set(success);
-            done_cb.set(true);
-        })),
-    );
-
-    while !done.get() {
-        match context.get_state() {
-            PaContextState::Failed | PaContextState::Terminated => break,
-            _ => {}
-        }
-        if op.get_state() != PaOperationState::Running {
-            break;
-        }
-        let _ = mainloop.iterate(false);
-    }
-
-    if ok.get() {
-        return Ok(());
-    }
-    Err(format!(
-        "set card profile failed for card={} profile={}",
-        card, profile
-    ))
-}
-
-fn ensure_pipewire_pro_audio_for_device(device_id: &str) -> Result<String, String> {
-    let card = card_from_pipewire_output_node(device_id)
-        .or_else(|| parse_pipewire_card_profile_target(device_id).map(|(card, _)| card))
-        .ok_or_else(|| "unsupported or empty device id".to_string())?;
-    if let Some(active) = pulseaudio_card_active_profile(&card) {
-        if active == "pro-audio" {
-            return Ok(card);
-        }
-    }
-    let mut last_err = String::new();
-    for _ in 0..3 {
-        if let Err(e) = pulseaudio_set_card_profile(&card, "pro-audio") {
-            last_err = e;
-        }
-        thread::sleep(Duration::from_millis(120));
-        if let Some(active) = pulseaudio_card_active_profile(&card) {
-            if active == "pro-audio" {
-                return Ok(card);
-            }
-        }
-    }
-    Err(format!("failed to switch {card} to pro-audio: {last_err}"))
-}
 
 fn as_mut_engine<'a>(ptr: *mut Engine) -> Option<&'a mut Engine> {
     if ptr.is_null() {
@@ -5267,9 +3036,8 @@ pub extern "C" fn rac_free(ptr: *mut Engine) {
     }
     // SAFETY: Pointer was allocated by Box::into_raw in rac_new.
     unsafe {
-        let mut boxed = Box::from_raw(ptr);
+        let boxed = Box::from_raw(ptr);
         let _ = boxed.playbin.set_state(gst::State::Null);
-        boxed.stop_mmap_sink();
     }
 }
 
@@ -5294,10 +3062,12 @@ pub extern "C" fn rac_set_uri(ptr: *mut Engine, uri: *const c_char) -> c_int {
         }
     };
 
-    // For USB Rawlink v2, the GStreamer pipeline is NOT used for audio
-    // playback — native transport handles everything.  Skip all GStreamer
-    // pipeline manipulation; just load via native transport.
-    if driver_is_usb_rawlink_v2(&engine.output_driver) {
+    // For USB Rawlink v2 and ALSA mmap, the GStreamer pipeline is NOT used
+    // for audio playback — native transport handles everything.  Skip all
+    // GStreamer pipeline manipulation; just load via native transport.
+    if driver_is_usb_rawlink_v2(&engine.output_driver)
+        || driver_is_alsa_mmap(&engine.output_driver)
+    {
         engine.uri = s.to_string();
         engine.maybe_load_native_transport_for_uri(s);
         engine.reset_spectrum_timeline();
@@ -5310,27 +3080,7 @@ pub extern "C" fn rac_set_uri(ptr: *mut Engine, uri: *const c_char) -> c_int {
         return 0;
     }
 
-    if engine.output_driver_is_mmap() {
-        let driver = engine.output_driver.clone();
-        let device = engine.output_device.clone();
-        let buffer_us = engine.output_buffer_us;
-        let latency_us = engine.output_latency_us;
-        let exclusive = engine.output_exclusive;
-        engine.emit_event(EVT_STATE, "alsa-mmap set_uri: rebuilding output");
-        let rc =
-            engine.set_output_tuned(&driver, device.as_deref(), buffer_us, latency_us, exclusive);
-        if rc != 0 {
-            engine.set_error(format!("alsa-mmap set_uri rebind failed rc={rc}"));
-            engine.emit_event(
-                EVT_ERROR,
-                &format!("alsa-mmap set_uri rebind failed rc={rc}"),
-            );
-            return rc;
-        }
-        let _ = engine.playbin.set_state(gst::State::Null);
-    } else {
-        let _ = engine.playbin.set_state(gst::State::Null);
-    }
+    let _ = engine.playbin.set_state(gst::State::Null);
     engine.reset_spectrum_timeline();
     engine.playbin.set_property("uri", s);
     engine.uri = s.to_string();
@@ -5366,10 +3116,12 @@ pub extern "C" fn rac_play(ptr: *mut Engine) -> c_int {
         engine.emit_event(EVT_ERROR, "rac_play: empty uri");
         return -2;
     }
-    // For USB Rawlink v2, ONLY use native transport — never start the
-    // GStreamer pipeline, which would claim the USB interface via usb-rawsink
-    // and block native transport from accessing the device.
-    if driver_is_usb_rawlink_v2(&engine.output_driver) {
+    // For USB Rawlink v2 and ALSA mmap, ONLY use native transport — never
+    // start the GStreamer pipeline, which would claim the device and block
+    // native transport from accessing it.
+    if driver_is_usb_rawlink_v2(&engine.output_driver)
+        || driver_is_alsa_mmap(&engine.output_driver)
+    {
         match engine.native_transport.play() {
             Ok(()) => {
                 engine.emit_event(EVT_STATE, "Playing");
@@ -5394,7 +3146,9 @@ pub extern "C" fn rac_pause(ptr: *mut Engine) -> c_int {
     let Some(engine) = as_mut_engine(ptr) else {
         return -1;
     };
-    if driver_is_usb_rawlink_v2(&engine.output_driver) {
+    if driver_is_usb_rawlink_v2(&engine.output_driver)
+        || driver_is_alsa_mmap(&engine.output_driver)
+    {
         match engine.native_transport.pause() {
             Ok(()) => {
                 engine.emit_event(EVT_STATE, "Paused");
@@ -5421,7 +3175,9 @@ pub extern "C" fn rac_stop(ptr: *mut Engine) -> c_int {
         return -1;
     };
     engine.reset_spectrum_timeline();
-    if driver_is_usb_rawlink_v2(&engine.output_driver) {
+    if driver_is_usb_rawlink_v2(&engine.output_driver)
+        || driver_is_alsa_mmap(&engine.output_driver)
+    {
         match engine.native_transport.stop() {
             Ok(()) => {
                 engine.emit_event(EVT_STATE, "Null");
@@ -5443,16 +3199,18 @@ pub extern "C" fn rac_release_output(ptr: *mut Engine) -> c_int {
     let Some(engine) = as_mut_engine(ptr) else {
         return -1;
     };
-    let had_native_transport = driver_is_usb_rawlink_v2(&engine.output_driver);
+    let had_v2_usb = driver_is_usb_rawlink_v2(&engine.output_driver);
+    let had_v2_alsa = driver_is_alsa_mmap(&engine.output_driver);
     engine.reset_spectrum_timeline();
-    if had_native_transport {
+    if had_v2_usb {
         let _ = engine.native_transport.stop_and_release();
+    } else if had_v2_alsa {
+        let _ = engine.native_transport.stop();
     } else {
         let _ = engine.native_transport.stop();
     }
     let _ = engine.playbin.set_state(gst::State::Null);
-    engine.stop_mmap_sink();
-    if had_native_transport {
+    if had_v2_usb {
         std::thread::sleep(std::time::Duration::from_millis(350));
     }
     engine.emit_event(EVT_STATE, "output-released");
@@ -5470,7 +3228,9 @@ pub extern "C" fn rac_seek(ptr: *mut Engine, pos_s: c_double) -> c_int {
         0.0
     };
 
-    if driver_is_usb_rawlink_v2(&engine.output_driver) {
+    if driver_is_usb_rawlink_v2(&engine.output_driver)
+        || driver_is_alsa_mmap(&engine.output_driver)
+    {
         let ms = (clamped * 1000.0) as u64;
         match engine.native_transport.seek_ms(ms) {
             Ok(()) => {
@@ -5677,7 +3437,9 @@ pub extern "C" fn rac_get_position(ptr: *const Engine, pos_out: *mut c_double) -
         return -2;
     }
 
-    let pos = if driver_is_usb_rawlink_v2(&engine.output_driver) {
+    let pos = if driver_is_usb_rawlink_v2(&engine.output_driver)
+        || driver_is_alsa_mmap(&engine.output_driver)
+    {
         // After EOS but before next track loads, return 0 so the UI doesn't
         // show stale position from the finished track.
         if engine.native_eos_emitted {
@@ -5689,6 +3451,8 @@ pub extern "C" fn rac_get_position(ptr: *const Engine, pos_out: *mut c_double) -
             // moving even while the stricter play-head estimate is waiting for
             // the in-flight ISO ring to drain. Spectrum release uses
             // playback_elapsed_s() above for DAC-aligned visuals.
+            // ALSA mmap path doesn't populate runtime info, so it falls
+            // through to the decoded-frame-count branch.
             if let Some(runtime) = engine.native_transport.runtime_info() {
                 let write_pos = runtime.feed.write_elapsed_s().unwrap_or(0.0);
                 if write_pos > 0.0 || snap.state != native_transport::NativeTransportState::Playing
@@ -5739,7 +3503,9 @@ pub extern "C" fn rac_get_duration(ptr: *const Engine, dur_out: *mut c_double) -
         return -2;
     }
 
-    let dur = if driver_is_usb_rawlink_v2(&engine.output_driver) {
+    let dur = if driver_is_usb_rawlink_v2(&engine.output_driver)
+        || driver_is_alsa_mmap(&engine.output_driver)
+    {
         if engine.native_eos_emitted {
             0.0
         } else {
@@ -6700,81 +4466,6 @@ pub extern "C" fn rac_set_pitch(ptr: *mut Engine, semitones: c_double) -> c_int 
 }
 
 #[no_mangle]
-pub extern "C" fn rac_set_pipewire_clock_rate(ptr: *mut Engine, rate: c_int) -> c_int {
-    let Some(engine) = as_mut_engine(ptr) else {
-        return -1;
-    };
-    match Engine::pipewire_set_clock_force_rate(rate) {
-        Ok(()) => {
-            engine.emit_event(EVT_STATE, &format!("pipewire clock.force-rate={}", rate));
-            0
-        }
-        Err(e) => {
-            engine.set_error(format!("pipewire clock.force-rate failed: {e}"));
-            engine.emit_event(EVT_ERROR, &format!("pipewire clock.force-rate failed: {e}"));
-            -2
-        }
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn rac_set_pipewire_allowed_rates(ptr: *mut Engine, csv: *const c_char) -> c_int {
-    let Some(engine) = as_mut_engine(ptr) else {
-        return -1;
-    };
-    if csv.is_null() {
-        engine.set_error("null allowed-rates csv");
-        return -2;
-    }
-    let csv_s = unsafe { CStr::from_ptr(csv) }.to_string_lossy().to_string();
-    match Engine::pipewire_set_clock_allowed_rates_csv(&csv_s) {
-        Ok(_) => {
-            engine.emit_event(
-                EVT_STATE,
-                &format!("pipewire clock.allowed-rates={}", csv_s),
-            );
-            0
-        }
-        Err(e) => {
-            engine.set_error(format!("pipewire clock.allowed-rates failed: {e}"));
-            engine.emit_event(
-                EVT_ERROR,
-                &format!("pipewire clock.allowed-rates failed: {e}"),
-            );
-            -3
-        }
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn rac_set_pipewire_pro_audio(ptr: *mut Engine, device: *const c_char) -> c_int {
-    let Some(engine) = as_mut_engine(ptr) else {
-        return -1;
-    };
-    if device.is_null() {
-        engine.set_error("null device for pro-audio switch");
-        return -2;
-    }
-    let dev_s = unsafe { CStr::from_ptr(device) }
-        .to_string_lossy()
-        .to_string();
-    match ensure_pipewire_pro_audio_for_device(&dev_s) {
-        Ok(card) => {
-            engine.emit_event(
-                EVT_STATE,
-                &format!("pipewire card profile=pro-audio card={card}"),
-            );
-            0
-        }
-        Err(e) => {
-            engine.set_error(format!("pipewire pro-audio switch failed: {e}"));
-            engine.emit_event(EVT_ERROR, &format!("pipewire pro-audio switch failed: {e}"));
-            -3
-        }
-    }
-}
-
-#[no_mangle]
 pub extern "C" fn rac_list_devices(ptr: *mut Engine, driver: *const c_char) -> *mut c_char {
     let Some(engine) = as_mut_engine(ptr) else {
         return ptr::null_mut();
@@ -6848,37 +4539,7 @@ pub extern "C" fn rac_get_runtime_snapshot(ptr: *const Engine) -> *mut c_char {
     };
     let (session_rate, session_depth) = engine.query_output_format();
     let (hw_rate, hw_depth) = read_running_alsa_hw_params();
-    let (pw_force_rate, pw_allowed_raw, pw_quantum, pw_rate) =
-        Engine::pipewire_read_settings_metadata().unwrap_or((0, String::new(), 0, 0));
-    let mut pw_latency_ms = Engine::pipewire_query_app_node_latency_ms().unwrap_or(-1.0);
-    if pw_latency_ms < 0.0 && pw_quantum > 0 && pw_rate > 0 {
-        pw_latency_ms = (pw_quantum as f64 / pw_rate as f64) * 1000.0;
-    }
-    let mmap_diag = engine
-        .mmap_sink
-        .as_ref()
-        .and_then(|sink| sink.diagnostics.lock().ok().map(|state| state.clone()));
-
     let mut s = String::from("{");
-    s.push_str("\"pipewire\":{");
-    s.push_str(&format!("\"force_rate\":{},", pw_force_rate.max(0)));
-    s.push_str(&format!(
-        "\"quantum\":{},\"rate\":{},",
-        pw_quantum.max(0),
-        pw_rate.max(0)
-    ));
-    s.push_str(&format!(
-        "\"latency_ms\":{},",
-        if pw_latency_ms >= 0.0 {
-            pw_latency_ms
-        } else {
-            -1.0
-        }
-    ));
-    s.push_str("\"allowed_rates_raw\":\"");
-    s.push_str(&json_escape(&pw_allowed_raw));
-    s.push_str("\"},");
-
     s.push_str("\"output\":{");
     s.push_str(&format!(
         "\"session_rate\":{},\"session_depth\":{},\"hardware_rate\":{},\"hardware_depth\":{}",
@@ -6888,35 +4549,7 @@ pub extern "C" fn rac_get_runtime_snapshot(ptr: *const Engine) -> *mut c_char {
         hw_depth.unwrap_or(0),
     ));
     s.push_str("},");
-    s.push_str("\"mmap_thread\":");
-    match mmap_diag {
-        Some(diag) => {
-            s.push('{');
-            s.push_str(&format!(
-                "\"running\":{},\"realtime_attempted\":{},\"realtime_enabled\":{},\"realtime_policy\":\"{}\",\"realtime_priority\":{},\"realtime_error\":\"{}\",\
-                 \"memlock_attempted\":{},\"memlock_enabled\":{},\"memlock_mode\":\"{}\",\"memlock_error\":\"{}\",\
-                 \"negotiated_rate\":{},\"period_frames\":{},\"buffer_frames\":{},\"open_failures\":{},\"device_resets\":{}",
-                diag.running,
-                diag.realtime_attempted,
-                diag.realtime_enabled,
-                json_escape(&diag.realtime_policy),
-                diag.realtime_priority,
-                json_escape(&diag.realtime_error),
-                diag.memlock_attempted,
-                diag.memlock_enabled,
-                json_escape(&diag.memlock_mode),
-                json_escape(&diag.memlock_error),
-                diag.negotiated_rate,
-                diag.period_frames,
-                diag.buffer_frames,
-                diag.open_failures,
-                diag.device_resets,
-            ));
-            s.push('}');
-        }
-        None => s.push_str("null"),
-    }
-    s.push(',');
+    s.push_str("\"mmap_thread\":null,");
 
     // USB rawlink runtime info (for signal-path display).
     s.push_str("\"usb_rawlink\":");
@@ -7021,42 +4654,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn audio_byte_window_reuses_stale_prefix_before_growing() {
-        let mut window = AudioByteWindow::with_capacity(16);
-        window.append(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
-        window.consume(8);
-
-        let cap_before = window.buf.capacity();
-        window.append(&[13, 14, 15, 16, 17, 18]);
-
-        assert_eq!(window.buf.capacity(), cap_before);
-        assert_eq!(window.len(), 10);
-        assert_eq!(
-            window.peek_prefix(10),
-            Some(&[9, 10, 11, 12, 13, 14, 15, 16, 17, 18][..])
-        );
-    }
-
-    #[test]
-    fn audio_byte_window_resets_offsets_when_fully_consumed() {
-        let mut window = AudioByteWindow::with_capacity(8);
-        window.append(&[1, 2, 3, 4]);
-        window.consume(4);
-
-        assert_eq!(window.start, 0);
-        assert_eq!(window.len(), 0);
-
-        window.append(&[5, 6, 7]);
-        assert_eq!(window.peek_prefix(3), Some(&[5, 6, 7][..]));
-    }
-
-    #[test]
-    fn frames_for_duration_us_tracks_stream_rate() {
-        assert_eq!(frames_for_duration_us(10_000, 44_100, 64, 4096), 441);
-        assert_eq!(frames_for_duration_us(10_000, 48_000, 64, 4096), 480);
-        assert_eq!(frames_for_duration_us(10_000, 96_000, 64, 4096), 960);
-    }
 
     #[test]
     fn alsa_mmap_recover_from_xrun_requires_restart() {
@@ -7119,12 +4716,6 @@ mod tests {
         config.enabled = true;
         assert!(config.has_active_processing());
         assert!(config.effective_peq_config().enabled);
-    }
-
-    #[test]
-    fn frames_for_duration_us_respects_clamps() {
-        assert_eq!(frames_for_duration_us(2_000, 44_100, 128, 4096), 128);
-        assert_eq!(frames_for_duration_us(500_000, 192_000, 64, 4096), 4096);
     }
 
     #[test]
@@ -7262,152 +4853,6 @@ Playback:
         ]);
 
         assert_eq!(depths, vec![16, 24, 32]);
-    }
-
-    #[test]
-    fn pipewire_target_id_prefers_node_name_and_falls_back_to_serial() {
-        assert_eq!(
-            pipewire_target_id_from_props("alsa_output.usb-DAC.pro-output-0", "701"),
-            Some("alsa_output.usb-DAC.pro-output-0".to_string())
-        );
-        assert_eq!(
-            pipewire_target_id_from_props("", "701"),
-            Some("701".to_string())
-        );
-        assert_eq!(pipewire_target_id_from_props("", ""), None);
-        assert_eq!(
-            pipewire_target_id_from_props("alsa_output.usb-DAC.monitor", "701"),
-            None
-        );
-    }
-
-    #[test]
-    fn merge_output_device_lists_prefers_primary_and_adds_missing_entries() {
-        let merged = merge_output_device_lists(
-            vec![
-                (
-                    "USB DAC".to_string(),
-                    Some("alsa_output.usb-DAC.pro-output-0".to_string()),
-                ),
-                ("Serial Only Sink".to_string(), Some("701".to_string())),
-            ],
-            vec![
-                (
-                    "USB DAC via Pulse".to_string(),
-                    Some("alsa_output.usb-DAC.pro-output-0".to_string()),
-                ),
-                (
-                    "HDMI Sink".to_string(),
-                    Some("alsa_output.pci-HDMI.iec958-stereo".to_string()),
-                ),
-                ("Serial Only Duplicate".to_string(), Some("701".to_string())),
-                ("Fallback Sink".to_string(), None),
-                ("Fallback Sink".to_string(), None),
-            ],
-        );
-
-        assert_eq!(
-            merged,
-            vec![
-                (
-                    "USB DAC".to_string(),
-                    Some("alsa_output.usb-DAC.pro-output-0".to_string())
-                ),
-                ("Serial Only Sink".to_string(), Some("701".to_string())),
-                (
-                    "HDMI Sink".to_string(),
-                    Some("alsa_output.pci-HDMI.iec958-stereo".to_string())
-                ),
-                ("Fallback Sink".to_string(), None),
-            ]
-        );
-    }
-
-    #[test]
-    fn pipewire_card_profile_target_round_trips() {
-        let built = build_pipewire_card_profile_target("alsa_card.pci-0000_00_03.0", "pro-audio");
-        assert_eq!(
-            built,
-            "pwcardprofile:alsa_card.pci-0000_00_03.0|pro-audio".to_string()
-        );
-        assert_eq!(
-            parse_pipewire_card_profile_target(&built),
-            Some((
-                "alsa_card.pci-0000_00_03.0".to_string(),
-                "pro-audio".to_string()
-            ))
-        );
-        assert_eq!(
-            parse_pipewire_card_profile_target("pwcardprofile:bad"),
-            None
-        );
-    }
-
-    #[test]
-    fn pipewire_display_name_combines_description_and_nick() {
-        assert_eq!(
-            pipewire_display_name_from_strings(
-                "Built-in Audio Pro 1",
-                "CS4208 Digital",
-                "alsa_output.pci-0000_00_1b.0.pro-output-1",
-            ),
-            "Built-in Audio / CS4208 Digital".to_string()
-        );
-        assert_eq!(
-            pipewire_display_name_from_strings(
-                "Built-in Audio Pro",
-                "Built-in Audio Pro",
-                "alsa_output.pci-0000_00_1b.0.analog-stereo"
-            ),
-            "Built-in Audio / Analog".to_string()
-        );
-        assert_eq!(
-            pipewire_display_name_from_strings("", "CS4208 Digital", "fallback"),
-            "CS4208 Digital".to_string()
-        );
-        assert_eq!(
-            pipewire_display_name_from_strings(
-                "Monitor 09 Analog Stereo",
-                "",
-                "alsa_output.usb-Monitor_09_USB_Audio-00.analog-stereo",
-            ),
-            "Monitor 09 / USB Audio".to_string()
-        );
-        assert_eq!(
-            pipewire_display_name_from_strings(
-                "Built-in Audio Pro 7",
-                "",
-                "alsa_output.pci-0000_00_03.0.hdmi-stereo-extra1",
-            ),
-            "Built-in Audio / HDMI 1".to_string()
-        );
-        // Actual MUSILAND Monitor 09: nick carries the real model name, desc adds
-        // "Analog Stereo" suffix — should return nick directly, not the fallback
-        // card label derived from the node path.
-        assert_eq!(
-            pipewire_display_name_from_strings(
-                "Monitor 09 Analog Stereo",
-                "Monitor 09",
-                "alsa_output.usb-MUSILAND_Monitor_09-00.analog-stereo",
-            ),
-            "Monitor 09".to_string()
-        );
-    }
-
-    #[test]
-    fn choose_pipewire_output_profile_prefers_active_then_available() {
-        let profiles = vec![
-            ("output:hdmi-stereo".to_string(), 1, 5900, false),
-            ("pro-audio".to_string(), 3, 1, true),
-        ];
-        assert_eq!(
-            choose_pipewire_output_profile_from_entries(Some("output:hdmi-stereo"), &profiles),
-            Some("output:hdmi-stereo".to_string())
-        );
-        assert_eq!(
-            choose_pipewire_output_profile_from_entries(Some("off"), &profiles),
-            Some("pro-audio".to_string())
-        );
     }
 
     #[test]

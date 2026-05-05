@@ -10,6 +10,7 @@ use super::source::{
     inspect_mpd_manifest, MpdManifestInfo, NativeDecoderKind, NativeTransportSource,
     NativeTransportSourceKind,
 };
+use super::alsa_output::AlsaMmapSession;
 use super::output::{NativeOutputTarget, OutputSession};
 use crate::alsa_clock::{AlsaHwClockFeed, ClockMode};
 use crate::usb_audio::{
@@ -513,7 +514,7 @@ fn transport_worker(
 ) {
     let processor_chain_len = PcmProcessorChain::new().len();
     let mut current_source: Option<NativeTransportSource> = None;
-    let mut current_output_config: Option<UsbRawSinkConfig> = None;
+    let mut current_output_target: Option<NativeOutputTarget> = None;
     let mut current_dsp_config: Option<crate::dsp::DspGraphConfig> = None;
     // Shared slot for hot-updating DSP config in the running decode worker.
     let dsp_config_slot: super::native_dsp::SharedDspConfig = Arc::new(Mutex::new(None));
@@ -700,10 +701,7 @@ fn transport_worker(
                 }
 
                 current_source = Some(request.source.clone());
-                current_output_config = request
-                    .output_target
-                    .as_ref()
-                    .and_then(|t| t.usb_cfg().cloned());
+                current_output_target = request.output_target.clone();
                 current_dsp_config = request.dsp_config.clone();
 
                 // ── Eager decode ─────────────────────────────────────────
@@ -723,10 +721,7 @@ fn transport_worker(
                     request.source.clone(),
                     Arc::clone(&snapshot),
                     Arc::clone(&events),
-                    request
-                        .output_target
-                        .as_ref()
-                        .and_then(|t| t.usb_cfg().cloned()),
+                    request.output_target.clone(),
                     Arc::clone(&runtime),
                     gen,
                     None,
@@ -796,7 +791,7 @@ fn transport_worker(
                             source,
                             Arc::clone(&snapshot),
                             Arc::clone(&events),
-                            current_output_config.clone(),
+                            current_output_target.clone(),
                             Arc::clone(&runtime),
                             generation,
                             seek_start_ms,
@@ -973,7 +968,7 @@ fn transport_worker(
                             source,
                             Arc::clone(&snapshot),
                             Arc::clone(&events),
-                            current_output_config.clone(),
+                            current_output_target.clone(),
                             Arc::clone(&runtime),
                             generation,
                             Some(position_ms),
@@ -1144,7 +1139,7 @@ fn transport_worker(
                     source,
                     Arc::clone(&snapshot),
                     Arc::clone(&events),
-                    current_output_config.clone(),
+                    current_output_target.clone(),
                     Arc::clone(&runtime),
                     generation,
                     restart_pos_ms,
@@ -1332,7 +1327,7 @@ fn start_direct_audio_decode_worker(
     source: NativeTransportSource,
     snapshot: Arc<Mutex<NativeTransportSnapshot>>,
     events: Arc<Mutex<VecDeque<(i32, String)>>>,
-    output_config: Option<UsbRawSinkConfig>,
+    output_target: Option<NativeOutputTarget>,
     runtime: Arc<Mutex<Option<NativeUsbRuntime>>>,
     generation: u64,
     seek_start_ms: Option<u64>,
@@ -1360,7 +1355,7 @@ fn start_direct_audio_decode_worker(
                 source,
                 snapshot,
                 events,
-                output_config,
+                output_target,
                 runtime,
                 generation,
                 seek_start_ms,
@@ -1391,7 +1386,7 @@ fn direct_audio_decode_worker(
     source: NativeTransportSource,
     snapshot: Arc<Mutex<NativeTransportSnapshot>>,
     events: Arc<Mutex<VecDeque<(i32, String)>>>,
-    output_config: Option<UsbRawSinkConfig>,
+    output_target: Option<NativeOutputTarget>,
     runtime: Arc<Mutex<Option<NativeUsbRuntime>>>,
     generation: u64,
     seek_start_ms: Option<u64>,
@@ -1413,7 +1408,7 @@ fn direct_audio_decode_worker(
         &source,
         &snapshot,
         &events,
-        output_config,
+        output_target,
         &runtime,
         generation,
         seek_start_ms,
@@ -1515,7 +1510,7 @@ fn decode_direct_audio_stream(
     source: &NativeTransportSource,
     snapshot: &Arc<Mutex<NativeTransportSnapshot>>,
     events: &Arc<Mutex<VecDeque<(i32, String)>>>,
-    output_config: Option<UsbRawSinkConfig>,
+    output_target: Option<NativeOutputTarget>,
     runtime: &Arc<Mutex<Option<NativeUsbRuntime>>>,
     generation: u64,
     seek_start_ms: Option<u64>,
@@ -1531,6 +1526,9 @@ fn decode_direct_audio_stream(
     dsp_config: Option<crate::dsp::DspGraphConfig>,
     dsp_config_slot: super::native_dsp::SharedDspConfig,
 ) -> Result<(), String> {
+    let output_config: Option<UsbRawSinkConfig> = output_target
+        .as_ref()
+        .and_then(|t| t.usb_cfg().cloned());
     let mss = open_source_as_media_source_stream(source, stop)?;
     let mut hint = Hint::new();
     if let Some(extension) = source_probe_hint(source) {
@@ -2063,6 +2061,55 @@ fn decode_direct_audio_stream(
                             pkt_dur_samples,
                         );
                     }
+                }
+            } else if let Some(NativeOutputTarget::AlsaMmap(ref alsa_cfg)) = output_target {
+                if output_session.is_none() {
+                    let feed = Arc::new(AlsaHwClockFeed::default());
+                    let session = AlsaMmapSession::open(
+                        alsa_cfg,
+                        slab.spec.sample_rate,
+                        feed,
+                        Arc::clone(stop),
+                    )?;
+                    queue_native_event(
+                        events,
+                        crate::EVT_STATE,
+                        format!(
+                            "native-transport alsa-mmap configured device={} rate={} format={} frame_bytes={}",
+                            alsa_cfg.device,
+                            session.actual_rate(),
+                            session.gst_format(),
+                            session.frame_bytes(),
+                        ),
+                    );
+                    output_session = Some(OutputSession::AlsaMmap(session));
+                }
+                let wire_str = output_session
+                    .as_mut()
+                    .and_then(|s| s.as_alsa_mut())
+                    .expect("alsa session just inserted")
+                    .gst_format();
+                if let Ok(wire_format) = pcm_format_from_gst_format(wire_str) {
+                    if slab.spec.format != wire_format {
+                        slab = convert_slab_to_wire_format(slab, wire_format)?;
+                    }
+                }
+                // Block in eager-decode mode until Play flips auto_start. The
+                // ring auto-starts as soon as bytes are pushed, so deferring
+                // the first push gates audible playback on Play.
+                while !auto_start.load(Ordering::Acquire) {
+                    if stop.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    thread::sleep(std::time::Duration::from_millis(2));
+                }
+                let alsa_session = output_session
+                    .as_mut()
+                    .and_then(|s| s.as_alsa_mut())
+                    .expect("alsa session just inserted");
+                alsa_session.push_bytes(&slab.data)?;
+                if stop.load(Ordering::Acquire) {
+                    return Ok(());
                 }
             }
             // Reclaim the data buffer for reuse in next iteration.
