@@ -62,7 +62,7 @@ pub struct UsbAudioSink {
     /// [`Self::push_bytes`]; the ISO OUT callback drains via the
     /// `Arc<dyn TransferSource>` stored on `RingState`.
     queue: Arc<FrameQueue>,
-    /// Frame-counting clock feed — expose to GStreamer as `AlsaHwClock`.
+    /// Frame-counting clock feed read by the native_transport timing path.
     pub feed: Arc<AlsaHwClockFeed>,
     /// Shared transfer state — exposes `error` and `xruns` counters.
     pub state: Arc<RingState>,

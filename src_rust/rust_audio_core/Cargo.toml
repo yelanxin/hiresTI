@@ -30,8 +30,6 @@ cc = "1"
 
 [dependencies]
 gstreamer = "0.23"
-gstreamer-base = "0.23"
-glib = "0.20"
 libc = "0.2"
 rustfft = "6"
 rusb = "0.9"
