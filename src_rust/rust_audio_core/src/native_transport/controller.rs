@@ -14,7 +14,7 @@ use super::alsa_output::AlsaSession;
 use super::output::{NativeOutputTarget, OutputSession};
 use crate::alsa_clock::{AlsaHwClockFeed, ClockMode};
 use crate::usb_audio::{
-    self, OpenUsbDevice, QueueMode, UacAltProfile, UsbAudioSink, UsbRawSinkConfig,
+    self, OpenUsbDevice, UacAltProfile, UsbAudioSink, UsbRawSinkConfig,
 };
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use std::collections::{HashSet, VecDeque};
@@ -2213,7 +2213,6 @@ fn open_native_usb_output(
             source_bit_depth,
             Arc::clone(&feed),
             preferred_profile,
-            QueueMode::Bytes,
         )?;
         let pps = session.state.packets_per_sec as usize;
         let n_pkts = (usb_audio::transfer::N_PACKETS_TARGET_MS * pps / 1000).max(8);
@@ -2257,14 +2256,13 @@ fn open_native_usb_output(
     let mut last_err = String::new();
     let mut session_result: Option<UsbAudioSink> = None;
     for attempt in 0..MAX_RETRIES {
-        match UsbAudioSink::open_with_feed_mode(
+        match UsbAudioSink::open_with_feed(
             &cfg.device_id,
             stream_spec.sample_rate,
             source_bit_depth,
             Arc::clone(&feed),
             None,
             preferred_profile,
-            QueueMode::Bytes,
         ) {
             Ok(s) => {
                 if attempt > 0 {

@@ -3,16 +3,17 @@
 //! # Lifecycle
 //!
 //! ```text
-//! UsbAudioSink::open(device_id, rate, bit_depth)
+//! UsbAudioSink::open_with_feed(device_id, rate, bit_depth, feed, …)
 //!   → find device → open handle → configure alt/rate
-//!   → create FrameQueue + AlsaHwClockFeed
+//!   → create FrameQueue
 //!   → build RingState → start IsoTransferRing
 //!   → start FeedbackReader (UAC 2.0 only)
-//!   → return (UsbAudioSink, AlsaHwClock)
+//!   → return UsbAudioSink
 //! ```
 //!
-//! The caller pushes PCM bytes into [`UsbAudioSink::queue`] via the GStreamer
-//! appsink; the `IsoTransferRing` drains the queue in its callback loop.
+//! The V2 native_transport decode worker pushes PCM bytes into the
+//! [`FrameQueue`] via [`UsbAudioSink::push_bytes`]; the `IsoTransferRing`
+//! drains the queue in its callback loop.
 //!
 //! Drop order is significant — fields are dropped top-to-bottom in declaration
 //! order:
@@ -32,7 +33,6 @@ use std::os::raw::{c_int, c_uchar, c_uint, c_void};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
-use gstreamer as gst;
 use libusb1_sys::{
     libusb_alloc_transfer, libusb_cancel_transfer, libusb_device_handle, libusb_fill_iso_transfer,
     libusb_free_transfer, libusb_handle_events_timeout, libusb_set_iso_packet_lengths,
@@ -41,124 +41,27 @@ use libusb1_sys::{
 
 use rusb::UsbContext as _;
 
-use crate::alsa_clock::{AlsaHwClock, AlsaHwClockFeed};
+use crate::alsa_clock::AlsaHwClockFeed;
 
-use super::borrowed_queue::BorrowedBufferQueue;
 use super::descriptor::UacVersion;
 use super::device::{enumerate_usb_audio_devices, OpenUsbDevice, UacAltProfile, UsbAudioDevice};
 use super::feedback::{parse_feedback_uac1, parse_feedback_uac2};
-use super::owned_buffer_queue::OwnedBufferQueue;
 use super::queue::FrameQueue;
-use super::source::TransferSource;
 use super::transfer::{IsoTransferRing, RingState};
 
 // ---------------------------------------------------------------------------
 // UsbAudioSink
 // ---------------------------------------------------------------------------
 
-pub enum PushBufferError {
-    Full(gst::Buffer),
-    MapFailed(gst::Buffer),
-}
-
-pub enum QueueMode {
-    Bytes,
-    Borrowed,
-    Owned,
-}
-
-enum ProducerQueue {
-    Bytes(Arc<FrameQueue>),
-    Borrowed(Arc<BorrowedBufferQueue>),
-    Owned(Arc<OwnedBufferQueue>),
-}
-
-impl ProducerQueue {
-    fn bytes() -> Self {
-        Self::Bytes(FrameQueue::new())
-    }
-
-    fn borrowed() -> Self {
-        Self::Borrowed(BorrowedBufferQueue::new(FrameQueue::capacity_bytes()))
-    }
-
-    fn owned() -> Self {
-        Self::Owned(OwnedBufferQueue::new(FrameQueue::capacity_bytes()))
-    }
-
-    fn transfer_source(&self) -> Arc<dyn TransferSource> {
-        match self {
-            Self::Bytes(queue) => queue.clone(),
-            Self::Borrowed(queue) => queue.clone(),
-            Self::Owned(queue) => queue.clone(),
-        }
-    }
-
-    fn kind_name(&self) -> &'static str {
-        match self {
-            Self::Bytes(queue) => queue.kind_name(),
-            Self::Borrowed(queue) => queue.kind_name(),
-            Self::Owned(queue) => queue.kind_name(),
-        }
-    }
-
-    fn available_read(&self) -> usize {
-        match self {
-            Self::Bytes(queue) => queue.available_read(),
-            Self::Borrowed(queue) => queue.available_read(),
-            Self::Owned(queue) => queue.available_read(),
-        }
-    }
-
-    fn available_write(&self) -> usize {
-        match self {
-            Self::Bytes(queue) => queue.available_write(),
-            Self::Borrowed(queue) => queue.available_write(),
-            Self::Owned(queue) => queue.available_write(),
-        }
-    }
-
-    fn set_frame_bytes(&self, frame_bytes: usize) {
-        match self {
-            Self::Bytes(queue) => queue.set_frame_bytes(frame_bytes),
-            Self::Borrowed(_) | Self::Owned(_) => {}
-        }
-    }
-
-    fn push_bytes(&self, data: &[u8]) -> usize {
-        match self {
-            Self::Bytes(queue) => queue.push(data),
-            Self::Borrowed(_) | Self::Owned(_) => 0,
-        }
-    }
-
-    fn push_buffer(&self, buffer: gst::Buffer) -> Result<(), PushBufferError> {
-        match self {
-            Self::Bytes(_) => Err(PushBufferError::MapFailed(buffer)),
-            Self::Borrowed(queue) => queue.push_buffer(buffer).map_err(PushBufferError::Full),
-            Self::Owned(_) => Err(PushBufferError::MapFailed(buffer)),
-        }
-    }
-
-    fn push_owned_bytes(&self, data: Vec<u8>) -> Result<(), Vec<u8>> {
-        match self {
-            Self::Owned(queue) => queue.push_bytes(data),
-            Self::Bytes(_) | Self::Borrowed(_) => Err(data),
-        }
-    }
-
-    fn supports_borrowed_buffers(&self) -> bool {
-        matches!(self, Self::Borrowed(_))
-    }
-}
-
 /// An active USB audio output session.
 ///
 /// Holds all live resources for one playback session.  Drop (or `stop()`) to
 /// tear down the transfer ring and release the USB interface.
 pub struct UsbAudioSink {
-    /// Producer-side queue implementation used by the pusher thread.
-    queue: ProducerQueue,
+    /// Producer-side PCM byte queue. The decode worker pushes via
+    /// [`Self::push_bytes`]; the ISO OUT callback drains via the
+    /// `Arc<dyn TransferSource>` stored on `RingState`.
+    queue: Arc<FrameQueue>,
     /// Frame-counting clock feed — expose to GStreamer as `AlsaHwClock`.
     pub feed: Arc<AlsaHwClockFeed>,
     /// Shared transfer state — exposes `error` and `xruns` counters.
@@ -200,15 +103,13 @@ impl UsbAudioSink {
         self.queue.available_read()
     }
 
-    /// One-line periodic telemetry snapshot for the V2 native_transport path.
+    /// One-line periodic telemetry snapshot.
     ///
-    /// V1 (GstAppsink pusher) emits `usb-audio: push=…` per second from its
-    /// pusher loop in `lib.rs`.  V2 has no equivalent loop because the decode
-    /// worker runs in `native_transport::controller`, so the controller calls
-    /// this function once per second to surface the same kind of telemetry —
-    /// queue depth, in-flight count, feedback rate, ISO jitter min/max, xrun
-    /// delta.  Atomically resets the windowed min/max counters after reading
-    /// so each line covers exactly the elapsed window.
+    /// `native_transport::controller` calls this once per second from its
+    /// decode worker to surface queue depth, in-flight count, feedback rate,
+    /// ISO jitter min/max, and xrun delta.  Atomically resets the windowed
+    /// min/max counters after reading so each line covers exactly the
+    /// elapsed window.
     ///
     /// `push_bytes_window` is the bytes the producer accepted into the queue
     /// during `secs`; the formatter shows it as a rate.
@@ -308,38 +209,12 @@ impl UsbAudioSink {
         )
     }
 
-    pub fn source_kind(&self) -> &'static str {
-        self.queue.kind_name()
-    }
-
-    pub fn supports_borrowed_buffers(&self) -> bool {
-        self.queue.supports_borrowed_buffers()
-    }
-
     pub fn push_bytes(&self, data: &[u8]) -> usize {
-        let written = self.queue.push_bytes(data);
+        let written = self.queue.push(data);
         if written > 0 {
             self.record_push(written);
         }
         written
-    }
-
-    pub fn push_owned_bytes(&self, data: Vec<u8>) -> Result<(), Vec<u8>> {
-        let len = data.len();
-        let result = self.queue.push_owned_bytes(data);
-        if result.is_ok() && len > 0 {
-            self.record_push(len);
-        }
-        result
-    }
-
-    pub fn push_buffer(&self, buffer: gst::Buffer) -> Result<(), PushBufferError> {
-        let len = buffer.size();
-        let result = self.queue.push_buffer(buffer);
-        if result.is_ok() && len > 0 {
-            self.record_push(len);
-        }
-        result
     }
 
     /// Update producer-side telemetry on `RingState`.  Read by
@@ -505,7 +380,7 @@ impl UsbAudioSink {
 
 impl UsbAudioSink {
     fn build_ring_state(
-        queue: &ProducerQueue,
+        queue: &Arc<FrameQueue>,
         feed: &Arc<AlsaHwClockFeed>,
         actual_rate: u32,
         alt: &super::descriptor::UacStreamAlt,
@@ -519,7 +394,7 @@ impl UsbAudioSink {
         queue.set_frame_bytes(alt.channels as usize * bytes_per_sample);
         let packets_per_sec = iso_packets_per_sec(is_high_speed, alt.out_ep_interval);
         RingState::new(
-            queue.transfer_source(),
+            Arc::clone(queue) as Arc<dyn super::source::TransferSource>,
             actual_rate,
             bytes_per_sample,
             alt.channels as usize,
@@ -584,84 +459,13 @@ impl UsbAudioSink {
 }
 
 impl UsbAudioSink {
-    /// Open a USB Audio device and start the isochronous transfer ring.
-    ///
-    /// # Arguments
-    ///
-    /// * `device_id`  — `"usb:VVVV:PPPP"` or `"usb:VVVV:PPPP:SERIAL"`
-    /// * `rate`       — desired sample rate in Hz (e.g. 44100, 48000, 96000)
-    /// * `bit_depth`  — desired bit depth (16, 24, or 32)
-    ///
-    /// Returns `(Self, AlsaHwClock)`.  Pass the clock to
-    /// `pipeline.use_clock(Some(&clock))` so GStreamer paces the pipeline with
-    /// the USB frame counter.
-    pub fn open(device_id: &str, rate: u32, bit_depth: u8) -> Result<(Self, AlsaHwClock), String> {
-        let (dev, open_dev, alt) = Self::open_and_configure(device_id, rate, bit_depth, None)?;
-        let queue = ProducerQueue::bytes();
-        let feed = Arc::new(AlsaHwClockFeed::default());
-        let clock = AlsaHwClock::new(Arc::clone(&feed));
-        let actual_rate = open_dev.active_rate;
-        eprintln!(
-            "usb-audio: sink::open device={} requested_rate={} actual_rate={} bit_depth={} channels={}",
-            device_id, rate, actual_rate, bit_depth, alt.channels
-        );
-
-        let dev_handle_raw = open_dev.handle.as_raw();
-        let ctx_raw = open_dev.handle.context().as_raw();
-        let state = Self::build_ring_state(&queue, &feed, actual_rate, &alt, dev.is_high_speed);
-
-        let anchor_ns = clock_monotonic_ns();
-        feed.anchor(anchor_ns, actual_rate);
-
-        let mut ring =
-            IsoTransferRing::new(dev_handle_raw, ctx_raw, alt.out_ep, Arc::clone(&state))?;
-        ring.start()?;
-
-        // 8. Start UAC 2.0 feedback reader (optional).
-        let feedback = alt
-            .feedback_ep
-            .map(|ep| {
-                FeedbackReader::new(
-                    dev_handle_raw,
-                    ep,
-                    Arc::clone(&state),
-                    dev.uac_version,
-                    dev.is_high_speed,
-                )
-                .and_then(|mut fr| {
-                    fr.start()?;
-                    Ok(fr)
-                })
-            })
-            .transpose()?;
-
-        // Register feedback transfer with the ring so stop() can cancel it.
-        if let Some(ref fb) = feedback {
-            ring.feedback_xfer = Some(fb.transfer);
-        }
-
-        Ok((
-            UsbAudioSink {
-                queue,
-                feed,
-                state,
-                actual_rate,
-                ring,
-                _feedback: feedback,
-                started: true,
-                _open_dev: Arc::new(Mutex::new(open_dev)),
-            },
-            clock,
-        ))
-    }
-
     /// Open the USB device using a caller-supplied clock feed.
     ///
-    /// Like [`open`] but the caller creates the [`AlsaHwClockFeed`] (and its
-    /// paired [`AlsaHwClock`]) before calling this function.  This enables a
-    /// **lazy-open** pattern: give GStreamer the clock immediately, then call
-    /// this once the negotiated sample rate is known (e.g. on the first PCM
-    /// buffer from the appsink).
+    /// Enables the **lazy-open** pattern: the caller creates the
+    /// [`AlsaHwClockFeed`] before the negotiated sample rate is known, so the
+    /// downstream consumer (V2 native_transport's worker) has a stable clock
+    /// reference to anchor against. This function is then called once the
+    /// first decoded slab arrives and the actual rate is known.
     ///
     /// `prefill` (when provided) is pushed into the queue before the ISO ring
     /// is started so the first submitted transfers can carry real audio rather
@@ -674,41 +478,11 @@ impl UsbAudioSink {
         feed: Arc<AlsaHwClockFeed>,
         prefill: Option<&[u8]>,
         preferred_profile: Option<UacAltProfile>,
-        borrow_direct_buffers: bool,
     ) -> Result<Self, String> {
-        let mode = if borrow_direct_buffers {
-            QueueMode::Borrowed
-        } else {
-            QueueMode::Bytes
-        };
-        Self::open_with_feed_mode(
-            device_id,
-            rate,
-            bit_depth,
-            feed,
-            prefill,
-            preferred_profile,
-            mode,
-        )
-    }
-
-    pub fn open_with_feed_mode(
-        device_id: &str,
-        rate: u32,
-        bit_depth: u8,
-        feed: Arc<AlsaHwClockFeed>,
-        prefill: Option<&[u8]>,
-        preferred_profile: Option<UacAltProfile>,
-        mode: QueueMode,
-    ) -> Result<Self, String> {
-        let queue = match mode {
-            QueueMode::Bytes => ProducerQueue::bytes(),
-            QueueMode::Borrowed => ProducerQueue::borrowed(),
-            QueueMode::Owned => ProducerQueue::owned(),
-        };
+        let queue = FrameQueue::new();
 
         if let Some(data) = prefill.filter(|data| !data.is_empty()) {
-            let written = queue.push_bytes(data);
+            let written = queue.push(data);
             if written < data.len() {
                 eprintln!(
                     "usb-audio: startup prefill truncated {} -> {} bytes",
@@ -724,11 +498,6 @@ impl UsbAudioSink {
         eprintln!(
             "usb-audio: sink::open_with_feed device={} requested_rate={} actual_rate={} bit_depth={} channels={} feedback_ep={:?}",
             device_id, rate, actual_rate, bit_depth, alt.channels, alt.feedback_ep
-        );
-        eprintln!(
-            "usb-audio: producer queue kind={} borrowed={}",
-            queue.kind_name(),
-            queue.supports_borrowed_buffers(),
         );
 
         let dev_handle_raw = open_dev.handle.as_raw();
@@ -764,13 +533,8 @@ impl UsbAudioSink {
         bit_depth: u8,
         feed: Arc<AlsaHwClockFeed>,
         preferred_profile: Option<UacAltProfile>,
-        mode: QueueMode,
     ) -> Result<Self, String> {
-        let queue = match mode {
-            QueueMode::Bytes => ProducerQueue::bytes(),
-            QueueMode::Borrowed => ProducerQueue::borrowed(),
-            QueueMode::Owned => ProducerQueue::owned(),
-        };
+        let queue = FrameQueue::new();
 
         let (open_dev, alt) =
             Self::configure_existing_handle(open_dev, rate, bit_depth, preferred_profile)?;
@@ -828,10 +592,10 @@ impl UsbAudioSink {
         self.ring.free_transfers();
 
         // 2. Clear the old queue and create a fresh one.
-        let queue = ProducerQueue::bytes();
+        let queue = FrameQueue::new();
 
         if let Some(data) = prefill.filter(|d| !d.is_empty()) {
-            let written = queue.push_bytes(data);
+            let written = queue.push(data);
             if written < data.len() {
                 eprintln!(
                     "usb-audio: reconfigure prefill truncated {} -> {} bytes",
@@ -931,7 +695,7 @@ impl UsbAudioSink {
         self.ring.free_transfers();
 
         // 4. Fresh queue.
-        let queue = ProducerQueue::bytes();
+        let queue = FrameQueue::new();
 
         // 5. Reuse the current alt/rate when possible. Re-issuing SET_CUR or
         // toggling alt=0 on a same-rate track switch can make some DACs mute
