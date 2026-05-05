@@ -71,7 +71,7 @@ def _dsp_processing_active(app):
         return True
     if bool(getattr(player, "widener_enabled", False)):
         return True
-    return any(bool((info or {}).get("enabled", True)) for info in dict(getattr(player, "lv2_slots", {}) or {}).values())
+    return False
 
 
 def _playback_status_visual(app):
@@ -1703,13 +1703,9 @@ def update_tech_label(self, info):
 def on_bit_perfect_toggled(self, switch, state):
     self.settings["bit_perfect"] = state; self.save_settings()
     logger.info(
-        "Bit-perfect toggle request state=%s current_dsp_enabled=%s lv2_slots=%s",
+        "Bit-perfect toggle request state=%s current_dsp_enabled=%s",
         bool(state),
         bool(getattr(getattr(self, "player", None), "dsp_enabled", False)),
-        [
-            (sid, bool((info or {}).get("enabled", True)))
-            for sid, info in dict(getattr(getattr(self, "player", None), "lv2_slots", {}) or {}).items()
-        ],
     )
     if state and bool(getattr(getattr(self, "player", None), "dsp_enabled", False)):
         try:
@@ -1721,11 +1717,6 @@ def on_bit_perfect_toggled(self, switch, state):
             self.save_settings()
         if dsp_disabled and hasattr(self, "show_output_notice"):
             self.show_output_notice("DSP disabled: Bit-Perfect mode enabled", "info", 2600)
-        if dsp_disabled and hasattr(self, "_lv2_restart_playback_for_graph_rebind"):
-            try:
-                self._lv2_restart_playback_for_graph_rebind(reason="bit-perfect-toggle")
-            except Exception:
-                logger.debug("bit-perfect lv2 rebind failed", exc_info=True)
     self.ex_switch.set_sensitive(state)
     if not state:
         setattr(self, "_exclusive_ui_syncing", True)

@@ -139,7 +139,6 @@ def test_sync_playback_status_icon_prefers_exclusive_over_bit_perfect():
             tape_enabled=False,
             tube_enabled=False,
             widener_enabled=False,
-            lv2_slots={},
         ),
     )
 
@@ -164,7 +163,6 @@ def test_sync_playback_status_icon_shows_dsp_only_when_processing_is_active():
             tape_enabled=False,
             tube_enabled=False,
             widener_enabled=False,
-            lv2_slots={},
         ),
     )
 
@@ -186,7 +184,6 @@ def test_sync_playback_status_icon_shows_dsp_only_when_processing_is_active():
             tape_enabled=False,
             tube_enabled=False,
             widener_enabled=False,
-            lv2_slots={},
         ),
     )
 

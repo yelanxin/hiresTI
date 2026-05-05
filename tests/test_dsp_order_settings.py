@@ -24,21 +24,3 @@ def test_normalize_settings_sanitizes_invalid_dsp_order_entries():
         }
     )
     assert out["dsp_order"] == ["tube", "peq", "convolver", "tape", "widener"]
-
-
-def test_normalize_settings_dedupes_lv2_slots_by_uri_and_prunes_order():
-    out = normalize_settings(
-        {
-            "settings_version": CURRENT_SETTINGS_VERSION,
-            "dsp_order": ["peq", "lv2_0", "lv2_1", "tube", "convolver", "tape", "widener"],
-            "dsp_lv2_slots": [
-                {"slot_id": "lv2_0", "uri": "http://example.com/plugin", "enabled": True, "port_values": {}},
-                {"slot_id": "lv2_1", "uri": "http://example.com/plugin", "enabled": True, "port_values": {}},
-            ],
-        }
-    )
-
-    assert out["dsp_lv2_slots"] == [
-        {"slot_id": "lv2_0", "uri": "http://example.com/plugin", "enabled": True, "port_values": {}}
-    ]
-    assert out["dsp_order"] == ["peq", "lv2_0", "tube", "convolver", "tape", "widener"]

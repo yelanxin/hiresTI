@@ -30,11 +30,7 @@ def test_init_paths_and_settings_migration_and_sanitize(tmp_path, monkeypatch):
                 "viz_sync_offset_ms": 999,
                 "viz_sync_device_offsets": {"ok": 120, "bad_type": "x", "too_big": 260, 1: 10},
                 "play_mode": 999,
-                "dsp_order": ["peq", "lv2_0", "lv2_1", "tube", "convolver", "tape", "widener"],
-                "dsp_lv2_slots": [
-                    {"slot_id": "lv2_0", "uri": "http://example.com/plugin", "enabled": True, "port_values": {}},
-                    {"slot_id": "lv2_1", "uri": "http://example.com/plugin", "enabled": True, "port_values": {}},
-                ],
+                "dsp_order": ["peq", "tube", "convolver", "tape", "widener"],
             }
         ),
     )
@@ -47,15 +43,11 @@ def test_init_paths_and_settings_migration_and_sanitize(tmp_path, monkeypatch):
     mod._init_paths_and_settings(app)
 
     assert app.settings_file == str(config_dir / "settings.json")
-    assert app._lv2_plugin_cache_file == str(cache_dir / "lv2_plugins.json")
     assert not old.exists()
     assert (config_dir / "settings.json").exists()
     assert app.settings["viz_sync_offset_ms"] == 0
     assert app.settings["viz_sync_device_offsets"] == {"ok": 120}
-    assert app.settings["dsp_lv2_slots"] == [
-        {"slot_id": "lv2_0", "uri": "http://example.com/plugin", "enabled": True, "port_values": {}}
-    ]
-    assert app.settings["dsp_order"] == ["peq", "lv2_0", "tube", "convolver", "tape", "widener"]
+    assert app.settings["dsp_order"] == ["peq", "tube", "convolver", "tape", "widener"]
     assert app.play_mode == app.MODE_NORMAL
     assert app.shuffle_indices == []
     assert app._account_scope == "guest"
@@ -467,109 +459,3 @@ def test_init_runtime_calls_stages_in_order(monkeypatch):
     ]
 
 
-def test_init_audio_and_data_services_batches_lv2_restore(tmp_path, monkeypatch):
-    pytest.importorskip("gi")
-    from app import app_init_runtime as mod
-
-    class _Player:
-        def __init__(self):
-            self.visual_sync_offset_ms = None
-            self.latency_calls = []
-            self.realtime_priority_calls = []
-            self.dsp_enabled_calls = []
-            self.dsp_order_calls = []
-            self.lv2_restore_slots_calls = []
-            self.limiter_threshold_calls = []
-            self.limiter_ratio_calls = []
-            self.limiter_enabled_calls = []
-
-        def set_alsa_latency(self, buf_ms, lat_ms):
-            self.latency_calls.append((buf_ms, lat_ms))
-
-        def set_alsa_mmap_realtime_priority(self, priority):
-            self.realtime_priority_calls.append(int(priority))
-
-        def set_dsp_order(self, order):
-            self.dsp_order_calls.append(list(order))
-            return True
-
-        def set_dsp_enabled(self, enabled):
-            self.dsp_enabled_calls.append(bool(enabled))
-            return True
-
-        def lv2_restore_slots(self, slots):
-            self.lv2_restore_slots_calls.append(list(slots))
-            return True
-
-        def set_limiter_threshold(self, threshold):
-            self.limiter_threshold_calls.append(float(threshold))
-            return True
-
-        def set_limiter_ratio(self, ratio):
-            self.limiter_ratio_calls.append(float(ratio))
-            return True
-
-        def set_limiter_enabled(self, enabled):
-            self.limiter_enabled_calls.append(bool(enabled))
-            return True
-
-    class _Mgr:
-        def __init__(self, base_dir, scope_key):
-            self.base_dir = base_dir
-            self.scope_key = scope_key
-
-    player = _Player()
-    monkeypatch.setattr(mod, "create_audio_engine", lambda **kwargs: player)
-    monkeypatch.setattr(mod, "LyricsManager", lambda: "lyrics_mgr")
-    monkeypatch.setattr(mod, "HistoryManager", _Mgr)
-    monkeypatch.setattr(mod, "PlaylistManager", _Mgr)
-    monkeypatch.setattr(mod, "DspPresetManager", lambda config_dir: SimpleNamespace(config_dir=config_dir))
-
-    root = tmp_path / "cache"
-    root.mkdir()
-    app = SimpleNamespace()
-    app._cache_root = str(root)
-    app._config_root = str(root)
-    app._account_scope = "guest"
-    app.settings = {
-        "viz_sync_device_offsets": {},
-        "viz_sync_offset_ms": 0,
-        "alsa_mmap_realtime_priority": "Recommended (60)",
-        "latency_profile": "Standard (100ms)",
-        "audio_cache_tracks": 0,
-        "dsp_order": ["peq", "lv2_0", "tube", "convolver", "tape", "widener"],
-        "dsp_lv2_slots": [
-            {
-                "slot_id": "lv2_0",
-                "uri": "http://example.com/plugin",
-                "enabled": False,
-                "port_values": {"mix": 0.5},
-            }
-        ],
-    }
-    app.LATENCY_MAP = {"Standard (100ms)": (100, 100)}
-    app.ALSA_MMAP_REALTIME_PRIORITY_MAP = {"Recommended (60)": 60}
-    app.ALSA_MMAP_REALTIME_PRIORITY_DEFAULT = "Recommended (60)"
-    app.on_next_track = lambda *a, **k: None
-    app.update_tech_label = lambda *a, **k: None
-    app.on_spectrum_data = lambda *a, **k: None
-    app.on_viz_sync_offset_update = lambda *a, **k: None
-    called = []
-    app._schedule_cache_maintenance = lambda: called.append("scheduled")
-
-    mod._init_audio_and_data_services(app)
-
-    assert app.player is player
-    assert player.dsp_order_calls == [["peq", "lv2_0", "tube", "convolver", "tape", "widener"]]
-    assert player.lv2_restore_slots_calls == [[
-        {
-            "slot_id": "lv2_0",
-            "uri": "http://example.com/plugin",
-            "enabled": False,
-            "port_values": {"mix": 0.5},
-        }
-    ]]
-    assert player.limiter_threshold_calls == [0.85]
-    assert player.limiter_ratio_calls == [20.0]
-    assert player.limiter_enabled_calls == [False]
-    assert called == ["scheduled"]
