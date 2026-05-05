@@ -11,7 +11,7 @@
 > **Re-login required for FLAC / Hi-Res quality.**
 > The legacy OAuth (device-code) login that previous versions used is now capped by TIDAL at 320 kbps AAC. A new **PKCE** login flow (added in `v1.9.5`) restores access to full FLAC CD-quality and Hi-Res Lossless streams.
 >
-> If you're still on the old OAuth session, open **Settings → Account**, sign out, and sign back in — the login dialog will use PKCE automatically and your library will resume at the higher tiers.
+> If you're still on the old OAuth session, open **Account**, sign out, and sign back in — the login dialog will use PKCE automatically and your library will resume at the higher tiers.
 
 ## Highlights
 
