@@ -1,7 +1,5 @@
-use gst::prelude::*;
 use gstreamer as gst;
 use std::collections::{HashMap, VecDeque};
-use std::env;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_double, c_int, c_uint, c_void};
 use std::path::Path;
@@ -90,10 +88,8 @@ fn driver_is_usb_rawlink_v2(driver: &str) -> bool {
 }
 
 /// True for any driver whose audio path goes through V2 native_transport
-/// (USB Rawlink v2 or any ALSA family driver). The GStreamer pipeline only
-/// holds a fakesink placeholder for these drivers; rac_set_uri / rac_play /
-/// rac_get_position must take the native_transport branch instead of
-/// querying playbin.
+/// (USB Rawlink v2 or any ALSA family driver). All currently supported
+/// drivers satisfy this — set_output_tuned rejects anything else.
 fn driver_uses_native_transport(driver: &str) -> bool {
     driver_is_usb_rawlink_v2(driver) || driver_routes_via_native_alsa(driver)
 }
@@ -187,7 +183,6 @@ fn json_escape(v: &str) -> String {
 
 #[derive(Debug)]
 pub struct Engine {
-    playbin: gst::Element,
     dsp_config: DspGraphConfig,
     uri: String,
     last_error: Option<String>,
@@ -455,14 +450,9 @@ impl Engine {
         let _ = self.sync_audio_filter_graph();
     }
 
-    /// Hot-push the current DSP config to V2 native_transport.
-    ///
-    /// Historically also rebuilt and re-attached a GStreamer audio-filter bin
-    /// to playbin; that bin became inert once every driver migrated to V2
-    /// (playbin no longer transitions to Playing for V2 paths, so no buffers
-    /// flow through audio-filter), so the attach side was removed in
-    /// commit-of-this-cleanup. The function name is kept to minimise churn at
-    /// the ~40 setter call sites that invoke it after a config change.
+    /// Hot-push the current DSP config to V2 native_transport. Name is kept
+    /// to minimise churn at the ~40 setter call sites that invoke it after a
+    /// config change.
     fn sync_audio_filter_graph(&mut self) -> Result<(), String> {
         let _ = self.native_transport.update_dsp_config(&self.dsp_config);
         Ok(())
@@ -1121,66 +1111,18 @@ impl Engine {
     }
 
     fn new() -> Result<Self, String> {
+        // gst::init() is still required for the LV2 plugin scanner
+        // (dsp/lv2.rs uses gst::Registry + gst::ElementFactory to enumerate
+        // plugin properties for the UI picker). The audio path is fully
+        // V2 native_transport — no playbin, no GStreamer pipeline.
         GST_INIT.call_once(|| {
             let _ = gst::init();
         });
-
-        let Some(playbin) = gst::ElementFactory::make("playbin")
-            .name("rust-audio-player")
-            .build()
-            .ok()
-        else {
-            return Err("failed to create playbin".to_string());
-        };
-
-        // Test helper: bypass real audio device to make CI/sandbox verification deterministic.
-        if env::var("HIRESTI_RUST_AUDIO_FAKE_SINK")
-            .ok()
-            .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
-            .unwrap_or(false)
-        {
-            if let Some(fake) = gst::ElementFactory::make("fakesink")
-                .name("rust-audio-fakesink")
-                .build()
-                .ok()
-            {
-                playbin.set_property("audio-sink", &fake);
-            }
-        }
-
-        // Increase the internal buffering for streaming sources (HTTP/Tidal).
-        // Default is ~2 seconds which is too low for network-sourced playback —
-        // any transient stall in the HTTP response causes the decoder to starve
-        // and produces an audible xrun on the USB output path.  10 seconds gives
-        // comfortable margin without significant memory overhead (~3.4 MB for
-        // 44.1 kHz stereo 32-bit).
-        playbin.set_property("buffer-duration", 10_i64 * 1_000_000_000); // 10 s in ns
-        playbin.set_property("buffer-size", 4 * 1024 * 1024); // 4 MiB byte cap
-
-        // Elevate GStreamer streaming thread (decode/demux) priority.
-        //
-        // GStreamer posts GST_MESSAGE_STREAM_STATUS with type Enter from within
-        // the streaming thread just before it starts running.  A sync handler
-        // is invoked in the posting thread's context, so `nice(-5)` applies to
-        // the streaming thread that called gst_bus_post().  This does not
-        // require elevated privileges (nice range [-20,19]; -5 is reachable by
-        // any process within its default nice range of [0,19]).
-        if let Some(bus) = playbin.bus() {
-            bus.set_sync_handler(|_bus, msg| {
-                if let gst::MessageView::StreamStatus(ss) = msg.view() {
-                    if ss.get().0 == gst::StreamStatusType::Enter {
-                        unsafe { libc::nice(-5) };
-                    }
-                }
-                gst::BusSyncReply::Pass
-            });
-        }
 
         let dsp_config = DspGraphConfig::default();
         let spectrum_enabled = false;
 
         Ok(Self {
-            playbin,
             dsp_config,
             uri: String::new(),
             last_error: None,
@@ -1230,20 +1172,6 @@ impl Engine {
 
     fn set_error(&mut self, msg: impl Into<String>) {
         self.last_error = Some(msg.into());
-    }
-
-    fn set_state(&mut self, state: gst::State) -> c_int {
-        match self.playbin.set_state(state) {
-            Ok(_) => {
-                self.emit_event(EVT_STATE, &format!("{state:?}"));
-                0
-            }
-            Err(e) => {
-                self.set_error(format!("set_state failed: {e}"));
-                self.emit_event(EVT_ERROR, &format!("set_state failed: {e}"));
-                -4
-            }
-        }
     }
 
     fn emit_event(&self, evt: c_int, msg: &str) {
@@ -1448,15 +1376,11 @@ impl Engine {
         exclusive: bool,
     ) -> c_int {
         let had_v2_usb = driver_is_usb_rawlink_v2(&self.output_driver);
-        let had_native_alsa = driver_routes_via_native_alsa(&self.output_driver);
-        let had_native_transport = had_v2_usb || had_native_alsa;
         if had_v2_usb {
             let _ = self.native_transport.stop_and_release();
         } else {
             let _ = self.native_transport.stop();
         }
-        let cur_state = self.playbin.state(gst::ClockTime::from_mseconds(50)).1;
-        let _ = self.playbin.set_state(gst::State::Null);
         // After releasing a USB rawlink session, snd-usb-audio re-attaches
         // asynchronously.  libusb_release_interface() returns before the kernel
         // driver finishes its probe and creates the ALSA device nodes.  Without
@@ -1466,9 +1390,7 @@ impl Engine {
         if had_v2_usb {
             std::thread::sleep(std::time::Duration::from_millis(300));
         }
-        let _ = had_native_transport;
 
-        let driver_norm = normalized_driver_label(driver);
         if let Err(err) = self.sync_audio_filter_graph() {
             self.set_error(format!("audio-filter setup failed: {err}"));
             self.emit_event(EVT_ERROR, &format!("audio-filter setup failed: {err}"));
@@ -1486,85 +1408,19 @@ impl Engine {
             .filter(|d| !d.is_empty());
         let device_norm = resolved_device.as_deref();
 
-        // Three drivers route audio through V2 native_transport's ALSA
-        // backend: Auto(Default), ALSA(auto), and ALSA(mmap). They all get a
-        // fakesink placeholder on playbin so the GStreamer pipeline has
-        // something wired; rac_set_uri / rac_play take the V2 path. Auto and
-        // ALSA(auto) default to the ALSA `default` device (which goes through
-        // the PipeWire/PulseAudio ALSA bridge on most desktops); ALSA(mmap)
-        // defaults to `hw:0,0` because users picking mmap typically want raw
-        // hardware.
-        let route_via_native_alsa = driver_norm.is_empty()
-            || driver_norm.starts_with("auto")
-            || driver_is_alsa_family(driver);
+        // V2 native_transport routes audio through ALSA (Auto / ALSA(auto) /
+        // ALSA(mmap)) or libusb (USB rawlink v2). Auto and ALSA(auto) default
+        // to the ALSA `default` device (which goes through the PipeWire /
+        // PulseAudio ALSA bridge on most desktops); ALSA(mmap) defaults to
+        // `hw:0,0` because users picking mmap typically want raw hardware.
+        let route_via_native_alsa = driver_routes_via_native_alsa(driver);
         let route_via_native_usb = driver_is_usb_rawlink_v2(driver);
 
-        let sink = if route_via_native_alsa {
-            let elem = gst::ElementFactory::make("fakesink")
-                .name("rust-v2-alsa-placeholder-sink")
-                .property("sync", false)
-                .property("async", false)
-                .property("enable-last-sample", false)
-                .build();
-            match elem {
-                Ok(elem) => {
-                    let default_device = if driver_is_alsa_mmap(driver) {
-                        "hw:0,0"
-                    } else {
-                        "default"
-                    };
-                    self.emit_event(
-                        EVT_STATE,
-                        &format!(
-                            "alsa placeholder configured driver={driver} device={}",
-                            device_norm.unwrap_or(default_device)
-                        ),
-                    );
-                    Some(elem)
-                }
-                Err(e) => {
-                    self.set_error(format!("fakesink unavailable: {e}"));
-                    self.emit_event(EVT_ERROR, &format!("fakesink unavailable: {e}"));
-                    return -17;
-                }
-            }
-        } else if route_via_native_usb {
-            // V2 native_transport bypasses GStreamer entirely; the placeholder
-            // just satisfies playbin's audio-sink slot.
-            let elem = gst::ElementFactory::make("fakesink")
-                .name("rust-v2-placeholder-sink")
-                .property("sync", false)
-                .property("async", false)
-                .property("enable-last-sample", false)
-                .build();
-            match elem {
-                Ok(elem) => {
-                    self.emit_event(
-                        EVT_STATE,
-                        &format!(
-                            "usb-rawlink-v2 placeholder configured device={}",
-                            device_norm.unwrap_or("")
-                        ),
-                    );
-                    Some(elem)
-                }
-                Err(e) => {
-                    self.set_error(format!("fakesink unavailable: {e}"));
-                    self.emit_event(EVT_ERROR, &format!("fakesink unavailable: {e}"));
-                    return -18;
-                }
-            }
-        } else {
+        if !route_via_native_alsa && !route_via_native_usb {
             self.set_error(format!("unsupported driver: {driver}"));
             self.emit_event(EVT_ERROR, &format!("unsupported driver: {driver}"));
             return -14;
-        };
-
-        let Some(final_sink) = sink else {
-            self.set_error("failed to create audio sink");
-            self.emit_event(EVT_ERROR, "failed to create audio sink");
-            return -15;
-        };
+        }
 
         self.output_driver = driver.to_string();
         self.output_device = resolved_device.clone();
@@ -1573,10 +1429,8 @@ impl Engine {
         self.output_exclusive = exclusive;
 
         // Pre-claim the USB device for native transport (v2) so PipeWire
-        // cannot reclaim it before the first track starts playing. Native
-        // transport keeps its own copy of the config so it does not have to
-        // reach into the (V1, GStreamer) usb_raw_sink element.
-        if driver_is_usb_rawlink_v2(driver) {
+        // cannot reclaim it before the first track starts playing.
+        if route_via_native_usb {
             let pref_depth = preferred_format_to_bit_depth(&self.preferred_output_format);
             let device_id = device_norm.unwrap_or("");
             match usb_audio::raw_config::build_usb_raw_sink_config(
@@ -1625,7 +1479,6 @@ impl Engine {
             self.native_alsa_config = None;
         }
 
-        self.playbin.set_property("audio-sink", &final_sink);
         self.emit_event(
             EVT_STATE,
             &format!(
@@ -1633,16 +1486,7 @@ impl Engine {
                 device_norm.unwrap_or("default")
             ),
         );
-
-        // Restore runtime state.
-        let target = if cur_state == gst::State::Playing {
-            gst::State::Playing
-        } else if cur_state == gst::State::Paused {
-            gst::State::Paused
-        } else {
-            gst::State::Null
-        };
-        self.set_state(target)
+        0
     }
 
     fn set_output(&mut self, driver: &str, device: Option<&str>) -> c_int {
@@ -2344,8 +2188,7 @@ pub extern "C" fn rac_free(ptr: *mut Engine) {
     }
     // SAFETY: Pointer was allocated by Box::into_raw in rac_new.
     unsafe {
-        let boxed = Box::from_raw(ptr);
-        let _ = boxed.playbin.set_state(gst::State::Null);
+        drop(Box::from_raw(ptr));
     }
 }
 
@@ -2454,7 +2297,6 @@ pub extern "C" fn rac_release_output(ptr: *mut Engine) -> c_int {
     } else {
         let _ = engine.native_transport.stop();
     }
-    let _ = engine.playbin.set_state(gst::State::Null);
     if had_v2_usb {
         std::thread::sleep(std::time::Duration::from_millis(350));
     }
@@ -2734,8 +2576,7 @@ pub extern "C" fn rac_get_duration(ptr: *const Engine, dur_out: *mut c_double) -
 
 fn probe_latency(engine: &Engine) -> (f64, &'static str) {
     // USB rawlink V2: estimate from the ISO transfer ring depth. Pre-anchor
-    // (first samples not yet on the wire) and post-anchor share this estimate
-    // since the playbin no longer participates in latency under V2.
+    // (first samples not yet on the wire) and post-anchor share this estimate.
     if active_usb_runtime_info(engine).is_some() {
         let ring_ms =
             (usb_audio::transfer::N_TRANSFERS * usb_audio::transfer::N_PACKETS_TARGET_MS) as f64;
