@@ -1,4 +1,4 @@
-/// ALSA-hardware-backed GStreamer clock — frame-counting design.
+/// ALSA-hardware-backed playback clock — frame-counting design.
 ///
 /// # Design
 ///
@@ -49,18 +49,12 @@
 /// [`AlsaHwClockFeed`] is `Send + Sync`.  The hot-path atomics are written by
 /// the ISO OUT callback thread (push: one `fetch_add`; pull: one
 /// `record_iso()` behind a lock that is taken at 125 Hz) and read by
-/// GStreamer's streaming threads.
+/// the native_transport timing path.
 use std::collections::VecDeque;
-use std::sync::OnceLock;
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering},
-    Arc, Mutex,
+    Mutex,
 };
-
-use gst::glib;
-use gst::prelude::*;
-use gst::subclass::prelude::*;
-use gstreamer as gst;
 
 // ---------------------------------------------------------------------------
 // Clock mode
@@ -350,7 +344,7 @@ impl AlsaHwClockFeed {
             // Publish anchor from the latest window point.
             // On the very first activation (!was_ready) we adjust pull_anchor_ns
             // so the pull clock is continuous with the push clock — avoiding the
-            // 128 ms backwards jump that would stall GStreamer delivery.
+            // 128 ms backwards jump that would stall downstream delivery.
             //
             // Push value at transition: push_anchor_ns + anchor_frames × 1e9/rate
             // We need:  pull_anchor_ns − buffer_depth_ns  =  push_value
@@ -364,8 +358,8 @@ impl AlsaHwClockFeed {
                 // On first activation: compute a seamless anchor so the pull clock
                 // is continuous with the push clock (no backwards jump).
                 // On subsequent calls: anchor is NEVER updated — only ns_per_frame
-                // changes.  This eliminates the triple-atomic race where GStreamer
-                // could read a mismatched (new anchor_ns, old anchor_frames) pair
+                // changes.  This eliminates the triple-atomic race where a reader
+                // could see a mismatched (new anchor_ns, old anchor_frames) pair
                 // and compute a clock value that jumps by ~8 ms.
                 if !was_ready {
                     let final_anchor_ns = {
@@ -518,70 +512,3 @@ impl AlsaHwClockFeed {
     }
 }
 
-// ---------------------------------------------------------------------------
-// GObject subclass implementation
-// ---------------------------------------------------------------------------
-
-mod imp {
-    use super::*;
-
-    #[derive(Default)]
-    pub struct AlsaHwClock {
-        /// Set once during construction; never changed afterwards.
-        pub feed: OnceLock<Arc<AlsaHwClockFeed>>,
-    }
-
-    // SAFETY: AlsaHwClockFeed is Send+Sync (atomics + Mutex).
-    unsafe impl Send for AlsaHwClock {}
-    unsafe impl Sync for AlsaHwClock {}
-
-    #[glib::object_subclass]
-    impl ObjectSubclass for AlsaHwClock {
-        const NAME: &'static str = "AlsaHwClock";
-        type Type = super::AlsaHwClock;
-        type ParentType = gst::SystemClock;
-    }
-
-    impl ObjectImpl for AlsaHwClock {}
-    impl GstObjectImpl for AlsaHwClock {}
-    impl gst::subclass::prelude::SystemClockImpl for AlsaHwClock {}
-
-    impl ClockImpl for AlsaHwClock {
-        /// Override the internal time source with the hardware playback position.
-        ///
-        /// In Push mode: returns `anchor_ns + total_frames × 1e9 / rate` (zero
-        /// jitter, integer arithmetic).  In Pull mode: returns the regression-
-        /// calibrated play position once warmed up.  Falls back to the parent
-        /// `SystemClock` (plain `CLOCK_MONOTONIC`) when the feed is not yet
-        /// anchored.
-        fn internal_time(&self) -> gst::ClockTime {
-            if let Some(feed) = self.feed.get() {
-                if let Some(hw_ns) = feed.hw_now_ns() {
-                    return gst::ClockTime::from_nseconds(hw_ns);
-                }
-            }
-            self.parent_internal_time()
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Public GObject wrapper
-// ---------------------------------------------------------------------------
-
-glib::wrapper! {
-    /// GStreamer clock whose internal time tracks committed PCM frame count.
-    pub struct AlsaHwClock(ObjectSubclass<imp::AlsaHwClock>)
-        @extends gst::SystemClock, gst::Clock, gst::Object;
-}
-
-impl AlsaHwClock {
-    pub fn new(feed: Arc<AlsaHwClockFeed>) -> Self {
-        let clock: Self = glib::Object::new();
-        clock.imp().feed.set(feed).ok();
-        // Use CLOCK_MONOTONIC as the base so times are compatible with the
-        // hardware timestamp domain (which is also CLOCK_MONOTONIC).
-        clock.set_clock_type(gst::ClockType::Monotonic);
-        clock
-    }
-}

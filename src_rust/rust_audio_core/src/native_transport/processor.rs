@@ -3,6 +3,7 @@ use rustfft::{num_complex::Complex, FftPlanner};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
+use super::format_util::{bytes_per_sample, sample_to_f32, sample_to_f64};
 use crate::dsp::lufs::{LufsState, LufsValues};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -354,8 +355,12 @@ impl PcmProcessor for SpectrumPcmProcessor {
     fn configure(&mut self, spec: &PcmStreamSpec) -> Result<(), String> {
         self.sample_rate = spec.sample_rate;
         self.channels = spec.channels;
-        // ~16ms interval to match GStreamer spectrum element.
-        self.samples_per_interval = (spec.sample_rate as usize * 16) / 1000;
+        // Match GStreamer's spectrum-element cadence (~16ms) so V1 and V2
+        // visualizer paths see frames at the same rate. Source of truth:
+        // crate::dsp::SPECTRUM_ACTIVE_INTERVAL_NS.
+        let interval_ns = crate::dsp::SPECTRUM_ACTIVE_INTERVAL_NS as usize;
+        self.samples_per_interval =
+            spec.sample_rate as usize * (interval_ns / 1_000_000) / 1000;
         self.window_left = vec![0.0; self.window_size];
         self.window_right = vec![0.0; self.window_size];
         self.window_pos = 0;
@@ -371,14 +376,8 @@ impl PcmProcessor for SpectrumPcmProcessor {
         }
         self.sync_bands();
         // Extract f32 samples per frame from the slab for spectrum analysis.
-        let bytes_per_sample = match slab.spec.format {
-            PcmSampleFormat::S16LE => 2,
-            PcmSampleFormat::S24_3LE => 3,
-            PcmSampleFormat::S24LE | PcmSampleFormat::S32LE => 4,
-            PcmSampleFormat::F32LE => 4,
-            PcmSampleFormat::F64LE => 8,
-        };
-        let frame_bytes = bytes_per_sample * self.channels;
+        let bps = bytes_per_sample(slab.spec.format);
+        let frame_bytes = bps * self.channels;
         let data = &slab.data;
 
         for frame_start in (0..data.len()).step_by(frame_bytes) {
@@ -386,11 +385,11 @@ impl PcmProcessor for SpectrumPcmProcessor {
                 break;
             }
             // Extract left channel (channel 0) sample as f32.
-            let left_sample = sample_to_f32(&data[frame_start..frame_start + bytes_per_sample], slab.spec.format);
+            let left_sample = sample_to_f32(&data[frame_start..frame_start + bps], slab.spec.format);
             // Extract right channel (channel 1) or duplicate mono.
             let right_sample = if self.channels >= 2 {
-                let offset = frame_start + bytes_per_sample;
-                sample_to_f32(&data[offset..offset + bytes_per_sample], slab.spec.format)
+                let offset = frame_start + bps;
+                sample_to_f32(&data[offset..offset + bps], slab.spec.format)
             } else {
                 left_sample
             };
@@ -447,17 +446,11 @@ impl PcmProcessor for LufsPcmProcessor {
 
     fn process(&mut self, slab: PcmSlab) -> Result<PcmSlab, String> {
         // Convert PCM to interleaved f64 for LufsState::process.
-        let bytes_per_sample = match slab.spec.format {
-            PcmSampleFormat::S16LE => 2,
-            PcmSampleFormat::S24_3LE => 3,
-            PcmSampleFormat::S24LE | PcmSampleFormat::S32LE => 4,
-            PcmSampleFormat::F32LE => 4,
-            PcmSampleFormat::F64LE => 8,
-        };
-        let total_samples = slab.data.len() / bytes_per_sample;
+        let bps = bytes_per_sample(slab.spec.format);
+        let total_samples = slab.data.len() / bps;
         self.f64_buf.clear();
         self.f64_buf.reserve(total_samples);
-        for chunk in slab.data.chunks_exact(bytes_per_sample) {
+        for chunk in slab.data.chunks_exact(bps) {
             self.f64_buf.push(sample_to_f64(chunk, slab.spec.format));
         }
         self.state.process(&self.f64_buf);
@@ -469,55 +462,3 @@ impl PcmProcessor for LufsPcmProcessor {
     }
 }
 
-fn sample_to_f64(bytes: &[u8], format: PcmSampleFormat) -> f64 {
-    match format {
-        PcmSampleFormat::S16LE => {
-            let v = i16::from_le_bytes([bytes[0], bytes[1]]);
-            v as f64 / 32768.0
-        }
-        PcmSampleFormat::S24_3LE => {
-            let raw = (bytes[0] as i32) | ((bytes[1] as i32) << 8) | ((bytes[2] as i8 as i32) << 16);
-            raw as f64 / 8388608.0
-        }
-        PcmSampleFormat::S24LE | PcmSampleFormat::S32LE => {
-            let v = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-            v as f64 / 2147483648.0
-        }
-        PcmSampleFormat::F32LE => {
-            f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f64
-        }
-        PcmSampleFormat::F64LE => {
-            f64::from_le_bytes([
-                bytes[0], bytes[1], bytes[2], bytes[3],
-                bytes[4], bytes[5], bytes[6], bytes[7],
-            ])
-        }
-    }
-}
-
-fn sample_to_f32(bytes: &[u8], format: PcmSampleFormat) -> f32 {
-    match format {
-        PcmSampleFormat::S16LE => {
-            let v = i16::from_le_bytes([bytes[0], bytes[1]]);
-            v as f32 / 32768.0
-        }
-        PcmSampleFormat::S24_3LE => {
-            let raw = (bytes[0] as i32) | ((bytes[1] as i32) << 8) | ((bytes[2] as i8 as i32) << 16);
-            raw as f32 / 8388608.0
-        }
-        PcmSampleFormat::S24LE | PcmSampleFormat::S32LE => {
-            let v = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-            v as f32 / 2147483648.0
-        }
-        PcmSampleFormat::F32LE => {
-            f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-        }
-        PcmSampleFormat::F64LE => {
-            let v = f64::from_le_bytes([
-                bytes[0], bytes[1], bytes[2], bytes[3],
-                bytes[4], bytes[5], bytes[6], bytes[7],
-            ]);
-            v as f32
-        }
-    }
-}

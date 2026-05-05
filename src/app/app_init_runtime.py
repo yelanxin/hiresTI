@@ -26,7 +26,6 @@ def _init_paths_and_settings(self):
     self._config_root = get_config_dir()
     os.makedirs(self._cache_root, exist_ok=True)
     os.makedirs(self._config_root, exist_ok=True)
-    self._lv2_plugin_cache_file = os.path.join(self._cache_root, "lv2_plugins.json")
     self._account_scope = "guest"
 
     # Migrate settings.json from old cache location to config dir (one-time).
@@ -245,25 +244,6 @@ def _init_audio_and_data_services(self):
             self.player.set_widener_enabled(saved_widener_enabled)
         except Exception:
             logger.debug("restore widener settings failed during startup", exc_info=True)
-    saved_lv2_slots = self.settings.get("dsp_lv2_slots") or []
-    if saved_lv2_slots and hasattr(self.player, "lv2_restore_slots"):
-        try:
-            self.player.lv2_restore_slots(saved_lv2_slots)
-        except Exception:
-            logger.debug("restore lv2 slots failed during startup", exc_info=True)
-    elif saved_lv2_slots and hasattr(self.player, "lv2_restore_slot"):
-        try:
-            for slot in saved_lv2_slots:
-                sid = slot.get("slot_id", "")
-                uri = slot.get("uri", "")
-                if sid and uri:
-                    self.player.lv2_restore_slot(
-                        sid, uri,
-                        enabled=slot.get("enabled", True),
-                        port_values=slot.get("port_values", {}),
-                    )
-        except Exception:
-            logger.debug("restore lv2 slots failed during startup", exc_info=True)
     limiter_threshold = int(self.settings.get("dsp_limiter_threshold", 85) or 85)
     limiter_ratio = int(self.settings.get("dsp_limiter_ratio", 20) or 20)
     try:

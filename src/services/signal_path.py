@@ -11,7 +11,7 @@ logger = logging.getLogger("signal_path")
 
 
 def _is_usb_rawlink_driver(driver):
-    return str(driver or "").strip() in ("USB Rawlink", "USB Rawlink v2")
+    return str(driver or "").strip() in ("USB Rawlink v2", "USB Rawlink")
 
 class AudioSignalPathWindow(Adw.Window):
     _PW_RUNTIME_CACHE_TTL_SEC = 1.5
@@ -549,7 +549,7 @@ class AudioSignalPathWindow(Adw.Window):
             return f"{pw_latency_ms:.1f} ms (PipeWire Node)", float(pw_latency_ms)
         if driver == "PipeWire" and latency_sec > 0:
             latency_ms = latency_sec * 1000.0
-            return f"{latency_ms:.1f} ms (GStreamer)", latency_ms
+            return f"{latency_ms:.1f} ms", latency_ms
         if latency_sec > 0:
             latency_ms = latency_sec * 1000.0
             return f"{latency_ms:.1f} ms", latency_ms
@@ -932,7 +932,7 @@ class AudioSignalPathWindow(Adw.Window):
         reasons = []
         driver = self._get_current_driver()
         bit_perfect = bool(getattr(self.player, "bit_perfect_mode", False))
-        supported_driver = driver in ("ALSA", "ALSA（auto）", "ALSA (mmap)", "ALSA（mmap）", "PipeWire", "USB Rawlink", "USB Rawlink v2")
+        supported_driver = driver in ("ALSA", "ALSA（auto）", "ALSA (mmap)", "ALSA（mmap）", "PipeWire", "USB Rawlink v2")
 
         if not bit_perfect:
             reasons.append("Bit-Perfect mode disabled")

@@ -3511,9 +3511,9 @@ class TidalBackend:
         types, unlike the legacy urlpostpaywall endpoint which caps at LOSSLESS.
 
         Returns (uri, stream) on success, raises on failure.
-        - BTS manifests: direct HTTP URL, GStreamer handles natively.
+        - BTS manifests: direct HTTP URL, the native transport handles fetch.
         - MPD manifests: written to a temp file and returned as file:// URI so
-          GStreamer's dashdemux (gst-plugins-bad) can parse and fetch segments.
+          the native transport's DASH parser can read and fetch segments.
         """
         import os
         import tempfile
@@ -3530,8 +3530,8 @@ class TidalBackend:
         if manifest.is_mpd:
             # Write the MPD XML to a per-track temp file.  Using a shared single
             # file caused a race condition: the prefetch thread overwrote the file
-            # for the current track before GStreamer finished reading it, causing
-            # GStreamer to load the wrong track's segments.
+            # for the current track before the transport finished reading it,
+            # loading the wrong track's segments.
             mpd_xml = stream.get_manifest_data()
             track_id = str(getattr(full_track, "id", "") or "tmp")
             tmp_path = os.path.join(
@@ -3576,7 +3576,7 @@ class TidalBackend:
                         url = full_track.get_url()
 
                     # Cache source format from TIDAL API for the player to inject
-                    # into stream_info (GStreamer TAGs don't carry Hz/-bit info).
+                    # into stream_info (TAG events don't carry Hz/-bit info).
                     self._last_stream_bit_depth = int(
                         getattr(stream_info, "bit_depth", 0) or 0
                     )

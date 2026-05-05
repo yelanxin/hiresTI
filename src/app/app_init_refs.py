@@ -121,7 +121,6 @@ def _init_widget_refs(self):
     self.content_overlay = None
     self.content_vbox = None
     self.add_playlist_btn = None
-    self.add_lv2_plugin_btn = None
     self.now_playing_backdrop = None
     self.now_playing_anchor = None
     self.now_playing_revealer = None
@@ -242,11 +241,6 @@ def _init_viz_refs(self):
     self._dsp_limiter_last_error = ""
     self._dsp_tube_last_error = ""
     self._dsp_widener_last_error = ""
-    self._lv2_plugin_cache = None
-    self._lv2_scan_inflight = False
-    self._lv2_scan_refresh_ui_pending = False
-    self._lv2_scan_ready_callbacks = []
-    self.dsp_lv2_slot_rows = {}
 
 
 def _init_runtime_refs(self):
@@ -317,8 +311,6 @@ def _init_runtime_refs(self):
     self._playback_rebind_hold_until_s = 0.0
     self._playback_rebind_inflight = False
     self._playback_rebind_pending = False
-    self._lv2_sidebar_rebuild_inflight = False
-    self._lv2_sidebar_rebuild_pending = False
     self._search_suggest_focus_check_source = 0
     self._search_focus_suppressed_until_us = 0
     self._search_press_active = False

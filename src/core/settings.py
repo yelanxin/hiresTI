@@ -76,7 +76,6 @@ class SettingsSchema:
     dsp_widener_width: int = 125
     dsp_widener_bass_mono_freq: int = 120
     dsp_widener_bass_mono_amount: int = 100
-    dsp_lv2_slots: list = field(default_factory=list)
     dsp_limiter_enabled: bool = False
     dsp_limiter_threshold: int = 85
     dsp_limiter_ratio: int = 20
@@ -148,7 +147,6 @@ DEFAULT_SETTINGS = {
     "dsp_widener_width": 125,
     "dsp_widener_bass_mono_freq": 120,
     "dsp_widener_bass_mono_amount": 100,
-    "dsp_lv2_slots": [],
     "dsp_limiter_enabled": False,
     "dsp_limiter_threshold": 85,
     "dsp_limiter_ratio": 20,
@@ -281,8 +279,7 @@ def _normalize_dsp_order(value: Any) -> list[str]:
         module_id = item.strip()
         if not module_id or module_id in seen:
             continue
-        # Allow both built-in module ids and lv2_ slot ids
-        if module_id not in DSP_REORDERABLE_MODULES and not module_id.startswith("lv2_"):
+        if module_id not in DSP_REORDERABLE_MODULES:
             continue
         seen.add(module_id)
         out.append(module_id)
@@ -327,45 +324,6 @@ def _as_int_dict(
             continue
         out[k] = v
         if len(out) >= max_items:
-            break
-    return out
-
-
-def _normalize_lv2_slots(value: Any) -> list:
-    """Validate and normalize the dsp_lv2_slots list."""
-    if not isinstance(value, list):
-        return []
-    out = []
-    seen_ids = set()
-    seen_uris = set()
-    for item in value:
-        if not isinstance(item, dict):
-            continue
-        slot_id = item.get("slot_id", "")
-        uri = item.get("uri", "")
-        if not isinstance(slot_id, str) or not slot_id.startswith("lv2_"):
-            continue
-        if not isinstance(uri, str) or not uri:
-            continue
-        if slot_id in seen_ids:
-            continue
-        uri_key = uri.strip()
-        if uri_key in seen_uris:
-            continue
-        seen_ids.add(slot_id)
-        seen_uris.add(uri_key)
-        enabled = item.get("enabled", True)
-        if not isinstance(enabled, bool):
-            enabled = True
-        port_values = item.get("port_values", {})
-        if not isinstance(port_values, dict):
-            port_values = {}
-        clean_ports = {}
-        for k, v in port_values.items():
-            if isinstance(k, str) and k and isinstance(v, (int, float)):
-                clean_ports[k] = float(v)
-        out.append({"slot_id": slot_id, "uri": uri, "enabled": enabled, "port_values": clean_ports})
-        if len(out) >= 32:
             break
     return out
 
@@ -472,12 +430,10 @@ def normalize_settings(raw: Optional[dict[str, Any]]) -> dict[str, Any]:
     normalized["dsp_widener_width"] = _as_int(raw.get("dsp_widener_width"), DEFAULT_SETTINGS["dsp_widener_width"], minimum=0, maximum=200)
     normalized["dsp_widener_bass_mono_freq"] = _as_int(raw.get("dsp_widener_bass_mono_freq"), DEFAULT_SETTINGS["dsp_widener_bass_mono_freq"], minimum=40, maximum=250)
     normalized["dsp_widener_bass_mono_amount"] = _as_int(raw.get("dsp_widener_bass_mono_amount"), DEFAULT_SETTINGS["dsp_widener_bass_mono_amount"], minimum=0, maximum=100)
-    normalized["dsp_lv2_slots"] = _normalize_lv2_slots(raw.get("dsp_lv2_slots"))
-    valid_lv2_slot_ids = {slot["slot_id"] for slot in normalized["dsp_lv2_slots"]}
     normalized["dsp_order"] = [
         item
         for item in _normalize_dsp_order(raw.get("dsp_order"))
-        if item in DSP_REORDERABLE_MODULES or item in valid_lv2_slot_ids
+        if item in DSP_REORDERABLE_MODULES
     ]
     for module_id in DSP_REORDERABLE_MODULES:
         if module_id not in normalized["dsp_order"]:
