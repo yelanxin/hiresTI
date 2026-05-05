@@ -1,12 +1,11 @@
 //! ALSA PCM output state.
 //!
 //! This module owns the raw `snd_pcm_*` FFI declarations plus the
-//! `AlsaMmapCtx` wrapper that opens a device for playback. It tries
+//! `AlsaCtx` wrapper that opens a device for playback. It tries
 //! `MMAP_INTERLEAVED` first (zero-copy ring writes) and falls back to the
 //! plain `RW_INTERLEAVED` interface (`snd_pcm_writei`) when mmap isn't
 //! supported by the device — common with the PipeWire ALSA bridge or
-//! certain plug-chain configurations. Shared between the GStreamer-fed
-//! writer thread (in `lib.rs`) and the V2 native_transport ALSA backend.
+//! certain plug-chain configurations.
 
 use std::os::raw::c_int;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -127,7 +126,7 @@ pub mod alsa_ffi {
 pub struct AlsaHandle(pub *mut std::os::raw::c_void);
 unsafe impl Send for AlsaHandle {}
 
-/// How `AlsaMmapCtx` writes frames to the device. `Mmap` uses the zero-copy
+/// How `AlsaCtx` writes frames to the device. `Mmap` uses the zero-copy
 /// `snd_pcm_mmap_begin`/`commit` ring; `Interleaved` falls back to a plain
 /// `snd_pcm_writei` blocking copy. The mode is selected by `open()` based on
 /// what the device's hw_params will actually accept.
@@ -137,9 +136,9 @@ pub enum AlsaAccessMode {
     Interleaved,
 }
 
-/// Resolved ALSA mmap output format (negotiated bit depth + frame stride).
+/// Resolved ALSA output format (negotiated bit depth + frame stride).
 #[derive(Clone, Copy)]
-pub struct MmapAudioFormat {
+pub struct AlsaWireFormat {
     pub gst_format: &'static str,
     pub alsa_format: c_int,
     pub frame_bytes: usize,
@@ -147,24 +146,24 @@ pub struct MmapAudioFormat {
 }
 
 /// Map a user-facing format preference (`"S16LE"` / `"S24LE"` / `"S32LE"`) to
-/// the corresponding ALSA mmap format descriptor. Unknown values fall back to
+/// the corresponding ALSA format descriptor. Unknown values fall back to
 /// `S32LE`.
-pub fn mmap_audio_format_from_preference(preferred: &str) -> MmapAudioFormat {
+pub fn alsa_wire_format_from_preference(preferred: &str) -> AlsaWireFormat {
     let norm = preferred.trim().to_ascii_uppercase();
     match norm.as_str() {
-        "S16LE" | "S16_LE" => MmapAudioFormat {
+        "S16LE" | "S16_LE" => AlsaWireFormat {
             gst_format: "S16LE",
             alsa_format: alsa_ffi::SND_PCM_FORMAT_S16_LE,
             frame_bytes: 4,
             log_label: "S16_LE",
         },
-        "S24LE" | "S24_LE" | "S24_32LE" | "S24_32_LE" => MmapAudioFormat {
+        "S24LE" | "S24_LE" | "S24_32LE" | "S24_32_LE" => AlsaWireFormat {
             gst_format: "S24_32LE",
             alsa_format: alsa_ffi::SND_PCM_FORMAT_S24_LE,
             frame_bytes: 8,
             log_label: "S24_LE",
         },
-        _ => MmapAudioFormat {
+        _ => AlsaWireFormat {
             gst_format: "S32LE",
             alsa_format: alsa_ffi::SND_PCM_FORMAT_S32_LE,
             frame_bytes: 8,
@@ -174,7 +173,7 @@ pub fn mmap_audio_format_from_preference(preferred: &str) -> MmapAudioFormat {
 }
 
 /// Open ALSA device state for playback.
-pub struct AlsaMmapCtx {
+pub struct AlsaCtx {
     pub(crate) pcm: AlsaHandle,
     pub(crate) period_frames: usize,
     pub(crate) buffer_frames: usize,
@@ -196,7 +195,7 @@ pub struct AlsaMmapCtx {
     pub(crate) access_mode: AlsaAccessMode,
 }
 
-impl AlsaMmapCtx {
+impl AlsaCtx {
     pub fn reset_start_sequence(&mut self) {
         self.primed_frames = 0;
         self.started = false;
@@ -352,7 +351,7 @@ impl AlsaMmapCtx {
             }
         }
 
-        Ok(AlsaMmapCtx {
+        Ok(AlsaCtx {
             pcm: AlsaHandle(pcm),
             period_frames,
             buffer_frames,
@@ -604,7 +603,7 @@ impl AlsaMmapCtx {
     }
 }
 
-impl Drop for AlsaMmapCtx {
+impl Drop for AlsaCtx {
     fn drop(&mut self) {
         if let Some(ref feed) = self.feed {
             feed.invalidate();

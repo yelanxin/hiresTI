@@ -18,7 +18,7 @@ mod native_transport;
 pub mod usb_audio;
 
 #[cfg(test)]
-use alsa_pcm::{AlsaHandle, AlsaMmapCtx};
+use alsa_pcm::{AlsaCtx, AlsaHandle};
 use dsp::{
     DspGraphConfig, DspGraphRuntime, LufsValues, PEQ_BAND_COUNT,
     SPECTRUM_ACTIVE_BANDS_DEFAULT,
@@ -235,7 +235,7 @@ pub struct Engine {
     /// ALSA mmap output config for native transport (V2). Populated when the
     /// alsa_mmap driver is selected; consumed when a track is loaded so V2
     /// can drive the ALSA mmap sink directly without going through GStreamer.
-    native_alsa_config: Option<native_transport::AlsaMmapOutputConfig>,
+    native_alsa_config: Option<native_transport::AlsaOutputConfig>,
     #[allow(dead_code)]
     native_transport: native_transport::NativeTransportController,
     /// USB rawlink clock alignment: 0 = push (default), 1 = pull (Level 3).
@@ -1690,7 +1690,7 @@ impl Engine {
         } else if is_alsa_mmap {
             self.native_alsa_config
                 .clone()
-                .map(native_transport::NativeOutputTarget::AlsaMmap)
+                .map(native_transport::NativeOutputTarget::Alsa)
         } else {
             None
         };
@@ -2175,7 +2175,7 @@ impl Engine {
         }
 
         if driver_is_alsa_mmap(driver) {
-            self.native_alsa_config = Some(native_transport::AlsaMmapOutputConfig {
+            self.native_alsa_config = Some(native_transport::AlsaOutputConfig {
                 device: device_norm.unwrap_or("hw:0,0").to_string(),
                 buffer_us: if buffer_us > 0 { buffer_us as u32 } else { 100_000 },
                 latency_us: if latency_us > 0 { latency_us as u32 } else { 10_000 },
@@ -4657,7 +4657,7 @@ mod tests {
 
     #[test]
     fn alsa_mmap_recover_from_xrun_requires_restart() {
-        let mut ctx = AlsaMmapCtx {
+        let mut ctx = AlsaCtx {
             pcm: AlsaHandle(std::ptr::null_mut()),
             period_frames: 480,
             buffer_frames: 1920,
@@ -4672,7 +4672,7 @@ mod tests {
             access_mode: crate::alsa_pcm::AlsaAccessMode::Mmap,
         };
 
-        assert!(AlsaMmapCtx::recover_requires_restart(-libc::EPIPE));
+        assert!(AlsaCtx::recover_requires_restart(-libc::EPIPE));
         ctx.reset_start_sequence();
 
         assert_eq!(ctx.primed_frames, 0);
@@ -4682,7 +4682,7 @@ mod tests {
 
     #[test]
     fn alsa_mmap_recover_from_interrupt_keeps_running_state() {
-        assert!(!AlsaMmapCtx::recover_requires_restart(-libc::EINTR));
+        assert!(!AlsaCtx::recover_requires_restart(-libc::EINTR));
     }
 
     #[test]

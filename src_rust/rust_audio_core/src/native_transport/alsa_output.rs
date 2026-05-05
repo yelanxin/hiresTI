@@ -1,19 +1,20 @@
-//! ALSA mmap output backend for V2 native_transport.
+//! ALSA output backend for V2 native_transport.
 //!
-//! Wraps [`AlsaMmapCtx`] in a synchronous "push slab → mmap_commit"
-//! interface that the V2 decode worker drives directly. No separate writer
-//! thread is needed: V2's worker already runs at audio cadence and calls
-//! `push_bytes` once per decoded packet.
+//! Wraps [`AlsaCtx`] in a synchronous "push slab → write" interface that the
+//! V2 decode worker drives directly. No separate writer thread is needed:
+//! V2's worker already runs at audio cadence and calls `push_bytes` once per
+//! decoded packet. `AlsaCtx` picks `MMAP_INTERLEAVED` or `RW_INTERLEAVED`
+//! automatically based on what the device accepts.
 
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use crate::alsa_clock::AlsaHwClockFeed;
 use crate::alsa_pcm::{
-    mmap_audio_format_from_preference, AlsaMmapCtx, MmapAudioFormat,
+    alsa_wire_format_from_preference, AlsaCtx, AlsaWireFormat,
 };
 
-use super::output::AlsaMmapOutputConfig;
+use super::output::AlsaOutputConfig;
 
 const MIN_PERIOD_FRAMES: u32 = 64;
 const MAX_PERIOD_FRAMES: u32 = 4096;
@@ -29,12 +30,12 @@ fn frames_for_duration_us(duration_us: u32, sample_rate: u32, min: u32, max: u32
     (frames as u32).clamp(min, max)
 }
 
-/// Live ALSA mmap output session. Owned by the V2 controller's decode
-/// worker; constructed when the first decoded slab arrives so the actual
-/// negotiated sample rate drives `snd_pcm_hw_params_set_rate_near`.
-pub struct AlsaMmapSession {
-    ctx: AlsaMmapCtx,
-    audio_format: MmapAudioFormat,
+/// Live ALSA output session. Owned by the V2 controller's decode worker;
+/// constructed when the first decoded slab arrives so the actual negotiated
+/// sample rate drives `snd_pcm_hw_params_set_rate_near`.
+pub struct AlsaSession {
+    ctx: AlsaCtx,
+    audio_format: AlsaWireFormat,
     /// Caller-provided clock feed; anchored on the first commit and
     /// advanced after every successful commit.
     pub feed: Arc<AlsaHwClockFeed>,
@@ -43,14 +44,14 @@ pub struct AlsaMmapSession {
     stop: Arc<AtomicBool>,
 }
 
-impl AlsaMmapSession {
+impl AlsaSession {
     pub fn open(
-        cfg: &AlsaMmapOutputConfig,
+        cfg: &AlsaOutputConfig,
         sample_rate: u32,
         feed: Arc<AlsaHwClockFeed>,
         stop: Arc<AtomicBool>,
     ) -> Result<Self, String> {
-        let audio_format = mmap_audio_format_from_preference(&cfg.preferred_format);
+        let audio_format = alsa_wire_format_from_preference(&cfg.preferred_format);
         let buffer_us = if cfg.buffer_us > 0 {
             cfg.buffer_us
         } else {
@@ -74,7 +75,7 @@ impl AlsaMmapSession {
             MAX_BUFFER_FRAMES,
         );
 
-        let mut ctx = AlsaMmapCtx::open(
+        let mut ctx = AlsaCtx::open(
             &cfg.device,
             sample_rate,
             period_frames,
@@ -93,7 +94,7 @@ impl AlsaMmapSession {
         })
     }
 
-    /// PCM format string that matches what `AlsaMmapCtx::open` configured on
+    /// PCM format string that matches what `AlsaCtx::open` configured on
     /// the device. The V2 controller uses this to decide whether incoming
     /// slabs need a format conversion before push.
     pub fn gst_format(&self) -> &'static str {
@@ -120,7 +121,7 @@ impl AlsaMmapSession {
         let frame_bytes = self.audio_format.frame_bytes.max(1);
         if data.len() % frame_bytes != 0 {
             return Err(format!(
-                "alsa_mmap push: data len {} not aligned to frame_bytes {}",
+                "alsa push: data len {} not aligned to frame_bytes {}",
                 data.len(),
                 frame_bytes
             ));

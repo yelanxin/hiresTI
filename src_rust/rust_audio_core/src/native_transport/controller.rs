@@ -10,7 +10,7 @@ use super::source::{
     inspect_mpd_manifest, MpdManifestInfo, NativeDecoderKind, NativeTransportSource,
     NativeTransportSourceKind,
 };
-use super::alsa_output::AlsaMmapSession;
+use super::alsa_output::AlsaSession;
 use super::output::{NativeOutputTarget, OutputSession};
 use crate::alsa_clock::{AlsaHwClockFeed, ClockMode};
 use crate::usb_audio::{
@@ -2062,10 +2062,10 @@ fn decode_direct_audio_stream(
                         );
                     }
                 }
-            } else if let Some(NativeOutputTarget::AlsaMmap(ref alsa_cfg)) = output_target {
+            } else if let Some(NativeOutputTarget::Alsa(ref alsa_cfg)) = output_target {
                 if output_session.is_none() {
                     let feed = Arc::new(AlsaHwClockFeed::default());
-                    let session = AlsaMmapSession::open(
+                    let session = AlsaSession::open(
                         alsa_cfg,
                         slab.spec.sample_rate,
                         feed,
@@ -2075,14 +2075,14 @@ fn decode_direct_audio_stream(
                         events,
                         crate::EVT_STATE,
                         format!(
-                            "native-transport alsa-mmap configured device={} rate={} format={} frame_bytes={}",
+                            "native-transport alsa configured device={} rate={} format={} frame_bytes={}",
                             alsa_cfg.device,
                             session.actual_rate(),
                             session.gst_format(),
                             session.frame_bytes(),
                         ),
                     );
-                    output_session = Some(OutputSession::AlsaMmap(session));
+                    output_session = Some(OutputSession::Alsa(session));
                 }
                 let wire_str = output_session
                     .as_mut()

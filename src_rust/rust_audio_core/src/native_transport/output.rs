@@ -8,15 +8,17 @@
 
 use crate::usb_audio::{UsbAudioSink, UsbRawSinkConfig};
 
-use super::alsa_output::AlsaMmapSession;
+use super::alsa_output::AlsaSession;
 
-/// Configuration for the ALSA mmap output backend.
+/// Configuration for the ALSA output backend.
 ///
 /// The ALSA device is opened by the V2 worker thread on the first decoded
 /// slab so the actual sample rate (which may differ from any caller-provided
-/// hint) drives `snd_pcm_hw_params_set_rate_near`.
+/// hint) drives `snd_pcm_hw_params_set_rate_near`. The backend tries
+/// `MMAP_INTERLEAVED` first and falls back to `RW_INTERLEAVED` automatically
+/// when the device doesn't accept mmap.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AlsaMmapOutputConfig {
+pub struct AlsaOutputConfig {
     /// ALSA device name in `hw:CARD,DEV` form (or `default`, `pipewire`, …).
     pub device: String,
     /// Caller-requested ring buffer (microseconds). Hardware may round.
@@ -36,7 +38,7 @@ pub struct AlsaMmapOutputConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NativeOutputTarget {
     Usb(UsbRawSinkConfig),
-    AlsaMmap(AlsaMmapOutputConfig),
+    Alsa(AlsaOutputConfig),
 }
 
 impl NativeOutputTarget {
@@ -44,8 +46,8 @@ impl NativeOutputTarget {
         matches!(self, Self::Usb(_))
     }
 
-    pub fn is_alsa_mmap(&self) -> bool {
-        matches!(self, Self::AlsaMmap(_))
+    pub fn is_alsa(&self) -> bool {
+        matches!(self, Self::Alsa(_))
     }
 
     pub fn usb_cfg(&self) -> Option<&UsbRawSinkConfig> {
@@ -55,9 +57,9 @@ impl NativeOutputTarget {
         }
     }
 
-    pub fn alsa_cfg(&self) -> Option<&AlsaMmapOutputConfig> {
+    pub fn alsa_cfg(&self) -> Option<&AlsaOutputConfig> {
         match self {
-            Self::AlsaMmap(cfg) => Some(cfg),
+            Self::Alsa(cfg) => Some(cfg),
             _ => None,
         }
     }
@@ -68,7 +70,7 @@ impl NativeOutputTarget {
 /// state queries) to whichever backend is active for the current load.
 pub enum OutputSession {
     Usb(UsbAudioSink),
-    AlsaMmap(AlsaMmapSession),
+    Alsa(AlsaSession),
 }
 
 impl OutputSession {
@@ -86,9 +88,9 @@ impl OutputSession {
         }
     }
 
-    pub fn as_alsa_mut(&mut self) -> Option<&mut AlsaMmapSession> {
+    pub fn as_alsa_mut(&mut self) -> Option<&mut AlsaSession> {
         match self {
-            Self::AlsaMmap(s) => Some(s),
+            Self::Alsa(s) => Some(s),
             _ => None,
         }
     }
