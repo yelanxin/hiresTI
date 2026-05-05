@@ -9,6 +9,12 @@
 
 HiresTI 是一款专为发烧友设计的原生、现代 Linux Tidal 桌面客户端。与 Electron 套壳应用不同，HiresTI 基于 Python 3 和 GTK4/Libadwaita 构建，资源占用极低，并能与 GNOME 桌面环境无缝集成。
 
+> [!IMPORTANT]
+> **需要重新登录才能播放 FLAC / Hi-Res 音质。**
+> 旧版本使用的 OAuth（设备码）登录方式已被 Tidal 限制为 320 kbps AAC。新增的 **PKCE** 登录方式（自 `v1.9.5` 起）可恢复完整的 FLAC CD 音质与 Hi-Res Lossless 流。
+>
+> 如果你目前仍在使用旧的 OAuth 会话，请打开 **设置 → 账户**，先退出登录再重新登录——登录对话框会自动改用 PKCE，你的曲库将恢复到更高的音质档位。
+
 
 ![Main Interface](screenshots/1.png)
 

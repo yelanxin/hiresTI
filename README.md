@@ -7,13 +7,19 @@
 
 `hiresTI` is a native Linux TIDAL client built for audiophiles, combining high-fidelity playback, rock-solid stability, and a modern GTK4/Libadwaita user experience.
 
+> [!IMPORTANT]
+> **Re-login required for FLAC / Hi-Res quality.**
+> The legacy OAuth (device-code) login that previous versions used is now capped by TIDAL at 320 kbps AAC. A new **PKCE** login flow (added in `v1.9.5`) restores access to full FLAC CD-quality and Hi-Res Lossless streams.
+>
+> If you're still on the old OAuth session, open **Settings → Account**, sign out, and sign back in — the login dialog will use PKCE automatically and your library will resume at the higher tiers.
+
 ## Highlights
 
 - A high performance Rust audio engine core
 - Bit-perfect playback flow with optional exclusive output controls
 - Built-in USB rawlink driver enables direct USB passthrough, bypassing OS drivers and mixing for purer sound.
 - High-flexibility DSP workspace with reorderable processing, PEQ, convolution, tube/tape color, stereo widening, limiter, resampler, and LV2 plugins
-- TIDAL OAuth login and account-scoped library access
+- TIDAL PKCE login (recommended for FLAC / Hi-Res) with legacy OAuth fallback, account-scoped library access
 - TIDAL Max Hi-Res Lossless streaming up to 24-bit / 192kHz
 - Built-in queue drawer, lyrics support, and visualizer modules
 - MPRIS support (`org.mpris.MediaPlayer2.hiresti`) for desktop media controls
