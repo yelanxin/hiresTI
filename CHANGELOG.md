@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.9.5.6 - 2026-05-06
+
+Hotfix for issue #65: app SIGTRAPs the moment a user clicks
+"HiFi Login (PKCE)" on hosts where WebKitGTK's bwrap sandbox can't
+launch its `xdg-dbus-proxy` helper. The crash showed up on Ubuntu
+24.04 even with `xdg-dbus-proxy 0.1.5` installed; the in-tree
+hotfix shipped in 1.9.5.5 only checked for the binary's *presence*
+and didn't catch the case where the proxy starts but exits 1
+(broken bwrap / userns disabled by AppArmor / unprivileged_userns
+clone restrictions / etc.).
+
+### Fixed
+
+- **PKCE login no longer crashes on broken-sandbox hosts.** Disable
+  WebKit's network-process sandbox at module load via
+  `WebKit.WebContext.get_default().set_sandbox_enabled(False)` so
+  the WebView never tries to spawn xdg-dbus-proxy + bwrap. UX
+  unchanged: the embedded login page still intercepts the redirect
+  to `tidal.com/android/login/auth?code=…` automatically. Trade-off:
+  web content runs without the WebKit sandbox, but the only page
+  ever loaded in this WebView is Tidal's login/SSO surface.
+
 ## 1.9.5 beta4 - 2026-05-03
 
 Beta build that follows up the isahc / HTTP/2 swap (beta3) with **parallel multi-segment prefetch**.  beta3 confirmed h2 negotiation and fast `setup_ms`, but a tester still hit ~10 s of stuttering mid-track — Tidal's CDN delivers each HTTP stream at roughly real-time per stream, so the previous 1-deep prefetch could never accumulate more than ~1 segment of head-room in the chunk channel and a 5 s network blip drained the entire pipeline.  This build opens up to 4 segments concurrently on the same h2 connection; nghttp2 multiplexes their bodies and the combined throughput is link-limited (Tidal will give you all 100 Mbps if you ask for 4 streams), so the chunk channel can actually pre-fill to several seconds of compressed FLAC ahead of the decoder.

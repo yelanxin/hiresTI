@@ -53,6 +53,37 @@ except (ValueError, ImportError):
     WebKit = None
     _WEBKIT_AVAILABLE = False
 
+# Disable WebKitGTK's bwrap-based sandbox before the first WebView
+# spawns its network/web process. Default-on sandboxing requires
+# xdg-dbus-proxy + bwrap + a working user-namespace setup; on hosts
+# where any of those is broken (Ubuntu kernel with userns disabled,
+# AppArmor restricting unprivileged_userns_clone, dbus-proxy build
+# missing the .service file, dbus-proxy itself launching but exiting
+# non-zero) the WebView crashes the whole process with a SIGTRAP
+# the moment its first page load tries to set up the sandbox — the
+# C-side abort isn't catchable from Python. Issue #65 surfaced this
+# on Ubuntu 24.04 even with `xdg-dbus-proxy` 0.1.5 installed.
+#
+# Sandbox-off keeps WebKit's seamless redirect interception (no
+# copy-paste) while making the dbus-proxy + bwrap chain irrelevant.
+# Trade-off: web content runs at the app process's privilege level;
+# we only ever load Tidal's login pages here, so the surface is
+# acceptable.
+if _WEBKIT_AVAILABLE:
+    try:
+        WebKit.WebContext.get_default().set_sandbox_enabled(False)
+        logging.getLogger(__name__).debug(
+            "WebKit sandbox disabled to avoid xdg-dbus-proxy / bwrap dependency"
+        )
+    except Exception as _e:
+        # If the API surface ever changes (WebKit 7+) we'd rather log and
+        # move on than refuse to launch the app entirely. The PKCE path
+        # has its own paste-URL fallback that still works.
+        logging.getLogger(__name__).warning(
+            "Could not disable WebKit sandbox: %s — PKCE may crash on hosts "
+            "with broken xdg-dbus-proxy/bwrap setups", _e,
+        )
+
 from core.errors import classify_exception
 from core.executor import submit_daemon
 from ui import config as ui_config
