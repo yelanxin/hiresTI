@@ -22,6 +22,22 @@ clone restrictions / etc.).
   web content runs without the WebKit sandbox, but the only page
   ever loaded in this WebView is Tidal's login/SSO surface.
 
+### Removed
+
+- **GStreamer is gone.** First release with the V2 native-transport
+  cleanup landed: the playbin field, GStreamer bus-message pump,
+  GStreamer DSP graph, `UsbRawSink` GStreamer element, V1 USB
+  rawlink + V1 PipeWire paths, the `AlsaClock` GObject `SystemClock`
+  subclass, and the LV2 plugin host (panel + ctypes bindings + preset
+  schema) all deleted. Both ALSA(auto) and Auto(Default) outputs now
+  go through the V2 native worker; USB rawlink and ALSA mmap outputs
+  share one `OutputSession` enum behind the same transport.
+  Operationally: the app no longer touches `gst*` libraries at
+  runtime, segment decode is symphonia-only, and there is no GStreamer
+  pipeline to flush on track change. Distro packaging still declares
+  `gstreamer*` runtime deps for safety on this point release; a
+  follow-up will drop them.
+
 ## 1.9.5 beta4 - 2026-05-03
 
 Beta build that follows up the isahc / HTTP/2 swap (beta3) with **parallel multi-segment prefetch**.  beta3 confirmed h2 negotiation and fast `setup_ms`, but a tester still hit ~10 s of stuttering mid-track — Tidal's CDN delivers each HTTP stream at roughly real-time per stream, so the previous 1-deep prefetch could never accumulate more than ~1 segment of head-room in the chunk channel and a 5 s network blip drained the entire pipeline.  This build opens up to 4 segments concurrently on the same h2 connection; nghttp2 multiplexes their bodies and the combined throughput is link-limited (Tidal will give you all 100 Mbps if you ask for 4 streams), so the chunk channel can actually pre-fill to several seconds of compressed FLAC ahead of the decoder.
