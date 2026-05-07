@@ -67,6 +67,20 @@ sudo dnf install ./hiresti-<版本>-1.fedora.x86_64.rpm
 sudo pacman -U ./hiresti-<版本>-1-x86_64.pkg.tar.zst
 ```
 
+❄️ Nix / NixOS
+
+仓库自带 `flake.nix`，Nix 或 NixOS 用户无需手动安装系统依赖即可直接运行：
+
+```bash
+# 不安装直接试用一次
+nix run github:yelanxin/hiresTI
+
+# 安装到用户 profile
+nix profile install github:yelanxin/hiresTI
+```
+
+flake 通过 `rustPlatform.buildRustPackage` 构建 Rust 音频核心与可视化核心，并用 `wrapGAppsHook4` 包装 Python 树；GTK4 / WebKit / GStreamer / PipeWire / ALSA 等依赖全部从 nixpkgs 拉取。
+
 📦 Flatpak
 从 [Releases Page](../../releases) 页面下载 .flatpak 文件。
 
