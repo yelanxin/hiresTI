@@ -18,7 +18,7 @@
 - A high performance Rust audio engine core
 - Bit-perfect playback flow with optional exclusive output controls
 - Built-in USB rawlink driver enables direct USB passthrough, bypassing OS drivers and mixing for purer sound.
-- High-flexibility DSP workspace with reorderable processing, PEQ, convolution, tube/tape color, stereo widening, limiter, resampler, and LV2 plugins
+- High-flexibility DSP workspace with reorderable processing, PEQ, convolution, tube/tape color, stereo widening, limiter, and resampler
 - TIDAL PKCE login (recommended for FLAC / Hi-Res) with legacy OAuth fallback, account-scoped library access
 - TIDAL Max Hi-Res Lossless streaming up to 24-bit / 192kHz
 - Built-in queue drawer, lyrics support, and visualizer modules
@@ -44,8 +44,8 @@ Audio Optimization Guide: [audio-optimization-guide.md](audio-optimization-guide
 
 - Python 3.10+
 - GTK4 + Libadwaita (PyGObject)
-- Rust audio engine core (`rust_audio_core`)
-- GStreamer (audio pipeline runtime via Rust core)
+- Rust audio engine core (`rust_audio_core`) — symphonia decode + native ALSA mmap / USB rawlink output
+- Rust visualizer core (`rust_viz_core`) — FFT + spectrum draw helpers
 - `tidalapi` (TIDAL integration)
 
 ## Audio Engine Note
@@ -60,8 +60,8 @@ Install these system packages first:
 - Python 3.10+
 - GTK4
 - Libadwaita
-- GStreamer core and plugins
 - PyGObject bindings
+- WebKitGTK 6.0 (for the embedded PKCE login flow; optional — paste-URL fallback works without it)
 
 Bundled Python dependencies used by packaging:
 
@@ -109,6 +109,20 @@ sudo dnf install ./hiresti-<version>-1.el9.<arch>.rpm
 ```bash
 sudo pacman -U ./hiresti-<version>-1-<arch>.pkg.tar.zst
 ```
+
+### Nix / NixOS
+
+`hiresTI` ships a flake that exposes `packages.default`, so users on Nix or NixOS can run / install directly from the GitHub repo with no manual dependency setup:
+
+```bash
+# One-shot run (no install)
+nix run github:yelanxin/hiresTI
+
+# Install into your user profile
+nix profile install github:yelanxin/hiresTI
+```
+
+The flake builds the Rust audio + visualizer cores via `rustPlatform.buildRustPackage` and wraps the Python tree with `wrapGAppsHook4`, pulling all GTK4 / WebKit / GStreamer / PipeWire / ALSA dependencies from nixpkgs — no system packages need to be pre-installed.
 
 ### Flatpak
 
