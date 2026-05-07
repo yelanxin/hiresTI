@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.9.5.7 - 2026-05-07
+
+Hotfix follow-up to 1.9.5.6: the previous fix called
+`WebKit.WebContext.set_sandbox_enabled(False)` at module load, but
+that method does not exist in WebKitGTK 6.0 — the call was a silent
+no-op, the WebView still started its mandatory `xdg-dbus-proxy + bwrap`
+chain, and on Ubuntu 24.04 hosts where AppArmor restricts
+`unprivileged_userns_clone` the app SIGTRAPed again with
+`bwrap: setting up uid map: Permission denied` /
+`Failed to fully launch dbus-proxy: Child process exited with code 1`.
+
+### Fixed
+
+- **PKCE login no longer crashes on Ubuntu 24.04 / restricted-userns
+  hosts.** `_webkit_runtime_usable()` now actively probes
+  `bwrap --unshare-user --unshare-pid --bind / / true` at module load.
+  When `bwrap` returns non-zero (kernel rejecting unprivileged userns,
+  AppArmor profile blocking the syscall, dbus-proxy build broken,
+  etc.) the app skips constructing a WebView entirely and falls
+  through to the paste-URL flow. The legacy `set_sandbox_enabled`
+  calls are kept as belt-and-suspenders for older WebKit 4.x builds
+  but are now `hasattr`-guarded so they don't log noise on 6.0.
+
 ## 1.9.5.6 - 2026-05-06
 
 Hotfix for issue #65: app SIGTRAPs the moment a user clicks
