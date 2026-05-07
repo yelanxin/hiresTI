@@ -23,7 +23,6 @@ _OUTPUT_BIT_DEPTH_GUESS_FORMATS = {
 
 DRIVER_ALSA_AUTO = "ALSA（auto）"
 DRIVER_ALSA_MMAP = "ALSA（mmap）"
-DRIVER_USB_RAWLINK = "USB Rawlink"
 DRIVER_USB_RAWLINK_V2 = "USB Rawlink v2"
 
 USB_CLOCK_OPTIONS = ["Push", "Pull"]
@@ -72,7 +71,7 @@ def _dsp_processing_active(app):
         return True
     if bool(getattr(player, "widener_enabled", False)):
         return True
-    return any(bool((info or {}).get("enabled", True)) for info in dict(getattr(player, "lv2_slots", {}) or {}).values())
+    return False
 
 
 def _playback_status_visual(app):
@@ -234,7 +233,8 @@ def _driver_key(driver_name):
     text = str(driver_name or "").strip().lower()
     text = text.replace("（", "(").replace("）", ")")
     compact = text.replace(" ", "")
-    if compact in ("usbrawlinkv2", "usb_rawlink_v2"):
+    if compact in ("usbrawlinkv2", "usb_rawlink_v2", "usbrawlink", "usb_rawlink"):
+        # Legacy "USB Rawlink" labels migrate to V2 transparently — V1 is gone.
         return "usb_rawlink_v2"
     if compact in ("alsa_mmap", "alsa(mmap)"):
         return "alsa_mmap"
@@ -252,7 +252,7 @@ def _driver_is_alsa_family(driver_name):
 
 
 def _driver_is_usb_rawlink_family(driver_name):
-    return _driver_key(driver_name) in ("usbrawlink", "usb_rawlink_v2")
+    return _driver_key(driver_name) == "usb_rawlink_v2"
 
 
 def _is_usb_rawlink_to_alsa_switch(previous_driver_name, target_driver_name):
@@ -695,7 +695,7 @@ def setup_device_dropdown_refresh_gesture(app):
                 return
             driver_name = drv_item.get_string()
             if _driver_key(driver_name) not in (
-                "alsa_auto", "alsa_mmap", "pipewire", "usbrawlink", "usb_rawlink_v2"
+                "alsa_auto", "alsa_mmap", "pipewire", "usb_rawlink_v2"
             ):
                 return
             if getattr(app, "ignore_device_change", False):
@@ -1164,7 +1164,7 @@ def on_driver_changed(app, dd, p):
         app._force_driver_selection(DRIVER_ALSA_AUTO)
         if hasattr(app, "show_output_notice"):
             app.show_output_notice(
-                f"Exclusive mode requires {DRIVER_ALSA_AUTO}, {DRIVER_ALSA_MMAP}, {DRIVER_USB_RAWLINK}, or {DRIVER_USB_RAWLINK_V2}.",
+                f"Exclusive mode requires {DRIVER_ALSA_AUTO}, {DRIVER_ALSA_MMAP}, or {DRIVER_USB_RAWLINK_V2}.",
                 "warn",
                 3200,
             )
@@ -1477,9 +1477,9 @@ def on_output_state_transition(self, prev_state, state, detail=None):
         return
     if state == "active" and prev_state in ("switching", "fallback", "error"):
         self.show_output_notice("Audio output reconnected", "ok", 2200)
-        # USB Rawlink: the USB sink was rebuilt by set_output but the GStreamer
-        # pipeline was stopped during the disconnect.  Resume automatically if a
-        # track was loaded and the player is not already playing.
+        # USB Rawlink: the USB sink was rebuilt by set_output but the native
+        # transport was stopped during the disconnect.  Resume automatically if
+        # a track was loaded and the player is not already playing.
         if _driver_is_usb_rawlink_family(getattr(player, "requested_driver", "")):
             uri = str(getattr(player, "_last_loaded_uri", "") or "")
             if uri and not player.is_playing():
@@ -1650,10 +1650,10 @@ def update_tech_label(self, info):
 
     bitrate = int(info.get("bitrate", 0) or 0)
     if bitrate > 0:
-        # GStreamer's bitrate estimate for lossless streams (FLAC) starts very
-        # low and converges upward over several TAG events.  Only display the
-        # value once two consecutive TAG events agree within ±40%, which means
-        # the estimate has stabilised.  Until then keep the last stable value
+        # The bitrate estimate for lossless streams (FLAC) starts very low and
+        # converges upward over several TAG events.  Only display the value
+        # once two consecutive TAG events agree within ±40%, which means the
+        # estimate has stabilised.  Until then keep the last stable value
         # (or show nothing if this is the very first track).
         pending = int(getattr(self, "_bitrate_pending", 0) or 0)
         shown   = int(getattr(self, "_bitrate_shown",   0) or 0)
@@ -1703,13 +1703,9 @@ def update_tech_label(self, info):
 def on_bit_perfect_toggled(self, switch, state):
     self.settings["bit_perfect"] = state; self.save_settings()
     logger.info(
-        "Bit-perfect toggle request state=%s current_dsp_enabled=%s lv2_slots=%s",
+        "Bit-perfect toggle request state=%s current_dsp_enabled=%s",
         bool(state),
         bool(getattr(getattr(self, "player", None), "dsp_enabled", False)),
-        [
-            (sid, bool((info or {}).get("enabled", True)))
-            for sid, info in dict(getattr(getattr(self, "player", None), "lv2_slots", {}) or {}).items()
-        ],
     )
     if state and bool(getattr(getattr(self, "player", None), "dsp_enabled", False)):
         try:
@@ -1721,11 +1717,6 @@ def on_bit_perfect_toggled(self, switch, state):
             self.save_settings()
         if dsp_disabled and hasattr(self, "show_output_notice"):
             self.show_output_notice("DSP disabled: Bit-Perfect mode enabled", "info", 2600)
-        if dsp_disabled and hasattr(self, "_lv2_restart_playback_for_graph_rebind"):
-            try:
-                self._lv2_restart_playback_for_graph_rebind(reason="bit-perfect-toggle")
-            except Exception:
-                logger.debug("bit-perfect lv2 rebind failed", exc_info=True)
     self.ex_switch.set_sensitive(state)
     if not state:
         setattr(self, "_exclusive_ui_syncing", True)

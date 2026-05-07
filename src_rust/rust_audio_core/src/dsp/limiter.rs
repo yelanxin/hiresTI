@@ -1,10 +1,3 @@
-use std::sync::{Arc, Mutex};
-
-use gst::prelude::*;
-use gst::PadProbeReturn;
-use gst::PadProbeType;
-use gstreamer as gst;
-
 /// Release time constant in seconds.
 const RELEASE_TIME_S: f64 = 0.100;
 
@@ -26,14 +19,19 @@ pub(crate) struct LimiterState {
 
 impl LimiterState {
     pub(crate) fn new() -> Self {
-        Self {
+        // Initialise from `LimiterConfig::default()` so the threshold/ratio
+        // defaults live in exactly one place (the public config type).
+        let mut state = Self {
             enabled: false,
-            threshold: 0.85,
-            ratio: 20.0,
+            threshold: 0.0,
+            ratio: 1.0,
             gain: 1.0,
             release_coeff: Self::release_coeff_for(44100),
             sample_rate: 44100,
-        }
+        };
+        state.apply_config(&LimiterConfig::default());
+        state.enabled = false;
+        state
     }
 
     pub(crate) fn release_coeff_for(rate: u32) -> f64 {
@@ -146,113 +144,6 @@ impl LimiterConfig {
         let clamped = ratio.clamp(1.0, 60.0);
         self.ratio = clamped;
         clamped
-    }
-}
-
-// ---------------------------------------------------------------------------
-// GStreamer node
-// ---------------------------------------------------------------------------
-
-#[derive(Debug)]
-pub struct LimiterNode {
-    bin: gst::Bin,
-    state: Arc<Mutex<LimiterState>>,
-}
-
-impl LimiterNode {
-    pub fn new() -> Result<Self, String> {
-        let bin = gst::Bin::new();
-
-        // `identity` is a passthrough element; we intercept its buffers via a
-        // pad probe so we can do in-place DSP without needing a custom element.
-        let identity = gst::ElementFactory::make("identity")
-            .name("rust-dsp-limiter")
-            .build()
-            .map_err(|e| format!("identity element unavailable: {e}"))?;
-        let _ = identity.set_property("silent", true);
-
-        bin.add(&identity)
-            .map_err(|_| "failed to add limiter identity".to_string())?;
-
-        let sink_pad = identity
-            .static_pad("sink")
-            .ok_or_else(|| "limiter identity missing sink pad".to_string())?;
-        let src_pad = identity
-            .static_pad("src")
-            .ok_or_else(|| "limiter identity missing src pad".to_string())?;
-
-        let ghost_sink = gst::GhostPad::with_target(&sink_pad)
-            .map_err(|_| "failed to create limiter ghost sink pad".to_string())?;
-        let ghost_src = gst::GhostPad::with_target(&src_pad)
-            .map_err(|_| "failed to create limiter ghost src pad".to_string())?;
-        bin.add_pad(&ghost_sink)
-            .map_err(|_| "failed to add limiter ghost sink pad".to_string())?;
-        bin.add_pad(&ghost_src)
-            .map_err(|_| "failed to add limiter ghost src pad".to_string())?;
-
-        let state = Arc::new(Mutex::new(LimiterState::new()));
-        let probe_state = Arc::clone(&state);
-
-        src_pad.add_probe(PadProbeType::BUFFER, move |pad, info| {
-            let Some(gst::PadProbeData::Buffer(ref mut buffer)) = info.data else {
-                return PadProbeReturn::Ok;
-            };
-            // try_lock avoids priority inversion on the audio thread.
-            let Ok(mut st) = probe_state.try_lock() else {
-                return PadProbeReturn::Ok;
-            };
-
-            // Read caps once per buffer to sync sample rate / channel count.
-            let (rate, channels) = if let Some(caps) = pad.current_caps() {
-                if let Some(s) = caps.structure(0) {
-                    let r = s.get::<i32>("rate").unwrap_or(44100) as u32;
-                    let ch = s.get::<i32>("channels").unwrap_or(2).max(1) as usize;
-                    (r, ch)
-                } else {
-                    (44100, 2)
-                }
-            } else {
-                (44100, 2)
-            };
-
-            st.update_sample_rate(rate);
-
-            // Map the buffer as writable and process samples in-place.
-            let buf = buffer.make_mut();
-            if let Ok(mut map) = buf.map_writable() {
-                let raw = map.as_mut_slice();
-                // DSP chain internal format is F64LE (8 bytes per sample).
-                if raw.len() % 8 == 0 {
-                    // SAFETY: format is F64LE, pointer is 8-byte aligned by GStreamer.
-                    let samples = unsafe {
-                        std::slice::from_raw_parts_mut(raw.as_mut_ptr() as *mut f64, raw.len() / 8)
-                    };
-                    st.process(samples, channels);
-                }
-            }
-
-            PadProbeReturn::Ok
-        });
-
-        let mut node = Self { bin, state };
-        node.apply_config(&LimiterConfig::default())?;
-        Ok(node)
-    }
-
-    pub fn element(&self) -> &gst::Element {
-        self.bin.upcast_ref()
-    }
-
-    pub fn apply_config(&mut self, config: &LimiterConfig) -> Result<(), String> {
-        let Ok(mut st) = self.state.lock() else {
-            return Err("limiter state lock poisoned".to_string());
-        };
-        st.enabled = config.enabled;
-        st.threshold = config.threshold.clamp(0.0, 1.0);
-        st.ratio = config.ratio.clamp(1.0, 60.0);
-        // Reset gain to 1.0 on each config change to avoid stale state.
-        st.gain = 1.0;
-        Ok(())
     }
 }
 

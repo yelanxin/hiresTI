@@ -20,11 +20,9 @@ logger = logging.getLogger(__name__)
 _NOOP_VIZ_PERF_AUDIO = VizPerfWindow("audio", logger, enabled=False)
 
 _MAX_SPECTRUM_BANDS = 4096
-_LV2_HOST_MANAGED_PORT_SYMBOLS = {"enabled", "enable", "bypass"}
 
 DRIVER_ALSA_AUTO = "ALSA（auto）"
 DRIVER_ALSA_MMAP = "ALSA（mmap）"
-DRIVER_USB_RAWLINK = "USB Rawlink"
 DRIVER_USB_RAWLINK_V2 = "USB Rawlink v2"
 
 # Matches the fallback label emitted by Rust when device.open() fails (no permission).
@@ -46,15 +44,14 @@ def _driver_key(driver_name):
         return "pipewire"
     if compact in ("auto", "auto(default)"):
         return "auto"
-    if compact in ("usbrawlinkv2", "usb_rawlink_v2"):
+    if compact in ("usbrawlinkv2", "usb_rawlink_v2", "usbrawlink", "usb_rawlink"):
+        # Legacy "USB Rawlink" labels migrate to V2 transparently — V1 is gone.
         return "usb_rawlink_v2"
-    if compact in ("usbrawlink", "usb_rawlink"):
-        return "usb_rawlink"
     return compact
 
 
 def _is_usb_rawlink_family(driver_name):
-    return _driver_key(driver_name) in ("usb_rawlink", "usb_rawlink_v2")
+    return _driver_key(driver_name) == "usb_rawlink_v2"
 
 
 class _RustAudioCore:
@@ -302,45 +299,6 @@ class _RustAudioCore:
             if hasattr(lib, "rac_set_widener_bass_mono_amount"):
                 lib.rac_set_widener_bass_mono_amount.restype = ctypes.c_int
                 lib.rac_set_widener_bass_mono_amount.argtypes = [ctypes.c_void_p, ctypes.c_int]
-            if hasattr(lib, "rac_lv2_add_slot"):
-                lib.rac_lv2_add_slot.restype = ctypes.c_int
-                lib.rac_lv2_add_slot.argtypes = [
-                    ctypes.c_void_p,
-                    ctypes.c_char_p,
-                    ctypes.POINTER(ctypes.c_char_p),
-                ]
-            if hasattr(lib, "rac_lv2_restore_slot"):
-                lib.rac_lv2_restore_slot.restype = ctypes.c_int
-                lib.rac_lv2_restore_slot.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
-            if hasattr(lib, "rac_lv2_clear_slots_for_restore"):
-                lib.rac_lv2_clear_slots_for_restore.restype = ctypes.c_int
-                lib.rac_lv2_clear_slots_for_restore.argtypes = [ctypes.c_void_p]
-            if hasattr(lib, "rac_lv2_restore_slot_deferred"):
-                lib.rac_lv2_restore_slot_deferred.restype = ctypes.c_int
-                lib.rac_lv2_restore_slot_deferred.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
-            if hasattr(lib, "rac_lv2_finish_restore_slots"):
-                lib.rac_lv2_finish_restore_slots.restype = ctypes.c_int
-                lib.rac_lv2_finish_restore_slots.argtypes = [ctypes.c_void_p]
-            if hasattr(lib, "rac_lv2_remove_slot"):
-                lib.rac_lv2_remove_slot.restype = ctypes.c_int
-                lib.rac_lv2_remove_slot.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-            if hasattr(lib, "rac_lv2_set_slot_enabled"):
-                lib.rac_lv2_set_slot_enabled.restype = ctypes.c_int
-                lib.rac_lv2_set_slot_enabled.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
-            if hasattr(lib, "rac_lv2_set_port_value"):
-                lib.rac_lv2_set_port_value.restype = ctypes.c_int
-                lib.rac_lv2_set_port_value.argtypes = [
-                    ctypes.c_void_p,
-                    ctypes.c_char_p,
-                    ctypes.c_char_p,
-                    ctypes.c_float,
-                ]
-            if hasattr(lib, "rac_lv2_scan_plugins"):
-                lib.rac_lv2_scan_plugins.restype = ctypes.c_void_p
-                lib.rac_lv2_scan_plugins.argtypes = [ctypes.c_void_p]
-            if hasattr(lib, "rac_lv2_free_string"):
-                lib.rac_lv2_free_string.restype = None
-                lib.rac_lv2_free_string.argtypes = [ctypes.c_void_p]
 
             lib.rac_set_speed.restype = ctypes.c_int
             lib.rac_set_speed.argtypes = [ctypes.c_void_p, ctypes.c_double]
@@ -892,105 +850,6 @@ class _RustAudioCore:
             return -3
         return self._call_int("rac_set_widener_bass_mono_amount", ctypes.c_int(int(amount)), default_rc=-2)
 
-    def lv2_add_slot(self, uri):
-        """Add an LV2 slot. Returns (slot_id_str, rc) where rc=0 on success."""
-        if (not self.available) or self._closed:
-            return None, -1
-        if not hasattr(self.lib, "rac_lv2_add_slot"):
-            return None, -3
-        out_ptr = ctypes.c_char_p(None)
-        rc = self.lib.rac_lv2_add_slot(
-            self.handle, uri.encode() if isinstance(uri, str) else uri, ctypes.byref(out_ptr)
-        )
-        if rc == 0 and out_ptr.value is not None:
-            slot_id = out_ptr.value.decode()
-            if hasattr(self.lib, "rac_lv2_free_string"):
-                self.lib.rac_lv2_free_string(ctypes.cast(out_ptr, ctypes.c_void_p))
-            return slot_id, 0
-        return None, rc
-
-    def lv2_restore_slot(self, slot_id, uri):
-        if (not self.available) or self._closed:
-            return -1
-        if not hasattr(self.lib, "rac_lv2_restore_slot"):
-            return -3
-        return self.lib.rac_lv2_restore_slot(
-            self.handle,
-            slot_id.encode() if isinstance(slot_id, str) else slot_id,
-            uri.encode() if isinstance(uri, str) else uri,
-        )
-
-    def lv2_clear_slots_for_restore(self):
-        if (not self.available) or self._closed:
-            return -1
-        if not hasattr(self.lib, "rac_lv2_clear_slots_for_restore"):
-            return -3
-        return self.lib.rac_lv2_clear_slots_for_restore(self.handle)
-
-    def lv2_restore_slot_deferred(self, slot_id, uri):
-        if (not self.available) or self._closed:
-            return -1
-        if not hasattr(self.lib, "rac_lv2_restore_slot_deferred"):
-            return -3
-        return self.lib.rac_lv2_restore_slot_deferred(
-            self.handle,
-            slot_id.encode() if isinstance(slot_id, str) else slot_id,
-            uri.encode() if isinstance(uri, str) else uri,
-        )
-
-    def lv2_finish_restore_slots(self):
-        if (not self.available) or self._closed:
-            return -1
-        if not hasattr(self.lib, "rac_lv2_finish_restore_slots"):
-            return -3
-        return self.lib.rac_lv2_finish_restore_slots(self.handle)
-
-    def lv2_remove_slot(self, slot_id):
-        if (not self.available) or self._closed:
-            return -1
-        if not hasattr(self.lib, "rac_lv2_remove_slot"):
-            return -3
-        return self.lib.rac_lv2_remove_slot(
-            self.handle, slot_id.encode() if isinstance(slot_id, str) else slot_id
-        )
-
-    def lv2_set_slot_enabled(self, slot_id, enabled):
-        if (not self.available) or self._closed:
-            return -1
-        if not hasattr(self.lib, "rac_lv2_set_slot_enabled"):
-            return -3
-        return self.lib.rac_lv2_set_slot_enabled(
-            self.handle,
-            slot_id.encode() if isinstance(slot_id, str) else slot_id,
-            ctypes.c_int(1 if enabled else 0),
-        )
-
-    def lv2_set_port_value(self, slot_id, symbol, value):
-        if (not self.available) or self._closed:
-            return -1
-        if not hasattr(self.lib, "rac_lv2_set_port_value"):
-            return -3
-        return self.lib.rac_lv2_set_port_value(
-            self.handle,
-            slot_id.encode() if isinstance(slot_id, str) else slot_id,
-            symbol.encode() if isinstance(symbol, str) else symbol,
-            ctypes.c_float(float(value)),
-        )
-
-    def lv2_scan_plugins(self):
-        """Scan installed LV2 plugins. Returns JSON string or None."""
-        if (not self.available) or self._closed:
-            return None
-        if not hasattr(self.lib, "rac_lv2_scan_plugins"):
-            return None
-        raw = self.lib.rac_lv2_scan_plugins(self.handle)
-        if not raw:
-            return None
-        result = ctypes.cast(raw, ctypes.c_char_p).value
-        if hasattr(self.lib, "rac_lv2_free_string"):
-            self.lib.rac_lv2_free_string(ctypes.c_void_p(raw))
-        return result.decode() if result else None
-
     def set_speed(self, speed):
         rc = self._call_int("rac_set_speed", ctypes.c_double(float(speed or 1.0)), default_rc=-2)
         if rc == 0:
@@ -1210,7 +1069,7 @@ class _RustAudioCore:
                     pass
 
     def get_last_error(self):
-        """Return the last GStreamer error string from the Rust engine, or empty string."""
+        """Return the last error string from the Rust engine, or empty string."""
         if (not self.available) or self._closed:
             return ""
         fn = getattr(self.lib, "rac_get_last_error", None)
@@ -1440,9 +1299,9 @@ class RustAudioPlayerAdapter:
     mirroring core transport state into Rust audio core for progressive migration.
     """
     # Keywords that unambiguously indicate a physical device disconnect.
-    # Note: "alsa" is intentionally NOT here — the GStreamer element name
-    # "rust-alsa-sink" contains "alsa" and would cause false positives.
-    # ALSA-specific disconnect detection is handled in _classify_rust_error.
+    # Note: "alsa" is intentionally NOT here — sink names like "rust-alsa-sink"
+    # contain "alsa" and would cause false positives.  ALSA-specific disconnect
+    # detection is handled in _classify_rust_error.
     _ERR_DEVICE_KEYS = (
         "disconnected",
         "no such device",
@@ -1597,7 +1456,7 @@ class RustAudioPlayerAdapter:
                 pass
         return nums
 
-    def _wait_pipewire_metadata(self, check_fn, timeout_s=0.45, interval_s=0.05):
+    def _wait_pipewire_metadata(self, check_fn, timeout_s=0.45, interval_s=0.06):
         deadline = time.monotonic() + max(0.05, float(timeout_s or 0.45))
         while True:
             meta = self._read_pipewire_clock_metadata()
@@ -1610,7 +1469,7 @@ class RustAudioPlayerAdapter:
                 return meta, True
             if time.monotonic() >= deadline:
                 return meta, False
-            time.sleep(max(0.01, float(interval_s or 0.05)))
+            time.sleep(max(0.01, float(interval_s or 0.06)))
 
     def _release_pipewire_clock_override(self, reason="idle"):
         """
@@ -1629,7 +1488,6 @@ class RustAudioPlayerAdapter:
             meta, released_ok = self._wait_pipewire_metadata(
                 lambda m: int(m.get("force_rate", 0) or 0) == 0,
                 timeout_s=1.4,
-                interval_s=0.06,
             )
             if not released_ok:
                 effective = int(meta.get("force_rate", 0) or 0)
@@ -1751,7 +1609,7 @@ class RustAudioPlayerAdapter:
         text = str(raw or "").strip()
         if not text:
             return ""
-        # GStreamer tag strings may contain escaped separators/spaces.
+        # Tag strings may contain escaped separators/spaces.
         cleaned = text.replace("\\", " ").replace("_", " ")
         lowered = cleaned.lower()
         if "flac" in lowered:
@@ -1825,8 +1683,6 @@ class RustAudioPlayerAdapter:
         self.widener_width = 125
         self.widener_bass_mono_freq = 120
         self.widener_bass_mono_amount = 100
-        # lv2_slots: dict of slot_id -> {"uri": str, "enabled": bool, "port_values": dict}
-        self.lv2_slots = {}
         self.limiter_enabled = False
         self.limiter_threshold = 0.85
         self.limiter_ratio = 20.0
@@ -2051,8 +1907,8 @@ class RustAudioPlayerAdapter:
                 info["depth"] = dv
                 changed = True
 
-        # source_rate / source_depth: parsed by Rust from the GStreamer TAG codec
-        # text (e.g. "FLAC, 192000 Hz, 24-bit").  These reflect the original media
+        # source_rate / source_depth: parsed by Rust from the TAG codec text
+        # (e.g. "FLAC, 192000 Hz, 24-bit").  These reflect the original media
         # resolution and take precedence over the output container format (S32LE)
         # for display purposes.
         src_rate = fields.get("source_rate")
@@ -2269,7 +2125,6 @@ class RustAudioPlayerAdapter:
                 meta_allow, allow_ok = self._wait_pipewire_metadata(
                     lambda m: allow_required.issubset(self._parse_allowed_rates(m.get("allowed_rates_raw"))),
                     timeout_s=1.2,
-                    interval_s=0.06,
                 )
                 allowed_now = self._parse_allowed_rates(meta_allow.get("allowed_rates_raw"))
                 if not allow_required.issubset(allowed_now):
@@ -2300,7 +2155,6 @@ class RustAudioPlayerAdapter:
                         meta, force_ok = self._wait_pipewire_metadata(
                             lambda m: int(m.get("force_rate", 0) or 0) == int(target_rate),
                             timeout_s=1.0 if attempt == 1 else 0.6,
-                            interval_s=0.06,
                         )
                         effective = int(meta.get("force_rate", 0) or 0)
                         if effective == int(target_rate):
@@ -2450,9 +2304,9 @@ class RustAudioPlayerAdapter:
         t = str(text or "").lower()
         if any(k in t for k in self._ERR_DEVICE_KEYS):
             return "device"
-        # "alsa" alone matches the GStreamer element name "rust-alsa-sink" and
-        # produces false positives.  Only classify as device error when the
-        # message also contains a specific hardware fault keyword.
+        # "alsa" alone matches sink names like "rust-alsa-sink" and produces
+        # false positives.  Only classify as a device error when the message
+        # also contains a specific hardware fault keyword.
         if "alsa" in t and any(k in t for k in self._ERR_ALSA_FAULT_KEYS):
             return "device"
         if any(k in t for k in self._ERR_NETWORK_KEYS):
@@ -2601,20 +2455,16 @@ class RustAudioPlayerAdapter:
         self.exclusive_lock_mode = bool(exclusive_lock)
         self.active_rate_switch = bool(enabled) and (not bool(exclusive_lock))
         if enabled:
-            # Reset GStreamer pipeline volume to 1.0 (unity gain / bypass).
+            # Reset engine volume to 1.0 (unity gain / bypass).
             # Call _rust directly to skip the bit_perfect_mode guard in
             # RustAdapter.set_volume — this covers all entry paths including
             # on_exclusive_toggled which does not go through _lock_volume_controls.
             self._rust.set_volume(1.0)
         logger.info(
-            "RustAdapter.toggle_bit_perfect enabled=%s exclusive_lock=%s dsp_enabled=%s lv2_slots=%s",
+            "RustAdapter.toggle_bit_perfect enabled=%s exclusive_lock=%s dsp_enabled=%s",
             bool(enabled),
             bool(exclusive_lock),
             bool(getattr(self, "dsp_enabled", False)),
-            [
-                (sid, bool((info or {}).get("enabled", True)))
-                for sid, info in dict(getattr(self, "lv2_slots", {}) or {}).items()
-            ],
         )
         if old_exclusive and not exclusive_lock:
             self._release_alsa_reservation()
@@ -2682,14 +2532,10 @@ class RustAudioPlayerAdapter:
     def set_dsp_enabled(self, enabled):
         state = bool(enabled)
         logger.info(
-            "RustAdapter.set_dsp_enabled request enabled=%s current=%s bit_perfect=%s lv2_slots=%s",
+            "RustAdapter.set_dsp_enabled request enabled=%s current=%s bit_perfect=%s",
             state,
             bool(getattr(self, "dsp_enabled", False)),
             bool(getattr(self, "bit_perfect_mode", False)),
-            [
-                (sid, bool((info or {}).get("enabled", True)))
-                for sid, info in dict(getattr(self, "lv2_slots", {}) or {}).items()
-            ],
         )
         rc = self._rust.set_dsp_enabled(state)
         if rc != 0:
@@ -2968,194 +2814,11 @@ class RustAudioPlayerAdapter:
         self.output_error = None
         return True
 
-    def lv2_add_slot(self, uri):
-        """Add a new LV2 plugin slot. Returns slot_id string or None on failure."""
-        slot_id, rc = self._rust.lv2_add_slot(uri)
-        if rc != 0 or slot_id is None:
-            logger.warning("RustAdapter.lv2_add_slot failed rc=%s uri=%s", rc, uri)
-            return None
-        self.lv2_slots[slot_id] = {"uri": uri, "enabled": True, "port_values": {}}
-        self.output_error = None
-        return slot_id
-
-    def lv2_restore_slot(self, slot_id, uri, enabled=True, port_values=None):
-        """Restore a saved LV2 slot (used on startup)."""
-        rc = self._rust.lv2_restore_slot(slot_id, uri)
-        if rc != 0:
-            logger.warning("RustAdapter.lv2_restore_slot failed rc=%s slot_id=%s uri=%s", rc, slot_id, uri)
-            return False
-        clean_port_values = {
-            symbol: float(value)
-            for symbol, value in dict(port_values or {}).items()
-            if str(symbol or "").strip().lower() not in _LV2_HOST_MANAGED_PORT_SYMBOLS
-        }
-        self.lv2_slots[slot_id] = {
-            "uri": uri,
-            "enabled": enabled,
-            "port_values": clean_port_values,
-        }
-        if not enabled:
-            self._rust.lv2_set_slot_enabled(slot_id, False)
-        if clean_port_values:
-            for symbol, value in clean_port_values.items():
-                self._rust.lv2_set_port_value(slot_id, symbol, value)
-        self.output_error = None
-        return True
-
-    def lv2_restore_slots(self, slots):
-        """Restore multiple saved LV2 slots with a single DSP graph rebuild."""
-        normalized = []
-        for slot in list(slots or []):
-            if not isinstance(slot, dict):
-                continue
-            slot_id = str(slot.get("slot_id", "") or "").strip()
-            uri = str(slot.get("uri", "") or "").strip()
-            if not slot_id or not uri:
-                continue
-            clean_port_values = {
-                symbol: float(value)
-                for symbol, value in dict(slot.get("port_values", {}) or {}).items()
-                if str(symbol or "").strip().lower() not in _LV2_HOST_MANAGED_PORT_SYMBOLS
-            }
-            normalized.append(
-                {
-                    "slot_id": slot_id,
-                    "uri": uri,
-                    "enabled": bool(slot.get("enabled", True)),
-                    "port_values": clean_port_values,
-                }
-            )
-        if not normalized:
-            self.lv2_slots = {}
-            self.output_error = None
-            return True
-        rust_lib = getattr(self._rust, "lib", None)
-        has_batch_restore = bool(
-            rust_lib is not None
-            and hasattr(rust_lib, "rac_lv2_clear_slots_for_restore")
-            and hasattr(rust_lib, "rac_lv2_restore_slot_deferred")
-            and hasattr(rust_lib, "rac_lv2_finish_restore_slots")
-        )
-        if not has_batch_restore:
-            ok = True
-            self.lv2_slots = {}
-            for slot in normalized:
-                ok = self.lv2_restore_slot(
-                    slot["slot_id"],
-                    slot["uri"],
-                    enabled=slot["enabled"],
-                    port_values=slot["port_values"],
-                ) and ok
-            return ok
-
-        previous_slots = dict(getattr(self, "lv2_slots", {}) or {})
-        rc = self._rust.lv2_clear_slots_for_restore()
-        if rc != 0:
-            logger.warning("RustAdapter.lv2_clear_slots_for_restore failed rc=%s", rc)
-            return False
-
-        restored = {}
-        for slot in normalized:
-            rc = self._rust.lv2_restore_slot_deferred(slot["slot_id"], slot["uri"])
-            if rc != 0:
-                logger.warning(
-                    "RustAdapter.lv2_restore_slot_deferred failed rc=%s slot_id=%s uri=%s",
-                    rc, slot["slot_id"], slot["uri"],
-                )
-                self.lv2_slots = previous_slots
-                return False
-            restored[slot["slot_id"]] = {
-                "uri": slot["uri"],
-                "enabled": slot["enabled"],
-                "port_values": dict(slot["port_values"]),
-            }
-
-        rc = self._rust.lv2_finish_restore_slots()
-        if rc != 0:
-            logger.warning("RustAdapter.lv2_finish_restore_slots failed rc=%s", rc)
-            self.lv2_slots = previous_slots
-            return False
-
-        self.lv2_slots = restored
-        for slot_id, slot in restored.items():
-            if not slot["enabled"]:
-                self._rust.lv2_set_slot_enabled(slot_id, False)
-            for symbol, value in slot["port_values"].items():
-                self._rust.lv2_set_port_value(slot_id, symbol, value)
-        self.output_error = None
-        return True
-
-    def lv2_remove_slot(self, slot_id):
-        """Remove an LV2 plugin slot."""
-        rc = self._rust.lv2_remove_slot(slot_id)
-        if rc != 0:
-            logger.warning("RustAdapter.lv2_remove_slot failed rc=%s slot_id=%s", rc, slot_id)
-            return False
-        self.lv2_slots.pop(slot_id, None)
-        self.output_error = None
-        return True
-
-    def lv2_set_slot_enabled(self, slot_id, enabled):
-        prev_enabled = None
-        if slot_id in self.lv2_slots:
-            prev_enabled = bool(self.lv2_slots[slot_id].get("enabled", True))
-        logger.info(
-            "RustAdapter.lv2_set_slot_enabled request slot_id=%s enabled=%s previous=%s",
-            slot_id,
-            bool(enabled),
-            prev_enabled,
-        )
-        rc = self._rust.lv2_set_slot_enabled(slot_id, enabled)
-        if rc != 0:
-            logger.warning("RustAdapter.lv2_set_slot_enabled failed rc=%s slot_id=%s enabled=%s", rc, slot_id, enabled)
-            return False
-        if slot_id in self.lv2_slots:
-            self.lv2_slots[slot_id]["enabled"] = bool(enabled)
-        logger.info("RustAdapter.lv2_set_slot_enabled ok slot_id=%s enabled=%s", slot_id, bool(enabled))
-        self.output_error = None
-        return True
-
-    def lv2_set_port_value(self, slot_id, symbol, value):
-        rc = self._rust.lv2_set_port_value(slot_id, symbol, float(value))
-        if rc != 0:
-            logger.warning(
-                "RustAdapter.lv2_set_port_value failed rc=%s slot_id=%s symbol=%s value=%s",
-                rc, slot_id, symbol, value,
-            )
-            return False
-        if (
-            slot_id in self.lv2_slots
-            and str(symbol or "").strip().lower() not in _LV2_HOST_MANAGED_PORT_SYMBOLS
-        ):
-            self.lv2_slots[slot_id]["port_values"][symbol] = float(value)
-        logger.info(
-            "RustAdapter.lv2_set_port_value ok slot_id=%s symbol=%s value=%s",
-            slot_id,
-            symbol,
-            float(value),
-        )
-        self.output_error = None
-        return True
-
-    def lv2_scan_plugins(self):
-        """Return list of plugin dicts parsed from JSON, or []."""
-        import json
-        raw = self._rust.lv2_scan_plugins()
-        if not raw:
-            return []
-        try:
-            return json.loads(raw)
-        except Exception as exc:
-            logger.warning("lv2_scan_plugins: json parse error: %s", exc)
-            return []
-
     def get_drivers(self):
         return [
             "Auto (Default)",
-            "PipeWire",
             DRIVER_ALSA_AUTO,
             DRIVER_ALSA_MMAP,
-            DRIVER_USB_RAWLINK,
             DRIVER_USB_RAWLINK_V2,
         ]
 
@@ -3259,7 +2922,6 @@ class RustAudioPlayerAdapter:
                     or ("alsa-mmap thread-config" in lmsg)
                     or ("container-adapter" in lmsg)
                     or ("audio-filter rebind" in lmsg)
-                    or ("dsp-lv2 " in lmsg)
                     or ("usb-rawsink" in lmsg)
                     or ("playing" in lmsg)
                     or ("paused" in lmsg)
@@ -3501,7 +3163,7 @@ class RustAudioPlayerAdapter:
                 delay_ms = self._estimate_rust_visual_delay_ms(current_pos_s=cur_pos, msg_pos_s=None)
                 target_pos = max(
                     0.0,
-                    cur_pos - (float(delay_ms) / 1000.0) - float(getattr(self, "_viz_interp_lookback_s", 0.12)),
+                    cur_pos - (float(delay_ms) / 1000.0) - float(self._viz_interp_lookback_s),
                 )
                 frame = self._sample_spectrum_at_pos(target_pos)
                 if frame is None:
@@ -3685,8 +3347,7 @@ class RustAudioPlayerAdapter:
                             self._spectrum_stall_count,
                         )
                     # After 5 consecutive stall cycles (~7.5 s with no frames),
-                    # the audio-filter is likely broken (e.g. DSP graph rebuild
-                    # failed silently after an LV2 toggle).  Force a pipeline
+                    # the decode/output path is likely stuck. Force a pipeline
                     # reload to recover — but only once per stall episode to
                     # avoid a restart loop.
                     if self._spectrum_stall_count == 5:
@@ -3755,8 +3416,8 @@ class RustAudioPlayerAdapter:
     def hint_source_format(self, bit_depth, sample_rate):
         """Store source format from the TIDAL API to inject on next load().
 
-        GStreamer TAG messages for FLAC do not carry Hz/-bit info, so the
-        values must be supplied externally before load() is called.
+        TAG messages for FLAC do not carry Hz/-bit info, so the values must
+        be supplied externally before load() is called.
         """
         self._pending_source_depth = int(bit_depth or 0)
         self._pending_source_rate = int(sample_rate or 0)
@@ -4016,7 +3677,7 @@ class RustAudioPlayerAdapter:
             chs = self.usb_hw_volume_channels()
             if chs and (len(chs) <= 1 or 0 in chs):
                 self.usb_hw_volume_set_percent(vol * 100.0)
-            # Keep GStreamer volume at unity so PCM data is untouched.
+            # Keep engine volume at unity so PCM data is untouched.
             self._rust.set_volume(1.0)
             self.output_error = None
             return

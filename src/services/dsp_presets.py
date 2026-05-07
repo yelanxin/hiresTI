@@ -40,7 +40,6 @@ DSP_PRESET_KEYS = [
     "dsp_limiter_enabled",
     "dsp_limiter_threshold",
     "dsp_limiter_ratio",
-    "dsp_lv2_slots",
 ]
 
 

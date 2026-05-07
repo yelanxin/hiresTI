@@ -494,7 +494,7 @@ def build_settings_page(app):
         "still passes through the system mixer.\n\n"
         "• <b>ALSA（auto）/ALSA（mmap） + Exclusive mode:</b> bypasses the system mixer and is treated as "
         "true bit-perfect playback.\n\n"
-        "• <b>USB Rawlink / USB Rawlink v2:</b> bypasses the kernel USB audio driver and lets hiresTI "
+        "• <b>USB Rawlink v2:</b> bypasses the kernel USB audio driver and lets hiresTI "
         "talk directly to a compatible external USB DAC. With Bit-Perfect Mode on, "
         "Rawlink uses the app's most direct player-to-device playback path."
     )
@@ -504,7 +504,7 @@ def build_settings_page(app):
     bp_help_btn.connect("clicked", lambda x: bp_help_pop.popup())
     bp_title_box.append(bp_help_btn)
     bp_info.append(bp_title_box)
-    bp_info.append(Gtk.Label(label="Bypass app EQ/volume; direct device path in USB Rawlink / v2", xalign=0, css_classes=["dim-label"]))
+    bp_info.append(Gtk.Label(label="Bypass app EQ/volume; direct device path in USB Rawlink v2", xalign=0, css_classes=["dim-label"]))
     row_bp.append(bp_info)
     row_bp.append(Gtk.Box(hexpand=True))
     app.bp_switch = Gtk.Switch(valign=Gtk.Align.CENTER)
@@ -629,7 +629,7 @@ def build_settings_page(app):
         "<b>Audio Driver Modes</b>\n\n"
         "• <b>ALSA（auto）:</b> Recommended for most setups. hiresTI chooses the most compatible ALSA path for your device automatically.\n\n"
         "• <b>ALSA（mmap）:</b> A zero-copy ALSA path with a more direct handoff to the device. Best for users who want a leaner playback path or prefer MMAP on their hardware.\n\n"
-        "• <b>USB Rawlink / USB Rawlink v2:</b> Bypasses the kernel USB audio driver and lets hiresTI talk directly to the USB device for playback. Best for users who want the most direct player-to-DAC path on a compatible external USB DAC."
+        "• <b>USB Rawlink v2:</b> Bypasses the kernel USB audio driver and lets hiresTI talk directly to the USB device for playback. Best for users who want the most direct player-to-DAC path on a compatible external USB DAC."
     )
     drv_pop_box = Gtk.Box(margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
     drv_pop_box.append(drv_pop_content)
@@ -638,7 +638,7 @@ def build_settings_page(app):
     drv_title_box.append(drv_help_btn)
     drv_info.append(drv_title_box)
     drv_desc = Gtk.Label(
-        label="ALSA（auto） for most setups. ALSA（mmap） for zero-copy tuning. USB Rawlink / v2 for direct USB playback.",
+        label="ALSA（auto） for most setups. ALSA（mmap） for zero-copy tuning. USB Rawlink v2 for direct USB playback.",
         xalign=0,
         css_classes=["dim-label"],
     )
@@ -653,7 +653,7 @@ def build_settings_page(app):
         drivers = [
             drv
             for drv in drivers
-            if drv in ("ALSA（auto）", "ALSA（mmap）", "USB Rawlink", "USB Rawlink v2")
+            if drv in ("ALSA（auto）", "ALSA（mmap）", "USB Rawlink v2")
         ]
     app.driver_dd = Gtk.DropDown(model=Gtk.StringList.new(drivers))
     app.driver_dd.connect("notify::selected-item", app.on_driver_changed)
@@ -665,7 +665,7 @@ def build_settings_page(app):
     depth_info.append(Gtk.Label(label="Output Bit Depth", xalign=0, css_classes=["settings-label"]))
     depth_info.append(
         Gtk.Label(
-            label="ALSA（auto） / ALSA（mmap） only. Not applicable for USB Rawlink / v2 (bit depth is fixed by the device).",
+            label="ALSA（auto） / ALSA（mmap） only. Not applicable for USB Rawlink v2 (bit depth is fixed by the device).",
             xalign=0,
             css_classes=["dim-label"],
         )
@@ -690,7 +690,7 @@ def build_settings_page(app):
     usb_clk_info.append(Gtk.Label(label="USB Clock Alignment", xalign=0, css_classes=["settings-label"]))
     usb_clk_info.append(
         Gtk.Label(
-            label="Push: clock driven by write position. Pull: clock driven by playback position. USB Rawlink / v2 only.",
+            label="Push: clock driven by write position. Pull: clock driven by playback position. USB Rawlink v2 only.",
             xalign=0,
             css_classes=["dim-label"],
         )
@@ -703,7 +703,7 @@ def build_settings_page(app):
     if saved_usb_clk not in USB_CLOCK_OPTIONS:
         saved_usb_clk = USB_CLOCK_DEFAULT
     app.usb_clock_mode_dd.set_selected(USB_CLOCK_OPTIONS.index(saved_usb_clk))
-    app.usb_clock_mode_dd.set_sensitive(saved_driver_init in ("USB Rawlink", "USB Rawlink v2"))
+    app.usb_clock_mode_dd.set_sensitive(saved_driver_init == "USB Rawlink v2")
     app.usb_clock_mode_dd.connect("notify::selected-item", app.on_usb_clock_mode_changed)
     row_usb_clk.append(app.usb_clock_mode_dd)
     group_out.append(row_usb_clk)

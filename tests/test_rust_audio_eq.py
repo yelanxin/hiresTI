@@ -30,12 +30,6 @@ class _FakeRust:
         widener_width_rc=0,
         widener_bass_freq_rc=0,
         widener_bass_amount_rc=0,
-        lv2_restore_rc=0,
-        lv2_clear_slots_for_restore_rc=0,
-        lv2_restore_slot_deferred_rc=0,
-        lv2_finish_restore_slots_rc=0,
-        lv2_set_slot_enabled_rc=0,
-        lv2_set_port_value_rc=0,
         usb_hw_volume_supported=False,
         usb_hw_volume_range=None,
         usb_hw_volume_set_rc=0,
@@ -60,12 +54,6 @@ class _FakeRust:
         self.widener_width_rc = widener_width_rc
         self.widener_bass_freq_rc = widener_bass_freq_rc
         self.widener_bass_amount_rc = widener_bass_amount_rc
-        self.lv2_restore_rc = lv2_restore_rc
-        self.lv2_clear_slots_for_restore_rc = lv2_clear_slots_for_restore_rc
-        self.lv2_restore_slot_deferred_rc = lv2_restore_slot_deferred_rc
-        self.lv2_finish_restore_slots_rc = lv2_finish_restore_slots_rc
-        self.lv2_set_slot_enabled_rc = lv2_set_slot_enabled_rc
-        self.lv2_set_port_value_rc = lv2_set_port_value_rc
         self.usb_hw_volume_supported_value = bool(usb_hw_volume_supported)
         self.usb_hw_volume_range_value = usb_hw_volume_range
         self.usb_hw_volume_set_rc = usb_hw_volume_set_rc
@@ -151,30 +139,6 @@ class _FakeRust:
     def set_widener_bass_mono_amount(self, amount):
         self.calls.append(("widener_bass_amount", amount))
         return self.widener_bass_amount_rc
-
-    def lv2_restore_slot(self, slot_id, uri):
-        self.calls.append(("lv2_restore_slot", slot_id, uri))
-        return self.lv2_restore_rc
-
-    def lv2_set_slot_enabled(self, slot_id, enabled):
-        self.calls.append(("lv2_set_slot_enabled", slot_id, enabled))
-        return self.lv2_set_slot_enabled_rc
-
-    def lv2_set_port_value(self, slot_id, symbol, value):
-        self.calls.append(("lv2_set_port_value", slot_id, symbol, value))
-        return self.lv2_set_port_value_rc
-
-    def lv2_clear_slots_for_restore(self):
-        self.calls.append(("lv2_clear_slots_for_restore",))
-        return self.lv2_clear_slots_for_restore_rc
-
-    def lv2_restore_slot_deferred(self, slot_id, uri):
-        self.calls.append(("lv2_restore_slot_deferred", slot_id, uri))
-        return self.lv2_restore_slot_deferred_rc
-
-    def lv2_finish_restore_slots(self):
-        self.calls.append(("lv2_finish_restore_slots",))
-        return self.lv2_finish_restore_slots_rc
 
     def usb_hw_volume_supported(self):
         return 1 if self.usb_hw_volume_supported_value else 0
@@ -288,119 +252,6 @@ def test_clear_convolver_ir_resets_state():
     assert adapter.output_error is None
     assert adapter.convolver_enabled is False
     assert adapter.convolver_ir_path == ""
-
-
-def test_lv2_restore_slot_ignores_enabled_port_value():
-    adapter = object.__new__(rust_audio.RustAudioPlayerAdapter)
-    adapter._rust = _FakeRust()
-    adapter.output_error = "boom"
-    adapter.lv2_slots = {}
-
-    assert adapter.lv2_restore_slot(
-        "lv2_0",
-        "http://example.com/plugin",
-        enabled=False,
-        port_values={"enabled": 0.0, "mix": 0.5},
-    ) is True
-    assert adapter._rust.calls == [
-        ("lv2_restore_slot", "lv2_0", "http://example.com/plugin"),
-        ("lv2_set_slot_enabled", "lv2_0", False),
-        ("lv2_set_port_value", "lv2_0", "mix", 0.5),
-    ]
-    assert adapter.lv2_slots == {
-        "lv2_0": {
-            "uri": "http://example.com/plugin",
-            "enabled": False,
-            "port_values": {"mix": 0.5},
-        }
-    }
-    assert adapter.output_error is None
-
-
-def test_lv2_set_port_value_does_not_persist_enabled_symbol():
-    adapter = object.__new__(rust_audio.RustAudioPlayerAdapter)
-    adapter._rust = _FakeRust()
-    adapter.output_error = "boom"
-    adapter.lv2_slots = {"lv2_0": {"uri": "http://example.com/plugin", "enabled": True, "port_values": {}}}
-
-    assert adapter.lv2_set_port_value("lv2_0", "enabled", 1.0) is True
-    assert adapter._rust.calls == [("lv2_set_port_value", "lv2_0", "enabled", 1.0)]
-    assert adapter.lv2_slots["lv2_0"]["port_values"] == {}
-    assert adapter.output_error is None
-
-
-def test_lv2_set_port_value_does_not_persist_enable_symbol():
-    adapter = object.__new__(rust_audio.RustAudioPlayerAdapter)
-    adapter._rust = _FakeRust()
-    adapter.output_error = "boom"
-    adapter.lv2_slots = {"lv2_0": {"uri": "http://example.com/plugin", "enabled": True, "port_values": {}}}
-
-    assert adapter.lv2_set_port_value("lv2_0", "enable", 1.0) is True
-    assert adapter._rust.calls == [("lv2_set_port_value", "lv2_0", "enable", 1.0)]
-    assert adapter.lv2_slots["lv2_0"]["port_values"] == {}
-    assert adapter.output_error is None
-
-
-def test_lv2_restore_slots_batches_graph_restore():
-    adapter = object.__new__(rust_audio.RustAudioPlayerAdapter)
-    adapter._rust = _FakeRust()
-    adapter._rust.lib = SimpleNamespace(
-        rac_lv2_clear_slots_for_restore=True,
-        rac_lv2_restore_slot_deferred=True,
-        rac_lv2_finish_restore_slots=True,
-    )
-    adapter.output_error = "boom"
-    adapter.lv2_slots = {"old": {"uri": "http://old/plugin", "enabled": True, "port_values": {"mix": 0.2}}}
-
-    assert adapter.lv2_restore_slots(
-        [
-            {
-                "slot_id": "lv2_0",
-                "uri": "http://example.com/plugin",
-                "enabled": False,
-                "port_values": {"enabled": 0.0, "mix": 0.5},
-            }
-        ]
-    ) is True
-    assert adapter._rust.calls == [
-        ("lv2_clear_slots_for_restore",),
-        ("lv2_restore_slot_deferred", "lv2_0", "http://example.com/plugin"),
-        ("lv2_finish_restore_slots",),
-        ("lv2_set_slot_enabled", "lv2_0", False),
-        ("lv2_set_port_value", "lv2_0", "mix", 0.5),
-    ]
-    assert adapter.lv2_slots == {
-        "lv2_0": {
-            "uri": "http://example.com/plugin",
-            "enabled": False,
-            "port_values": {"mix": 0.5},
-        }
-    }
-    assert adapter.output_error is None
-
-
-def test_lv2_restore_slots_falls_back_when_batch_symbols_are_unavailable():
-    adapter = object.__new__(rust_audio.RustAudioPlayerAdapter)
-    adapter._rust = _FakeRust()
-    adapter._rust.lib = object()
-    adapter.output_error = "boom"
-    adapter.lv2_slots = {}
-
-    assert adapter.lv2_restore_slots(
-        [
-            {
-                "slot_id": "lv2_0",
-                "uri": "http://example.com/plugin",
-                "enabled": False,
-                "port_values": {"mix": 0.5},
-            }
-        ]
-    ) is True
-    assert adapter._rust.calls == [
-        ("lv2_restore_slot", "lv2_0", "http://example.com/plugin"),
-        ("lv2_set_slot_enabled", "lv2_0", False),
-        ("lv2_set_port_value", "lv2_0", "mix", 0.5),
-    ]
 
 
 def test_set_limiter_enabled_forwards_to_rust():

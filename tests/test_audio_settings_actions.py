@@ -627,8 +627,8 @@ def test_on_driver_changed_releases_usb_rawlink_before_enumerating_alsa(monkeypa
             super().__init__()
             self.output_state = "active"
             self.current_device_id = "usb:1a2b:3c4d"
-            self.current_driver = "USB Rawlink"
-            self.requested_driver = "USB Rawlink"
+            self.current_driver = "USB Rawlink v2"
+            self.requested_driver = "USB Rawlink v2"
             self.phase = []
             self.release_calls = []
 
@@ -695,7 +695,7 @@ def test_schedule_output_refresh_after_usb_release_prefers_requested_device(monk
 
     audio_settings_actions._schedule_output_refresh_after_usb_release(
         app,
-        audio_settings_actions.DRIVER_USB_RAWLINK,
+        audio_settings_actions.DRIVER_USB_RAWLINK_V2,
         audio_settings_actions.DRIVER_ALSA_AUTO,
     )
 

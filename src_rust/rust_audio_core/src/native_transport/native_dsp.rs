@@ -9,6 +9,9 @@ use crate::dsp::{
     ConvolverState, DspGraphConfig, DspOrderEntry, DspReorderableModule,
     LimiterState, PeqState, TapeState, TubeState, WidenerState,
 };
+use crate::native_transport::format_util::{
+    bytes_per_sample, sample_to_f64, PCM_S16_SCALE, PCM_S24_SCALE, PCM_S32_SCALE,
+};
 use crate::native_transport::processor::{
     PcmProcessor, PcmSampleFormat, PcmSlab, PcmStreamSpec,
 };
@@ -186,9 +189,6 @@ impl PcmProcessor for DspPcmProcessor {
                 DspOrderEntry::Builtin(DspReorderableModule::Widener) => {
                     self.widener.process(&mut self.f64_buf, channels);
                 }
-                DspOrderEntry::Lv2Slot(_) => {
-                    // LV2 plugins are GStreamer-only; skip in native transport.
-                }
             }
         }
         // Limiter always runs last (same as GStreamer graph).
@@ -256,17 +256,23 @@ fn f64_to_pcm(samples: &[f64], format: PcmSampleFormat, out: &mut Vec<u8>) {
     for &s in samples {
         match format {
             PcmSampleFormat::S16LE => {
-                let v = (s * 32768.0).round().clamp(-32768.0, 32767.0) as i16;
+                let v = (s * PCM_S16_SCALE)
+                    .round()
+                    .clamp(-PCM_S16_SCALE, PCM_S16_SCALE - 1.0) as i16;
                 out.extend_from_slice(&v.to_le_bytes());
             }
             PcmSampleFormat::S24_3LE => {
-                let v = (s * 8388608.0).round().clamp(-8388608.0, 8388607.0) as i32;
+                let v = (s * PCM_S24_SCALE)
+                    .round()
+                    .clamp(-PCM_S24_SCALE, PCM_S24_SCALE - 1.0) as i32;
                 out.push(v as u8);
                 out.push((v >> 8) as u8);
                 out.push((v >> 16) as u8);
             }
             PcmSampleFormat::S24LE | PcmSampleFormat::S32LE => {
-                let v = (s * 2147483648.0).round().clamp(i32::MIN as f64, i32::MAX as f64) as i32;
+                let v = (s * PCM_S32_SCALE)
+                    .round()
+                    .clamp(-PCM_S32_SCALE, PCM_S32_SCALE - 1.0) as i32;
                 out.extend_from_slice(&v.to_le_bytes());
             }
             PcmSampleFormat::F32LE => {
@@ -279,36 +285,3 @@ fn f64_to_pcm(samples: &[f64], format: PcmSampleFormat, out: &mut Vec<u8>) {
     }
 }
 
-fn bytes_per_sample(format: PcmSampleFormat) -> usize {
-    match format {
-        PcmSampleFormat::S16LE => 2,
-        PcmSampleFormat::S24_3LE => 3,
-        PcmSampleFormat::S24LE | PcmSampleFormat::S32LE => 4,
-        PcmSampleFormat::F32LE => 4,
-        PcmSampleFormat::F64LE => 8,
-    }
-}
-
-fn sample_to_f64(bytes: &[u8], format: PcmSampleFormat) -> f64 {
-    match format {
-        PcmSampleFormat::S16LE => {
-            i16::from_le_bytes([bytes[0], bytes[1]]) as f64 / 32768.0
-        }
-        PcmSampleFormat::S24_3LE => {
-            let raw = (bytes[0] as i32) | ((bytes[1] as i32) << 8) | ((bytes[2] as i8 as i32) << 16);
-            raw as f64 / 8388608.0
-        }
-        PcmSampleFormat::S24LE | PcmSampleFormat::S32LE => {
-            i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f64 / 2147483648.0
-        }
-        PcmSampleFormat::F32LE => {
-            f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f64
-        }
-        PcmSampleFormat::F64LE => {
-            f64::from_le_bytes([
-                bytes[0], bytes[1], bytes[2], bytes[3],
-                bytes[4], bytes[5], bytes[6], bytes[7],
-            ])
-        }
-    }
-}

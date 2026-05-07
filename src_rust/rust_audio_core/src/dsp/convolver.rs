@@ -1,12 +1,7 @@
-use gst::prelude::*;
-use gst::PadProbeReturn;
-use gst::PadProbeType;
-use gstreamer as gst;
 use rustfft::{num_complex::Complex, FftPlanner};
 use std::collections::VecDeque;
 use std::fs;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
 
 const MAX_CONVOLVER_TAPS: usize = 262_144;
 
@@ -479,114 +474,6 @@ impl ConvolverState {
                 self.wet_gain = self.wet_gain_target;
             }
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Public GStreamer node
-// ---------------------------------------------------------------------------
-
-#[derive(Debug)]
-pub struct ConvolverNode {
-    bin: gst::Bin,
-    state: Arc<Mutex<ConvolverState>>,
-}
-
-impl ConvolverNode {
-    pub fn new() -> Result<Self, String> {
-        let bin = gst::Bin::new();
-
-        // Single identity element; the pad probe below does all DSP.
-        // Dry/wet mixing and crossfade are handled in Rust — no tee or
-        // audiomixer needed, which avoids the deadlock-prone deinterleave
-        // pipeline and the audiomixer synchronization stall on the dry path.
-        let identity = gst::ElementFactory::make("identity")
-            .name("rust-dsp-conv")
-            .build()
-            .map_err(|e| format!("identity unavailable: {e}"))?;
-        let _ = identity.set_property("silent", true);
-
-        bin.add(&identity)
-            .map_err(|_| "failed to add conv identity".to_string())?;
-
-        let sink_pad = identity
-            .static_pad("sink")
-            .ok_or("conv identity missing sink")?;
-        let src_pad = identity
-            .static_pad("src")
-            .ok_or("conv identity missing src")?;
-        let ghost_sink = gst::GhostPad::with_target(&sink_pad)
-            .map_err(|_| "failed to create conv ghost sink")?;
-        let ghost_src =
-            gst::GhostPad::with_target(&src_pad).map_err(|_| "failed to create conv ghost src")?;
-        bin.add_pad(&ghost_sink)
-            .map_err(|_| "failed to add conv ghost sink")?;
-        bin.add_pad(&ghost_src)
-            .map_err(|_| "failed to add conv ghost src")?;
-
-        let state = Arc::new(Mutex::new(ConvolverState::new()));
-        let probe_state = Arc::clone(&state);
-
-        src_pad.add_probe(PadProbeType::BUFFER, move |pad, info| {
-            let Some(gst::PadProbeData::Buffer(ref mut buffer)) = info.data else {
-                return PadProbeReturn::Ok;
-            };
-            let Ok(mut st) = probe_state.try_lock() else {
-                return PadProbeReturn::Ok;
-            };
-            let (rate, channels) = if let Some(caps) = pad.current_caps() {
-                if let Some(s) = caps.structure(0) {
-                    let r = s.get::<i32>("rate").unwrap_or(44100) as u32;
-                    let ch = s.get::<i32>("channels").unwrap_or(2).max(1) as usize;
-                    (r, ch)
-                } else {
-                    (44100, 2)
-                }
-            } else {
-                (44100, 2)
-            };
-            st.update_stream_rate(rate);
-            let buf = buffer.make_mut();
-            if let Ok(mut map) = buf.map_writable() {
-                let raw = map.as_mut_slice();
-                if raw.len() % 8 == 0 {
-                    // SAFETY: format is F64LE, 8-byte aligned by GStreamer.
-                    let samples = unsafe {
-                        std::slice::from_raw_parts_mut(raw.as_mut_ptr() as *mut f64, raw.len() / 8)
-                    };
-                    st.process(samples, channels);
-                }
-            }
-            PadProbeReturn::Ok
-        });
-
-        let mut node = Self { bin, state };
-        node.apply_config(&ConvolverConfig::default())?;
-        Ok(node)
-    }
-
-    pub fn element(&self) -> &gst::Element {
-        self.bin.upcast_ref()
-    }
-
-    pub fn apply_config(&mut self, config: &ConvolverConfig) -> Result<(), String> {
-        let Ok(mut st) = self.state.lock() else {
-            return Err("convolver state lock poisoned".to_string());
-        };
-        if config.is_active() {
-            st.pre_delay_ms = config.pre_delay_ms;
-            st.update_kernels(
-                config.kernel_l.clone(),
-                config.kernel_r.clone(),
-                config.sample_rate_hz,
-            );
-            st.dry_gain_target = (1.0 - config.mix).clamp(0.0, 1.0);
-            st.wet_gain_target = config.mix.clamp(0.0, 1.0);
-        } else {
-            st.dry_gain_target = 1.0;
-            st.wet_gain_target = 0.0;
-        }
-        Ok(())
     }
 }
 

@@ -14,7 +14,6 @@ _tag="v${pkgver}"
 _srcdir="hiresTI-${pkgver}"
 depends=(
   'alsa-lib'
-  'gst-plugin-pipewire'
   'gst-plugins-bad'
   'gst-plugins-good'
   'gst-plugins-ugly'
@@ -22,8 +21,6 @@ depends=(
   'gstreamer'
   'gtk4'
   'libadwaita'
-  'libpulse'
-  'pipewire'
   'python'
   'python-cairo'
   'python-dateutil'
@@ -42,6 +39,7 @@ depends=(
   'mesa'
   'libglvnd'
   'webkitgtk-6.0'
+  'xdg-dbus-proxy'
 )
 makedepends=(
   'cargo'

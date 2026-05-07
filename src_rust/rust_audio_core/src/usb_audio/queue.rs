@@ -1,8 +1,8 @@
 //! SPSC lock-free ring buffer for PCM byte streaming.
 //!
-//! [`FrameQueue`] bridges the GStreamer appsink pull thread (producer) and
-//! the USB ISO transfer callback (consumer).  Both ends operate concurrently
-//! with no mutex — only two `AtomicUsize` indices.
+//! [`FrameQueue`] bridges the V2 native_transport decode worker (producer)
+//! and the USB ISO transfer callback (consumer).  Both ends operate
+//! concurrently with no mutex — only two `AtomicUsize` indices.
 //!
 //! # Capacity
 //!

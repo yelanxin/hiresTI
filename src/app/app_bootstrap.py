@@ -355,11 +355,28 @@ def do_activate(self):
         saved_drv = "ALSA（auto）"
     elif saved_drv == "ALSA (mmap)":
         saved_drv = "ALSA（mmap）"
+    elif saved_drv == "USB Rawlink":
+        # Legacy V1 driver removed; migrate forward to V2 silently.
+        saved_drv = "USB Rawlink v2"
+        self.settings["driver"] = saved_drv
+        try:
+            self.save_settings()
+        except Exception:
+            pass
+    elif saved_drv == "PipeWire":
+        # PipeWire driver removed; fall back to Auto (Default) which still
+        # picks the system default sink (ALSA→PipeWire bridge if present).
+        saved_drv = "Auto (Default)"
+        self.settings["driver"] = saved_drv
+        try:
+            self.save_settings()
+        except Exception:
+            pass
     if is_ex:
         drivers = [
             drv
             for drv in drivers
-            if drv in ("ALSA（auto）", "ALSA（mmap）", "USB Rawlink", "USB Rawlink v2")
+            if drv in ("ALSA（auto）", "ALSA（mmap）", "USB Rawlink v2")
         ]
 
     # 如果保存的是 ALSA 或其他驱动，先尝试选中
