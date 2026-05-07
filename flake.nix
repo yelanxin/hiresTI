@@ -42,11 +42,16 @@
           cargoLock = {
             lockFile = ./src_rust/rust_audio_core/Cargo.lock;
           };
+          # The in-tree .cargo/config.toml pins crates-io to a local
+          # `vendor/` dir for the offline Docker / AUR builds; Nix has
+          # its own vendor handling via cargoLock, so wipe the override
+          # before the build phase.
+          postPatch = ''
+            rm -f .cargo/config.toml
+          '';
           nativeBuildInputs = with pkgs; [ pkg-config cmake ];
           buildInputs = with pkgs; [ alsa-lib libusb1 openssl ];
           doCheck = false;
-          # We only need the .so library; usb_enum / play_test bins go to /bin
-          # in the resulting derivation but we don't propagate them.
         };
 
         rustVizCore = rustPlatform.buildRustPackage {
@@ -76,8 +81,19 @@
           libadwaita
           gtksourceview5
           webkitgtk_6_0
+          graphene
+          harfbuzz
+          pango
+          cairo
+          gdk-pixbuf
+          glib
           gobject-introspection
           glib-networking
+          # GStreamer kept only for GstPbutils.Discoverer (URI probing in
+          # src/_rust/audio.py); the audio playback path itself no longer
+          # uses GStreamer.
+          gst_all_1.gstreamer
+          gst_all_1.gst-plugins-base
           alsa-lib
           libpulseaudio
           pipewire
@@ -93,7 +109,7 @@
           src = ./.;
 
           nativeBuildInputs = with pkgs; [
-            wrapGAppsHook
+            wrapGAppsHook4
             gobject-introspection
             makeWrapper
           ];
@@ -127,7 +143,7 @@
               --add-flags "$out/share/hiresti/src/main.py" \
               --set PYTHONDONTWRITEBYTECODE 1 \
               --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath runtimeLibs}" \
-              --set GI_TYPELIB_PATH "${pkgs.lib.makeSearchPathOutput "lib" "lib/girepository-1.0" runtimeLibs}" \
+              --prefix GI_TYPELIB_PATH : "${pkgs.lib.makeSearchPathOutput "lib" "lib/girepository-1.0" runtimeLibs}" \
               --chdir $out/share/hiresti
 
             runHook postInstall
