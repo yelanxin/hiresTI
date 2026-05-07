@@ -19,13 +19,16 @@ logger = logging.getLogger(__name__)
 
 
 def _webkit_runtime_usable():
-    """WebKitGTK 6.0 spawns `xdg-dbus-proxy` to sandbox its network process.
-    When the binary is missing (or the user has explicitly opted out)
-    the WebView constructor aborts with SIGTRAP after printing
-    `Failed to fully launch dbus-proxy: Child process exited with code 1`,
-    which crashes the whole app — Python can't intercept that signal.
-    Probe at module load so we can fall through to the paste-URL flow
-    cleanly instead of trying and dying."""
+    """WebKitGTK 6.0 spawns `xdg-dbus-proxy` to sandbox its network process,
+    and the proxy itself runs inside a `bwrap` user namespace. When any
+    link in that chain is broken — binaries missing, the kernel rejecting
+    unprivileged userns clones, AppArmor restricting the chrome profile,
+    or dbus-proxy exiting non-zero — the WebView constructor aborts with
+    SIGTRAP after printing the canonical
+    `Failed to fully launch dbus-proxy: Child process exited with code 1`
+    message, which crashes the whole app (Python can't intercept that
+    signal). Probe at module load so we can fall through to the
+    paste-URL flow cleanly instead of trying and dying."""
     if os.environ.get("HIRESTI_DISABLE_WEBKIT", "").strip() in ("1", "true", "yes"):
         logger.info("Embedded WebKit login disabled via HIRESTI_DISABLE_WEBKIT.")
         return False
@@ -33,6 +36,39 @@ def _webkit_runtime_usable():
         logger.info(
             "xdg-dbus-proxy not on PATH — WebKit login disabled, "
             "falling back to paste-URL flow."
+        )
+        return False
+    if shutil.which("bwrap") is None:
+        logger.info(
+            "bwrap not on PATH — WebKit login disabled, "
+            "falling back to paste-URL flow."
+        )
+        return False
+    # Active probe: WebKit's network-process sandbox needs an
+    # unprivileged user namespace. On Ubuntu 24.04 with the default
+    # AppArmor `unprivileged_userns_clone` restriction this fails with
+    # "bwrap: setting up uid map: Permission denied" even though both
+    # `xdg-dbus-proxy` and `bwrap` are installed. Run a minimal bwrap
+    # invocation to see whether userns actually works for our process.
+    try:
+        result = subprocess.run(
+            ["bwrap", "--unshare-user", "--unshare-pid",
+             "--bind", "/", "/", "true"],
+            capture_output=True,
+            timeout=3,
+        )
+    except Exception as _e:
+        logger.info(
+            "bwrap probe could not run (%s) — WebKit login disabled.", _e,
+        )
+        return False
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", errors="ignore").strip()
+        logger.info(
+            "bwrap userns probe failed (rc=%d%s) — WebKit login disabled, "
+            "falling back to paste-URL flow.",
+            result.returncode,
+            f": {stderr}" if stderr else "",
         )
         return False
     return True
@@ -70,19 +106,34 @@ except (ValueError, ImportError):
 # we only ever load Tidal's login pages here, so the surface is
 # acceptable.
 if _WEBKIT_AVAILABLE:
-    try:
-        WebKit.WebContext.get_default().set_sandbox_enabled(False)
-        logging.getLogger(__name__).debug(
-            "WebKit sandbox disabled to avoid xdg-dbus-proxy / bwrap dependency"
-        )
-    except Exception as _e:
-        # If the API surface ever changes (WebKit 7+) we'd rather log and
-        # move on than refuse to launch the app entirely. The PKCE path
-        # has its own paste-URL fallback that still works.
-        logging.getLogger(__name__).warning(
-            "Could not disable WebKit sandbox: %s — PKCE may crash on hosts "
-            "with broken xdg-dbus-proxy/bwrap setups", _e,
-        )
+    _logger = logging.getLogger(__name__)
+    # Attempt to disable the WebKit network-process sandbox on builds
+    # that still expose the API. WebKitGTK 4.x had it on WebContext;
+    # newer builds may put it on NetworkSession; in WebKit 6.0 the
+    # method is gone entirely and the sandbox is mandatory — that's
+    # why `_webkit_runtime_usable()` actively probes bwrap so the
+    # paste-URL flow takes over before any WebView is constructed.
+    # We attempt both calls quietly; missing methods are not warnings.
+    _ctx = WebKit.WebContext.get_default()
+    if hasattr(_ctx, "set_sandbox_enabled"):
+        try:
+            _ctx.set_sandbox_enabled(False)
+            _logger.debug("WebKit WebContext sandbox disabled")
+        except Exception as _e:
+            _logger.warning("WebKit WebContext.set_sandbox_enabled failed: %s", _e)
+    if hasattr(WebKit, "NetworkSession"):
+        try:
+            _ses = WebKit.NetworkSession.get_default()
+        except Exception:
+            _ses = None
+        if _ses is not None and hasattr(_ses, "set_sandbox_enabled"):
+            try:
+                _ses.set_sandbox_enabled(False)
+                _logger.debug("WebKit NetworkSession sandbox disabled")
+            except Exception as _e:
+                _logger.warning(
+                    "WebKit NetworkSession.set_sandbox_enabled failed: %s", _e,
+                )
 
 from core.errors import classify_exception
 from core.executor import submit_daemon
