@@ -1,5 +1,68 @@
 # Changelog
 
+## 1.9.5.8 - 2026-05-20
+
+Cleanup point release that quiets four startup-stage issues surfaced
+in user logs: an always-on `gst_is_initialized()` assertion left over
+from the rust-only migration, a `no valid context` PyOpenGL failure
+that blanked the GL visualizers on GTK4 / EGL stacks, a CSS
+`color-mix()` parse error on GTK < 4.10, and a silent settings/UI
+drift in the audio-driver dropdown when **Exclusive lock** is on.
+
+### Fixed
+
+- **`gst_is_initialized() failed` assertion + misleading "Rust discoverer
+  init failed" warning gone.** `GstPbutils.Discoverer.new()` was the
+  URI pre-detect path for the **PipeWire** driver, which the rust-only
+  migration removed — `_maybe_pre_adjust_pipewire_rate` now early-
+  returns at the driver check, so the Discoverer is unreachable.
+  Constructing it still fired `gst_element_factory_make` against an
+  un-`Gst.init()`'d process every startup, producing two
+  `GStreamer-CRITICAL` lines and a `WARNING | _rust.audio | Rust
+  discoverer init failed; source pre-detect disabled`. Dropped the
+  `try: GstPbutils.Discoverer.new(...)` block; the existing
+  `if self._discoverer is None: return True` short-circuit keeps the
+  rest of the path correct.
+- **DotsGL / BarsGL visualizer setup no longer fails on GTK4 + EGL
+  with `Attempt to retrieve context when no valid context`.**
+  `_setup_gl()` called `GL.glVertexAttribPointer(0, 2, GL_FLOAT,
+  GL_FALSE, 0, None)`. PyOpenGL's wrapper routed the `None` pointer
+  through `contextdata.setValue → getContext`, which on Linux queries
+  the legacy `glXGetCurrentContext()` — that returns NULL on a GTK4
+  EGL context (Wayland and many recent X11 setups), and PyOpenGL
+  raises. Replaced `None` with `ctypes.c_void_p(0)` at both call sites
+  (`viz/visualizer.py:4065` and `:5250`) so PyOpenGL treats it as a
+  VBO offset and skips the array-tracking path entirely.
+- **Mini-queue drawer background color now applies on GTK 4.6 / 4.8
+  hosts (no more "Theme parser error: Expected a valid color").** The
+  bundled CSS used CSS4 `color-mix(in srgb, @headerbar_bg_color 85%,
+  black)`, which GTK only learned in 4.10. On older hosts the parser
+  dropped the whole rule and the list fell back to the default
+  list-view background. Switched to GTK's native
+  `mix(@headerbar_bg_color, black, 0.15)`, which is supported all the
+  way back to GTK 3 and is the visual equivalent.
+- **Audio-driver dropdown no longer silently drifts away from saved
+  settings when Exclusive lock is on.** With `exclusive_lock = true`,
+  `app_bootstrap` filters the dropdown down to
+  `ALSA（auto）` / `ALSA（mmap）` / `USB Rawlink v2`, but the
+  `settings["driver"]` default is `"Auto (Default)"`. Because the
+  saved label was no longer in the filtered list, `set_selected` was
+  never called, the dropdown silently defaulted to the first row
+  (visually `ALSA（auto）`), and `current_driver` stayed
+  `"Auto (Default)"`. The two labels happen to route through the same
+  `snd_pcm_open("default")` path in Rust, so playback worked, but a
+  user looking at the settings UI couldn't tell what was actually
+  selected. On entering the filtered branch, `bootstrap` now migrates
+  `"Auto (Default)"` → `"ALSA（auto）"` in settings (writing back via
+  `save_settings()`) so the UI label, the in-memory `current_driver`,
+  and the on-disk setting all agree.
+
+### Unreleased
+
+- 1.9.5.7 was tagged in `CHANGELOG.md` (below) but never published —
+  its bwrap-userns-probe content is rolled into the 1.9.5.8 release
+  binaries, so users coming from 1.9.5.6 get both fixes in one jump.
+
 ## 1.9.5.7 - 2026-05-07
 
 Hotfix follow-up to 1.9.5.6: the previous fix called
