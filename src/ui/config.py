@@ -953,7 +953,7 @@ window.mini-mode .mini-queue-drawer {
     padding-top: 0;
     margin-top: 0;
 }
-.mini-queue-drawer list.mini-queue-list { background-color: color-mix(in srgb, @headerbar_bg_color 85%, black); border-radius: 8px; padding: 4px; }
+.mini-queue-drawer list.mini-queue-list { background-color: mix(@headerbar_bg_color, black, 0.15); border-radius: 8px; padding: 4px; }
 .mini-queue-list row { padding: 2px 4px; border-radius: 6px; }
 .mini-queue-list row:hover { background: alpha(currentColor, 0.08); }
 .mini-queue-list row:selected { background: alpha(@accent_color, 0.15); }

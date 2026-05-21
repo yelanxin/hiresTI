@@ -4062,7 +4062,13 @@ class DotsGLVisualizer(Gtk.GLArea):
         GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self._vbo)
         GL.glBufferData(GL.GL_ARRAY_BUFFER, ctypes.sizeof(arr), arr, GL.GL_STATIC_DRAW)
         GL.glEnableVertexAttribArray(0)
-        GL.glVertexAttribPointer(0, 2, GL.GL_FLOAT, GL.GL_FALSE, 0, None)
+        # Use a 0-offset c_void_p instead of `None`. With `None`, PyOpenGL
+        # routes through contextdata.setValue → getContext, which on GTK4's
+        # EGL stack queries the legacy GLX `glXGetCurrentContext()` and
+        # finds no context → raises "Attempt to retrieve context when no
+        # valid context", breaking GL viz setup. A c_void_p(0) is treated
+        # as a VBO offset and skips that array-tracking path entirely.
+        GL.glVertexAttribPointer(0, 2, GL.GL_FLOAT, GL.GL_FALSE, 0, ctypes.c_void_p(0))
         GL.glBindBuffer(GL.GL_ARRAY_BUFFER, 0)
         GL.glBindVertexArray(0)
 
@@ -5247,7 +5253,13 @@ class BarsGLVisualizer(Gtk.GLArea):
         GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self._vbo)
         GL.glBufferData(GL.GL_ARRAY_BUFFER, ctypes.sizeof(arr), arr, GL.GL_STATIC_DRAW)
         GL.glEnableVertexAttribArray(0)
-        GL.glVertexAttribPointer(0, 2, GL.GL_FLOAT, GL.GL_FALSE, 0, None)
+        # Use a 0-offset c_void_p instead of `None`. With `None`, PyOpenGL
+        # routes through contextdata.setValue → getContext, which on GTK4's
+        # EGL stack queries the legacy GLX `glXGetCurrentContext()` and
+        # finds no context → raises "Attempt to retrieve context when no
+        # valid context", breaking GL viz setup. A c_void_p(0) is treated
+        # as a VBO offset and skips that array-tracking path entirely.
+        GL.glVertexAttribPointer(0, 2, GL.GL_FLOAT, GL.GL_FALSE, 0, ctypes.c_void_p(0))
         GL.glBindBuffer(GL.GL_ARRAY_BUFFER, 0)
         GL.glBindVertexArray(0)
 

@@ -1780,12 +1780,14 @@ class RustAudioPlayerAdapter:
         self._pw_last_probe_ts = 0.0
         self._pw_retry_backoff_s = 0.0
         self._pipewire_rate_blocked = False
+        # GStreamer Discoverer was the URI pre-detect path for the PipeWire
+        # driver, but rust-only migration dropped Gst.init() and removed the
+        # PipeWire driver — _maybe_pre_adjust_pipewire_rate() now always
+        # early-returns at the driver check. Constructing the Discoverer
+        # still fired `gst_is_initialized()` assertions every startup with
+        # no functional gain, so leave the slot None and let the existing
+        # `if self._discoverer is None` short-circuit handle it.
         self._discoverer = None
-        try:
-            self._discoverer = GstPbutils.Discoverer.new(1 * Gst.SECOND)
-        except Exception:
-            self._discoverer = None
-            logger.warning("Rust discoverer init failed; source pre-detect disabled")
         if self._rust.available:
             self._rust.set_event_callback(self._on_rust_event)
             try:

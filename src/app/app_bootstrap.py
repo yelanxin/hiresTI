@@ -378,6 +378,18 @@ def do_activate(self):
             for drv in drivers
             if drv in ("ALSA（auto）", "ALSA（mmap）", "USB Rawlink v2")
         ]
+        # Exclusive-lock 隐藏了 "Auto (Default)" 这一项，但 settings 默认值
+        # 还是 "Auto (Default)"。不迁移就会出现：UI 视觉停在 ALSA（auto）、
+        # current_driver 仍是 "Auto (Default)"、on_driver_changed 也不触发，
+        # 三处状态错位。两者在 Rust 端都走 driver_routes_via_native_alsa →
+        # snd_pcm_open("default")，路径完全一致，直接换字符串无副作用。
+        if saved_drv == "Auto (Default)":
+            saved_drv = "ALSA（auto）"
+            self.settings["driver"] = saved_drv
+            try:
+                self.save_settings()
+            except Exception:
+                pass
 
     # 如果保存的是 ALSA 或其他驱动，先尝试选中
     # Suppress the signal so on_driver_changed doesn't fire now —
