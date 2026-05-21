@@ -2,7 +2,21 @@
 src_rust/rust_audio_core/target
 src_rust/rust_viz_core/target
 src_rust/rust_launcher/target
+# Stray Rust build artifacts from working on the flatpak/portal-engine-wire
+# branch (where src/ IS the Rust workspace). On main, src/ is the Python
+# tree and these subdirs are untracked / not part of the source. Without
+# this exclusion the docker build context balloons to ~36 GB and the
+# rootless buildkit context-builder fails before COPY can even run.
+src/target
+src/rust_audio_core
+src/rust_viz_core
+src/rust_launcher
+src/rust_tidal_core
+src/Cargo.lock
 build_tmp
+build-flatpak
+.flatpak-builder
+.codex
 dist
 build_rpmbuild_*
 build_archpkg
