@@ -299,7 +299,12 @@ def do_activate(self):
 
     # === 恢复设置逻辑 ===
     is_bp = self.settings.get("bit_perfect", False)
-    is_ex = self.settings.get("exclusive_lock", False)
+    # The standalone exclusive_lock UI is gone — Bit-Perfect is the
+    # single user-facing toggle and implies exclusive at the audio path.
+    # Still honor a legacy saved exclusive_lock=True when bit_perfect is
+    # off, so users coming from an older build don't lose their setting.
+    is_ex = bool(is_bp) or bool(self.settings.get("exclusive_lock", False))
+    self.settings["exclusive_lock"] = is_ex
 
     # 1. 应用 Bit-Perfect 和 独占状态
     if is_bp:
@@ -358,15 +363,6 @@ def do_activate(self):
     elif saved_drv == "USB Rawlink":
         # Legacy V1 driver removed; migrate forward to V2 silently.
         saved_drv = "USB Rawlink v2"
-        self.settings["driver"] = saved_drv
-        try:
-            self.save_settings()
-        except Exception:
-            pass
-    elif saved_drv == "PipeWire":
-        # PipeWire driver removed; fall back to Auto (Default) which still
-        # picks the system default sink (ALSA→PipeWire bridge if present).
-        saved_drv = "Auto (Default)"
         self.settings["driver"] = saved_drv
         try:
             self.save_settings()

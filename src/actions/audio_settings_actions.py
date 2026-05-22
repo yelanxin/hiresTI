@@ -305,11 +305,15 @@ def _driver_choices_for_mode(app, exclusive_enabled=None):
     player = getattr(app, "player", None)
     drivers = list(player.get_drivers() or []) if player is not None else []
     if exclusive_enabled is None:
-        ex_switch = getattr(app, "ex_switch", None)
-        if ex_switch is not None:
-            exclusive_enabled = bool(ex_switch.get_active())
-        else:
-            exclusive_enabled = bool(getattr(app, "settings", {}).get("exclusive_lock", False))
+        # The historical exclusive_lock toggle is gone — Bit-Perfect is the
+        # single source of truth for the "hide PipeWire + Auto Default"
+        # filter. Prefer the live player state and fall back to the saved
+        # setting (covers calls that run before the player has been told
+        # about Bit-Perfect on startup).
+        bp_state = getattr(player, "bit_perfect_mode", None) if player is not None else None
+        if bp_state is None:
+            bp_state = bool(getattr(app, "settings", {}).get("bit_perfect", False))
+        exclusive_enabled = bool(bp_state)
     if exclusive_enabled:
         drivers = [drv for drv in drivers if _driver_is_alsa_family(drv) or _driver_is_usb_rawlink_family(drv)]
     return drivers
@@ -1160,17 +1164,19 @@ def on_driver_changed(app, dd, p):
     )
     _driver_mark(f"begin driver={driver_name}")
 
-    if app.ex_switch.get_active() and not _driver_is_alsa_family(driver_name) and not _driver_is_usb_rawlink_family(driver_name):
+    bp_active = bool(getattr(app.player, "bit_perfect_mode", False)) \
+        or bool(getattr(app, "settings", {}).get("bit_perfect", False))
+    if bp_active and not _driver_is_alsa_family(driver_name) and not _driver_is_usb_rawlink_family(driver_name):
         app._force_driver_selection(DRIVER_ALSA_AUTO)
         if hasattr(app, "show_output_notice"):
             app.show_output_notice(
-                f"Exclusive mode requires {DRIVER_ALSA_AUTO}, {DRIVER_ALSA_MMAP}, or {DRIVER_USB_RAWLINK_V2}.",
+                f"Bit-Perfect mode requires {DRIVER_ALSA_AUTO}, {DRIVER_ALSA_MMAP}, or {DRIVER_USB_RAWLINK_V2}.",
                 "warn",
                 3200,
             )
         return
 
-    if not app.ex_switch.get_active() or _driver_is_alsa_family(driver_name) or _driver_is_usb_rawlink_family(driver_name):
+    if not bp_active or _driver_is_alsa_family(driver_name) or _driver_is_usb_rawlink_family(driver_name):
         app.settings["driver"] = driver_name
         app.save_settings()
     _driver_mark("settings-saved")
@@ -1717,14 +1723,13 @@ def on_bit_perfect_toggled(self, switch, state):
             self.save_settings()
         if dsp_disabled and hasattr(self, "show_output_notice"):
             self.show_output_notice("DSP disabled: Bit-Perfect mode enabled", "info", 2600)
-    self.ex_switch.set_sensitive(state)
-    if not state:
-        setattr(self, "_exclusive_ui_syncing", True)
-        try:
-            self.ex_switch.set_active(False)
-        finally:
-            setattr(self, "_exclusive_ui_syncing", False)
-    is_ex = self.ex_switch.get_active()
+    # Bit-Perfect now implies hardware exclusive: the two flags move
+    # together so the legacy `Force Hardware Exclusive` switch can stay
+    # removed without losing the D-Bus reservation / driver-filter
+    # behavior the old switch provided.
+    is_ex = bool(state)
+    self.settings["exclusive_lock"] = is_ex
+    self.save_settings()
     if state:
         # Hardware volume (e.g. USB Rawlink v2) doesn't touch PCM data,
         # so volume controls stay unlocked in bit-perfect mode.
@@ -1804,40 +1809,6 @@ def on_bit_perfect_toggled(self, switch, state):
                 GLib.idle_add(_apply_ui)
 
             submit_daemon(_switch_to_pro_audio)
-
-
-def on_exclusive_toggled(self, switch, state):
-    if bool(getattr(self, "_exclusive_ui_syncing", False)):
-        return False
-
-    self.settings["exclusive_lock"] = state
-    self.save_settings()
-
-    self.player.toggle_bit_perfect(True, exclusive_lock=state)
-    if hasattr(self, "_sync_playback_status_icon"):
-        self._sync_playback_status_icon()
-
-    if state:
-        # 开启独占：允许在 ALSA（auto） / ALSA（mmap）之间切换。
-        prev_driver = _selected_driver_name(self)
-        _refresh_driver_dropdown_options(
-            self,
-            preferred_driver=prev_driver,
-            exclusive_enabled=True,
-        )
-        self.on_driver_changed(self.driver_dd, None)
-    else:
-        # 关闭独占：恢复驱动选择
-        _refresh_driver_dropdown_options(
-            self,
-            preferred_driver=_selected_driver_name(self),
-            exclusive_enabled=False,
-        )
-        self.driver_dd.set_sensitive(True)
-        # 刷新一下非独占状态下的设备列表
-        self.on_device_changed(self.device_dd, None)
-    if hasattr(self, "latency_dd") and self.latency_dd is not None:
-        self.latency_dd.set_sensitive(_driver_is_alsa_family(_selected_driver_name(self)))
 
 
 def on_auto_rebind_once_toggled(self, switch, state):

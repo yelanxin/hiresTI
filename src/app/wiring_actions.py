@@ -154,7 +154,6 @@ def bind_audio_settings_extras(TidalApp, seen=None):
     from actions import audio_settings_actions
     from actions.audio_settings_actions import (
         on_bit_perfect_toggled,
-        on_exclusive_toggled,
         on_auto_rebind_once_toggled,
         on_output_bit_depth_changed,
         _sync_playback_status_icon,
@@ -167,7 +166,6 @@ def bind_audio_settings_extras(TidalApp, seen=None):
 
     bind_map(TidalApp, [
         ("on_bit_perfect_toggled", on_bit_perfect_toggled),
-        ("on_exclusive_toggled", on_exclusive_toggled),
         ("on_auto_rebind_once_toggled", on_auto_rebind_once_toggled),
         ("on_output_bit_depth_changed", on_output_bit_depth_changed),
         ("_sync_playback_status_icon", _sync_playback_status_icon),

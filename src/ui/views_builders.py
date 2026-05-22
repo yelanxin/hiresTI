@@ -489,9 +489,9 @@ def build_settings_page(app):
     bp_pop_content.set_markup(
         "<b>Bit-Perfect Mode</b>\n\n"
         "• <b>Always:</b> bypasses the app EQ and app volume processing.\n\n"
-        "• <b>PipeWire mode:</b> follows the music source sample rate when possible "
-        "and uses the same rate/depth verdict rules as ALSA Exclusive, but audio "
-        "still passes through the system mixer.\n\n"
+        "• <b>PipeWire mode:</b> shared output through the PipeWire graph. Convenient "
+        "for sharing the device with other apps, but PipeWire resamples to its own "
+        "session rate, so this path is not bit-perfect.\n\n"
         "• <b>ALSA（auto）/ALSA（mmap） + Exclusive mode:</b> bypasses the system mixer and is treated as "
         "true bit-perfect playback.\n\n"
         "• <b>USB Rawlink v2:</b> bypasses the kernel USB audio driver and lets hiresTI "
@@ -513,43 +513,14 @@ def build_settings_page(app):
     row_bp.append(app.bp_switch)
     group_out.append(row_bp)
 
-    row_ex = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
-    ex_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
-    title_box = Gtk.Box(spacing=6, orientation=Gtk.Orientation.HORIZONTAL)
-    title_box.append(Gtk.Label(label="Force Hardware Exclusive", xalign=0, css_classes=["settings-label"]))
-    help_btn = Gtk.Button(icon_name="dialog-question-symbolic", css_classes=["flat", "circular"])
-    help_btn.set_tooltip_text("Click for details")
-    help_pop = Gtk.Popover()
-    help_pop.set_parent(help_btn)
-    help_pop.set_autohide(True)
-    pop_content = Gtk.Label(wrap=True, max_width_chars=40, xalign=0)
-    pop_content.set_markup(
-        "<b>Exclusive Mode Control</b>\n\n"
-        "<b>⚠️ Recommendation:</b>\nOnly enable this for <b>External USB DACs</b>.\n\n"
-        "• <b>Benefits:</b> Ensures true Bit-Perfect playback.\n"
-        "• <b>Limitations:</b> System volume DISABLED."
-    )
-    pop_box = Gtk.Box(margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
-    pop_box.append(pop_content)
-    help_pop.set_child(pop_box)
-    help_btn.connect("clicked", lambda x: help_pop.popup())
-    title_box.append(help_btn)
-    ex_info.append(title_box)
-    ex_info.append(
-        Gtk.Label(
-            label="Bypass and release system audio control for this device",
-            xalign=0,
-            css_classes=["dim-label"],
-        )
-    )
-    row_ex.append(ex_info)
-    row_ex.append(Gtk.Box(hexpand=True))
-    app.ex_switch = Gtk.Switch(valign=Gtk.Align.CENTER)
-    app.ex_switch.set_sensitive(app.settings.get("bit_perfect", False))
-    app.ex_switch.set_active(app.settings.get("exclusive_lock", False))
-    app.ex_switch.connect("state-set", app.on_exclusive_toggled)
-    row_ex.append(app.ex_switch)
-    group_out.append(row_ex)
+    # Bit-Perfect now implies hardware exclusive: when the user turns
+    # Bit-Perfect on we filter the driver dropdown to ALSA(auto)/(mmap)/USB
+    # Rawlink v2 and toggle the internal exclusive_lock_mode along with it,
+    # so a separate "Force Hardware Exclusive" switch would just be a second
+    # control wired to the same state. Keep `ex_switch` as a hidden stub so
+    # the few remaining `getattr(app, "ex_switch", None)` call sites are
+    # safe; the real intent now lives in `bp_switch`.
+    app.ex_switch = None
 
     row_rt = Gtk.Box(spacing=12, margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
     rt_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
@@ -629,6 +600,7 @@ def build_settings_page(app):
         "<b>Audio Driver Modes</b>\n\n"
         "• <b>ALSA（auto）:</b> Recommended for most setups. hiresTI chooses the most compatible ALSA path for your device automatically.\n\n"
         "• <b>ALSA（mmap）:</b> A zero-copy ALSA path with a more direct handoff to the device. Best for users who want a leaner playback path or prefer MMAP on their hardware.\n\n"
+        "• <b>PipeWire:</b> Routes through the PipeWire shared graph (ALSA→PipeWire bridge). Shared with other apps and resampled to PipeWire's session rate — convenient, but not bit-perfect.\n\n"
         "• <b>USB Rawlink v2:</b> Bypasses the kernel USB audio driver and lets hiresTI talk directly to the USB device for playback. Best for users who want the most direct player-to-DAC path on a compatible external USB DAC."
     )
     drv_pop_box = Gtk.Box(margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
@@ -649,7 +621,12 @@ def build_settings_page(app):
     row_drv.append(drv_info)
     row_drv.append(Gtk.Box(hexpand=True))
     drivers = app.player.get_drivers()
-    if app.settings.get("exclusive_lock", False):
+    # Bit-Perfect mode hides the non-exclusive drivers (PipeWire shared sink
+    # and Auto (Default) which routes through it). The legacy exclusive_lock
+    # setting is treated as an alias here so users upgrading from older
+    # builds still see the filter applied.
+    if (app.settings.get("bit_perfect", False)
+            or app.settings.get("exclusive_lock", False)):
         drivers = [
             drv
             for drv in drivers
