@@ -1,5 +1,80 @@
 # Changelog
 
+## 1.9.6 - 2026-05-21
+
+Brings back the **PipeWire** output driver as a first-class
+non-bit-perfect choice, simplifies the Bit-Perfect / Exclusive UI into
+a single toggle, and fixes a long-standing Liked Songs pagination cap
+that hid tracks past ~998 from the dashboard.
+
+### Added
+
+- **PipeWire output driver returns.** The PipeWire entry is back in
+  the Audio Driver dropdown alongside `Auto (Default)`, `ALSA（auto）`,
+  `ALSA（mmap）`, and `USB Rawlink v2`. It targets the system's PipeWire
+  graph via the ALSA→PipeWire bridge (`snd_pcm_open("pipewire")`), so
+  the device stays shareable with other apps and PipeWire's own
+  resampler decides the session rate. This is explicitly a shared,
+  non-bit-perfect path; for bit-perfect playback use the ALSA family
+  or USB Rawlink v2 entries.
+- **Per-sink device picker for PipeWire.** Selecting PipeWire as the
+  driver enumerates the actual PipeWire sinks on the system via
+  `pactl list sinks` (descriptions shown in the device dropdown,
+  `Default PipeWire Sink` first). Picking a non-default sink routes
+  the stream to that node via the ALSA plugin's `NODE=` arg form
+  (`snd_pcm_open("pipewire:NODE=<sink-name>")`). When `pactl` is
+  unavailable the dropdown falls back to a single default entry.
+
+### Changed
+
+- **Bit-Perfect is now the single user-facing toggle.** The standalone
+  **Force Hardware Exclusive** switch on the Output settings page is
+  removed — it was operating on the same internal `exclusive_lock`
+  state as Bit-Perfect itself and looked like a no-op to most users.
+  Turning Bit-Perfect on now (a) hides PipeWire and Auto (Default)
+  from the driver dropdown, leaving only `ALSA（auto）`, `ALSA（mmap）`,
+  and `USB Rawlink v2`, and (b) sets the internal exclusive flag so
+  the D-Bus ALSA reservation and Rust `exclusive=true` path still
+  engage. Legacy `exclusive_lock=true` saved settings are honored
+  alongside `bit_perfect` so users upgrading from older builds keep
+  the same behavior.
+
+### Fixed
+
+- **Liked Songs dashboard no longer caps at ~998 tracks.** The
+  manual-pagination path in `get_favorite_tracks` used a 1000-item
+  page size and treated any page returning fewer items as
+  end-of-data. Tidal's v1 `favorites/tracks` endpoint silently
+  returns short pages (commonly ~998) when the requested `limit`
+  approaches its internal cap, so a single short first page stopped
+  pagination at ~998 even when the user had thousands of liked
+  tracks. Page size is now 100 (well under the cap), the
+  short-page early-exit is gone, the loop advances `offset` by the
+  actually-returned page length, and a 100k offset hard ceiling
+  guards against runaway loops. Users with very large libraries see
+  the full list on the next dashboard open.
+- **PipeWire / Auto (Default) driver no longer plays silently with
+  aggressive ALSA latency profiles.** The ALSA latency dropdown is
+  greyed out for non-ALSA drivers, but its stored value was still
+  being passed into the Rust `set_output_tuned` call. A previously
+  selected `Aggressive (20 ms)` profile (≈2 ms period) is well below
+  PipeWire's ~21 ms graph quantum, and the bridge would accept the
+  hw_params, write zeros into the emulated MMAP areas, and produce
+  audible silence with no error. For PipeWire and Auto (Default), the
+  buffer / latency now pin to the `Standard (100 ms)` defaults
+  regardless of the saved ALSA-only profile.
+- **`snd_pcm_open` on the PipeWire ALSA bridge no longer routes audio
+  through emulated MMAP that the bridge can't commit.** The
+  ALSA→PipeWire plugin advertises `MMAP_INTERLEAVED` support and
+  accepts hw_params for it, but its `snd_pcm_mmap_begin` areas don't
+  always make it back into the PipeWire graph — open succeeds, writes
+  commit, and the sink stays silent. `AlsaCtx::open` now skips the
+  MMAP attempt entirely whenever the device string is `default`,
+  `pipewire`, or `pipewire:…` and goes straight to the
+  `snd_pcm_writei` (RW_INTERLEAVED) path, which the bridge handles
+  correctly. Hardware ALSA paths (`hw:N,M`, `plughw:…`) are unchanged
+  and still try MMAP first.
+
 ## 1.9.5.8 - 2026-05-20
 
 Cleanup point release that quiets four startup-stage issues surfaced
