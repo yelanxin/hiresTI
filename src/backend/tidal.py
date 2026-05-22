@@ -1024,11 +1024,21 @@ class TidalBackend:
                     return []
                 tracks_api = getattr(fav, "tracks", None)
                 if callable(tracks_api) and order_obj is not None:
-                    page_size = min(1000, max(1, target))
+                    # Page size 100 stays well under Tidal's per-call cap.
+                    # The v1 favorites/tracks endpoint silently returns
+                    # fewer items than requested when `limit` approaches
+                    # its internal cap (~999), so the previous 1000-item
+                    # page_size made a short first page indistinguishable
+                    # from end-of-data and capped users at ~998 tracks.
+                    page_size = min(100, max(1, target))
                     merged = []
                     seen = set()
                     offset = 0
-                    while len(merged) < target:
+                    # Hard ceiling on offset advancement so a misbehaving
+                    # API can never spin forever; covers users with up to
+                    # 100k liked tracks.
+                    MAX_OFFSET = 100_000
+                    while len(merged) < target and offset <= MAX_OFFSET:
                         kwargs = {
                             "limit": page_size,
                             "offset": offset,
@@ -1057,14 +1067,18 @@ class TidalBackend:
                             if len(merged) >= target:
                                 break
                         if new_in_page == 0:
-                            logger.warning(
-                                "Favorite tracks pagination stalled at offset=%d (page=%d, no new ids); stopping.",
+                            # All-duplicate page means the server is
+                            # cycling — safe to stop here, no more data.
+                            logger.info(
+                                "Favorite tracks pagination: duplicates-only page at offset=%d size=%d total=%d; stopping.",
                                 offset,
                                 len(page),
+                                len(merged),
                             )
                             break
-                        if len(page) < page_size:
-                            break
+                        # Advance by the returned count, not the requested
+                        # size — Tidal sometimes returns short pages with
+                        # more data still available at later offsets.
                         offset += len(page)
                     if merged:
                         return merged[:target]
