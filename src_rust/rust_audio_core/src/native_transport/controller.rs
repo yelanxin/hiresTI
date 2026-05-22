@@ -2071,6 +2071,15 @@ fn decode_direct_audio_stream(
                         feed,
                         Arc::clone(stop),
                     )?;
+                    eprintln!(
+                        "native-transport: ALSA opened device='{}' rate={} format={} access={:?} buffer_us={} latency_us={}",
+                        alsa_cfg.device,
+                        session.actual_rate(),
+                        session.gst_format(),
+                        session.access_mode(),
+                        alsa_cfg.buffer_us,
+                        alsa_cfg.latency_us,
+                    );
                     queue_native_event(
                         events,
                         crate::EVT_STATE,

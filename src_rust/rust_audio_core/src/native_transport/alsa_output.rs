@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use crate::alsa_clock::AlsaHwClockFeed;
 use crate::alsa_pcm::{
-    alsa_wire_format_from_preference, AlsaCtx, AlsaWireFormat,
+    alsa_wire_format_from_preference, AlsaAccessMode, AlsaCtx, AlsaWireFormat,
 };
 
 use super::output::AlsaOutputConfig;
@@ -109,6 +109,10 @@ impl AlsaSession {
     /// when the device only supports a discrete set.
     pub fn actual_rate(&self) -> u32 {
         self.ctx.rate
+    }
+
+    pub fn access_mode(&self) -> AlsaAccessMode {
+        self.ctx.access_mode()
     }
 
     /// Push `data` (interleaved samples in this session's wire format) to the

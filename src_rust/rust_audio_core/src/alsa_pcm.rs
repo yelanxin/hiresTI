@@ -303,32 +303,57 @@ impl AlsaCtx {
             Ok((period as usize, bufsize as usize, rate))
         }
 
+        // The pipewire-alsa plugin advertises MMAP_INTERLEAVED support and
+        // accepts hw_params for it, but its emulated areas don't always make
+        // it back into the PipeWire graph — opens cleanly, writes commit,
+        // and the sink stays silent. The plain writei path works correctly
+        // on the same device, so skip the MMAP attempt entirely whenever
+        // we're talking to the bridge and go straight to RW_INTERLEAVED.
+        // "default" on PipeWire systems redirects to pcm.pipewire inside
+        // ALSA before we see it, so treat it as bridge-routed too.
+        let dev_lower = device.to_ascii_lowercase();
+        let skip_mmap = dev_lower == "default"
+            || dev_lower == "pipewire"
+            || dev_lower.starts_with("pipewire:")
+            || dev_lower.starts_with("pipewire,");
         let (access_mode, period_frames, buffer_frames, rate) = unsafe {
-            match negotiate_hw_params(
-                pcm,
-                SND_PCM_ACCESS_MMAP_INTERLEAVED,
-                sample_format,
-                want_rate,
-                want_period_frames,
-                want_buffer_frames,
-            ) {
-                Ok((p, b, r)) => (AlsaAccessMode::Mmap, p, b, r),
-                Err(mmap_err) => match negotiate_hw_params(
+            let try_mmap_first = !skip_mmap;
+            let mmap_result = if try_mmap_first {
+                Some(negotiate_hw_params(
                     pcm,
-                    SND_PCM_ACCESS_RW_INTERLEAVED,
+                    SND_PCM_ACCESS_MMAP_INTERLEAVED,
                     sample_format,
                     want_rate,
                     want_period_frames,
                     want_buffer_frames,
-                ) {
-                    Ok((p, b, r)) => (AlsaAccessMode::Interleaved, p, b, r),
-                    Err(rw_err) => {
-                        snd_pcm_close(pcm);
-                        return Err(format!(
-                            "hw_params: mmap failed ({mmap_err}); interleaved failed ({rw_err})"
-                        ));
+                ))
+            } else {
+                None
+            };
+            match mmap_result {
+                Some(Ok((p, b, r))) => (AlsaAccessMode::Mmap, p, b, r),
+                mmap_attempt => {
+                    let mmap_err_text = match mmap_attempt {
+                        Some(Err(e)) => e,
+                        _ => "skipped (pipewire bridge)".to_string(),
+                    };
+                    match negotiate_hw_params(
+                        pcm,
+                        SND_PCM_ACCESS_RW_INTERLEAVED,
+                        sample_format,
+                        want_rate,
+                        want_period_frames,
+                        want_buffer_frames,
+                    ) {
+                        Ok((p, b, r)) => (AlsaAccessMode::Interleaved, p, b, r),
+                        Err(rw_err) => {
+                            snd_pcm_close(pcm);
+                            return Err(format!(
+                                "hw_params: mmap failed ({mmap_err_text}); interleaved failed ({rw_err})"
+                            ));
+                        }
                     }
-                },
+                }
             }
         };
 

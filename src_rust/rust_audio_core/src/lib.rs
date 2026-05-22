@@ -64,11 +64,22 @@ fn driver_is_alsa_family(driver: &str) -> bool {
     driver_is_alsa_auto(driver) || driver_is_alsa_mmap(driver)
 }
 
+/// True when the user explicitly picks the ALSA→PipeWire bridge as the
+/// output. We treat this as a thin shared-mixer driver: always routes
+/// through `snd_pcm_open("pipewire")`, never exclusive, never tries to
+/// follow the source sample rate (PipeWire's own resampler handles that).
+fn driver_is_pipewire(driver: &str) -> bool {
+    matches!(normalized_driver_label(driver).as_str(), "pipewire")
+}
+
 /// True for any driver routed through V2 native_transport's ALSA backend:
-/// Auto(Default), ALSA(auto), and ALSA(mmap).
+/// Auto(Default), ALSA(auto), ALSA(mmap), and PipeWire (via ALSA bridge).
 fn driver_routes_via_native_alsa(driver: &str) -> bool {
     let norm = normalized_driver_label(driver);
-    norm.is_empty() || norm.starts_with("auto") || driver_is_alsa_family(driver)
+    norm.is_empty()
+        || norm.starts_with("auto")
+        || driver_is_alsa_family(driver)
+        || driver_is_pipewire(driver)
 }
 
 
@@ -1315,18 +1326,69 @@ impl Engine {
         }
 
         if route_via_native_alsa {
-            let default_device = if driver_is_alsa_mmap(driver) {
+            let is_pw = driver_is_pipewire(driver);
+            let default_device = if is_pw {
+                "pipewire"
+            } else if driver_is_alsa_mmap(driver) {
                 "hw:0,0"
             } else {
                 "default"
             };
+            // PipeWire driver is intentionally non-bit-perfect: PipeWire's
+            // graph does its own resampling, so exclusive (hw:) access
+            // would defeat the purpose. Always force exclusive=false here.
+            let effective_exclusive = exclusive && !is_pw;
+            if is_pw {
+                self.output_exclusive = false;
+            }
+            let chosen_device = device_norm.unwrap_or(default_device).to_string();
+            // PipeWire driver: enumerated sinks come back as bare PipeWire
+            // node names (e.g. `alsa_output.usb-FIIO_KA13-01.analog-stereo`).
+            // Translate to the ALSA pipewire-plugin's NODE arg so snd_pcm_open
+            // routes to the chosen sink instead of the session default.
+            // Plain "pipewire" or any explicit "pipewire:..." string is
+            // passed through unchanged. (The installed pipewire-alsa plugin
+            // advertises args as `SERVER NODE EXCLUSIVE ROLE RATE FORMAT
+            // CHANNELS …` — not PLAYBACK_NODE, which is the protocol-pulse
+            // variant in some forks.)
+            let final_device = if is_pw
+                && chosen_device != "pipewire"
+                && !chosen_device.starts_with("pipewire:")
+            {
+                format!("pipewire:NODE={}", chosen_device)
+            } else {
+                chosen_device
+            };
+            // The ALSA latency dropdown only applies to direct ALSA(auto)/
+            // (mmap) hardware paths. Auto(Default) and PipeWire both route
+            // through PipeWire's ALSA bridge, where periods below the
+            // PipeWire quantum (~21 ms at 48 kHz) cause continuous
+            // underruns and silent playback. Pin those drivers to the
+            // 100 ms / 10 ms defaults regardless of the saved
+            // ALSA-only profile so the bridge gets a buffer it can honor.
+            let auto_default = normalized_driver_label(driver).starts_with("auto");
+            let routes_via_pw_bridge = is_pw || auto_default;
+            let effective_buffer_us = if routes_via_pw_bridge {
+                100_000
+            } else if buffer_us > 0 {
+                buffer_us as u32
+            } else {
+                100_000
+            };
+            let effective_latency_us = if routes_via_pw_bridge {
+                10_000
+            } else if latency_us > 0 {
+                latency_us as u32
+            } else {
+                10_000
+            };
             self.native_alsa_config = Some(native_transport::AlsaOutputConfig {
-                device: device_norm.unwrap_or(default_device).to_string(),
-                buffer_us: if buffer_us > 0 { buffer_us as u32 } else { 100_000 },
-                latency_us: if latency_us > 0 { latency_us as u32 } else { 10_000 },
+                device: final_device,
+                buffer_us: effective_buffer_us,
+                latency_us: effective_latency_us,
                 realtime_priority: self.output_mmap_realtime_priority,
                 preferred_format: self.preferred_output_format.clone(),
-                exclusive,
+                exclusive: effective_exclusive,
             });
         } else {
             self.native_alsa_config = None;
@@ -1968,10 +2030,83 @@ fn list_usb_rawlink_devices() -> Vec<(String, Option<String>)> {
         .collect()
 }
 
+/// Enumerate PipeWire sinks via the pactl pulse-compat tool.
+///
+/// device_id is the raw sink name (e.g. `alsa_output.usb-FIIO_KA13-01.analog-stereo`);
+/// set_output_tuned converts it to the ALSA pipewire-plugin form
+/// `pipewire:PLAYBACK_NODE=<name>` when opening the PCM. When pactl is
+/// unavailable or returns nothing, fall back to a single Default entry
+/// so the dropdown is never empty.
+fn list_pipewire_sinks() -> Vec<(String, Option<String>)> {
+    let default_entry = || {
+        vec![(
+            "Default PipeWire Sink".to_string(),
+            Some("pipewire".to_string()),
+        )]
+    };
+    let output = match std::process::Command::new("pactl")
+        .arg("list")
+        .arg("sinks")
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return default_entry(),
+    };
+    let text = match String::from_utf8(output.stdout) {
+        Ok(t) => t,
+        Err(_) => return default_entry(),
+    };
+
+    let mut sinks: Vec<(String, String)> = Vec::new();
+    let mut cur_name: Option<String> = None;
+    let mut cur_desc: Option<String> = None;
+    let flush = |sinks: &mut Vec<(String, String)>,
+                 name: &mut Option<String>,
+                 desc: &mut Option<String>| {
+        if let Some(n) = name.take() {
+            let label = desc
+                .take()
+                .filter(|d| !d.is_empty())
+                .unwrap_or_else(|| n.clone());
+            sinks.push((label, n));
+        } else {
+            *desc = None;
+        }
+    };
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("Sink #") {
+            flush(&mut sinks, &mut cur_name, &mut cur_desc);
+        } else if let Some(rest) = trimmed.strip_prefix("Name:") {
+            cur_name = Some(rest.trim().to_string());
+        } else if let Some(rest) = trimmed.strip_prefix("Description:") {
+            cur_desc = Some(rest.trim().to_string());
+        }
+    }
+    flush(&mut sinks, &mut cur_name, &mut cur_desc);
+
+    if sinks.is_empty() {
+        return default_entry();
+    }
+
+    let mut out: Vec<(String, Option<String>)> = Vec::with_capacity(sinks.len() + 1);
+    out.push((
+        "Default PipeWire Sink".to_string(),
+        Some("pipewire".to_string()),
+    ));
+    for (label, name) in sinks {
+        out.push((label, Some(name)));
+    }
+    out
+}
+
 fn devices_for_driver(driver: &str) -> Vec<(String, Option<String>)> {
     let d = normalized_driver_label(driver);
     if d == "auto(default)" || d == "auto" {
         return vec![("Default Output".to_string(), None)];
+    }
+    if driver_is_pipewire(driver) {
+        return list_pipewire_sinks();
     }
     if driver_is_alsa_family(driver) {
         return list_alsa_cards();

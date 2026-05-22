@@ -24,6 +24,7 @@ _MAX_SPECTRUM_BANDS = 4096
 DRIVER_ALSA_AUTO = "ALSA（auto）"
 DRIVER_ALSA_MMAP = "ALSA（mmap）"
 DRIVER_USB_RAWLINK_V2 = "USB Rawlink v2"
+DRIVER_PIPEWIRE = "PipeWire"
 
 # Matches the fallback label emitted by Rust when device.open() fails (no permission).
 # Format: "USB Audio Device (1fc9:6004)"
@@ -2459,8 +2460,8 @@ class RustAudioPlayerAdapter:
         if enabled:
             # Reset engine volume to 1.0 (unity gain / bypass).
             # Call _rust directly to skip the bit_perfect_mode guard in
-            # RustAdapter.set_volume — this covers all entry paths including
-            # on_exclusive_toggled which does not go through _lock_volume_controls.
+            # RustAdapter.set_volume so the reset still lands when the
+            # caller bypasses _lock_volume_controls.
             self._rust.set_volume(1.0)
         logger.info(
             "RustAdapter.toggle_bit_perfect enabled=%s exclusive_lock=%s dsp_enabled=%s",
@@ -2821,6 +2822,7 @@ class RustAudioPlayerAdapter:
             "Auto (Default)",
             DRIVER_ALSA_AUTO,
             DRIVER_ALSA_MMAP,
+            DRIVER_PIPEWIRE,
             DRIVER_USB_RAWLINK_V2,
         ]
 
