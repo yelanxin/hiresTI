@@ -1,5 +1,41 @@
 # Changelog
 
+## 1.9.6.1 - 2026-05-23
+
+Hotfix follow-up to 1.9.6. The PipeWire / Auto (Default) / ALSA(auto) /
+ALSA(mmap) paths exposed a long-standing assumption in the volume UI
+and the Rust hardware-volume cache: software volume silently did
+nothing on non-USB-Rawlink drivers, even with Bit-Perfect off. Three
+small fixes restore the expected behavior.
+
+### Fixed
+
+- **Software volume now works on PipeWire / ALSA / Auto (Default)
+  with Bit-Perfect off.** The volume popover's
+  `_update_volume_device_label` hid the master slider and showed
+  "Hardware volume not supported" whenever the active driver had no
+  UAC Feature Unit. That covered the bit-perfect-only case, but with
+  Bit-Perfect off the V2 transport's `VolumePcmProcessor` is the
+  software-gain path that *should* be running — hiding the slider
+  meant the user had no way to invoke it. The popover now has a
+  third state: "Software Volume" + slider for non-USB drivers when
+  Bit-Perfect is off, slider scales PCM via the Rust engine.
+- **Switching from USB Rawlink v2 to a non-USB driver no longer
+  leaves stale hardware-volume state cached in the Rust core.**
+  `Controller::hw_vol_info` was populated by the USB pre-claim path
+  so the UI could show volume range before playback started, but
+  `ReleaseDevice` and `StopAndRelease` never reset it. After a
+  switch to PipeWire / ALSA, `Controller::hw_volume_supported()`
+  kept returning `true` from the cached info, the Python adapter
+  routed `set_volume()` into the (now non-existent) USB feature
+  unit, and the slider movement silently no-op'd. Both release
+  paths now reset `hw_vol_info` to default.
+- **Python `usb_hw_volume_supported()` gates on the active driver.**
+  Defensive layer: even if the Rust cache regresses, the Python
+  adapter only reports hw-volume support when `current_driver` is in
+  the USB Rawlink family, so `set_volume` never routes to the
+  hardware path under a non-USB driver again.
+
 ## 1.9.6 - 2026-05-21
 
 Brings back the **PipeWire** output driver as a first-class
