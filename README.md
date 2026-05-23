@@ -6,6 +6,8 @@
 ![License](https://img.shields.io/badge/License-GPL--3.0-purple)
 
 `hiresTI` is a native Linux TIDAL client built for audiophiles, combining high-fidelity playback, rock-solid stability, and a modern GTK4/Libadwaita user experience.
+> [!NOTE]
+> I'M refactoring the player in Pure RUST, which will deliver the best and fastest using experience. If everything goest well, it will release in next month.
 
 > [!IMPORTANT]
 > **Re-login required for FLAC / Hi-Res quality.**
