@@ -2983,14 +2983,22 @@ def _update_volume_db_label(self, percent):
 
 
 def _update_volume_device_label(self):
-    """Show a hardware-volume hint and current output device when applicable.
+    """Pick the right popover content for the active driver / Bit-Perfect state.
 
-    When the active DAC doesn't expose a UAC Feature Unit (or it advertises
-    no volume control), the master Gtk.Scale would either move software
-    volume or — in bit-perfect mode — silently snap back to 100, neither of
-    which is useful.  In that state we replace the popover content with a
-    clear "Hardware volume not supported" message so the user isn't fiddling
-    with a slider that has no audible effect.
+    Three cases:
+
+    1. USB Rawlink v2 with a UAC Feature Unit → "Hardware Volume" label
+       above the slider, slider controls the DAC directly.
+    2. Any other driver (ALSA / PipeWire / Auto) with Bit-Perfect *off* →
+       "Software Volume" label, slider scales PCM via the Rust engine's
+       VolumePcmProcessor. Previously this case was treated the same as
+       case 3 (slider hidden, "Hardware volume not supported" shown),
+       which silently broke software volume after the V2 transport
+       gained per-slab gain.
+    3. No hardware volume *and* Bit-Perfect on → no usable volume path:
+       hide the slider and show the "Hardware volume not supported"
+       placeholder so the user isn't fiddling with a slider that has
+       no audible effect.
     """
     player = getattr(self, "player", None)
     hw_vol = (
@@ -2998,6 +3006,8 @@ def _update_volume_device_label(self):
         and hasattr(player, "usb_hw_volume_supported")
         and player.usb_hw_volume_supported()
     )
+    bit_perfect = bool(getattr(self, "settings", {}).get("bit_perfect", False))
+    software_vol = (not hw_vol) and (not bit_perfect)
     device_name = str(getattr(self, "current_device_name", "") or "").strip()
     for prefix in ("", "now_playing_"):
         device_label = getattr(self, f"{prefix}vol_device_label", None)
@@ -3019,6 +3029,21 @@ def _update_volume_device_label(self):
                 scale.set_visible(True)
             if db_label is not None:
                 db_label.set_visible(True)
+        elif software_vol:
+            if device_label is not None:
+                device_label.set_text(
+                    f"Software Volume\n{device_name}" if device_name else "Software Volume"
+                )
+                device_label.set_visible(True)
+            if unsupported_label is not None:
+                unsupported_label.set_visible(False)
+            if scale is not None:
+                scale.set_visible(True)
+            if db_label is not None:
+                db_label.set_visible(True)
+            if ch_box is not None:
+                # Per-channel sliders are a hardware-only concept.
+                ch_box.set_visible(False)
         else:
             if device_label is not None:
                 device_label.set_text("")
