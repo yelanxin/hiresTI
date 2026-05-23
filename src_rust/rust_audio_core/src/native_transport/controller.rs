@@ -623,6 +623,16 @@ fn transport_worker(
             NativeTransportCommand::ReleaseDevice => {
                 claimed_device = None;
                 claimed_cfg = None;
+                // hw_vol_info was populated by the pre-claim path so the UI
+                // could show volume info before playback. Once the device is
+                // released the cached "supported=true" no longer reflects
+                // reality — leaving it set makes hw_volume_supported()
+                // report true after a switch to a non-USB driver, which
+                // routes the volume slider into a hardware path that
+                // silently no-ops (no active USB session).
+                if let Ok(mut info) = hw_vol_info.lock() {
+                    *info = HwVolInfo::default();
+                }
                 eprintln!("native-transport: USB device claim released");
             }
             NativeTransportCommand::StopAndRelease(done_tx) => {
@@ -632,9 +642,13 @@ fn transport_worker(
                     sink.set_skip_release_on_drop(true);
                     drop(sink);
                 }
-                // Release — do NOT reclaim.
+                // Release — do NOT reclaim. Clear the pre-claim cache for
+                // the same reason as ReleaseDevice above.
                 claimed_device = None;
                 claimed_cfg = None;
+                if let Ok(mut info) = hw_vol_info.lock() {
+                    *info = HwVolInfo::default();
+                }
                 {
                     let mut state = match snapshot.lock() {
                         Ok(guard) => guard,

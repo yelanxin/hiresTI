@@ -3692,7 +3692,18 @@ class RustAudioPlayerAdapter:
             self.output_error = None
 
     def usb_hw_volume_supported(self):
-        """Return True if the current USB sink supports hardware volume."""
+        """Return True if the current USB sink supports hardware volume.
+
+        Gated by the active driver: even if the Rust engine still has a
+        cached `hw_vol_info` from a previous USB Rawlink claim, we refuse
+        to report hw-volume support when the user has switched to a
+        non-USB driver (ALSA / PipeWire / Auto). Without this gate
+        `set_volume` would route slider movement to the (now non-existent)
+        USB feature unit while pinning the engine to unity gain, so
+        software volume on PipeWire / ALSA paths would silently no-op.
+        """
+        if not _is_usb_rawlink_family(getattr(self, "current_driver", "")):
+            return False
         return self._rust.usb_hw_volume_supported() == 1
 
     def usb_hw_volume_has_master(self):
