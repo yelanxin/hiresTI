@@ -106,6 +106,20 @@ sudo dnf install ./hiresti-<version>-1.el9.<arch>.rpm
 
 ### Arch Linux
 
+**AUR** (builds from source; recommended for rolling updates):
+
+```bash
+# yay
+yay -S hiresti
+
+# paru
+paru -S hiresti
+```
+
+Package page: https://aur.archlinux.org/packages/hiresti
+
+**Prebuilt** (from the GitHub release page):
+
 ```bash
 sudo pacman -U ./hiresti-<version>-1-<arch>.pkg.tar.zst
 ```
