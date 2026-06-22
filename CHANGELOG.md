@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.9.7 - 2026-06-22
+
+Adds per-track radio navigation from any track list and fixes the
+sidebar selection when a Mix / Track Radio detail page is open.
+
+### Added
+
+- **Go to Track Radio on track rows.** The track overflow menu (⋯)
+  now includes **Go to Track Radio**, alongside Play Next and Add to
+  Queue. It queries TIDAL's `tracks/{id}/mix` endpoint via
+  `tidalapi.Track.get_radio_mix()` and opens the resulting Mix in the
+  existing track-list detail view — same layout as Mixes & Radio
+  favorites, with Play / Shuffle and the full radio track list.
+  Unavailable radios surface a notice instead of failing silently.
+
+### Fixed
+
+- **Mix / Track Radio pages now highlight Mixes & Radio in the
+  sidebar.** Opening a track radio (or any Mix detail view) from an
+  album page no longer leaves **Albums** selected in the left nav.
+  `show_album_details()` now switches the sidebar to **Mixes & Radio**
+  for Mix objects, and playback-source navigation understands the new
+  `mix` source type.
+
 ## 1.9.6.1 - 2026-05-23
 
 Hotfix follow-up to 1.9.6. The PipeWire / Auto (Default) / ALSA(auto) /

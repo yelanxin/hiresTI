@@ -1847,6 +1847,7 @@ def on_now_playing_track_selected(self, _box, row):
 
 _SOURCE_TYPE_TO_NAV_ID = {
     "album": "collection",
+    "mix": "mixes",
     "playlist": "playlists",
     "search": None,
     "history": "history",
@@ -1887,6 +1888,13 @@ def _on_playback_source_clicked(self, _btn=None):
         if album_obj is not None:
             _select_sidebar_nav_row(self, "collection")
             self.show_album_details(album_obj)
+            return
+
+    if src_type == "mix":
+        mix_obj = src.get("obj")
+        if mix_obj is not None:
+            _select_sidebar_nav_row(self, "mixes")
+            self.show_album_details(mix_obj)
             return
 
     if src_type == "playlist":

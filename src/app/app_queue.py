@@ -1,6 +1,7 @@
 """Queue-related handlers extracted from app_handlers."""
 
 import logging
+from threading import Thread
 
 from gi.repository import GLib, Gtk
 
@@ -395,6 +396,34 @@ def on_add_track_to_queue_clicked(self, track):
     base_queue = list(self._get_active_queue() if hasattr(self, "_get_active_queue") else [])
     _insert_queue_at(self, items, len(base_queue), event_reason="queue_appended")
     _show_add_to_queue_notice(self, items, played_now=False)
+
+
+def _notify_track_radio_unavailable(self, track_name):
+    notice = getattr(self, "show_output_notice", None)
+    if callable(notice):
+        notice(f"Track radio not available for {track_name}", "warn", 3200)
+
+
+def on_go_to_track_radio_clicked(self, track):
+    if track is None:
+        return
+    track_name = str(getattr(track, "name", "Track") or "Track")
+    notice = getattr(self, "show_output_notice", None)
+    if callable(notice):
+        notice("Loading track radio…", "info", 2200)
+
+    def task():
+        mix = None
+        try:
+            mix = self.backend.get_track_radio_mix(track)
+        except Exception:
+            logger.exception("Failed to load track radio for %s", getattr(track, "id", "unknown"))
+        if mix is None:
+            GLib.idle_add(_notify_track_radio_unavailable, self, track_name)
+            return
+        GLib.idle_add(self.show_album_details, mix)
+
+    Thread(target=task, daemon=True).start()
 
 
 def _show_add_to_queue_notice(self, tracks, played_now=False):

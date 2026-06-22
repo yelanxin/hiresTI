@@ -1703,6 +1703,10 @@ def show_album_details(app, alb):
     is_mix = "Mix" in type(alb).__name__
     if getattr(app, "header_kicker", None) is not None:
         app.header_kicker.set_text("Mix" if is_mix else "Album")
+    if is_mix:
+        select_nav = getattr(app, "_select_sidebar_nav_row", None)
+        if callable(select_nav):
+            select_nav("mixes")
 
     current_view = app.right_stack.get_visible_child_name()
     if current_view and current_view != "tracks":
@@ -1719,7 +1723,9 @@ def show_album_details(app, alb):
     gtl = getattr(app, "grid_title_label", None)
     if gtl is not None:
         section = str(gtl.get_text() or "").strip()
-    if section and section.lower() not in ("", "albums"):
+    if is_mix:
+        app._track_view_source = {"type": "mix", "name": title, "obj": alb, "open_method": "show_album_details"}
+    elif section and section.lower() not in ("", "albums"):
         app._track_view_source = {"type": section, "name": title, "obj": alb, "open_method": "show_album_details"}
     else:
         app._track_view_source = {"type": "album", "name": title, "obj": alb, "open_method": "show_album_details"}
@@ -1826,6 +1832,7 @@ def _build_track_row_overflow_menu(app, track):
     menu_btn.set_popover(_build_overflow_popover([
         ("Play Next", lambda tr=track: app.on_play_next_track_clicked(tr)),
         ("Add to Queue", lambda tr=track: app.on_add_track_to_queue_clicked(tr)),
+        ("Go to Track Radio", lambda tr=track: app.on_go_to_track_radio_clicked(tr)),
     ]))
     return menu_btn
 

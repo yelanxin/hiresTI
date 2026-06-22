@@ -1854,6 +1854,24 @@ class TidalBackend:
             logger.warning("Failed to fetch similar artists for %s: %s", getattr(art, "id", "unknown"), e)
             return []
 
+    def get_track_radio_mix(self, track):
+        def _fetch():
+            t = track
+            if isinstance(t, (int, str)):
+                t = self.session.track(t)
+            elif hasattr(t, "id") and not hasattr(t, "get_radio_mix"):
+                t = self.session.track(getattr(t, "id"))
+            return t.get_radio_mix()
+        try:
+            return self._call_with_session_recovery(_fetch, context="track radio mix")
+        except Exception as e:
+            logger.warning(
+                "Failed to fetch track radio mix for %s: %s",
+                getattr(track, "id", "unknown"),
+                e,
+            )
+            return None
+
     def get_artist_ep_singles_all(self, art, limit=2000):
         try:
             artist_obj = art
