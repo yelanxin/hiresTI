@@ -1,5 +1,47 @@
 # Changelog
 
+## 1.9.7.1 - 2026-06-28
+
+Hotfix for **USB Rawlink v2** on systems without a polkit authentication
+agent (e.g. wlroots compositors such as Hyprland / Sway). Selecting USB
+Rawlink there could silently fall back to ALSA because the udev permission
+fix never completed and the resulting `EACCES` was misread as a decode
+fault. The error is now surfaced with an actionable manual-setup path, and
+the packages pull in the tools the fix needs.
+
+### Fixed
+
+- **USB permission errors no longer trigger a silent ALSA fallback.** Raw
+  `libusb` access on the USB Rawlink v2 driver fails with `EACCES` /
+  "Access denied (insufficient permissions)" when the udev rule is missing.
+  The Rust audio wrapper wrapped this as a `native-transport decode error`,
+  so `_classify_rust_error` filed it under `codec` and the recovery flow
+  rebound playback to ALSA while the UI still claimed USB Rawlink. EACCES /
+  access-denied messages are now classified as `usb_permission`, ahead of
+  the device and codec categories, and the error policy stops playback and
+  reports the real (fixable) problem instead of rebinding.
+- **Failed automatic udev install now tells you, with manual steps.** When
+  the rule install via `pkexec` cannot run — `pkexec` not installed, no
+  polkit agent to show the prompt, dismissed, or unauthorized — HiresTI no
+  longer fails quietly. It shows a toast and a **Manual Setup** dialog with
+  copy-pasteable `sudo tee` + `udevadm` commands (pre-filled with the DAC's
+  VID:PID when known). The USB permission prompt also gains a **Manual
+  Setup** button up front.
+
+### Packaging
+
+- **`polkit` and `acl` are now declared runtime dependencies** for the AUR,
+  Debian, Fedora, and openSUSE packages, so `pkexec` and `setfacl` (used by
+  the USB permission fix) are present after a fresh install. Also drops the
+  unresolvable `python-ratelimit` from the AUR `depends`.
+
+### Docs
+
+- **udev requirement documented.** `audio-optimization-guide.md` gains a
+  "USB Rawlink Device Permissions (udev rule)" section covering the polkit
+  agent requirement, generic and VID:PID-specific manual rules, and a tip
+  for wlroots users on starting a polkit agent.
+
 ## 1.9.7 - 2026-06-22
 
 Adds per-track radio navigation from any track list and fixes the
