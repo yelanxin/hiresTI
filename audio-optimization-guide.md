@@ -137,6 +137,34 @@ echo 1 | sudo tee /sys/module/snd_usb_audio/parameters/nrpacks
 echo 'options snd-usb-audio nrpacks=1' | sudo tee /etc/modprobe.d/usb-audio.conf
 ```
 
+### 2.4.1 USB Rawlink Device Permissions (udev rule)
+
+The **USB Rawlink v2** driver opens your DAC directly via `libusb`, bypassing the kernel `snd-usb-audio` driver. Raw USB access requires device permissions that the default ALSA-only setup does not grant, so HiresTI installs a `udev` rule that tags your USB audio device with `uaccess` (granting access to the logged-in session user).
+
+HiresTI normally installs this rule for you through `pkexec` (it pops up a password prompt). **This requires a working polkit authentication agent.** On wlroots compositors such as **Hyprland** or **Sway**, no polkit agent is started automatically, so the prompt cannot appear and the automatic install fails. When that happens HiresTI now shows the manual commands instead of silently falling back to ALSA.
+
+To install the rule by hand, run the commands below in a terminal (replace the VID:PID rule with your DAC's if you prefer a device-specific rule), then replug the DAC or re-select it in Output settings:
+
+```bash
+sudo tee /etc/udev/rules.d/99-hiresti-usb-audio.rules > /dev/null <<'EOF'
+# HiresTI USB Rawlink - grant logged-in user access to USB audio devices
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ENV{ID_USB_INTERFACES}=="*:01????:*", TAG+="uaccess"
+EOF
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=usb
+```
+
+The generic rule above matches any USB Audio Class device. To restrict it to a single DAC, find its `VID:PID` with `lsusb` and add a device-specific line:
+
+```bash
+# Example for a DAC with USB ID 06cb:1595
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTRS{idVendor}=="06cb", ATTRS{idProduct}=="1595", TAG+="uaccess"
+```
+
+> **Tip (wlroots users):** to make the automatic prompt work, start a polkit agent in your compositor config, e.g. `exec-once = /usr/lib/polkit-gnome/polkit-gnome-authentication-agent-1` (Hyprland) or run `lxqt-policykit-agent` / `polkit-kde-authentication-agent-1`.
+
+If you see an `Access denied (insufficient permissions)` error on the **USB Rawlink v2** driver, the rule is missing or hasn't been applied yet — install it as above (or click **Fix USB Permissions** in Output settings) and replug the DAC.
+
 ### 2.5 Memory
 
 #### Reduce Swap Pressure

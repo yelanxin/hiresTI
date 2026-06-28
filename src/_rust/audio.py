@@ -1324,6 +1324,18 @@ class RustAudioPlayerAdapter:
     )
     _ERR_NETWORK_KEYS = ("timeout", "timed out", "network", "connection", "dns", "tls", "ssl")
     _ERR_CODEC_KEYS = ("decode", "decoder", "codec", "not-negotiated", "caps", "demux", "parser")
+    # USB Rawlink raw libusb access requires a udev rule.  Without it, device.open()
+    # fails with EACCES.  These messages must be detected BEFORE the codec keys —
+    # the libusb error text is wrapped as "native-transport decode error: ... Access
+    # denied (insufficient permissions)", and "decode" would otherwise misclassify it
+    # as a codec fault and hide the real (fixable) permission problem from the user.
+    _ERR_USB_PERMISSION_KEYS = (
+        "access denied",
+        "insufficient permissions",
+        "permission denied",
+        "operation not permitted",
+        "eacces",
+    )
 
     def _ensure_pipewire_pro_audio_profile(self, device_id):
         """
@@ -2305,6 +2317,11 @@ class RustAudioPlayerAdapter:
 
     def _classify_rust_error(self, text):
         t = str(text or "").lower()
+        # USB permission errors win over every other category: the message often
+        # also contains "decode"/"device" substrings, but the actionable fault is
+        # the missing udev rule.  Surfacing it lets the UI offer the fix flow.
+        if any(k in t for k in self._ERR_USB_PERMISSION_KEYS):
+            return "usb_permission"
         if any(k in t for k in self._ERR_DEVICE_KEYS):
             return "device"
         # "alsa" alone matches sink names like "rust-alsa-sink" and produces
@@ -2348,6 +2365,20 @@ class RustAudioPlayerAdapter:
                 return False
 
             GLib.idle_add(_retry_without_limiter)
+            return
+        if category == "usb_permission":
+            # Raw USB (Rawlink) open was rejected for lack of device permission.
+            # This is NOT a disconnect — do NOT trigger the rebind-to-ALSA recovery
+            # flow, which would silently move playback onto a different path while
+            # the UI still claims USB Rawlink.  Instead, surface a clear error so the
+            # UI can show the "Fix USB Permissions" button / manual udev instructions.
+            self._cached_is_playing = False
+            try:
+                self._rust.stop()
+            except Exception:
+                pass
+            self.output_state = "error"
+            self.output_error = text or "USB device access denied (insufficient permissions)"
             return
         if category == "device":
             # In exclusive ALSA mode, errors from the sink (clock drift, underruns,

@@ -1,4 +1,5 @@
 from threading import Thread
+from types import SimpleNamespace
 import logging
 import os
 import re
@@ -9,7 +10,7 @@ import time
 
 import gi
 gi.require_version('Gtk', '4.0')
-from gi.repository import Gtk, GLib
+from gi.repository import Gtk, GLib, Gdk
 
 from core.executor import submit_daemon
 
@@ -755,10 +756,14 @@ def update_output_status_ui(app):
         except Exception:
             pass
 
+    err_low = str(err or "").lower()
     is_usb_perm_error = (
         state == "error"
         and bool(err)
-        and ("Access denied" in err or "Permission denied" in err)
+        and any(
+            k in err_low
+            for k in ("access denied", "permission denied", "insufficient permissions", "eacces")
+        )
         and _driver_is_usb_rawlink_family(getattr(app.player, "requested_driver", ""))
     )
     if hasattr(app, "usb_fix_perm_btn") and app.usb_fix_perm_btn is not None:
@@ -907,6 +912,110 @@ def _build_usb_permission_install_cmd(tmp_path, device_id=None):
     )
 
 
+def _build_manual_udev_setup_script(device_id=None):
+    """Return a copy-pasteable shell snippet that installs the udev rule by hand.
+
+    Uses ``sudo`` instead of ``pkexec`` so it works in a terminal without a
+    polkit authentication agent (relevant for wlroots compositors such as
+    Hyprland/Sway, which don't auto-start a polkit agent).  The exact udev rule
+    — including the detected VID:PID when known — is embedded via a heredoc.
+    """
+    rule_content = _build_udev_rule_content(device_id).rstrip("\n")
+    lines = [
+        f"sudo tee {_USB_UDEV_RULE_PATH} > /dev/null <<'EOF'",
+        rule_content,
+        "EOF",
+        "sudo udevadm control --reload-rules",
+        "sudo udevadm trigger --subsystem-match=usb",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _copy_text_to_clipboard(app, text):
+    """Best-effort clipboard copy via the app window, falling back to the display."""
+    for getter in (
+        lambda: getattr(app, "win", None) and app.win.get_clipboard(),
+        lambda: (Gdk.Display.get_default() and Gdk.Display.get_default().get_clipboard()),
+    ):
+        try:
+            clipboard = getter()
+        except Exception:
+            clipboard = None
+        if clipboard is not None:
+            try:
+                clipboard.set(str(text))
+                return True
+            except Exception:
+                logger.debug("Clipboard copy failed", exc_info=True)
+    return False
+
+
+def _show_usb_manual_setup_dialog(app, device_id=None, intro=None):
+    """Show a dialog with a copyable manual udev-rule install snippet.
+
+    Used when automatic install via pkexec is unavailable or fails (e.g. no
+    polkit agent on wlroots compositors), so users can finish setup by hand.
+    """
+    win = getattr(app, "win", None)
+    dialog = Gtk.Dialog(title="Manual USB Setup", transient_for=win, modal=True)
+    try:
+        dialog.set_default_size(620, -1)
+    except Exception:
+        pass
+    root = Gtk.Box(
+        orientation=Gtk.Orientation.VERTICAL,
+        spacing=12,
+        margin_top=16,
+        margin_bottom=16,
+        margin_start=20,
+        margin_end=20,
+    )
+    intro_text = intro or (
+        "Automatic setup needs a polkit authentication agent, which isn't running.\n"
+        "On Hyprland/Sway and other wlroots compositors no agent is started by "
+        "default, so the password prompt can't appear.\n\n"
+        "Run the commands below in a terminal to install the USB access rule "
+        "manually, then replug the DAC (or re-select it) and start playback."
+    )
+    msg = Gtk.Label(label=intro_text, wrap=True, xalign=0.0, max_width_chars=64)
+    root.append(msg)
+
+    script = _build_manual_udev_setup_script(device_id)
+    text_view = Gtk.TextView()
+    text_view.set_editable(False)
+    text_view.set_monospace(True)
+    text_view.set_wrap_mode(Gtk.WrapMode.NONE)
+    text_view.get_buffer().set_text(script)
+    scroller = Gtk.ScrolledWindow()
+    scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
+    scroller.set_min_content_height(150)
+    scroller.set_child(text_view)
+    try:
+        scroller.add_css_class("card")
+    except Exception:
+        pass
+    root.append(scroller)
+
+    action_row = Gtk.Box(spacing=8, halign=Gtk.Align.END)
+    copy_btn = Gtk.Button(label="Copy Commands")
+    close_btn = Gtk.Button(label="Close", css_classes=["suggested-action"])
+    action_row.append(copy_btn)
+    action_row.append(close_btn)
+    root.append(action_row)
+    dialog.set_child(root)
+
+    def _on_copy(_b):
+        if _copy_text_to_clipboard(app, script):
+            copy_btn.set_label("Copied")
+            if hasattr(app, "show_output_notice"):
+                app.show_output_notice("Manual USB setup commands copied to clipboard.", "ok", 2200)
+
+    copy_btn.connect("clicked", _on_copy)
+    close_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.CLOSE))
+    dialog.connect("response", lambda d, _r: d.destroy())
+    dialog.present()
+
+
 _USB_FALLBACK_NAME_RE = re.compile(
     r'^USB Audio Device \([0-9a-f]{4}:[0-9a-f]{4}\)$', re.IGNORECASE
 )
@@ -941,8 +1050,10 @@ def _show_usb_permission_dialog(app, dev_name, device_id):
     root.append(msg)
     action_row = Gtk.Box(spacing=8, halign=Gtk.Align.END)
     no_btn = Gtk.Button(label="Not Now")
+    manual_btn = Gtk.Button(label="Manual Setup")
     yes_btn = Gtk.Button(label="Grant Access", css_classes=["suggested-action"])
     action_row.append(no_btn)
+    action_row.append(manual_btn)
     action_row.append(yes_btn)
     root.append(action_row)
     dialog.set_child(root)
@@ -951,8 +1062,19 @@ def _show_usb_permission_dialog(app, dev_name, device_id):
         d.destroy()
         if resp == Gtk.ResponseType.YES:
             on_usb_fix_permissions_clicked(app, device_id=device_id)
+        elif resp == Gtk.ResponseType.APPLY:
+            _show_usb_manual_setup_dialog(
+                app,
+                device_id,
+                intro=(
+                    "Run the commands below in a terminal to grant USB access for "
+                    f"\"{dev_name}\" manually, then replug the DAC (or re-select it) "
+                    "and start playback."
+                ),
+            )
 
     no_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.NO))
+    manual_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.APPLY))
     yes_btn.connect("clicked", lambda _b: dialog.response(Gtk.ResponseType.YES))
     dialog.connect("response", _on_response)
     dialog.present()
@@ -1048,12 +1170,34 @@ def on_usb_fix_permissions_clicked(app, _btn=None, device_id=None):
                     GLib.timeout_add(1000, _recover_and_refresh)
                 else:
                     logger.warning("pkexec USB rule install failed (rc=%d)", rc)
+                    if hasattr(app, "record_diag_event"):
+                        app.record_diag_event(f"USB permission rule install failed (pkexec rc={rc})")
+                    # The automatic install via polkit failed (no agent, dismissed, or
+                    # not authorized).  Tell the user instead of silently degrading, and
+                    # offer the copy-pasteable manual udev steps.
+                    if hasattr(app, "show_output_notice"):
+                        app.show_output_notice(
+                            "Couldn't install the USB access rule automatically. "
+                            "Showing manual setup steps.",
+                            "error",
+                            4200,
+                        )
+                    _show_usb_manual_setup_dialog(app, requested_device_id)
 
             GLib.idle_add(_ui)
 
         def _run():
-            proc = subprocess.run(["pkexec", "/bin/sh", "-c", cmd])
-            _on_done(proc)
+            try:
+                proc = subprocess.run(["pkexec", "/bin/sh", "-c", cmd])
+                rc = proc.returncode
+            except FileNotFoundError:
+                # pkexec is not installed — common on minimal/wlroots setups.
+                logger.warning("pkexec not found; cannot auto-install USB rule")
+                rc = 127
+            except Exception:
+                logger.exception("pkexec USB rule install raised")
+                rc = 1
+            _on_done(SimpleNamespace(returncode=rc))
 
         Thread(target=_run, daemon=True).start()
 

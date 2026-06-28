@@ -32,7 +32,6 @@ depends=(
   'python-mpegdash'
   'python-opengl'
   'python-pyaes'
-  'python-ratelimit'
   'python-requests'
   'python-six'
   'python-tidalapi'
@@ -42,6 +41,8 @@ depends=(
   'mesa'
   'libglvnd'
   'webkitgtk-6.0'
+  'polkit'
+  'acl'
 )
 makedepends=(
   'cargo'

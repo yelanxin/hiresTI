@@ -177,6 +177,26 @@ def test_build_usb_permission_install_cmd_falls_back_to_audio_class_filter():
     assert "^ID_MODEL_ID=" not in cmd
 
 
+def test_build_manual_udev_setup_script_includes_vid_pid_and_sudo_commands():
+    script = audio_settings_actions._build_manual_udev_setup_script("usb:06cb:1595")
+
+    assert f"sudo tee {audio_settings_actions._USB_UDEV_RULE_PATH}" in script
+    assert 'ATTRS{idVendor}=="06cb"' in script
+    assert 'ATTRS{idProduct}=="1595"' in script
+    assert "sudo udevadm control --reload-rules" in script
+    assert "sudo udevadm trigger --subsystem-match=usb" in script
+    # Must be runnable without pkexec / a polkit agent.
+    assert "pkexec" not in script
+
+
+def test_build_manual_udev_setup_script_generic_without_device():
+    script = audio_settings_actions._build_manual_udev_setup_script(None)
+
+    assert 'ENV{ID_USB_INTERFACES}=="*:01????:*"' in script
+    assert "ATTRS{idVendor}" not in script
+    assert "sudo udevadm control --reload-rules" in script
+
+
 def test_on_bit_perfect_toggled_allows_missing_eq_controls():
     saved = []
     locked = []
