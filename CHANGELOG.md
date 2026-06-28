@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.9.7.2 - 2026-06-28
+
+Hotfix for **USB Rawlink v2** device recovery after the player exits or
+switches away from the native USB path. The DAC could remain invisible to
+the OS (and to GNOME / PipeWire sound settings) even though libusb had
+released the handle.
+
+### Fixed
+
+- **USB Rawlink now fully releases the device on exit and driver switch.**
+  `StopAndRelease` mistakenly dropped the USB sink with
+  `skip_release_on_drop=true`, so interfaces were never returned to the
+  kernel and `snd-usb-audio` could not re-attach. Shutdown and release
+  paths now reset the alt-setting, release both streaming and control
+  interfaces, and park/resume sessions correctly across Stop/Pause vs
+  quit.
+- **Player cleanup calls `release_output_route()` for USB Rawlink** so
+  closing the app (or tray quit) always runs the synchronous Rust release
+  before the engine is torn down.
+- **PipeWire / GNOME device list refreshes after USB Rawlink release.**
+  ALSA could show the DAC in `aplay -l` while PipeWire still held a stale
+  card list. HiresTI now restarts the user `wireplumber` service after a
+  successful USB release so the DAC reappears in system sound settings
+  without a manual service restart or replug.
+
 ## 1.9.7.1 - 2026-06-28
 
 Hotfix for **USB Rawlink v2** on systems without a polkit authentication

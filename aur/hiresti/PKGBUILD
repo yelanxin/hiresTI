@@ -1,5 +1,5 @@
 pkgname=hiresti
-pkgver=1.9.7.1
+pkgver=1.9.7.2
 pkgrel=1
 pkgdesc="High-Res TIDAL player for Linux with bit-perfect playback support"
 arch=('x86_64')

@@ -500,6 +500,32 @@ fn queue_native_event(
     }
 }
 
+/// Tear down a USB sink and return the device to the OS (reset alt-setting,
+/// release interfaces, re-attach snd-usb-audio).
+fn drop_usb_sink_releasing(sink: Option<UsbAudioSink>) {
+    if let Some(mut sink) = sink {
+        sink.set_skip_release_on_drop(false);
+        drop(sink);
+    }
+}
+
+fn release_claimed_device(claimed: &mut Option<OpenUsbDevice>) {
+    if let Some(mut dev) = claimed.take() {
+        dev.skip_release_on_drop = false;
+        drop(dev);
+    }
+}
+
+fn release_all_usb_state(
+    parked: &mut Option<UsbAudioSink>,
+    claimed: &mut Option<OpenUsbDevice>,
+    worker: &mut Option<DecodeWorkerHandle>,
+) {
+    drop_usb_sink_releasing(parked.take());
+    drop_usb_sink_releasing(stop_decode_worker(worker));
+    release_claimed_device(claimed);
+}
+
 fn transport_worker(
     rx: Receiver<NativeTransportCommand>,
     snapshot: Arc<Mutex<NativeTransportSnapshot>>,
@@ -524,6 +550,9 @@ fn transport_worker(
     // or before the first track starts playing.
     let mut claimed_device: Option<OpenUsbDevice> = None;
     let mut claimed_cfg: Option<ClaimedDeviceCfg> = None;
+    // USB session parked by Stop/Pause — kept alive (skip_release) until the
+    // next Load/Play or an explicit release/shutdown path runs.
+    let mut parked_usb_session: Option<UsbAudioSink> = None;
     while let Ok(cmd) = rx.recv() {
         match cmd {
             NativeTransportCommand::ClaimDevice {
@@ -532,7 +561,8 @@ fn transport_worker(
                 alt_profile,
             } => {
                 // Release any previous claim.
-                claimed_device = None;
+                drop_usb_sink_releasing(parked_usb_session.take());
+                release_claimed_device(&mut claimed_device);
                 claimed_cfg = Some(ClaimedDeviceCfg {
                     device_id: device_id.clone(),
                     bit_depth,
@@ -621,7 +651,11 @@ fn transport_worker(
                 }
             }
             NativeTransportCommand::ReleaseDevice => {
-                claimed_device = None;
+                release_all_usb_state(
+                    &mut parked_usb_session,
+                    &mut claimed_device,
+                    &mut decode_worker,
+                );
                 claimed_cfg = None;
                 // hw_vol_info was populated by the pre-claim path so the UI
                 // could show volume info before playback. Once the device is
@@ -637,14 +671,13 @@ fn transport_worker(
             }
             NativeTransportCommand::StopAndRelease(done_tx) => {
                 set_native_runtime(&runtime, None);
-                let old_sink = stop_decode_worker(&mut decode_worker);
-                if let Some(mut sink) = old_sink {
-                    sink.set_skip_release_on_drop(true);
-                    drop(sink);
-                }
+                release_all_usb_state(
+                    &mut parked_usb_session,
+                    &mut claimed_device,
+                    &mut decode_worker,
+                );
                 // Release — do NOT reclaim. Clear the pre-claim cache for
                 // the same reason as ReleaseDevice above.
-                claimed_device = None;
                 claimed_cfg = None;
                 if let Ok(mut info) = hw_vol_info.lock() {
                     *info = HwVolInfo::default();
@@ -674,7 +707,8 @@ fn transport_worker(
                 // and the DAC PLL remains locked — dropping the handle would
                 // trigger libusb_close → kernel driver reattach → PLL reset
                 // → 1-2 seconds of DAC mute on the next track.
-                let reuse_session = stop_decode_worker(&mut decode_worker);
+                let reuse_session = stop_decode_worker(&mut decode_worker)
+                    .or(parked_usb_session.take());
                 if reuse_session.is_some() {
                     eprintln!("native-transport: load — keeping old USB session for reuse");
                 } else if claimed_device.is_none() {
@@ -816,7 +850,7 @@ fn transport_worker(
                             hw_vol_cache.clone(),
                             claimed_device.take(),
                             auto_start,
-                            None, // no reuse_session for Play
+                            parked_usb_session.take(),
                             current_dsp_config.clone(),
                             Arc::clone(&dsp_config_slot),
                         ) {
@@ -864,10 +898,9 @@ fn transport_worker(
                 // Play handler reads it straight out of the snapshot.
                 let pause_pos_ms = current_native_playback_position_ms(&snapshot, &runtime);
                 set_native_runtime(&runtime, None);
-                let old_sink = stop_decode_worker(&mut decode_worker);
-                if let Some(mut sink) = old_sink {
+                if let Some(mut sink) = stop_decode_worker(&mut decode_worker) {
                     sink.set_skip_release_on_drop(true);
-                    drop(sink);
+                    parked_usb_session = Some(sink);
                 }
                 let mut state = match snapshot.lock() {
                     Ok(guard) => guard,
@@ -888,16 +921,13 @@ fn transport_worker(
             }
             NativeTransportCommand::Stop => {
                 set_native_runtime(&runtime, None);
-                // Stop the decode worker but keep the device claimed (don't
-                // release + reclaim).  This avoids PLL disturbance on DACs
-                // like Monitor 09 that are sensitive to interface cycling.
-                // The old sink's OpenUsbDevice is dropped with
-                // skip_release_on_drop so libusb_close doesn't reset
-                // alt-setting to 0 (PLL stays locked).
-                let old_sink = stop_decode_worker(&mut decode_worker);
-                if let Some(mut sink) = old_sink {
+                // Stop the decode worker but keep the USB session parked so the
+                // kernel driver stays detached and the DAC PLL stays locked.
+                // Shutdown / StopAndRelease drop the parked session with a full
+                // interface release so snd-usb-audio can re-attach.
+                if let Some(mut sink) = stop_decode_worker(&mut decode_worker) {
                     sink.set_skip_release_on_drop(true);
-                    drop(sink);
+                    parked_usb_session = Some(sink);
                 }
                 let mut state = match snapshot.lock() {
                     Ok(guard) => guard,
@@ -1190,9 +1220,11 @@ fn transport_worker(
             }
             NativeTransportCommand::Shutdown => {
                 set_native_runtime(&runtime, None);
-                let _old = stop_decode_worker(&mut decode_worker);
-                drop(_old);
-                claimed_device = None; // release USB claim
+                release_all_usb_state(
+                    &mut parked_usb_session,
+                    &mut claimed_device,
+                    &mut decode_worker,
+                );
                 let mut state = match snapshot.lock() {
                     Ok(guard) => guard,
                     Err(_) => break,
@@ -1202,8 +1234,12 @@ fn transport_worker(
             }
         }
     }
-    // Final drop of `claimed_device` releases the USB interface on shutdown.
-    drop(claimed_device);
+    // Belt-and-suspenders: release anything still held if the loop exited early.
+    release_all_usb_state(
+        &mut parked_usb_session,
+        &mut claimed_device,
+        &mut decode_worker,
+    );
 }
 
 /// Stop the decode worker and return the parked USB session (if any).

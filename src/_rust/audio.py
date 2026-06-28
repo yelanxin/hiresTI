@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -3444,6 +3445,13 @@ class RustAudioPlayerAdapter:
             pass
         try:
             self._release_pipewire_clock_override(reason="cleanup")
+            if _is_usb_rawlink_family(
+                getattr(self, "current_driver", None) or getattr(self, "requested_driver", None)
+            ):
+                try:
+                    self.release_output_route()
+                except Exception:
+                    logger.debug("USB Rawlink release during cleanup failed", exc_info=True)
             self._release_alsa_reservation()
         finally:
             self._rust.close()
@@ -3609,6 +3617,26 @@ class RustAudioPlayerAdapter:
             self._refresh_rust_cache(force=True)
             self._retune_idle_timers()
 
+    def _refresh_pipewire_after_usb_release(self, reason="usb-rawlink-release"):
+        """Restart WirePlumber so PipeWire/GNOME see re-attached snd-usb-audio cards.
+
+        ALSA nodes can reappear after libusb release while PipeWire still holds a
+        stale card list until WirePlumber is restarted.
+        """
+        def _run():
+            try:
+                subprocess.run(
+                    ["systemctl", "--user", "restart", "wireplumber"],
+                    check=False,
+                    timeout=8,
+                    capture_output=True,
+                )
+                logger.info("WirePlumber restarted after USB Rawlink release (%s)", reason)
+            except Exception:
+                logger.debug("WirePlumber restart after USB release failed", exc_info=True)
+
+        threading.Thread(target=_run, name="pipewire-usb-refresh", daemon=True).start()
+
     def release_output_route(self):
         self._reset_rust_visual_sync_state()
         rc = -2
@@ -3621,6 +3649,7 @@ class RustAudioPlayerAdapter:
             self.stop()
             if _is_usb_rawlink_family(getattr(self, "current_driver", None) or getattr(self, "requested_driver", None)):
                 time.sleep(0.35)
+                self._refresh_pipewire_after_usb_release(reason="release-output-fallback")
             return True
         logger.info("RustAdapter.release_output_route: rust release rc=%s", rc)
         if rc != 0:
@@ -3631,6 +3660,8 @@ class RustAudioPlayerAdapter:
         self._release_pipewire_clock_override(reason="release-output")
         self._refresh_rust_cache(force=True)
         self._retune_idle_timers()
+        if _is_usb_rawlink_family(getattr(self, "current_driver", None) or getattr(self, "requested_driver", None)):
+            self._refresh_pipewire_after_usb_release(reason="release-output")
         return True
 
     def seek(self, position_seconds):
