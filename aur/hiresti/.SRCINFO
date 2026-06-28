@@ -46,6 +46,6 @@ pkgbase = hiresti
 	conflicts = hiresti-git
 	options = !lto
 	source = hiresti-1.9.7.1.tar.gz::https://github.com/yelanxin/hiresTI/archive/refs/tags/v1.9.7.1.tar.gz
-	sha256sums = 586e5853ec1b5597aace3d2dd22a37872573b7697048f0abb1da482e5f98f50a
+	sha256sums = 3fee5268f31a5da5deab1928ba37dab92304718df7355c4f9b6fede0af960d1c
 
 pkgname = hiresti
