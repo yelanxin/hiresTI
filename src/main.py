@@ -3,6 +3,12 @@ import sys
 import logging
 import subprocess
 os.environ["MESA_LOG_LEVEL"] = "error"
+# Best-effort future-proofing for issue #83: newer GStreamer (with the device
+# provider rank MR) will honor this to keep WebKit's PipeWire device provider
+# from crashing PKCE login on Hyprland/wlroots. Current GStreamer ignores it
+# for device providers, so app_auth._disable_gst_pipewire_device_provider()
+# demotes the factory rank programmatically as the actual fix.
+os.environ.setdefault("GST_PLUGIN_FEATURE_RANK", "pipewiredeviceprovider:NONE")
 
 _src_dir = os.path.dirname(os.path.abspath(__file__))
 if _src_dir not in sys.path:

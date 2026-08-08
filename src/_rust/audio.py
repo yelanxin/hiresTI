@@ -10,10 +10,6 @@ from pathlib import Path
 from collections import deque
 
 from gi.repository import GLib
-import gi
-gi.require_version("Gst", "1.0")
-gi.require_version("GstPbutils", "1.0")
-from gi.repository import Gst, GstPbutils
 from _rust.viz import RustVizCore
 from core.viz_perf import VizPerfWindow
 

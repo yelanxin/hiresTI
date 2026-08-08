@@ -71,6 +71,32 @@ def test_ensure_svg_white_background_inserts_rect():
         assert svg.index('fill="white"') < svg.index("<path")
 
 
+def test_configure_login_webview_settings_disables_media_apis():
+    calls = []
+
+    class _Settings:
+        def set_enable_webrtc(self, value):
+            calls.append(("enable_webrtc", value))
+
+        def set_enable_media_stream(self, value):
+            calls.append(("enable_media_stream", value))
+
+        def set_enable_webaudio(self, value):
+            calls.append(("enable_webaudio", value))
+
+        def set_enable_mediasource(self, value):
+            calls.append(("enable_mediasource", value))
+
+    app_auth._configure_login_webview_settings(_Settings())
+
+    assert calls == [
+        ("enable_webrtc", False),
+        ("enable_media_stream", False),
+        ("enable_webaudio", False),
+        ("enable_mediasource", False),
+    ]
+
+
 def _write_file(path, content):
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(content)

@@ -74,6 +74,59 @@ def _webkit_runtime_usable():
     return True
 
 
+_GST_PIPEWIRE_PROVIDER_DISABLED = False
+
+
+def _disable_gst_pipewire_device_provider():
+    """Demote GStreamer's PipeWire device provider before WebKit starts it.
+
+    WebKitGTK enumerates media devices through a GStreamer device monitor on
+    page load. On Hyprland/wlroots the PipeWire device provider can SEGV the
+    WebKitWebProcess (issue #83). The `GST_PLUGIN_FEATURE_RANK` env var does
+    not affect device providers (verified on GStreamer 1.28.4), so demote the
+    factory rank programmatically — the same workaround WebKit itself uses.
+
+    Best-effort and idempotent: any failure leaves login to fall back to the
+    paste-URL flow."""
+    global _GST_PIPEWIRE_PROVIDER_DISABLED
+    if _GST_PIPEWIRE_PROVIDER_DISABLED:
+        return
+    try:
+        gi.require_version("Gst", "1.0")
+        from gi.repository import Gst
+
+        if not Gst.is_initialized():
+            Gst.init(None)
+        factory = Gst.DeviceProviderFactory.find("pipewiredeviceprovider")
+        if factory is not None:
+            factory.set_rank(Gst.Rank.NONE)
+            logger.info("Disabled GStreamer pipewiredeviceprovider for WebKit login.")
+        _GST_PIPEWIRE_PROVIDER_DISABLED = True
+    except Exception as exc:
+        logger.debug("Could not disable GStreamer pipewire device provider: %s", exc)
+
+
+def _configure_login_webview_settings(settings):
+    """PKCE login only needs HTML/JS + redirect capture.
+
+    WebKitGTK uses GStreamer for media/WebRTC device monitoring; on
+    Hyprland/wlroots the PipeWire device provider can SEGV during page
+    load (issue #83). Disable media APIs we do not need for login."""
+    for attr, value in (
+        ("enable_webrtc", False),
+        ("enable_media_stream", False),
+        ("enable_webaudio", False),
+        ("enable_mediasource", False),
+    ):
+        setter = getattr(settings, f"set_{attr}", None)
+        if not callable(setter):
+            continue
+        try:
+            setter(value)
+        except Exception as exc:
+            logger.debug("WebKit settings %s=%s skipped: %s", attr, value, exc)
+
+
 # Optional embedded browser for the PKCE redirect-capture path.  When
 # WebKitGTK 6.0 introspection (`gir1.2-webkit-6.0` / `webkitgtk-6.0`)
 # is present AND the runtime sandbox helper is available we open the
@@ -480,6 +533,7 @@ def _show_pkce_webview_dialog(self, login_url, attempt_id):
     # construction (e.g. SECCOMP rejecting a syscall, sandbox setup
     # failing partway). Catch what we can, fall through to paste-URL
     # for everything else by never reaching WebKit when in doubt.
+    _disable_gst_pipewire_device_provider()
     try:
         webview = WebKit.WebView()
     except Exception as e:  # noqa: BLE001
@@ -519,12 +573,14 @@ def _show_pkce_webview_dialog(self, login_url, attempt_id):
     # Spoof a recent stable Chrome string so the login page loads without
     # the captcha gate.
     try:
-        webview.get_settings().set_user_agent(
+        settings = webview.get_settings()
+        _configure_login_webview_settings(settings)
+        settings.set_user_agent(
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"
         )
     except Exception as e:
-        logger.debug("Could not override WebView user agent: %s", e)
+        logger.debug("Could not configure WebView settings: %s", e)
 
     webview.set_hexpand(True)
     webview.set_vexpand(True)
