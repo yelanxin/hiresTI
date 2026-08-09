@@ -1647,7 +1647,13 @@ def on_output_state_transition(self, prev_state, state, detail=None):
                         player.load(uri)
                         player.play()
                         if pos_s > 0.5:
-                            GLib.timeout_add(500, lambda: (player.seek(pos_s), None)[1] or False)
+                            def _restore_position():
+                                player.seek(pos_s)
+                                if hasattr(self, "_mpris_emit_seeked"):
+                                    self._mpris_emit_seeked(pos_s)
+                                return False
+
+                            GLib.timeout_add(500, _restore_position)
                         if self.play_btn is not None:
                             self.play_btn.set_icon_name("media-playback-pause-symbolic")
                         update_output_status_ui(self)

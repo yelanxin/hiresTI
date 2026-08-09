@@ -1,7 +1,6 @@
 """MPRIS (Media Player Remote Interfacing Specification) service."""
 
 import logging
-import time
 
 import gi
 
@@ -125,8 +124,6 @@ class MPRISService:
         self._reg_ids = []
         self._name_owned = False
         self._started = False
-        self._last_position_emit_ts = 0.0
-        self._last_position_us = -1
         self._stopped_override = False
 
     @property
@@ -211,8 +208,6 @@ class MPRISService:
         self._conn = None
         self._node_info = None
         self._started = False
-        self._last_position_emit_ts = 0.0
-        self._last_position_us = -1
 
     def sync_all(self, force=False):
         if not self._started:
@@ -260,21 +255,11 @@ class MPRISService:
         )
 
     def sync_position(self, force=False):
-        if not self._started:
-            return
-        now = time.monotonic()
-        interval = 0.25 if self._is_playing() else 0.8
-        if (not force) and (now - self._last_position_emit_ts) < interval:
-            return
-        pos_us = self._position_us()
-        if (not force) and self._last_position_us >= 0 and abs(pos_us - self._last_position_us) < 100_000:
-            return
-        self._last_position_emit_ts = now
-        self._last_position_us = pos_us
-        self._emit_properties_changed(
-            IFACE_PLAYER,
-            {"Position": GLib.Variant("x", pos_us)},
-        )
+        # MPRIS forbids announcing Player.Position through PropertiesChanged.
+        # Clients read the property on demand and watch Seeked for jumps, so a
+        # position that simply advanced has nothing to broadcast. Kept as a
+        # no-op because the playback and remote-control paths call it directly.
+        return
 
     def emit_seeked(self, position_seconds=None):
         if not self._started or self._conn is None:
@@ -293,7 +278,6 @@ class MPRISService:
             )
         except Exception:
             logger.debug("Failed to emit MPRIS Seeked signal", exc_info=True)
-        self.sync_position(force=True)
 
     def _request_bus_name(self):
         if self._conn is None:

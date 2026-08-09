@@ -3387,6 +3387,10 @@ class RustAudioPlayerAdapter:
                     # reload to recover — but only once per stall episode to
                     # avoid a restart loop.
                     if self._spectrum_stall_count == 5:
+                        # This check runs on every pump tick, but the counter
+                        # only advances once per stall cycle, so step past the
+                        # trigger here to keep the reload genuinely one-shot.
+                        self._spectrum_stall_count += 1
                         uri = str(getattr(self, "_last_loaded_uri", "") or "")
                         if uri:
                             logger.warning(
@@ -3401,13 +3405,20 @@ class RustAudioPlayerAdapter:
                                 if rc == 0:
                                     self._cached_is_playing = True
                                     self._rust_last_play_ts = time.monotonic()
-                                    GLib.timeout_add(
-                                        800,
-                                        lambda: (
-                                            self._rust.seek(pos_s),
-                                            None,
-                                        )[1],
-                                    )
+
+                                    def _restore_stall_position():
+                                        self._rust.seek(pos_s)
+                                        cb = getattr(
+                                            self, "_on_internal_seek_callback", None
+                                        )
+                                        if callable(cb):
+                                            try:
+                                                cb(pos_s)
+                                            except Exception:
+                                                pass
+                                        return False
+
+                                    GLib.timeout_add(800, _restore_stall_position)
                             except Exception:
                                 logger.debug(
                                     "Rust spectrum stall recovery: reload failed",
