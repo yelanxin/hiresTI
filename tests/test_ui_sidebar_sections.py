@@ -23,6 +23,6 @@ def test_sidebar_nav_sections_group_discover_library_and_recent():
     library_ids = [nav_id for nav_id, _icon, _label in sections[1][1]]
     recent_ids = [nav_id for nav_id, _icon, _label in sections[2][1]]
 
-    assert discover_ids == ["home", "new", "top", "hires", "genres", "decades"]
-    assert library_ids == ["collection", "liked_songs", "artists", "playlists"]
+    assert discover_ids == ["home", "new", "top", "hires", "genres", "decades", "moods"]
+    assert library_ids == ["collection", "liked_songs", "artists", "playlists", "mixes", "uploads"]
     assert recent_ids == ["history"]

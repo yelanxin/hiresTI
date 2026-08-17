@@ -138,6 +138,8 @@ def _update_track_list_icon(self, target_list=None):
             targets.append(self.track_list)
         if getattr(self, "liked_track_list", None) is not None:
             targets.append(self.liked_track_list)
+        if getattr(self, "uploads_track_list", None) is not None:
+            targets.append(self.uploads_track_list)
         if getattr(self, "playlist_track_list", None) is not None:
             targets.append(self.playlist_track_list)
         if getattr(self, "queue_track_list", None) is not None:

@@ -5846,6 +5846,166 @@ def render_queue_dashboard(app):
         app._update_track_list_icon(target_list=list_box)
 
 
+def render_uploads_dashboard(app, tracks=None):
+    _clear_container(app.collection_content_box)
+
+    if tracks is None:
+        loading = Gtk.Label(
+            label="Loading your uploads...",
+            xalign=0,
+            css_classes=["dim-label"],
+            margin_start=8,
+            margin_top=8,
+        )
+        app.collection_content_box.append(loading)
+        token = object()
+        app._uploads_render_token = token
+
+        def _uploads_view_active():
+            nav = getattr(app, "nav_list", None)
+            current = nav.get_selected_row() if nav is not None else None
+            return bool(current and getattr(current, "nav_id", None) == "uploads")
+
+        def task():
+            items = app.backend.get_uploaded_tracks()
+
+            def apply():
+                if getattr(app, "_uploads_render_token", None) is token and _uploads_view_active():
+                    render_uploads_dashboard(app, tracks=items)
+                return False
+
+            GLib.idle_add(apply)
+
+        Thread(target=task, daemon=True).start()
+        return
+
+    all_tracks = [t for t in list(tracks or []) if t is not None]
+
+    head = Gtk.Box(spacing=8, css_classes=["home-section-head"], margin_start=6, margin_end=6, margin_bottom=8)
+    head.append(Gtk.Label(label="My Uploads", xalign=0, hexpand=True, css_classes=["home-section-title"]))
+    head.append(Gtk.Label(label=f"{len(all_tracks)} tracks", css_classes=["home-section-count"]))
+
+    def _play_uploads(shuffle=False):
+        queue = list(all_tracks)
+        if not queue:
+            return
+        if shuffle:
+            random.shuffle(queue)
+        app.on_history_track_clicked(queue, 0, source={"type": "uploads", "name": "Uploads"})
+
+    play_all_btn = Gtk.Button(icon_name="media-playback-start-symbolic", css_classes=["flat", "playlist-tool-btn"])
+    play_all_btn.set_tooltip_text("Play All")
+    play_all_btn.set_sensitive(bool(all_tracks))
+    play_all_btn.connect("clicked", lambda _b: _play_uploads(shuffle=False))
+    head.append(play_all_btn)
+
+    shuffle_btn = Gtk.Button(icon_name="media-playlist-shuffle-symbolic", css_classes=["flat", "playlist-tool-btn"])
+    shuffle_btn.set_tooltip_text("Shuffle All")
+    shuffle_btn.set_sensitive(bool(all_tracks))
+    shuffle_btn.connect("clicked", lambda _b: _play_uploads(shuffle=True))
+    head.append(shuffle_btn)
+
+    app.collection_content_box.append(head)
+
+    if not all_tracks:
+        hint = Gtk.Label(
+            label="No uploads yet. Upload your own music from the TIDAL app or web player and it will show up here.",
+            xalign=0,
+            css_classes=["dim-label"],
+            margin_start=8,
+            margin_top=8,
+        )
+        app.collection_content_box.append(hint)
+        return
+
+    table_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+    app.collection_content_box.append(table_box)
+
+    tracks_head, _head_btns = build_tracks_header(
+        on_sort_title=lambda _b: None,
+        on_sort_artist=lambda _b: None,
+        on_sort_album=lambda _b: None,
+        on_sort_time=lambda _b: None,
+    )
+    append_header_action_spacers(tracks_head, ["add"])
+    table_box.append(tracks_head)
+
+    list_box = Gtk.ListBox(css_classes=["tracks-list"], margin_start=0, margin_end=0, margin_bottom=32)
+    list_box.upload_tracks = all_tracks
+    list_box.connect(
+        "row-activated",
+        lambda box, row: app.on_history_track_clicked(
+            getattr(box, "upload_tracks", []),
+            getattr(row, "upload_track_index", -1),
+            source={"type": "uploads", "name": "Uploads"},
+        ),
+    )
+    app.uploads_track_list = list_box
+    table_box.append(list_box)
+
+    for i, t in enumerate(all_tracks):
+        row = Gtk.ListBoxRow(css_classes=["track-row"])
+        row.upload_track_index = i
+        row.track_id = getattr(t, "id", None)
+        box = Gtk.Box(
+            spacing=LAYOUT["col_gap"],
+            margin_top=LAYOUT["row_margin_y"],
+            margin_bottom=LAYOUT["row_margin_y"],
+            margin_start=0,
+            margin_end=0,
+        )
+        stack = Gtk.Stack()
+        stack.set_size_request(LAYOUT["index_width"], -1)
+        stack.add_css_class("track-index-stack")
+        idx = Gtk.Label(label=str(i + 1), css_classes=["dim-label"])
+        stack.add_named(idx, "num")
+        icon = Gtk.Image(icon_name="media-playback-start-symbolic")
+        icon.add_css_class("accent")
+        stack.add_named(icon, "icon")
+        stack.set_visible_child_name("num")
+        box.append(stack)
+
+        title = str(getattr(t, "name", "Unknown Track") or "Unknown Track")
+        title_lbl = Gtk.Label(label=title, xalign=0, ellipsize=3, hexpand=True, css_classes=["track-title"])
+        title_lbl.set_tooltip_text(title)
+        box.append(title_lbl)
+
+        artist_name = str(getattr(getattr(t, "artist", None), "name", "Unknown") or "Unknown")
+        artist_lbl = Gtk.Label(label=artist_name, xalign=0, ellipsize=3, css_classes=["dim-label", "track-artist"])
+        artist_lbl.set_tooltip_text(artist_name)
+        artist_lbl.set_size_request(LAYOUT["artist_width"], -1)
+        artist_lbl.set_max_width_chars(16)
+        artist_lbl.set_margin_end(LAYOUT["cell_margin_end"])
+        box.append(artist_lbl)
+
+        album_name = str(getattr(getattr(t, "album", None), "name", "Unknown Album") or "Unknown Album")
+        album_lbl = Gtk.Label(label=album_name, xalign=0, ellipsize=3, css_classes=["dim-label", "track-album"])
+        album_lbl.set_tooltip_text(album_name)
+        album_lbl.set_size_request(LAYOUT["album_width"], -1)
+        album_lbl.set_max_width_chars(16)
+        album_lbl.set_margin_end(LAYOUT["cell_margin_end"])
+        box.append(album_lbl)
+
+        dur = int(getattr(t, "duration", 0) or 0)
+        m, s = divmod(max(0, dur), 60)
+        d = Gtk.Label(label=f"{m}:{s:02d}", xalign=0, css_classes=["dim-label", "track-duration"])
+        d.set_attributes(Pango.AttrList.from_string("font-features 'tnum=1'"))
+        d.set_size_request(LAYOUT["time_width"], -1)
+        d.set_halign(Gtk.Align.FILL)
+        box.append(d)
+
+        add_btn = Gtk.Button(icon_name="list-add-symbolic", css_classes=["flat", "circular", "history-scroll-btn"])
+        add_btn.set_tooltip_text("Add to Playlist")
+        add_btn.connect("clicked", lambda _b, tr=t: app.on_add_single_track_to_playlist(tr))
+        box.append(add_btn)
+
+        row.set_child(box)
+        list_box.append(row)
+
+    if hasattr(app, "_update_track_list_icon"):
+        app._update_track_list_icon(target_list=list_box)
+
+
 def render_liked_songs_dashboard(app, tracks=None):
     all_tracks = list(tracks or [])
     n = len(all_tracks)

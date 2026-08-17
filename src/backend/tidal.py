@@ -971,6 +971,102 @@ class TidalBackend:
             logger.warning("Failed to fetch favorite mixes: %s", e)
             return []
 
+    @staticmethod
+    def _extract_owned_track_ids(payload):
+        """Ordered track ids from one JSON:API /tracks?filter[owners.id] page."""
+        ids = []
+        for item in (payload or {}).get("data") or []:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("type") or "") != "tracks":
+                continue
+            tid = str(item.get("id") or "")
+            if tid:
+                ids.append(tid)
+        return ids
+
+    @staticmethod
+    def _extract_next_page_cursor(payload):
+        """page[cursor] value from a JSON:API links.next path, or None."""
+        from urllib.parse import parse_qs, urlparse as _urlparse
+
+        nxt = ((payload or {}).get("links") or {}).get("next")
+        if not nxt:
+            return None
+        try:
+            query = parse_qs(_urlparse(str(nxt)).query)
+            values = query.get("page[cursor]") or []
+            return values[0] if values else None
+        except Exception:
+            return None
+
+    def get_uploaded_tracks(self, limit=1000):
+        """Tracks the user uploaded to TIDAL (TIDAL Upload / My Collection).
+
+        Uploads are regular track resources owned by the user (accessType
+        PRIVATE), but the legacy v1 API has no endpoint that lists them.
+        The openapi v2 catalog does — `/tracks?filter[owners.id]=<uid>` —
+        and accepts the app's existing OAuth token, while v1 resolves the
+        returned ids fine. So: list ids via openapi, then hydrate through
+        `session.track()` so every other code path (rows, playback,
+        favorites, MPRIS) sees the same tidalapi Track objects it already
+        knows.
+        """
+        if not self.user:
+            return []
+
+        openapi_base = (
+            getattr(self.session.config, "openapi_v2_location", None)
+            or "https://openapi.tidal.com/v2/"
+        )
+
+        def _list_ids():
+            ids = []
+            seen = set()
+            cursor = None
+            while len(ids) < limit:
+                params = {"filter[owners.id]": str(self.user.id)}
+                if cursor:
+                    params["page[cursor]"] = cursor
+                resp = self.session.request.request(
+                    "GET", "tracks", params=params, base_url=openapi_base
+                )
+                payload = resp.json()
+                page_ids = self._extract_owned_track_ids(payload)
+                for tid in page_ids:
+                    if tid not in seen:
+                        seen.add(tid)
+                        ids.append(tid)
+                cursor = self._extract_next_page_cursor(payload)
+                if not page_ids or not cursor:
+                    break
+            return ids[:limit]
+
+        def _fetch():
+            ids = _list_ids()
+            if not ids:
+                return []
+
+            def _hydrate(tid):
+                try:
+                    return self.session.track(tid)
+                except Exception as e:
+                    logger.debug("Upload track %s hydrate failed: %s", tid, e)
+                    return None
+
+            from core.executor import TaskExecutor
+
+            tracks = list(TaskExecutor().map(_hydrate, ids))
+            return [t for t in tracks if t is not None]
+
+        try:
+            return self._call_with_session_recovery(_fetch, context="uploaded tracks") or []
+        except Exception as e:
+            logger.warning(
+                "Failed to fetch uploaded tracks [%s]: %s", classify_exception(e), e
+            )
+            return []
+
     def get_favorite_tracks(self, limit=50, sort="recent"):
         """Fetch favorite tracks, ordered by date-added DESC by default.
 

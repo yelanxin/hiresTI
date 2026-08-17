@@ -184,6 +184,7 @@ def on_nav_selected(app, box, row):
         app.collection_content_box.remove(c)
     app.queue_track_list = None
     app.liked_track_list = None
+    app.uploads_track_list = None
 
     if row.nav_id == "home":
         app.grid_title_label.set_text("Home")
@@ -400,6 +401,13 @@ def on_nav_selected(app, box, row):
         if hasattr(app, "grid_subtitle_label") and app.grid_subtitle_label is not None:
             app.grid_subtitle_label.set_text("Mixes and radio stations you've favorited")
         ui_actions.render_mixes_dashboard(app)
+        return
+
+    if row.nav_id == "uploads":
+        app.grid_title_label.set_text("Uploads")
+        if hasattr(app, "grid_subtitle_label") and app.grid_subtitle_label is not None:
+            app.grid_subtitle_label.set_text("Music you uploaded to TIDAL")
+        ui_actions.render_uploads_dashboard(app)
         return
 
 

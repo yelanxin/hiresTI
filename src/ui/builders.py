@@ -49,6 +49,7 @@ def _sidebar_nav_sections():
                 ("artists", "hiresti-artists-symbolic", "Artists"),
                 ("playlists", "hiresti-playlists-symbolic", "Playlists"),
                 ("mixes", "hiresti-mixes-symbolic", "Mixes & Radio"),
+                ("uploads", "hiresti-uploads-symbolic", "Uploads"),
             ],
         ),
         (

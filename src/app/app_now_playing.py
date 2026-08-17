@@ -1852,6 +1852,7 @@ _SOURCE_TYPE_TO_NAV_ID = {
     "search": None,
     "history": "history",
     "tracks": "liked_songs",
+    "uploads": "uploads",
     "Daily Mix": "daily_mix",
     "Home": "home",
     "New": "new",
