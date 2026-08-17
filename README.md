@@ -7,6 +7,9 @@
 
 `hiresTI` is a native Linux TIDAL client built for audiophiles, combining high-fidelity playback, rock-solid stability, and a modern GTK4/Libadwaita user experience. 
 
+> [!TIP]
+> **Try [OxiTide](https://github.com/yelanxin/OxiTide-release)** — a ground-up **pure-Rust rewrite** of hiresTI by the same author: native UI, no Python runtime, faster startup, lower memory. Free download.
+
 > [!IMPORTANT]
 > **Re-login required for FLAC / Hi-Res quality.**
 > The legacy OAuth (device-code) login that previous versions used is now capped by TIDAL at 320 kbps AAC. A new **PKCE** login flow (added in `v1.9.5`) restores access to full FLAC CD-quality and Hi-Res Lossless streams.
