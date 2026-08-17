@@ -219,6 +219,15 @@ pub struct Engine {
     /// until the playback position catches up to the frame's decode-time
     /// `pos_s`, matching GStreamer's clock-synchronized delivery behaviour.
     native_spectrum_pending: VecDeque<native_transport::SpectrumFrame>,
+    native_levels_pending: VecDeque<dsp::lufs::LevelFrame>,
+    /// Latest released meter levels: [peak_l, rms_l, peak_r, rms_r] dBFS.
+    current_levels: [f32; 4],
+    /// Wall-clock smoothing for the ALSA-family fallback release clock:
+    /// decoded_frame_count advances in slab quanta (~93 ms for FLAC), so
+    /// between slabs the clock is extrapolated with monotonic time to keep
+    /// 20 ms frame releases flowing instead of bursting per slab.
+    fallback_clock_base_pos: f64,
+    fallback_clock_base_at: Option<std::time::Instant>,
     /// Guards against emitting multiple EOS events for a single native transport track.
     native_eos_emitted: bool,
     fmt_probe_tick: u64,
@@ -423,6 +432,10 @@ impl Engine {
         self.spectrum_lead_ms = 0.0;
         self.spectrum_len = 0;
         self.native_spectrum_pending.clear();
+        self.native_levels_pending.clear();
+        // Discard frames the decode thread produced before the seek/reset.
+        let _ = self.native_transport.take_level_frames();
+        self.current_levels = [dsp::lufs::LEVEL_DISPLAY_FLOOR_DB; 4];
         self.spectrum_ring_write = 0;
         self.spectrum_ring_count = 0;
         self.spectrum_vals = [0.0; SPECTRUM_BANDS_MAX];
@@ -1010,6 +1023,10 @@ impl Engine {
             spectrum_ring_count: 0,
             spectrum_lead_ms: 0.0,
             native_spectrum_pending: VecDeque::new(),
+            native_levels_pending: VecDeque::new(),
+            current_levels: [dsp::lufs::LEVEL_DISPLAY_FLOOR_DB; 4],
+            fallback_clock_base_pos: 0.0,
+            fallback_clock_base_at: None,
             native_eos_emitted: false,
             fmt_probe_tick: 0,
             last_codec: String::new(),
@@ -1133,6 +1150,53 @@ impl Engine {
             }
             self.emit_event(evt, &msg);
         }
+        // Playback clock used to release position-stamped frames (spectrum
+        // and meter levels alike). Only USB Rawlink publishes runtime_info
+        // with a hardware clock; the ALSA-family drivers (ALSA, PipeWire
+        // bridge) never fill it, so fall back to the decode clock — the same
+        // one rac_get_position reports for those drivers. Without the
+        // fallback the gate never opens and every frame is held until the
+        // safety valve drops it.
+        let snap = self.native_transport.snapshot();
+        let seek_off = snap.seek_offset_s;
+        let hw_clock = self.native_transport.runtime_info().is_some();
+        let playback_pos_s = if let Some(rt) = self.native_transport.runtime_info() {
+            seek_off + rt.feed.playback_elapsed_s().unwrap_or(0.0)
+        } else {
+            let rate = snap
+                .stream_spec
+                .as_ref()
+                .map(|s| s.sample_rate as f64)
+                .unwrap_or(0.0);
+            let raw = if rate > 0.0 {
+                seek_off + snap.decoded_frame_count as f64 / rate
+            } else {
+                seek_off
+            };
+            // decoded_frame_count moves in slab quanta; smooth it with
+            // monotonic time so the release gate ticks continuously.
+            let now = std::time::Instant::now();
+            let playing = snap.state == native_transport::NativeTransportState::Playing;
+            if !playing {
+                self.fallback_clock_base_pos = raw;
+                self.fallback_clock_base_at = None;
+                raw
+            } else {
+                if raw > self.fallback_clock_base_pos + 1e-9
+                    || raw < self.fallback_clock_base_pos - 0.5
+                {
+                    self.fallback_clock_base_pos = raw;
+                    self.fallback_clock_base_at = Some(now);
+                }
+                let extra = self
+                    .fallback_clock_base_at
+                    .map(|t| now.duration_since(t).as_secs_f64())
+                    .unwrap_or(0.0)
+                    .min(0.25);
+                self.fallback_clock_base_pos + extra
+            }
+        };
+
         if self.spectrum_enabled {
             // Enqueue newly arrived frames from the decode thread.
             for frame in self.native_transport.take_spectrum_frames() {
@@ -1141,28 +1205,6 @@ impl Engine {
             // Release frames whose decode-time pos_s has been reached by the
             // playback clock.  This replicates GStreamer's clock-synchronized
             // spectrum delivery: frames are held until the audio actually plays.
-            //
-            // Only USB Rawlink publishes runtime_info with a hardware clock;
-            // the ALSA-family drivers (ALSA, PipeWire bridge) never fill it,
-            // so fall back to the decode clock — the same one rac_get_position
-            // reports for those drivers. Without the fallback the gate never
-            // opens and every frame is held until the safety valve drops it.
-            let snap = self.native_transport.snapshot();
-            let seek_off = snap.seek_offset_s;
-            let playback_pos_s = if let Some(rt) = self.native_transport.runtime_info() {
-                seek_off + rt.feed.playback_elapsed_s().unwrap_or(0.0)
-            } else {
-                let rate = snap
-                    .stream_spec
-                    .as_ref()
-                    .map(|s| s.sample_rate as f64)
-                    .unwrap_or(0.0);
-                if rate > 0.0 {
-                    seek_off + snap.decoded_frame_count as f64 / rate
-                } else {
-                    seek_off
-                }
-            };
             while let Some(frame) = self.native_spectrum_pending.front() {
                 if frame.pos_s > playback_pos_s + 0.02 {
                     break; // not yet — hold for next pump cycle
@@ -1178,6 +1220,35 @@ impl Engine {
             }
         } else {
             self.native_spectrum_pending.clear();
+        }
+
+        // Meter level frames go through the same playback-clock gate so the
+        // bars move at their 20 ms production cadence aligned to what is
+        // audible — the decode thread hands them over in slab-sized bursts.
+        //
+        // On the ALSA-family fallback the "playback" clock IS the decode
+        // front, so every frame stamp is already behind it and the gate
+        // would pass whole slabs at once. Hold those frames by the rough
+        // output-pipeline depth (ALSA buffer + queued slabs) so they
+        // trickle out at production cadence near the audible time. The USB
+        // hardware clock genuinely lags decode, so it needs no offset.
+        let level_release_pos = if hw_clock {
+            playback_pos_s
+        } else {
+            (playback_pos_s - 0.30).max(0.0)
+        };
+        for frame in self.native_transport.take_level_frames() {
+            self.native_levels_pending.push_back(frame);
+        }
+        while let Some(frame) = self.native_levels_pending.front() {
+            if frame.pos_s > level_release_pos + 0.02 {
+                break;
+            }
+            let frame = self.native_levels_pending.pop_front().unwrap();
+            self.current_levels = [frame.peak_l, frame.rms_l, frame.peak_r, frame.rms_r];
+        }
+        while self.native_levels_pending.len() > 600 {
+            self.native_levels_pending.pop_front();
         }
 
         // Detect end-of-stream for native transport: decode worker finished
@@ -1576,10 +1647,11 @@ pub extern "C" fn rac_get_lufs(
     0
 }
 
-/// Per-channel time-domain meter levels (dBFS) over the last 100 ms block:
-/// true sample peak and RMS for L and R. Separate from rac_get_lufs so
-/// older callers keep their ABI. Returns NEG_INFINITY-ish values (< -1e30)
-/// when unavailable.
+/// Per-channel time-domain meter levels (dBFS): true sample peak and RMS
+/// for L and R, PPM-ballistic on a 20 ms cadence and released against the
+/// playback clock (see drain_native_transport_events). Separate from
+/// rac_get_lufs so older callers keep their ABI. Values at or below -100
+/// mean silence/unavailable.
 #[no_mangle]
 pub extern "C" fn rac_get_levels(
     ptr: *const Engine,
@@ -1594,12 +1666,12 @@ pub extern "C" fn rac_get_levels(
     if out_peak_l.is_null() || out_rms_l.is_null() || out_peak_r.is_null() || out_rms_r.is_null() {
         return -2;
     }
-    let vals: LufsValues = engine.native_transport.lufs_values();
+    let [peak_l, rms_l, peak_r, rms_r] = engine.current_levels;
     unsafe {
-        *out_peak_l = vals.level_peak_l;
-        *out_rms_l = vals.level_rms_l;
-        *out_peak_r = vals.level_peak_r;
-        *out_rms_r = vals.level_rms_r;
+        *out_peak_l = peak_l;
+        *out_rms_l = rms_l;
+        *out_peak_r = peak_r;
+        *out_rms_r = rms_r;
     }
     0
 }

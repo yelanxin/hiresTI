@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::format_util::{bytes_per_sample, sample_to_f32, sample_to_f64};
-use crate::dsp::lufs::{LufsState, LufsValues};
+use crate::dsp::lufs::{LufsShared, LufsState, LEVEL_FRAME_QUEUE_CAP};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PcmSampleFormat {
@@ -425,7 +425,7 @@ impl PcmProcessor for SpectrumPcmProcessor {
 // ---------------------------------------------------------------------------
 
 /// Shared LUFS values: written by LufsPcmProcessor, read by Engine via rac_get_lufs.
-pub type SharedLufsValues = Arc<Mutex<LufsValues>>;
+pub type SharedLufsValues = Arc<Mutex<LufsShared>>;
 
 pub struct LufsPcmProcessor {
     state: LufsState,
@@ -434,9 +434,11 @@ pub struct LufsPcmProcessor {
 }
 
 impl LufsPcmProcessor {
-    pub fn new(shared: SharedLufsValues) -> Self {
+    pub fn new(shared: SharedLufsValues, start_offset_s: f64) -> Self {
+        let mut state = LufsState::new();
+        state.set_start_offset(start_offset_s);
         Self {
-            state: LufsState::new(),
+            state,
             shared,
             f64_buf: Vec::new(),
         }
@@ -464,9 +466,15 @@ impl PcmProcessor for LufsPcmProcessor {
             self.f64_buf.push(sample_to_f64(chunk, slab.spec.format));
         }
         self.state.process(&self.f64_buf);
-        // Publish latest values (try_lock to avoid blocking the decode thread).
-        if let Ok(mut vals) = self.shared.try_lock() {
-            *vals = self.state.values.clone();
+        // Publish latest values + finished display frames (try_lock to avoid
+        // blocking the decode thread; frames simply stay pending until the
+        // next slab if the lock is contended).
+        if let Ok(mut sh) = self.shared.try_lock() {
+            sh.values = self.state.values.clone();
+            sh.level_frames.extend(self.state.drain_level_frames());
+            while sh.level_frames.len() > LEVEL_FRAME_QUEUE_CAP {
+                sh.level_frames.pop_front();
+            }
         }
         Ok(slab)
     }

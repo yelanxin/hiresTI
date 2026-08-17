@@ -119,12 +119,12 @@ class LevelMonitor(Gtk.DrawingArea):
     # ------------------------------------------------------------------
 
     def set_levels(self, peak_l, rms_l, peak_r, rms_r):
-        """Store true time-domain dBFS targets from the Rust PCM tap.
+        """Store true time-domain dBFS levels from the Rust PCM tap.
 
-        peak_*: sample peak of the last 100 ms block; rms_*: block RMS.
-        Values arrive at the ~8 Hz LUFS poll cadence; the per-frame update()
-        tick animates the bars toward them at display frame rate, so the
-        meter stays smooth while reading true.
+        The values are already PPM-ballistic (20 ms sub-blocks in Rust:
+        instant peak attack, 60 dB/s fall, fast-attack RMS), so the UI
+        adopts them as-is — smoothing again here would double the
+        ballistics and make the meter feel sluggish.
         """
         def _clamp(v):
             try:
@@ -140,20 +140,17 @@ class LevelMonitor(Gtk.DrawingArea):
         self._td_rms_r  = _clamp(rms_r)
 
     def update(self, left_mags, right_mags):
-        """Per-frame bar animation tick (called at viz frame rate).
+        """Per-frame bar tick (called at meter frame rate).
 
-        With the time-domain tap active, animates toward the latest true
-        dBFS targets from set_levels(). Otherwise falls back to driving the
-        bars from the FFT magnitude arrays (older engine builds).
+        With the time-domain tap active, adopts the latest ballistic dBFS
+        values from set_levels(). Otherwise falls back to driving the bars
+        from the FFT magnitude arrays (older engine builds).
         """
         if getattr(self, "_td_mode", False):
-            a = self._LEVEL_ALPHA
-            self._level_l = a * self._td_rms_l + (1.0 - a) * self._level_l
-            self._level_r = a * self._td_rms_r + (1.0 - a) * self._level_r
-            al = self._PEAK_ATTACK if self._td_peak_l > self._peak_l else self._PEAK_RELEASE
-            ar = self._PEAK_ATTACK if self._td_peak_r > self._peak_r else self._PEAK_RELEASE
-            self._peak_l = al * self._td_peak_l + (1.0 - al) * self._peak_l
-            self._peak_r = ar * self._td_peak_r + (1.0 - ar) * self._peak_r
+            self._level_l = self._td_rms_l
+            self._level_r = self._td_rms_r
+            self._peak_l = self._td_peak_l
+            self._peak_r = self._td_peak_r
             self.queue_draw()
             return
         raw_peak_l, raw_mean_l, raw_peak_r, raw_mean_r = _compute_level_metrics(left_mags, right_mags)

@@ -893,6 +893,17 @@ def _apply_viz_frame(self, frame):
                     left  = _spectrum_frame_get(frame, "left")
                     right = _spectrum_frame_get(frame, "right")
                     with _APP_VIZ_PERF.track("dr_meter_update"):
+                        # The Rust tap publishes PPM-ballistic levels on a
+                        # 20 ms cadence — poll it at meter frame rate so the
+                        # bars track that rhythm (the LUFS text below still
+                        # polls at ~8 Hz).
+                        if hasattr(self.player, "get_levels"):
+                            try:
+                                levels = self.player.get_levels()
+                            except Exception:
+                                levels = None
+                            if levels is not None:
+                                dr_meter.set_levels(*levels)
                         dr_meter.update(left, right)
                     self._dr_meter_last_update_ts = now
                 # LUFS evolves slowly enough that polling at ~8 Hz is visually
@@ -910,10 +921,6 @@ def _apply_viz_frame(self, frame):
                                 self._dr_lufs_last_poll_ts = now
                         if did_poll and lufs is not None:
                             dr_meter.set_lufs(*lufs)
-                        if did_poll and hasattr(self.player, "get_levels"):
-                            levels = self.player.get_levels()
-                            if levels is not None:
-                                dr_meter.set_levels(*levels)
                 except Exception:
                     pass
 

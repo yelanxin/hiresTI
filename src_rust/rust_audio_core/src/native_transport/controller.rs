@@ -191,7 +191,7 @@ impl NativeTransportController {
         let (spectrum_tx, spectrum_rx) = crossbeam_channel::bounded(64);
         let spectrum_bands = Arc::new(AtomicU32::new(512));
         let lufs_values: SharedLufsValues = Arc::new(std::sync::Mutex::new(
-            crate::dsp::lufs::LufsValues::default(),
+            crate::dsp::lufs::LufsShared::default(),
         ));
         let hw_vol_cache: HwVolCache = [
             Arc::new(AtomicI32::new(i32::MIN)),
@@ -331,7 +331,17 @@ impl NativeTransportController {
     pub fn lufs_values(&self) -> crate::dsp::lufs::LufsValues {
         self.lufs_values
             .lock()
-            .map(|v| v.clone())
+            .map(|sh| sh.values.clone())
+            .unwrap_or_default()
+    }
+
+    /// Drain the position-stamped meter display frames produced by the
+    /// LUFS tap. The engine gates them against the playback clock, exactly
+    /// like the spectrum frames.
+    pub fn take_level_frames(&self) -> Vec<crate::dsp::lufs::LevelFrame> {
+        self.lufs_values
+            .lock()
+            .map(|mut sh| sh.level_frames.drain(..).collect())
             .unwrap_or_default()
     }
 
@@ -1742,7 +1752,10 @@ fn decode_direct_audio_stream(
             spectrum_bands,
             seek_start_ms.unwrap_or(0) as f64 / 1000.0,
         )));
-        processor_chain.push(Box::new(LufsPcmProcessor::new(lufs_values)));
+        processor_chain.push(Box::new(LufsPcmProcessor::new(
+            lufs_values,
+            seek_start_ms.unwrap_or(0) as f64 / 1000.0,
+        )));
     }
     let mut chain_configured = false;
     let mut output_session: Option<OutputSession> = None;

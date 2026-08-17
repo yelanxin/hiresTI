@@ -117,15 +117,40 @@ pub struct LufsValues {
     pub lra: f32,
     /// Dynamic Range = peak_dBFS − rms_dBFS over ≈4 s window. 0.0 when unavailable.
     pub dr: f32,
-    /// Per-channel time-domain levels over the last 100 ms block, in dBFS.
-    /// True sample peak and RMS for the L/R meter bars (unweighted, unlike
-    /// the LUFS fields). f32::NEG_INFINITY when unavailable. Mono sources
-    /// mirror L into R.
-    pub level_peak_l: f32,
-    pub level_rms_l: f32,
-    pub level_peak_r: f32,
-    pub level_rms_r: f32,
 }
+
+/// Display floor for the meter levels (dBFS). Finite so the smoothing
+/// math stays well-defined; anything at or below this reads as silence.
+pub const LEVEL_DISPLAY_FLOOR_DB: f32 = -100.0;
+
+/// One ~20 ms display sub-block of per-channel meter levels, already
+/// ballistic (instant peak attack, 60 dB/s fall; fast-attack RMS) and
+/// stamped with the track-absolute position of its last sample. The
+/// engine holds these until the playback clock reaches `pos_s`, so the
+/// meter shows what is audible, not what was just decoded — and slab-
+/// granular decoding no longer collapses several sub-blocks into one
+/// visible update.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LevelFrame {
+    pub pos_s: f64,
+    pub peak_l: f32,
+    pub rms_l: f32,
+    pub peak_r: f32,
+    pub rms_r: f32,
+}
+
+/// Payload behind the shared LUFS mutex: latest measurement values plus
+/// the queue of position-stamped display frames awaiting release.
+#[derive(Debug, Default)]
+pub struct LufsShared {
+    pub values: LufsValues,
+    pub level_frames: VecDeque<LevelFrame>,
+}
+
+/// Cap on queued display frames (~80 s at 20 ms) — decode normally runs
+/// less than a couple of seconds ahead of playback; this is a safety
+/// valve, not a working depth.
+pub const LEVEL_FRAME_QUEUE_CAP: usize = 4096;
 
 impl Default for LufsValues {
     fn default() -> Self {
@@ -135,10 +160,6 @@ impl Default for LufsValues {
             integrated: f32::NEG_INFINITY,
             lra: 0.0,
             dr: 0.0,
-            level_peak_l: f32::NEG_INFINITY,
-            level_rms_l: f32::NEG_INFINITY,
-            level_peak_r: f32::NEG_INFINITY,
-            level_rms_r: f32::NEG_INFINITY,
         }
     }
 }
@@ -178,9 +199,22 @@ pub(crate) struct LufsState {
     block_peak: f64,      // max |sample| in current block
     block_power_sum: f64, // sum of sample² across all channels
 
-    // Per-channel (L/R) accumulators for the level meter bars
-    ch_peak: [f64; 2],      // max |sample| per channel in current block
+    // Per-channel (L/R) display sub-block accumulators for the meter bars.
+    // ~20 ms so the bars react like a hardware PPM, decoupled from the
+    // 100 ms measurement blocks (shrinking those would change LUFS/DR
+    // semantics).
+    ch_peak: [f64; 2],      // max |sample| per channel in current sub-block
     ch_power_sum: [f64; 2], // sum of sample² per channel
+    disp_count: usize,      // frames in the current sub-block
+    disp_target: usize,     // frames per ~20 ms sub-block
+    // Smoothed display state (ballistics applied per sub-block)
+    disp_rms_db: [f32; 2],
+    disp_peak_db: [f32; 2],
+    // Track-absolute position stamping for display frames
+    start_offset_s: f64, // seek target of this decode run (0 for track start)
+    total_frames: u64,   // frames processed since configure/reset
+    // Finished display frames awaiting hand-off to the shared queue
+    pending_level_frames: Vec<LevelFrame>,
 
     // Ring buffers of per-block LUFS values
     m_buf: VecDeque<f64>,   // last M_BLOCKS  blocks
@@ -218,6 +252,13 @@ impl LufsState {
             block_power_sum: 0.0,
             ch_peak: [0.0; 2],
             ch_power_sum: [0.0; 2],
+            disp_count: 0,
+            disp_target: rate as usize / 50, // 20 ms
+            disp_rms_db: [LEVEL_DISPLAY_FLOOR_DB; 2],
+            disp_peak_db: [LEVEL_DISPLAY_FLOOR_DB; 2],
+            start_offset_s: 0.0,
+            total_frames: 0,
+            pending_level_frames: Vec::new(),
             m_buf: VecDeque::new(),
             s_buf: VecDeque::new(),
             lra_buf: VecDeque::new(),
@@ -241,11 +282,15 @@ impl LufsState {
         self.filt1 = [BiquadState::default(); MAX_CHANNELS];
         self.filt2 = [BiquadState::default(); MAX_CHANNELS];
         self.block_target = (rate as usize).max(1) / 10;
+        self.disp_target = ((rate as usize).max(1) / 50).max(1);
         // Flush the in-progress block so we don't mix old and new rates.
         self.block_sum = 0.0;
         self.block_count = 0;
         self.block_peak = 0.0;
         self.block_power_sum = 0.0;
+        self.ch_peak = [0.0; 2];
+        self.ch_power_sum = [0.0; 2];
+        self.disp_count = 0;
     }
 
     /// Process a slice of interleaved F64LE samples (read-only tap).
@@ -285,11 +330,85 @@ impl LufsState {
             }
             self.block_sum += sum_sq;
             self.block_count += 1;
+            self.disp_count += 1;
+            self.total_frames += 1;
 
+            if self.disp_count >= self.disp_target.max(1) {
+                self.flush_display_block();
+            }
             if self.block_count >= self.block_target {
                 self.flush_block();
             }
         }
+    }
+
+    /// Set the track-absolute time of the first frame this decode run will
+    /// process (the seek target). Survives clear()/reset() — it describes
+    /// the run, not the accumulator state.
+    pub(crate) fn set_start_offset(&mut self, start_offset_s: f64) {
+        self.start_offset_s = start_offset_s;
+    }
+
+    /// Hand off finished display frames (called by the processor while it
+    /// already holds the shared lock).
+    pub(crate) fn drain_level_frames(&mut self) -> std::vec::Drain<'_, LevelFrame> {
+        self.pending_level_frames.drain(..)
+    }
+
+    /// Flush the ~20 ms display sub-block: apply PPM-style ballistics and
+    /// publish the per-channel meter levels. Kept separate from
+    /// flush_block() so display responsiveness never touches the LUFS/DR
+    /// measurement chain.
+    fn flush_display_block(&mut self) {
+        if self.disp_count == 0 {
+            return;
+        }
+        let n = self.disp_count as f64;
+        let ch = self.channels.min(2).max(1);
+        for c in 0..ch {
+            let raw_peak = if self.ch_peak[c] > 1e-10 {
+                (20.0 * self.ch_peak[c].log10()) as f32
+            } else {
+                LEVEL_DISPLAY_FLOOR_DB
+            };
+            let mean = self.ch_power_sum[c] / n;
+            let raw_rms = if mean > 0.0 {
+                (10.0 * mean.log10()) as f32
+            } else {
+                LEVEL_DISPLAY_FLOOR_DB
+            };
+            // RMS: fast attack, moderate release (per 20 ms step).
+            let alpha = if raw_rms > self.disp_rms_db[c] { 0.6 } else { 0.35 };
+            self.disp_rms_db[c] += alpha * (raw_rms - self.disp_rms_db[c]);
+            // Peak: instant attack, 1.2 dB per 20 ms fall (= 60 dB/s).
+            if raw_peak > self.disp_peak_db[c] {
+                self.disp_peak_db[c] = raw_peak;
+            } else {
+                self.disp_peak_db[c] = (self.disp_peak_db[c] - 1.2)
+                    .max(raw_peak)
+                    .max(LEVEL_DISPLAY_FLOOR_DB);
+            }
+        }
+        let (peak_r, rms_r) = if self.channels >= 2 {
+            (self.disp_peak_db[1], self.disp_rms_db[1])
+        } else {
+            (self.disp_peak_db[0], self.disp_rms_db[0])
+        };
+        let pos_s = if self.sample_rate > 0 {
+            self.start_offset_s + self.total_frames as f64 / self.sample_rate as f64
+        } else {
+            self.start_offset_s
+        };
+        self.pending_level_frames.push(LevelFrame {
+            pos_s,
+            peak_l: self.disp_peak_db[0],
+            rms_l: self.disp_rms_db[0],
+            peak_r,
+            rms_r,
+        });
+        self.ch_peak = [0.0; 2];
+        self.ch_power_sum = [0.0; 2];
+        self.disp_count = 0;
     }
 
     fn flush_block(&mut self) {
@@ -312,35 +431,6 @@ impl LufsState {
         } else {
             0.0
         };
-
-        // Per-channel meter levels in dBFS from this block. Mono mirrors L→R.
-        let block_frames = self.block_count.max(1) as f64;
-        let db_of = |lin: f64| -> f32 {
-            if lin > 0.0 {
-                (20.0 * lin.log10()) as f32
-            } else {
-                f32::NEG_INFINITY
-            }
-        };
-        let rms_of = |power_sum: f64| -> f32 {
-            let mean = power_sum / block_frames;
-            if mean > 0.0 {
-                (10.0 * mean.log10()) as f32
-            } else {
-                f32::NEG_INFINITY
-            }
-        };
-        self.values.level_peak_l = db_of(self.ch_peak[0]);
-        self.values.level_rms_l = rms_of(self.ch_power_sum[0]);
-        if self.channels >= 2 {
-            self.values.level_peak_r = db_of(self.ch_peak[1]);
-            self.values.level_rms_r = rms_of(self.ch_power_sum[1]);
-        } else {
-            self.values.level_peak_r = self.values.level_peak_l;
-            self.values.level_rms_r = self.values.level_rms_l;
-        }
-        self.ch_peak = [0.0; 2];
-        self.ch_power_sum = [0.0; 2];
 
         self.block_sum = 0.0;
         self.block_count = 0;
@@ -390,6 +480,11 @@ impl LufsState {
         self.block_power_sum = 0.0;
         self.ch_peak = [0.0; 2];
         self.ch_power_sum = [0.0; 2];
+        self.disp_count = 0;
+        self.disp_rms_db = [LEVEL_DISPLAY_FLOOR_DB; 2];
+        self.disp_peak_db = [LEVEL_DISPLAY_FLOOR_DB; 2];
+        self.total_frames = 0;
+        self.pending_level_frames.clear();
         self.m_buf.clear();
         self.s_buf.clear();
         self.lra_buf.clear();
@@ -476,7 +571,8 @@ mod tests {
     }
 
     // A full-scale square wave has peak 0 dBFS and RMS 0 dBFS; the meter
-    // levels must read true, not FFT-normalized.
+    // levels must read true, not FFT-normalized. Peak attack is instant;
+    // RMS attacks at α=0.6 per 20 ms sub-block, so 200 ms converges it.
     #[test]
     fn per_channel_levels_read_true_dbfs() {
         let mut state = LufsState::new();
@@ -491,23 +587,60 @@ mod tests {
             .collect();
         feed_blocks(&mut state, &frames);
 
-        let v = &state.values;
-        assert!((v.level_peak_l - 0.0).abs() < 0.1, "peak_l={}", v.level_peak_l);
-        assert!((v.level_rms_l - 0.0).abs() < 0.1, "rms_l={}", v.level_rms_l);
-        assert!((v.level_peak_r + 6.02).abs() < 0.1, "peak_r={}", v.level_peak_r);
-        assert!((v.level_rms_r + 6.02).abs() < 0.1, "rms_r={}", v.level_rms_r);
+        let f = *state.pending_level_frames.last().expect("frames");
+        assert!((f.peak_l - 0.0).abs() < 0.1, "peak_l={}", f.peak_l);
+        assert!((f.rms_l - 0.0).abs() < 0.1, "rms_l={}", f.rms_l);
+        assert!((f.peak_r + 6.02).abs() < 0.1, "peak_r={}", f.peak_r);
+        assert!((f.rms_r + 6.02).abs() < 0.1, "rms_r={}", f.rms_r);
+    }
+
+    // 20 ms display cadence with track-absolute position stamps: every
+    // sub-block yields one frame, so slab-granular decoding can no longer
+    // collapse several updates into one.
+    #[test]
+    fn display_frames_are_stamped_at_twenty_ms_cadence() {
+        let mut state = LufsState::new();
+        state.update_rate_channels(48_000, 2);
+        state.set_start_offset(42.0);
+        let frames: Vec<(f64, f64)> = (0..9600).map(|_| (0.5, -0.5)).collect();
+        feed_blocks(&mut state, &frames);
+
+        let stamps: Vec<f64> = state.pending_level_frames.iter().map(|f| f.pos_s).collect();
+        assert_eq!(stamps.len(), 10, "200 ms should yield 10 sub-blocks");
+        assert!((stamps[0] - 42.02).abs() < 1e-9, "first={}", stamps[0]);
+        assert!((stamps[9] - 42.20).abs() < 1e-9, "last={}", stamps[9]);
+        assert!(stamps.windows(2).all(|w| w[1] > w[0]));
     }
 
     #[test]
-    fn levels_default_to_neg_infinity_and_reset() {
+    fn peak_falls_at_sixty_db_per_second() {
         let mut state = LufsState::new();
-        assert!(state.values.level_peak_l.is_infinite());
         state.update_rate_channels(48_000, 2);
+        // 100 ms full-scale square → peak at 0 dBFS.
+        let loud: Vec<(f64, f64)> = (0..4800)
+            .map(|i| { let s = if i % 2 == 0 { 1.0 } else { -1.0 }; (s, s) })
+            .collect();
+        feed_blocks(&mut state, &loud);
+        assert!((state.pending_level_frames.last().unwrap().peak_l - 0.0).abs() < 0.1);
+        // 200 ms of silence = 10 sub-blocks × 1.2 dB → −12 dB.
+        let quiet: Vec<(f64, f64)> = (0..9600).map(|_| (0.0, 0.0)).collect();
+        feed_blocks(&mut state, &quiet);
+        let last = state.pending_level_frames.last().unwrap().peak_l;
+        assert!((last + 12.0).abs() < 0.1, "peak_l={last}");
+    }
+
+    #[test]
+    fn reset_clears_pending_frames_but_keeps_start_offset() {
+        let mut state = LufsState::new();
+        state.update_rate_channels(48_000, 2);
+        state.set_start_offset(7.5);
         let frames: Vec<(f64, f64)> = (0..4800).map(|_| (0.5, 0.5)).collect();
         feed_blocks(&mut state, &frames);
-        assert!(state.values.level_peak_l.is_finite());
+        assert!(!state.pending_level_frames.is_empty());
         state.reset();
-        assert!(state.values.level_peak_l.is_infinite());
+        assert!(state.pending_level_frames.is_empty());
+        feed_blocks(&mut state, &frames);
+        assert!((state.pending_level_frames[0].pos_s - 7.52).abs() < 1e-9);
     }
 
     #[test]
@@ -516,8 +649,9 @@ mod tests {
         state.update_rate_channels(48_000, 1);
         let samples: Vec<f64> = (0..4800).map(|i| if i % 2 == 0 { 0.25 } else { -0.25 }).collect();
         state.process(&samples);
-        assert!(state.values.level_peak_r.is_finite());
-        assert_eq!(state.values.level_peak_l, state.values.level_peak_r);
-        assert_eq!(state.values.level_rms_l, state.values.level_rms_r);
+        let f = *state.pending_level_frames.last().expect("frames");
+        assert!(f.peak_r > LEVEL_DISPLAY_FLOOR_DB);
+        assert_eq!(f.peak_l, f.peak_r);
+        assert_eq!(f.rms_l, f.rms_r);
     }
 }

@@ -171,24 +171,18 @@ class _MeterShim:
         self.draws += 1
 
 
-def test_update_animates_toward_time_domain_targets_each_frame():
+def test_update_adopts_ballistic_levels_directly():
     m = _MeterShim()
     m.set_levels(-6.0, -18.0, -3.0, -15.0)
     assert m._td_mode
 
-    # set_levels only stores targets; the per-frame tick does the animation,
-    # so an 8 Hz poll still yields frame-rate bar motion.
-    assert m._peak_l == dr_mod._NEG_INF
-
-    values = []
-    for _ in range(6):
-        m.update([], [])
-        values.append(m._peak_l)
-
-    # Every frame moves the bar (smooth animation), converging on the target.
-    assert all(b > a for a, b in zip(values, values[1:]))
-    assert abs(values[-1] - (-6.0)) < 1.0
-    assert m.draws == 6
+    # The Rust tap already applies PPM ballistics on a 20 ms cadence; the
+    # UI must adopt the values as-is — smoothing again would double the
+    # ballistics and read sluggish.
+    m.update([], [])
+    assert (m._peak_l, m._level_l) == (-6.0, -18.0)
+    assert (m._peak_r, m._level_r) == (-3.0, -15.0)
+    assert m.draws == 1
 
 
 def test_update_ignores_fft_data_once_levels_arrive(monkeypatch):
@@ -202,22 +196,9 @@ def test_update_ignores_fft_data_once_levels_arrive(monkeypatch):
     m.update([0.0] * 8, [0.0] * 8)  # must not touch the FFT helper
 
 
-def test_update_peak_falls_gradually_after_target_drops():
-    m = _MeterShim()
-    m.set_levels(-6.0, -20.0, -6.0, -20.0)
-    for _ in range(10):
-        m.update([], [])
-    near_top = m._peak_l
-    m.set_levels(-30.0, -40.0, -30.0, -40.0)
-    m.update([], [])
-    # One release step: below the held peak, above the new target.
-    assert -30.0 < m._peak_l < near_top
-
-
 def test_set_levels_clamps_non_finite_input():
     m = _MeterShim()
     m.set_levels(float("-inf"), float("nan"), None, "x")
-    for _ in range(3):
-        m.update([], [])
+    m.update([], [])
     assert m._peak_l <= dr_mod._NEG_INF + 1e-9
     assert m._level_r <= dr_mod._NEG_INF + 1e-9
