@@ -1,5 +1,57 @@
 # Changelog
 
+## 1.9.8 - 2026-08-17
+
+Feature release: **TIDAL Uploads in the library**, a **true-reading level
+meter**, and a deep overhaul of position reporting that finally makes
+seeking rock-solid on every output path.
+
+### Added
+
+- **Uploads library view (#85).** A new *Uploads* section under YOUR
+  LIBRARY lists the tracks you uploaded to TIDAL (played through the
+  same engine path as catalog tracks). Freshly uploaded files show
+  *Processing…* until TIDAL finishes the server-side transcode, then
+  become playable automatically.
+- **Level meter reads true dBFS.** The L/R bars are now driven by real
+  time-domain sample peak and RMS from the Rust PCM tap instead of
+  FFT-derived approximations (which could never exceed roughly −20 dB).
+  A dB scale with 10 dB ticks sits beside the bars, and the display runs
+  hardware-PPM ballistics (instant peak attack, 60 dB/s fall) on a 16 ms
+  cadence — the same rhythm as the spectrum.
+- **Progress bar restyle.** Thicker 8 px track with a thin sharp-cornered
+  vertical bar as the knob.
+
+### Fixed
+
+- **Seeking no longer bounces the progress dot.** Seek is handled
+  asynchronously by the transport worker (and a DASH seek re-fetches
+  segments first), so the engine keeps reporting the pre-seek position
+  for a while. The reported position is now pinned to the seek target
+  until the engine's post-seek decode run actually starts, then hands
+  off seamlessly — across every layer that previously leaked the stale
+  position (adapter cache, UI extrapolation, convergence heuristics).
+- **Spectrum no longer twitches for the first seconds after a seek.**
+  The visualizer sampling clock follows the same pinned position as the
+  progress bar while the transition settles.
+- **Visualizer works on PipeWire and plain ALSA outputs (#87).** The
+  clock gate that releases spectrum frames only ever opened on the USB
+  Rawlink path; other drivers now fall back to the decode clock.
+- **Visualizer frame rate no longer degrades after stop/seek (#88).**
+  Spectrum frames are stamped with track-absolute positions, so the
+  release gate stays on one timeline across seeks.
+- **Stereo spectrum ruler drawn per half (#88).** In the split-stereo
+  view each half is its own full-range spectrum; the frequency labels
+  now line up with the bars.
+- **Linear spectrum jitter.** Linear bars map far fewer FFT bins than
+  log bars and flickered frame-to-frame; a mild temporal smoothing
+  (~35 ms) equalises the stability without visible lag.
+- **MPRIS no longer broadcasts `Position` via `PropertiesChanged`**
+  (spec violation that could starve GTK overlay clients of frames);
+  real jumps announce themselves with `Seeked` instead. Thanks
+  @godlyfast (#86).
+- **WebKit login no longer crashes on Hyprland (#83).**
+
 ## 1.9.7.2 - 2026-06-28
 
 Hotfix for **USB Rawlink v2** device recovery after the player exits or
