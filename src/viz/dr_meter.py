@@ -194,6 +194,17 @@ class LevelMonitor(Gtk.DrawingArea):
     def _db_to_ratio(self, db, floor=_NEG_INF, ceil=0.0):
         return (max(floor, min(ceil, db)) - floor) / (ceil - floor)
 
+    @staticmethod
+    def _scale_tick_dbs(bar_h):
+        """dB tick values for the level-bar scale.
+
+        Positions must come from _db_to_ratio so the scale is true to the
+        bars. Short bars thin to 20 dB steps so labels don't collide; the
+        -70 floor edge is omitted (it sits on the bar's bottom border).
+        """
+        step = 10 if bar_h >= 140 else 20
+        return list(range(0, -61, -step))
+
     def _lufs_str(self, val):
         """Format a LUFS value; returns '  ---' for -inf / unavailable."""
         try:
@@ -259,6 +270,28 @@ class LevelMonitor(Gtk.DrawingArea):
             cr.set_source_rgba(1.0, 1.0, 1.0, 0.90)
             cr.rectangle(bx, max(bt, pk_y - 1), bw, 2)
             cr.fill()
+
+        # ---- dB scale (same linear -70..0 dBFS mapping as the bars) ----
+        bt, bh = g["bar_top"], g["bar_h"]
+        bars_x = g["x_l"]
+        bars_w = g["bar_w"] * 2 + g["gap"]
+        cr.select_font_face("monospace", 0, 0)
+        cr.set_font_size(7)
+        for db in self._scale_tick_dbs(bh):
+            y = round(bt + (1.0 - self._db_to_ratio(db)) * bh)
+            # Faint grid line across both bars (drawn after the fills so it
+            # stays visible on lit segments too).
+            cr.set_source_rgba(1.0, 1.0, 1.0, 0.10)
+            cr.rectangle(bars_x, y, bars_w, 1)
+            cr.fill()
+            # Tick nub + label in the left margin.
+            cr.set_source_rgba(0.55, 0.55, 0.55, 0.85)
+            cr.rectangle(bars_x - 3, y, 2, 1)
+            cr.fill()
+            label = str(db)
+            ext = cr.text_extents(label)
+            cr.move_to(max(1.0, bars_x - 5 - ext[2] - ext[0]), y + 2.5)
+            cr.show_text(label)
 
         # ---- Separator ----
         sep_y = g["bar_top"] + g["bar_h"] + 3

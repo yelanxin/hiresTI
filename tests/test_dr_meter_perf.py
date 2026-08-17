@@ -130,3 +130,21 @@ def test_apply_viz_frame_skips_dr_meter_when_hidden(monkeypatch):
     app_visualizer._apply_viz_frame(app, frame)
 
     assert updates == []
+
+
+def test_scale_tick_dbs_matches_bar_mapping():
+    # Tall bars: 10 dB steps from 0 to -60; floor edge (-70) omitted.
+    assert dr_mod.LevelMonitor._scale_tick_dbs(300) == [0, -10, -20, -30, -40, -50, -60]
+    # Short bars thin to 20 dB steps so labels don't collide.
+    assert dr_mod.LevelMonitor._scale_tick_dbs(100) == [0, -20, -40, -60]
+
+
+def test_scale_ticks_land_on_true_bar_positions():
+    mon = dr_mod.LevelMonitor.__new__(dr_mod.LevelMonitor)
+    # The scale is only honest if it uses the exact bar mapping: linear
+    # over [-70, 0] dBFS.
+    assert mon._db_to_ratio(0.0) == 1.0
+    assert mon._db_to_ratio(-70.0) == 0.0
+    assert mon._db_to_ratio(-35.0) == 0.5
+    for db in dr_mod.LevelMonitor._scale_tick_dbs(300):
+        assert abs(mon._db_to_ratio(db) - (db + 70.0) / 70.0) < 1e-9
