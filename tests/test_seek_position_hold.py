@@ -16,16 +16,24 @@ class _Shim:
 
     get_position = audio_mod.RustAudioPlayerAdapter.get_position
 
-    def __init__(self, cached_pos, target=None, hold_for=1.0, stale_pos=None, hard_for=8.0):
+    def __init__(self, cached_pos, target=None, hold_for=1.0, stale_pos=None,
+                 hard_for=8.0, engine_pos=None):
         self._cached_pos_s = cached_pos
         self._cached_dur_s = 240.0
         self._seek_target_s = target
         self._seek_hold_until = time.monotonic() + hold_for
         self._seek_hold_hard_until = time.monotonic() + hard_for
         self._seek_stale_pos_s = stale_pos
+        # Engine-truth position served when the cache is force-refreshed
+        # (None = leave the cached value untouched, like a fresh cache).
+        self._engine_pos = engine_pos
+        self.forced_refreshes = 0
 
     def _refresh_rust_cache(self, force=False):
-        pass
+        if force:
+            self.forced_refreshes += 1
+            if self._engine_pos is not None:
+                self._cached_pos_s = self._engine_pos
 
 
 def test_backward_seek_pins_to_target_while_engine_is_stale():
@@ -79,6 +87,20 @@ def test_no_hold_passes_engine_position_through():
     shim = _Shim(cached_pos=42.0, target=None)
     pos, dur = shim.get_position()
     assert (pos, dur) == (42.0, 240.0)
+    assert shim.forced_refreshes == 0  # no seek -> normal cached refresh
+
+
+def test_optimistic_cache_write_cannot_fake_convergence():
+    # seek() writes the target into _cached_pos_s optimistically. If the
+    # convergence check reads that value back (fresh-cache early return),
+    # the hold is dropped while the engine still reports the pre-seek
+    # position — the dot bounces on the next tick. The hold must force a
+    # real engine read instead.
+    shim = _Shim(cached_pos=60.0, target=60.0, stale_pos=180.0, engine_pos=180.0)
+    pos, _dur = shim.get_position()
+    assert shim.forced_refreshes == 1
+    assert pos == 60.0                 # pinned to target
+    assert shim._seek_target_s == 60.0  # hold NOT dropped by the fake value
 
 
 from types import SimpleNamespace

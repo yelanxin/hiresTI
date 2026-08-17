@@ -4123,7 +4123,13 @@ class RustAudioPlayerAdapter:
         return self._rust.get_levels()
 
     def get_position(self):
-        self._refresh_rust_cache(force=False)
+        # While a seek hold is active, bypass the cache-freshness window and
+        # read the engine directly: seek() optimistically writes the target
+        # into _cached_pos_s, and a fresh-cache early-return would feed that
+        # value straight back into the convergence check below — a false
+        # convergence that dropped the hold while the engine still reported
+        # the pre-seek position (the dot bounced on the next tick).
+        self._refresh_rust_cache(force=self._seek_target_s is not None)
         p = float(self._cached_pos_s or 0.0)
         d = float(self._cached_dur_s or 0.0)
         if self._seek_target_s is not None:
