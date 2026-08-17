@@ -1748,6 +1748,8 @@ class RustAudioPlayerAdapter:
         self.current_driver = "Auto (Default)"
         self.current_device_id = None
         self._seek_hold_until = 0.0
+        self._seek_hold_hard_until = 0.0
+        self._seek_stale_pos_s = None
         self._seek_target_s = None
         self._last_seek_issue_ts = 0.0
         self._last_seek_issue_target = None
@@ -3732,11 +3734,18 @@ class RustAudioPlayerAdapter:
                 return
         self._last_seek_issue_ts = now
         self._last_seek_issue_target = self._seek_target_s
-        # Upper bound on how long get_position() reports the seek target while
-        # the async worker restart catches up. Released early once the engine
-        # position converges on the target; generous enough to cover a DASH
-        # seek that has to re-fetch segments.
-        self._seek_hold_until = time.monotonic() + 1.5
+        # Engine position at the moment the seek was issued. While the hold
+        # is active, a position still parked here means the async worker has
+        # not processed the seek yet (a USB + DASH seek can take ~2 s: the
+        # segment reader re-fetches up to the target, then the session and
+        # clock re-settle) — get_position() keeps pinning the target in that
+        # case instead of exposing the stale value.
+        self._seek_stale_pos_s = float(self._cached_pos_s or 0.0)
+        # Soft deadline: released early once the engine converges on the
+        # target. Hard deadline: give up pinning even if the engine never
+        # moves (failed seek), so the UI cannot stick forever.
+        self._seek_hold_until = time.monotonic() + 4.0
+        self._seek_hold_hard_until = time.monotonic() + 8.0
         self._cached_pos_s = self._seek_target_s
         # Seek can restart/rewire spectrum stream; reset visual cursor defensively.
         self._reset_rust_visual_sync_state()
@@ -4119,17 +4128,28 @@ class RustAudioPlayerAdapter:
         d = float(self._cached_dur_s or 0.0)
         if self._seek_target_s is not None:
             target = float(self._seek_target_s)
-            if time.monotonic() < self._seek_hold_until:
-                # Seek is handled asynchronously by the transport worker, so
-                # the engine keeps reporting the pre-seek position for a
-                # moment (longer for DASH sources that re-fetch segments).
-                # Pin the reported position to the target until the engine
-                # converges — in ANY direction; the old rebound-only mask let
-                # backward and short forward seeks show the stale position,
-                # making the progress dot jump back and forth.
-                if abs(p - target) <= 1.0:
-                    self._seek_target_s = None  # converged — hand off seamlessly
-                    return p, d
+            mono = time.monotonic()
+            # Seek is handled asynchronously by the transport worker, so the
+            # engine keeps reporting the pre-seek position for a while (a
+            # USB + DASH seek can take ~2 s). Pin the reported position to
+            # the target until the engine converges — in ANY direction; the
+            # old rebound-only mask let backward and short forward seeks
+            # show the stale position, bouncing the progress dot.
+            if abs(p - target) <= 1.0:
+                self._seek_target_s = None  # converged — hand off seamlessly
+                return p, d
+            if mono < self._seek_hold_until:
+                return target, d
+            # Soft deadline passed. If the engine is still parked at the
+            # pre-seek position the worker simply hasn't finished the seek —
+            # showing that stale value is never right, so keep pinning up to
+            # the hard deadline (which guards against a failed seek).
+            stale = getattr(self, "_seek_stale_pos_s", None)
+            if (
+                stale is not None
+                and abs(p - float(stale)) <= 1.5
+                and mono < getattr(self, "_seek_hold_hard_until", 0.0)
+            ):
                 return target, d
             self._seek_target_s = None
         return p, d

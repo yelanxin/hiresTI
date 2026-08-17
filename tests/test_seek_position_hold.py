@@ -16,11 +16,13 @@ class _Shim:
 
     get_position = audio_mod.RustAudioPlayerAdapter.get_position
 
-    def __init__(self, cached_pos, target=None, hold_for=1.0):
+    def __init__(self, cached_pos, target=None, hold_for=1.0, stale_pos=None, hard_for=8.0):
         self._cached_pos_s = cached_pos
         self._cached_dur_s = 240.0
         self._seek_target_s = target
         self._seek_hold_until = time.monotonic() + hold_for
+        self._seek_hold_hard_until = time.monotonic() + hard_for
+        self._seek_stale_pos_s = stale_pos
 
     def _refresh_rust_cache(self, force=False):
         pass
@@ -48,8 +50,26 @@ def test_hold_releases_when_engine_converges():
     assert shim._seek_target_s is None
 
 
-def test_hold_expires_after_deadline():
-    shim = _Shim(cached_pos=180.0, target=60.0, hold_for=-0.1)
+def test_soft_expiry_keeps_pinning_while_engine_is_parked_at_pre_seek_pos():
+    # Slow USB+DASH seek: soft deadline passed but the engine still reports
+    # the pre-seek position — showing that stale value is never right.
+    shim = _Shim(cached_pos=180.0, target=60.0, hold_for=-0.1, stale_pos=180.0)
+    pos, _dur = shim.get_position()
+    assert pos == 60.0
+    assert shim._seek_target_s == 60.0
+
+
+def test_soft_expiry_releases_once_engine_moved_elsewhere():
+    # Engine restarted somewhere that is neither the stale spot nor the
+    # target (e.g. seek clamped) — trust it after the soft deadline.
+    shim = _Shim(cached_pos=100.0, target=60.0, hold_for=-0.1, stale_pos=180.0)
+    pos, _dur = shim.get_position()
+    assert pos == 100.0
+    assert shim._seek_target_s is None
+
+
+def test_hard_expiry_gives_up_even_if_engine_never_moved():
+    shim = _Shim(cached_pos=180.0, target=60.0, hold_for=-0.1, stale_pos=180.0, hard_for=-0.1)
     pos, _dur = shim.get_position()
     assert pos == 180.0
     assert shim._seek_target_s is None
