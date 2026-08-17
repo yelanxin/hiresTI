@@ -603,6 +603,23 @@ def scroll_to_lyric(app, widget):
         pass
 
 
+def _position_poll_due(app, now, last_poll, poll_interval, cached_pd):
+    """Whether the UI tick must poll get_position() instead of using the cache.
+
+    While a seek hold is active (adapter's _seek_target_s set), the cache
+    still contains the pre-seek position and the wall-clock extrapolation
+    would keep advancing it — that showed the old position for up to one
+    poll interval after a seek, making the progress dot jump back before
+    landing on the target. Polling during the hold returns the pinned seek
+    target, so the dot never leaves it.
+    """
+    if cached_pd is None:
+        return True
+    if getattr(app.player, "_seek_target_s", None) is not None:
+        return True
+    return (now - last_poll) >= poll_interval
+
+
 def update_ui_loop(app):
     now = GLib.get_monotonic_time() / 1_000_000.0
     try:
@@ -630,7 +647,7 @@ def update_ui_loop(app):
     else:
         poll_interval = 0.25 if fast_ui_mode else 0.80
 
-    if cached_pd is None or (now - last_poll) >= poll_interval:
+    if _position_poll_due(app, now, last_poll, poll_interval, cached_pd):
         p, d = app.player.get_position()
         app._ui_cached_pd = (p, d)
         app._ui_last_pos_poll_ts = now

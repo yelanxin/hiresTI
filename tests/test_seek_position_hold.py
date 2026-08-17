@@ -59,3 +59,26 @@ def test_no_hold_passes_engine_position_through():
     shim = _Shim(cached_pos=42.0, target=None)
     pos, dur = shim.get_position()
     assert (pos, dur) == (42.0, 240.0)
+
+
+from types import SimpleNamespace
+
+from actions.lyrics_playback_actions import _position_poll_due
+
+
+def test_ui_cache_bypassed_while_seek_hold_active():
+    app = SimpleNamespace(player=SimpleNamespace(_seek_target_s=60.0))
+    # Cache is fresh, but a seek hold is active -> must poll anyway.
+    assert _position_poll_due(app, now=10.0, last_poll=9.9, poll_interval=0.45, cached_pd=(180.0, 240.0))
+
+
+def test_ui_cache_used_when_fresh_and_no_seek():
+    app = SimpleNamespace(player=SimpleNamespace(_seek_target_s=None))
+    assert not _position_poll_due(app, now=10.0, last_poll=9.9, poll_interval=0.45, cached_pd=(60.0, 240.0))
+    assert _position_poll_due(app, now=10.5, last_poll=9.9, poll_interval=0.45, cached_pd=(60.0, 240.0))
+    assert _position_poll_due(app, now=10.0, last_poll=9.9, poll_interval=0.45, cached_pd=None)
+
+
+def test_ui_cache_poll_due_tolerates_players_without_hold_state():
+    app = SimpleNamespace(player=SimpleNamespace())
+    assert not _position_poll_due(app, now=10.0, last_poll=9.9, poll_interval=0.45, cached_pd=(60.0, 240.0))
