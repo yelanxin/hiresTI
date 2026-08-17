@@ -87,9 +87,14 @@ class LevelMonitor(Gtk.DrawingArea):
     _PEAK_ATTACK  = 0.92
     _PEAK_RELEASE = 0.07
 
+    # ---- time-domain ballistics (set_levels polls at ~8 Hz) ----
+    _TD_LEVEL_ALPHA   = 0.45   # bar fill (block RMS)
+    _TD_PEAK_RELEASE  = 0.25   # peak falls toward current block peak
+
     def __init__(self):
         super().__init__()
         # Level bar display state
+        self._td_mode = False   # True once set_levels() delivers real dBFS
         self._level_l = _NEG_INF
         self._level_r = _NEG_INF
         self._peak_l  = _NEG_INF
@@ -112,8 +117,44 @@ class LevelMonitor(Gtk.DrawingArea):
     # Public API
     # ------------------------------------------------------------------
 
+    def set_levels(self, peak_l, rms_l, peak_r, rms_r):
+        """Update level bars from true time-domain dBFS values (Rust PCM tap).
+
+        peak_*: sample peak of the last 100 ms block; rms_*: block RMS.
+        Preferred over the FFT-derived update() — once this is called, the
+        FFT path stops driving the bars so the dB scale reads true.
+        """
+        self._td_mode = True
+
+        def _clamp(v):
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                return _NEG_INF
+            return v if math.isfinite(v) and v > _NEG_INF else _NEG_INF
+
+        rms_l, rms_r = _clamp(rms_l), _clamp(rms_r)
+        peak_l, peak_r = _clamp(peak_l), _clamp(peak_r)
+
+        a = self._TD_LEVEL_ALPHA
+        self._level_l = a * rms_l + (1.0 - a) * self._level_l
+        self._level_r = a * rms_r + (1.0 - a) * self._level_r
+
+        # Peak: jump up instantly, fall gradually (peak-hold feel).
+        rel = self._TD_PEAK_RELEASE
+        self._peak_l = peak_l if peak_l > self._peak_l else rel * peak_l + (1.0 - rel) * self._peak_l
+        self._peak_r = peak_r if peak_r > self._peak_r else rel * peak_r + (1.0 - rel) * self._peak_r
+
+        self.queue_draw()
+
     def update(self, left_mags, right_mags):
-        """Update level bars from FFT magnitude arrays (called each frame)."""
+        """Update level bars from FFT magnitude arrays (called each frame).
+
+        Fallback path for engines without the time-domain level tap; inert
+        once set_levels() has delivered real dBFS values.
+        """
+        if getattr(self, "_td_mode", False):
+            return
         raw_peak_l, raw_mean_l, raw_peak_r, raw_mean_r = _compute_level_metrics(left_mags, right_mags)
 
         # Level bar (mean power, smoothed)
@@ -144,6 +185,7 @@ class LevelMonitor(Gtk.DrawingArea):
         self.queue_draw()
 
     def reset(self):
+        self._td_mode = False
         self._level_l = _NEG_INF
         self._level_r = _NEG_INF
         self._peak_l  = _NEG_INF

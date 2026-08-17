@@ -148,3 +148,53 @@ def test_scale_ticks_land_on_true_bar_positions():
     assert mon._db_to_ratio(-35.0) == 0.5
     for db in dr_mod.LevelMonitor._scale_tick_dbs(300):
         assert abs(mon._db_to_ratio(db) - (db + 70.0) / 70.0) < 1e-9
+
+
+class _MeterShim:
+    """LevelMonitor methods bound to a plain object (no Gtk widget needed)."""
+
+    _TD_LEVEL_ALPHA = dr_mod.LevelMonitor._TD_LEVEL_ALPHA
+    _TD_PEAK_RELEASE = dr_mod.LevelMonitor._TD_PEAK_RELEASE
+    _LEVEL_ALPHA = dr_mod.LevelMonitor._LEVEL_ALPHA
+    _PEAK_ATTACK = dr_mod.LevelMonitor._PEAK_ATTACK
+    _PEAK_RELEASE = dr_mod.LevelMonitor._PEAK_RELEASE
+    set_levels = dr_mod.LevelMonitor.set_levels
+    update = dr_mod.LevelMonitor.update
+
+    def __init__(self):
+        self._td_mode = False
+        self._level_l = self._level_r = dr_mod._NEG_INF
+        self._peak_l = self._peak_r = dr_mod._NEG_INF
+        self.draws = 0
+
+    def queue_draw(self):
+        self.draws += 1
+
+
+def test_set_levels_drives_bars_and_disables_fft_path():
+    m = _MeterShim()
+    m.set_levels(-6.0, -18.0, -3.0, -15.0)
+
+    assert m._td_mode
+    assert m._peak_l == -6.0 and m._peak_r == -3.0  # instant attack
+    assert m._level_l > dr_mod._NEG_INF
+
+    # FFT update must no longer touch the bars once real levels arrived.
+    before = (m._level_l, m._peak_l)
+    m.update([0.0] * 8, [0.0] * 8)
+    assert (m._level_l, m._peak_l) == before
+
+
+def test_set_levels_peak_falls_gradually():
+    m = _MeterShim()
+    m.set_levels(-6.0, -20.0, -6.0, -20.0)
+    m.set_levels(-30.0, -40.0, -30.0, -40.0)
+    # One release step: below the old peak, above the new block peak.
+    assert -30.0 < m._peak_l < -6.0
+
+
+def test_set_levels_clamps_non_finite_input():
+    m = _MeterShim()
+    m.set_levels(float("-inf"), float("nan"), None, "x")
+    assert m._peak_l == dr_mod._NEG_INF
+    assert m._level_r <= dr_mod._NEG_INF + 1e-9

@@ -391,6 +391,18 @@ class _RustAudioCore:
                 ]
                 self._rac_get_lufs = lib.rac_get_lufs
 
+            self._rac_get_levels = None
+            if hasattr(lib, "rac_get_levels"):
+                lib.rac_get_levels.restype = ctypes.c_int
+                lib.rac_get_levels.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.POINTER(ctypes.c_float),
+                    ctypes.POINTER(ctypes.c_float),
+                    ctypes.POINTER(ctypes.c_float),
+                    ctypes.POINTER(ctypes.c_float),
+                ]
+                self._rac_get_levels = lib.rac_get_levels
+
             self.lib = lib
             self.handle = ctypes.c_void_p(lib.rac_new())
             self.available = bool(self.handle)
@@ -1127,6 +1139,40 @@ class _RustAudioCore:
                     float(out_i.value),
                     float(out_lra.value),
                     float(out_dr.value),
+                )
+            except Exception:
+                return None
+
+    def get_levels(self):
+        """Return (peak_l, rms_l, peak_r, rms_r) in dBFS, or None.
+
+        True time-domain sample peak / RMS per channel over the last 100 ms
+        block, from the Rust LUFS tap. Unavailable values are float('-inf').
+        """
+        if (not self.available) or self._closed or self._rac_get_levels is None:
+            return None
+        with self._call_lock:
+            if self._closed or not self.handle:
+                return None
+            try:
+                out_pl = ctypes.c_float(0.0)
+                out_rl = ctypes.c_float(0.0)
+                out_pr = ctypes.c_float(0.0)
+                out_rr = ctypes.c_float(0.0)
+                rc = int(self._rac_get_levels(
+                    self.handle,
+                    ctypes.byref(out_pl),
+                    ctypes.byref(out_rl),
+                    ctypes.byref(out_pr),
+                    ctypes.byref(out_rr),
+                ))
+                if rc != 0:
+                    return None
+                return (
+                    float(out_pl.value),
+                    float(out_rl.value),
+                    float(out_pr.value),
+                    float(out_rr.value),
                 )
             except Exception:
                 return None
@@ -4058,6 +4104,10 @@ class RustAudioPlayerAdapter:
     def get_lufs(self):
         """Return (momentary, short_term, integrated, lra) from the K-weighted LUFS meter."""
         return self._rust.get_lufs()
+
+    def get_levels(self):
+        """Return (peak_l, rms_l, peak_r, rms_r) dBFS from the time-domain level tap, or None."""
+        return self._rust.get_levels()
 
     def get_position(self):
         self._refresh_rust_cache(force=False)

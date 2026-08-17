@@ -1576,6 +1576,34 @@ pub extern "C" fn rac_get_lufs(
     0
 }
 
+/// Per-channel time-domain meter levels (dBFS) over the last 100 ms block:
+/// true sample peak and RMS for L and R. Separate from rac_get_lufs so
+/// older callers keep their ABI. Returns NEG_INFINITY-ish values (< -1e30)
+/// when unavailable.
+#[no_mangle]
+pub extern "C" fn rac_get_levels(
+    ptr: *const Engine,
+    out_peak_l: *mut f32,
+    out_rms_l: *mut f32,
+    out_peak_r: *mut f32,
+    out_rms_r: *mut f32,
+) -> c_int {
+    let Some(engine) = as_engine(ptr) else {
+        return -1;
+    };
+    if out_peak_l.is_null() || out_rms_l.is_null() || out_peak_r.is_null() || out_rms_r.is_null() {
+        return -2;
+    }
+    let vals: LufsValues = engine.native_transport.lufs_values();
+    unsafe {
+        *out_peak_l = vals.level_peak_l;
+        *out_rms_l = vals.level_rms_l;
+        *out_peak_r = vals.level_peak_r;
+        *out_rms_r = vals.level_rms_r;
+    }
+    0
+}
+
 #[no_mangle]
 pub extern "C" fn rac_get_spectrum_frames_since(
     ptr: *const Engine,

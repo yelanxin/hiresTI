@@ -117,6 +117,14 @@ pub struct LufsValues {
     pub lra: f32,
     /// Dynamic Range = peak_dBFS − rms_dBFS over ≈4 s window. 0.0 when unavailable.
     pub dr: f32,
+    /// Per-channel time-domain levels over the last 100 ms block, in dBFS.
+    /// True sample peak and RMS for the L/R meter bars (unweighted, unlike
+    /// the LUFS fields). f32::NEG_INFINITY when unavailable. Mono sources
+    /// mirror L into R.
+    pub level_peak_l: f32,
+    pub level_rms_l: f32,
+    pub level_peak_r: f32,
+    pub level_rms_r: f32,
 }
 
 impl Default for LufsValues {
@@ -127,6 +135,10 @@ impl Default for LufsValues {
             integrated: f32::NEG_INFINITY,
             lra: 0.0,
             dr: 0.0,
+            level_peak_l: f32::NEG_INFINITY,
+            level_rms_l: f32::NEG_INFINITY,
+            level_peak_r: f32::NEG_INFINITY,
+            level_rms_r: f32::NEG_INFINITY,
         }
     }
 }
@@ -166,6 +178,10 @@ pub(crate) struct LufsState {
     block_peak: f64,      // max |sample| in current block
     block_power_sum: f64, // sum of sample² across all channels
 
+    // Per-channel (L/R) accumulators for the level meter bars
+    ch_peak: [f64; 2],      // max |sample| per channel in current block
+    ch_power_sum: [f64; 2], // sum of sample² per channel
+
     // Ring buffers of per-block LUFS values
     m_buf: VecDeque<f64>,   // last M_BLOCKS  blocks
     s_buf: VecDeque<f64>,   // last S_BLOCKS  blocks
@@ -200,6 +216,8 @@ impl LufsState {
             block_target: rate as usize / 10, // 100 ms
             block_peak: 0.0,
             block_power_sum: 0.0,
+            ch_peak: [0.0; 2],
+            ch_power_sum: [0.0; 2],
             m_buf: VecDeque::new(),
             s_buf: VecDeque::new(),
             lra_buf: VecDeque::new(),
@@ -257,6 +275,13 @@ impl LufsState {
                     self.block_peak = ax;
                 }
                 self.block_power_sum += x * x;
+                // Per-channel levels for the meter bars (first two channels)
+                if c < 2 {
+                    if ax > self.ch_peak[c] {
+                        self.ch_peak[c] = ax;
+                    }
+                    self.ch_power_sum[c] += x * x;
+                }
             }
             self.block_sum += sum_sq;
             self.block_count += 1;
@@ -287,6 +312,35 @@ impl LufsState {
         } else {
             0.0
         };
+
+        // Per-channel meter levels in dBFS from this block. Mono mirrors L→R.
+        let block_frames = self.block_count.max(1) as f64;
+        let db_of = |lin: f64| -> f32 {
+            if lin > 0.0 {
+                (20.0 * lin.log10()) as f32
+            } else {
+                f32::NEG_INFINITY
+            }
+        };
+        let rms_of = |power_sum: f64| -> f32 {
+            let mean = power_sum / block_frames;
+            if mean > 0.0 {
+                (10.0 * mean.log10()) as f32
+            } else {
+                f32::NEG_INFINITY
+            }
+        };
+        self.values.level_peak_l = db_of(self.ch_peak[0]);
+        self.values.level_rms_l = rms_of(self.ch_power_sum[0]);
+        if self.channels >= 2 {
+            self.values.level_peak_r = db_of(self.ch_peak[1]);
+            self.values.level_rms_r = rms_of(self.ch_power_sum[1]);
+        } else {
+            self.values.level_peak_r = self.values.level_peak_l;
+            self.values.level_rms_r = self.values.level_rms_l;
+        }
+        self.ch_peak = [0.0; 2];
+        self.ch_power_sum = [0.0; 2];
 
         self.block_sum = 0.0;
         self.block_count = 0;
@@ -334,6 +388,8 @@ impl LufsState {
         self.block_count = 0;
         self.block_peak = 0.0;
         self.block_power_sum = 0.0;
+        self.ch_peak = [0.0; 2];
+        self.ch_power_sum = [0.0; 2];
         self.m_buf.clear();
         self.s_buf.clear();
         self.lra_buf.clear();
@@ -405,3 +461,63 @@ fn compute_lra(buf: &VecDeque<f64>) -> f64 {
     (hi - lo).max(0.0)
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn feed_blocks(state: &mut LufsState, frames: &[(f64, f64)]) {
+        let mut interleaved = Vec::with_capacity(frames.len() * 2);
+        for (l, r) in frames {
+            interleaved.push(*l);
+            interleaved.push(*r);
+        }
+        state.process(&interleaved);
+    }
+
+    // A full-scale square wave has peak 0 dBFS and RMS 0 dBFS; the meter
+    // levels must read true, not FFT-normalized.
+    #[test]
+    fn per_channel_levels_read_true_dbfs() {
+        let mut state = LufsState::new();
+        state.update_rate_channels(48_000, 2);
+        // 200 ms: L = ±1.0 square (0 dBFS peak, 0 dBFS RMS),
+        //         R = ±0.5 square (-6.02 dBFS peak and RMS).
+        let frames: Vec<(f64, f64)> = (0..9600)
+            .map(|i| {
+                let s = if i % 2 == 0 { 1.0 } else { -1.0 };
+                (s, s * 0.5)
+            })
+            .collect();
+        feed_blocks(&mut state, &frames);
+
+        let v = &state.values;
+        assert!((v.level_peak_l - 0.0).abs() < 0.1, "peak_l={}", v.level_peak_l);
+        assert!((v.level_rms_l - 0.0).abs() < 0.1, "rms_l={}", v.level_rms_l);
+        assert!((v.level_peak_r + 6.02).abs() < 0.1, "peak_r={}", v.level_peak_r);
+        assert!((v.level_rms_r + 6.02).abs() < 0.1, "rms_r={}", v.level_rms_r);
+    }
+
+    #[test]
+    fn levels_default_to_neg_infinity_and_reset() {
+        let mut state = LufsState::new();
+        assert!(state.values.level_peak_l.is_infinite());
+        state.update_rate_channels(48_000, 2);
+        let frames: Vec<(f64, f64)> = (0..4800).map(|_| (0.5, 0.5)).collect();
+        feed_blocks(&mut state, &frames);
+        assert!(state.values.level_peak_l.is_finite());
+        state.reset();
+        assert!(state.values.level_peak_l.is_infinite());
+    }
+
+    #[test]
+    fn mono_mirrors_left_into_right() {
+        let mut state = LufsState::new();
+        state.update_rate_channels(48_000, 1);
+        let samples: Vec<f64> = (0..4800).map(|i| if i % 2 == 0 { 0.25 } else { -0.25 }).collect();
+        state.process(&samples);
+        assert!(state.values.level_peak_r.is_finite());
+        assert_eq!(state.values.level_peak_l, state.values.level_peak_r);
+        assert_eq!(state.values.level_rms_l, state.values.level_rms_r);
+    }
+}

@@ -910,6 +910,10 @@ def _apply_viz_frame(self, frame):
                                 self._dr_lufs_last_poll_ts = now
                         if did_poll and lufs is not None:
                             dr_meter.set_lufs(*lufs)
+                        if did_poll and hasattr(self.player, "get_levels"):
+                            levels = self.player.get_levels()
+                            if levels is not None:
+                                dr_meter.set_levels(*levels)
                 except Exception:
                     pass
 
