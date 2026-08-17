@@ -3247,6 +3247,16 @@ class RustAudioPlayerAdapter:
             try:
                 self._refresh_rust_cache(force=True)
                 cur_pos = float(self._cached_pos_s or 0.0)
+                held_target = getattr(self, "_seek_target_s", None)
+                if held_target is not None:
+                    # Seek transition: the engine clock wobbles while the old
+                    # session drains and the new one re-settles (ring restart,
+                    # pull-clock recalibration). Sample the viz at the pinned
+                    # seek target — the same position the UI shows — otherwise
+                    # the spectrum twitches for the first ~2 s after a seek.
+                    # get_position() clears the pin once the engine converges,
+                    # so the hand-off follows the same state machine.
+                    cur_pos = float(held_target)
                 delay_ms = self._estimate_rust_visual_delay_ms(current_pos_s=cur_pos, msg_pos_s=None)
                 target_pos = max(
                     0.0,
