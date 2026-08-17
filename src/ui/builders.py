@@ -1524,6 +1524,7 @@ def build_player_bar(app, container):
     app.lbl_total_time.set_xalign(0.0)
     app.scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
     app.scale.set_hexpand(True)
+    app.scale.add_css_class("progress-scale")
     app.scale.connect("value-changed", app.on_seek)
     app.timeline_box.append(app.lbl_current_time)
     app.timeline_box.append(app.scale)

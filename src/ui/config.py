@@ -965,6 +965,23 @@ window.mini-mode .mini-queue-drawer {
 .eq-btn { min-width: 36px; min-height: 36px; padding: 0; }
 .card-bar scale.horizontal { margin: 0; padding: 0; }
 .card-bar scale trough { min-height: 4px; }
+/* Progress slider: thin vertical bar (2:10) instead of the round knob.
+   The margin SHORTHAND is load-bearing: libadwaita gives the slider a
+   -8px margin on all sides (hit-area padding); overriding only the
+   vertical margins leaves the horizontal -8px in place, the computed
+   width goes negative (4 - 16), and GTK falls back to the square. */
+scale.progress-scale trough,
+scale.progress-scale highlight {
+    min-height: 8px;
+}
+scale.progress-scale slider {
+    min-width: 4px;
+    min-height: 16px;
+    padding: 0;
+    border: none;
+    margin: -4px 0;
+    border-radius: 0;
+}
 .player-ctrls-box .transport-main-btn {
     min-width: 40px;
     min-height: 40px;
