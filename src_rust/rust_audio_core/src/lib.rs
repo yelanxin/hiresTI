@@ -1141,12 +1141,28 @@ impl Engine {
             // Release frames whose decode-time pos_s has been reached by the
             // playback clock.  This replicates GStreamer's clock-synchronized
             // spectrum delivery: frames are held until the audio actually plays.
-            let seek_off = self.native_transport.snapshot().seek_offset_s;
-            let playback_pos_s = self
-                .native_transport
-                .runtime_info()
-                .map(|rt| seek_off + rt.feed.playback_elapsed_s().unwrap_or(0.0))
-                .unwrap_or(seek_off);
+            //
+            // Only USB Rawlink publishes runtime_info with a hardware clock;
+            // the ALSA-family drivers (ALSA, PipeWire bridge) never fill it,
+            // so fall back to the decode clock — the same one rac_get_position
+            // reports for those drivers. Without the fallback the gate never
+            // opens and every frame is held until the safety valve drops it.
+            let snap = self.native_transport.snapshot();
+            let seek_off = snap.seek_offset_s;
+            let playback_pos_s = if let Some(rt) = self.native_transport.runtime_info() {
+                seek_off + rt.feed.playback_elapsed_s().unwrap_or(0.0)
+            } else {
+                let rate = snap
+                    .stream_spec
+                    .as_ref()
+                    .map(|s| s.sample_rate as f64)
+                    .unwrap_or(0.0);
+                if rate > 0.0 {
+                    seek_off + snap.decoded_frame_count as f64 / rate
+                } else {
+                    seek_off
+                }
+            };
             while let Some(frame) = self.native_spectrum_pending.front() {
                 if frame.pos_s > playback_pos_s + 0.02 {
                     break; // not yet — hold for next pump cycle

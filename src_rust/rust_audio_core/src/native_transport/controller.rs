@@ -1740,6 +1740,7 @@ fn decode_direct_audio_stream(
         processor_chain.push(Box::new(SpectrumPcmProcessor::new(
             spectrum_tx,
             spectrum_bands,
+            seek_start_ms.unwrap_or(0) as f64 / 1000.0,
         )));
         processor_chain.push(Box::new(LufsPcmProcessor::new(lufs_values)));
     }

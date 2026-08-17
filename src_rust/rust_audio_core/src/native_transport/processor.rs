@@ -259,13 +259,22 @@ pub struct SpectrumPcmProcessor {
     samples_per_interval: usize,
     // Total frames decoded so far (for position tracking).
     total_frames: u64,
+    // Track-absolute time of the first decoded frame (the seek target, or
+    // 0 for a fresh track). total_frames counts from the seek point, so
+    // emitted positions must add this to stay on the playback-clock
+    // timeline the release gate and the UI position query use.
+    start_offset_s: f64,
     sample_rate: u32,
     channels: usize,
     configured: bool,
 }
 
 impl SpectrumPcmProcessor {
-    pub fn new(tx: Sender<SpectrumFrame>, bands_source: Arc<AtomicU32>) -> Self {
+    pub fn new(
+        tx: Sender<SpectrumFrame>,
+        bands_source: Arc<AtomicU32>,
+        start_offset_s: f64,
+    ) -> Self {
         let bands = (bands_source.load(Ordering::Relaxed) as usize).clamp(2, SPECTRUM_BANDS_MAX);
         let window_size = bands * 2; // FFT size
         Self {
@@ -280,6 +289,7 @@ impl SpectrumPcmProcessor {
             samples_since_emit: 0,
             samples_per_interval: 0,
             total_frames: 0,
+            start_offset_s,
             sample_rate: 0,
             channels: 0,
             configured: false,
@@ -332,9 +342,9 @@ impl SpectrumPcmProcessor {
         }
 
         let pos_s = if self.sample_rate > 0 {
-            self.total_frames as f64 / self.sample_rate as f64
+            self.start_offset_s + self.total_frames as f64 / self.sample_rate as f64
         } else {
-            0.0
+            self.start_offset_s
         };
 
         let _ = self.tx.try_send(SpectrumFrame {
@@ -459,6 +469,52 @@ impl PcmProcessor for LufsPcmProcessor {
             *vals = self.state.values.clone();
         }
         Ok(slab)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run_spectrum_over_silence(start_offset_s: f64, seconds: usize) -> Vec<f64> {
+        let (tx, rx) = crossbeam_channel::bounded(4096);
+        let bands = Arc::new(AtomicU32::new(16));
+        let mut proc = SpectrumPcmProcessor::new(tx, bands, start_offset_s);
+        let spec = PcmStreamSpec {
+            sample_rate: 48_000,
+            channels: 2,
+            format: PcmSampleFormat::F32LE,
+        };
+        proc.configure(&spec).unwrap();
+        let frames = 48_000 * seconds;
+        let slab = PcmSlab {
+            spec: spec.clone(),
+            frames,
+            data: vec![0u8; frames * 2 * 4],
+        };
+        proc.process(slab).unwrap();
+        rx.try_iter().map(|f| f.pos_s).collect()
+    }
+
+    // Frames must carry track-absolute positions: the playback clock the
+    // release gate compares against includes the seek offset, so a
+    // decode-relative timestamp stalls (or floods) the gate after any seek.
+    #[test]
+    fn spectrum_positions_are_absolute_from_seek_offset() {
+        let positions = run_spectrum_over_silence(42.0, 1);
+        assert!(!positions.is_empty());
+        assert!(positions[0] >= 42.0);
+        assert!(positions[0] < 42.1);
+        assert!(positions.windows(2).all(|w| w[1] > w[0]));
+        let last = *positions.last().unwrap();
+        assert!(last > 42.9 && last <= 43.0 + 0.1);
+    }
+
+    #[test]
+    fn spectrum_positions_start_at_zero_without_seek() {
+        let positions = run_spectrum_over_silence(0.0, 1);
+        assert!(!positions.is_empty());
+        assert!(positions[0] < 0.1);
     }
 }
 
