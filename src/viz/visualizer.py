@@ -561,12 +561,32 @@ def _log_display_eq_gain(freq_hz):
     return anchors[-1][1]
 
 
+# The split-stereo effect draws each channel's full 0..Nyquist spectrum in
+# its own half of the widget, separated by this pixel gap on each side of
+# the centre line. The frequency axis has to repeat per half accordingly.
+_STEREO_SPLIT_INNER_GAP = 10.0
+
+
+def _split_stereo_band_regions(width):
+    """Pixel intervals (x0, x1) of the L/R band areas in the split-stereo effect."""
+    half_w = width * 0.5
+    return (
+        (0.0, half_w - _STEREO_SPLIT_INNER_GAP),
+        (half_w + _STEREO_SPLIT_INNER_GAP, float(width)),
+    )
+
+
 def _draw_freq_axis_cairo(cr, width, height, frequency_scale_name,
-                          input_band_count=_DEFAULT_SPECTRUM_BANDS):
+                          input_band_count=_DEFAULT_SPECTRUM_BANDS,
+                          regions=None):
     """Draw 9 evenly-spaced frequency tick marks and labels along the top edge.
 
     Standalone version of SpectrumVisualizer._draw_freq_axis so it can be
     reused by the GL overlay in HybridVisualizer.
+
+    ``regions`` is an optional list of (x0, x1) pixel intervals; the full tick
+    set is drawn once per interval (used by the split-stereo effect, where each
+    half of the widget spans the whole frequency range on its own).
     """
     HALF_RATE = _SPECTRUM_HALF_RATE_HZ
     TOTAL_BANDS = float(max(2, int(input_band_count or _DEFAULT_SPECTRUM_BANDS)))
@@ -589,32 +609,48 @@ def _draw_freq_axis_cairo(cr, width, height, frequency_scale_name,
     cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
     cr.set_font_size(LABEL_FONT)
 
-    for freq in tick_freqs:
-        if frequency_scale_name == _FREQ_SCALE_LOG:
-            p = _log_display_frequency_to_fraction_from_points(freq, log_points)
-        else:
-            p = (freq - min_f) / (max_f - min_f) if max_f > min_f else 0.0
-        x = p * width
+    if not regions:
+        regions = ((0.0, float(width)),)
 
-        if freq >= 1000.0:
-            kv = freq / 1000.0
-            label = f"{kv:.0f}k" if kv >= 10.0 else f"{kv:.1f}k"
-        else:
-            label = f"{freq:.0f}"
+    for x0, x1 in regions:
+        region_w = x1 - x0
+        if region_w <= 1.0:
+            continue
+        freqs = tick_freqs
+        if (
+            len(regions) > 1
+            and frequency_scale_name != _FREQ_SCALE_LOG
+            and region_w < 640.0
+        ):
+            # Half-width panes get cramped: keep every other linear tick.
+            freqs = tick_freqs[::2]
 
-        ext = cr.text_extents(label)
-        tx = x - ext.width * 0.5
-        tx = max(1.0, min(width - ext.width - 1.0, tx))
+        for freq in freqs:
+            if frequency_scale_name == _FREQ_SCALE_LOG:
+                p = _log_display_frequency_to_fraction_from_points(freq, log_points)
+            else:
+                p = (freq - min_f) / (max_f - min_f) if max_f > min_f else 0.0
+            x = x0 + p * region_w
 
-        cr.set_source_rgba(1.0, 1.0, 1.0, TICK_ALPHA)
-        cr.set_line_width(1.0)
-        cr.move_to(x, 0.0)
-        cr.line_to(x, TICK_H)
-        cr.stroke()
+            if freq >= 1000.0:
+                kv = freq / 1000.0
+                label = f"{kv:.0f}k" if kv >= 10.0 else f"{kv:.1f}k"
+            else:
+                label = f"{freq:.0f}"
 
-        cr.set_source_rgba(1.0, 1.0, 1.0, LABEL_ALPHA)
-        cr.move_to(tx, LABEL_Y)
-        cr.show_text(label)
+            ext = cr.text_extents(label)
+            tx = x - ext.width * 0.5
+            tx = max(x0 + 1.0, min(x1 - ext.width - 1.0, tx))
+
+            cr.set_source_rgba(1.0, 1.0, 1.0, TICK_ALPHA)
+            cr.set_line_width(1.0)
+            cr.move_to(x, 0.0)
+            cr.line_to(x, TICK_H)
+            cr.stroke()
+
+            cr.set_source_rgba(1.0, 1.0, 1.0, LABEL_ALPHA)
+            cr.move_to(tx, LABEL_Y)
+            cr.show_text(label)
 
 
 def _build_log_spectrum_bins(values, out_count, half_rate_hz=_SPECTRUM_HALF_RATE_HZ, rust_core=None):
@@ -1615,7 +1651,10 @@ class SpectrumVisualizer(Gtk.DrawingArea):
             bar_w = max(1.0, (width - (n - 1) * spacing) / n)
             effect = self._effect_code
             if effect not in (14, 15, 16, 17, 18, 20, 21, 22, 23, 24, 25, 26):
-                self._draw_freq_axis(cr, width, height)
+                # Split stereo shows the full frequency range once per half,
+                # so the axis has to repeat per half as well.
+                regions = _split_stereo_band_regions(width) if effect == 9 else None
+                self._draw_freq_axis(cr, width, height, regions=regions)
             if effect == 0:
                 gradient = self._make_gradient(height, theme)
                 with _VIZ_DRAW_PERF.track("bars"):
@@ -1700,9 +1739,9 @@ class SpectrumVisualizer(Gtk.DrawingArea):
             cr.line_to(width, y)
             cr.stroke()
 
-    def _draw_freq_axis(self, cr, width, height):
+    def _draw_freq_axis(self, cr, width, height, regions=None):
         band_count = int(getattr(self, "_input_band_count", _DEFAULT_SPECTRUM_BANDS) or _DEFAULT_SPECTRUM_BANDS)
-        _draw_freq_axis_cairo(cr, width, height, self.frequency_scale_name, band_count)
+        _draw_freq_axis_cairo(cr, width, height, self.frequency_scale_name, band_count, regions=regions)
 
     def _make_gradient(self, height, theme):
         key = (height, self.theme_name)
@@ -2684,7 +2723,7 @@ class SpectrumVisualizer(Gtk.DrawingArea):
         if n <= 0:
             return
         half_w = width * 0.5
-        inner_gap = 10.0
+        inner_gap = _STEREO_SPLIT_INNER_GAP
         bars_per_side = max(1, n // 2)
         spacing = 1.2
         left_w = max(1.0, (half_w - inner_gap - (bars_per_side - 1) * spacing) / bars_per_side)
