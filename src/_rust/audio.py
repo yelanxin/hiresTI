@@ -1750,6 +1750,7 @@ class RustAudioPlayerAdapter:
         self._seek_hold_until = 0.0
         self._seek_hold_hard_until = 0.0
         self._seek_stale_pos_s = None
+        self._seek_restart_seen = True
         self._seek_target_s = None
         self._last_seek_issue_ts = 0.0
         self._last_seek_issue_target = None
@@ -2954,6 +2955,12 @@ class RustAudioPlayerAdapter:
                         except Exception:
                             pass
                 return
+            if msg and "native-transport decode-start" in msg:
+                # A new decode run has begun (fresh play or post-seek
+                # restart). From here the engine position is derived from
+                # the new seek offset, so the seek hold in get_position()
+                # may hand off once the value converges.
+                self._seek_restart_seen = True
             if msg and "usb-audio configured" in msg:
                 # USB sink just became available — check if hw volume is now
                 # supported and notify the app so it can unlock the slider.
@@ -3746,6 +3753,15 @@ class RustAudioPlayerAdapter:
         # moves (failed seek), so the UI cannot stick forever.
         self._seek_hold_until = time.monotonic() + 4.0
         self._seek_hold_hard_until = time.monotonic() + 8.0
+        # Event gate: the hold may only hand off after the engine reports
+        # "native-transport decode-start" for the post-seek decode run —
+        # numeric coincidences (the pre-seek position drifting past the
+        # target) can no longer release it early.
+        self._seek_restart_seen = False
+        self._seek_trace_state = None
+        logger.info(
+            "SeekTrace: issue target=%.2f stale=%.2f", self._seek_target_s, self._seek_stale_pos_s
+        )
         self._cached_pos_s = self._seek_target_s
         # Seek can restart/rewire spectrum stream; reset visual cursor defensively.
         self._reset_rust_visual_sync_state()
@@ -4135,29 +4151,41 @@ class RustAudioPlayerAdapter:
         if self._seek_target_s is not None:
             target = float(self._seek_target_s)
             mono = time.monotonic()
-            # Seek is handled asynchronously by the transport worker, so the
-            # engine keeps reporting the pre-seek position for a while (a
-            # USB + DASH seek can take ~2 s). Pin the reported position to
-            # the target until the engine converges — in ANY direction; the
-            # old rebound-only mask let backward and short forward seeks
-            # show the stale position, bouncing the progress dot.
-            if abs(p - target) <= 1.0:
-                self._seek_target_s = None  # converged — hand off seamlessly
+
+            def _trace(state):
+                if getattr(self, "_seek_trace_state", None) != state:
+                    self._seek_trace_state = state
+                    logger.info(
+                        "SeekTrace: %s target=%.2f engine=%.2f stale=%s",
+                        state, target, p, getattr(self, "_seek_stale_pos_s", None),
+                    )
+
+            # Seek is handled asynchronously by the transport worker: it has
+            # to stop the old decode run (which can block on the output
+            # ring) and, for DASH, re-fetch segments before audio restarts.
+            # Until the engine reports decode-start for the NEW run, every
+            # position it publishes belongs to the pre-seek world — pin the
+            # target unconditionally in that window. Only after the restart
+            # event may the hold hand off, and only to a value that
+            # converged on the target (or, past the soft deadline, to
+            # whatever the restarted engine actually plays, e.g. a clamped
+            # seek near EOF). The hard deadline guards against a seek whose
+            # restart event never arrives.
+            restart_seen = bool(getattr(self, "_seek_restart_seen", True))
+            if restart_seen and abs(p - target) <= 2.0:
+                _trace("converged")
+                self._seek_target_s = None
                 return p, d
-            if mono < self._seek_hold_until:
-                return target, d
-            # Soft deadline passed. If the engine is still parked at the
-            # pre-seek position the worker simply hasn't finished the seek —
-            # showing that stale value is never right, so keep pinning up to
-            # the hard deadline (which guards against a failed seek).
-            stale = getattr(self, "_seek_stale_pos_s", None)
-            if (
-                stale is not None
-                and abs(p - float(stale)) <= 1.5
-                and mono < getattr(self, "_seek_hold_hard_until", 0.0)
-            ):
-                return target, d
-            self._seek_target_s = None
+            if restart_seen and mono >= self._seek_hold_until:
+                _trace("released-post-restart")
+                self._seek_target_s = None
+                return p, d
+            if mono >= getattr(self, "_seek_hold_hard_until", 0.0):
+                _trace("released-hard")
+                self._seek_target_s = None
+                return p, d
+            _trace("pin" if not restart_seen else "pin-await-converge")
+            return target, d
         return p, d
 
     def set_speed(self, speed):

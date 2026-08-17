@@ -695,6 +695,16 @@ def update_ui_loop(app):
                 cur_scale_v = 0.0
             scale_epsilon = 0.025 if fast_ui_mode else 0.18
             if abs(cur_scale_v - float(p)) >= scale_epsilon:
+                if float(p) < cur_scale_v - 2.0:
+                    # Diagnostic: the visible progress dot is about to jump
+                    # backwards — record where the value came from.
+                    logger.info(
+                        "SeekTrace: UI backward jump scale=%.2f -> p=%.2f "
+                        "(hold_target=%s cached=%.2f)",
+                        cur_scale_v, float(p),
+                        getattr(app.player, "_seek_target_s", None),
+                        float(getattr(app.player, "_cached_pos_s", 0.0) or 0.0),
+                    )
                 app.is_programmatic_update = True
                 app.scale.set_value(p)
                 app.is_programmatic_update = False

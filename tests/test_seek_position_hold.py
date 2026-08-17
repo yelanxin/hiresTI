@@ -16,14 +16,15 @@ class _Shim:
 
     get_position = audio_mod.RustAudioPlayerAdapter.get_position
 
-    def __init__(self, cached_pos, target=None, hold_for=1.0, stale_pos=None,
-                 hard_for=8.0, engine_pos=None):
+    def __init__(self, cached_pos, target=None, hold_for=4.0, stale_pos=None,
+                 hard_for=8.0, engine_pos=None, restart_seen=False):
         self._cached_pos_s = cached_pos
         self._cached_dur_s = 240.0
         self._seek_target_s = target
         self._seek_hold_until = time.monotonic() + hold_for
         self._seek_hold_hard_until = time.monotonic() + hard_for
         self._seek_stale_pos_s = stale_pos
+        self._seek_restart_seen = restart_seen
         # Engine-truth position served when the cache is force-refreshed
         # (None = leave the cached value untouched, like a fresh cache).
         self._engine_pos = engine_pos
@@ -36,48 +37,64 @@ class _Shim:
                 self._cached_pos_s = self._engine_pos
 
 
-def test_backward_seek_pins_to_target_while_engine_is_stale():
-    # Seek 3:00 -> 1:00; engine still reports the pre-seek position.
-    shim = _Shim(cached_pos=180.0, target=60.0)
+def test_pins_target_before_restart_event_regardless_of_engine_value():
+    # Until the post-seek decode run starts, every engine position belongs
+    # to the pre-seek world — backward seek, short forward seek, or even a
+    # value that coincidentally matches the target must all stay pinned.
+    for engine_value in (180.0, 60.5, 30.0, 0.0):
+        shim = _Shim(cached_pos=engine_value, target=30.0, restart_seen=False)
+        pos, _dur = shim.get_position()
+        assert pos == 30.0, f"engine={engine_value}"
+        assert shim._seek_target_s == 30.0  # hold intact
+
+
+def test_optimistic_cache_write_cannot_fake_convergence():
+    # seek() writes the target into _cached_pos_s optimistically; without
+    # the restart event that value must not release the hold.
+    shim = _Shim(cached_pos=60.0, target=60.0, engine_pos=180.0, restart_seen=False)
     pos, _dur = shim.get_position()
-    assert pos == 60.0
-    assert shim._seek_target_s == 60.0  # still holding
-
-
-def test_short_forward_seek_pins_to_target_while_engine_is_stale():
-    # Seek 1:00 -> 1:10; the old rebound-only mask exposed the stale 60s.
-    shim = _Shim(cached_pos=60.0, target=70.0)
-    pos, _dur = shim.get_position()
-    assert pos == 70.0
-
-
-def test_hold_releases_when_engine_converges():
-    shim = _Shim(cached_pos=60.4, target=60.0)
-    pos, _dur = shim.get_position()
-    assert pos == 60.4  # engine value, handed off seamlessly
-    assert shim._seek_target_s is None
-
-
-def test_soft_expiry_keeps_pinning_while_engine_is_parked_at_pre_seek_pos():
-    # Slow USB+DASH seek: soft deadline passed but the engine still reports
-    # the pre-seek position — showing that stale value is never right.
-    shim = _Shim(cached_pos=180.0, target=60.0, hold_for=-0.1, stale_pos=180.0)
-    pos, _dur = shim.get_position()
+    assert shim.forced_refreshes == 1  # hold forces a real engine read
     assert pos == 60.0
     assert shim._seek_target_s == 60.0
 
 
-def test_soft_expiry_releases_once_engine_moved_elsewhere():
-    # Engine restarted somewhere that is neither the stale spot nor the
-    # target (e.g. seek clamped) — trust it after the soft deadline.
-    shim = _Shim(cached_pos=100.0, target=60.0, hold_for=-0.1, stale_pos=180.0)
+def test_converges_after_restart_event():
+    shim = _Shim(cached_pos=30.4, target=30.0, restart_seen=True)
     pos, _dur = shim.get_position()
-    assert pos == 100.0
+    assert pos == 30.4  # engine value, handed off seamlessly
     assert shim._seek_target_s is None
 
 
-def test_hard_expiry_gives_up_even_if_engine_never_moved():
-    shim = _Shim(cached_pos=180.0, target=60.0, hold_for=-0.1, stale_pos=180.0, hard_for=-0.1)
+def test_no_convergence_after_restart_until_engine_reaches_target():
+    # Restarted but the engine still reports the old spot (e.g. cache lag):
+    # keep pinning until it actually lands near the target.
+    shim = _Shim(cached_pos=180.0, target=30.0, restart_seen=True)
+    pos, _dur = shim.get_position()
+    assert pos == 30.0
+    assert shim._seek_target_s == 30.0
+
+
+def test_soft_expiry_trusts_engine_after_restart():
+    # Restart happened but the engine never converged (e.g. seek clamped
+    # at EOF) — after the soft deadline, show what actually plays.
+    shim = _Shim(cached_pos=200.0, target=230.0, hold_for=-0.1, restart_seen=True)
+    pos, _dur = shim.get_position()
+    assert pos == 200.0
+    assert shim._seek_target_s is None
+
+
+def test_soft_expiry_keeps_pinning_without_restart_event():
+    # Slow seek: soft deadline passed but the decode run has not restarted
+    # yet — the engine value is still pre-seek and must stay hidden.
+    shim = _Shim(cached_pos=180.0, target=30.0, hold_for=-0.1, restart_seen=False)
+    pos, _dur = shim.get_position()
+    assert pos == 30.0
+    assert shim._seek_target_s == 30.0
+
+
+def test_hard_expiry_gives_up_even_without_restart_event():
+    shim = _Shim(cached_pos=180.0, target=30.0, hold_for=-0.1, hard_for=-0.1,
+                 restart_seen=False)
     pos, _dur = shim.get_position()
     assert pos == 180.0
     assert shim._seek_target_s is None
@@ -88,19 +105,6 @@ def test_no_hold_passes_engine_position_through():
     pos, dur = shim.get_position()
     assert (pos, dur) == (42.0, 240.0)
     assert shim.forced_refreshes == 0  # no seek -> normal cached refresh
-
-
-def test_optimistic_cache_write_cannot_fake_convergence():
-    # seek() writes the target into _cached_pos_s optimistically. If the
-    # convergence check reads that value back (fresh-cache early return),
-    # the hold is dropped while the engine still reports the pre-seek
-    # position — the dot bounces on the next tick. The hold must force a
-    # real engine read instead.
-    shim = _Shim(cached_pos=60.0, target=60.0, stale_pos=180.0, engine_pos=180.0)
-    pos, _dur = shim.get_position()
-    assert shim.forced_refreshes == 1
-    assert pos == 60.0                 # pinned to target
-    assert shim._seek_target_s == 60.0  # hold NOT dropped by the fake value
 
 
 from types import SimpleNamespace
