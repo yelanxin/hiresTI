@@ -5885,8 +5885,13 @@ def render_uploads_dashboard(app, tracks=None):
     head.append(Gtk.Label(label="My Uploads", xalign=0, hexpand=True, css_classes=["home-section-title"]))
     head.append(Gtk.Label(label=f"{len(all_tracks)} tracks", css_classes=["home-section-count"]))
 
+    def _upload_ready(t):
+        # Freshly uploaded files are transcoded server-side before they can
+        # stream; until then playback resolution fails, so keep them inert.
+        return bool(getattr(t, "stream_ready", True)) and bool(getattr(t, "allow_streaming", True))
+
     def _play_uploads(shuffle=False):
-        queue = list(all_tracks)
+        queue = [t for t in all_tracks if _upload_ready(t)]
         if not queue:
             return
         if shuffle:
@@ -5986,9 +5991,14 @@ def render_uploads_dashboard(app, tracks=None):
         album_lbl.set_margin_end(LAYOUT["cell_margin_end"])
         box.append(album_lbl)
 
-        dur = int(getattr(t, "duration", 0) or 0)
-        m, s = divmod(max(0, dur), 60)
-        d = Gtk.Label(label=f"{m}:{s:02d}", xalign=0, css_classes=["dim-label", "track-duration"])
+        ready = _upload_ready(t)
+        if ready:
+            dur = int(getattr(t, "duration", 0) or 0)
+            m, s = divmod(max(0, dur), 60)
+            dur_text = f"{m}:{s:02d}"
+        else:
+            dur_text = "Processing…"
+        d = Gtk.Label(label=dur_text, xalign=0, css_classes=["dim-label", "track-duration"])
         d.set_attributes(Pango.AttrList.from_string("font-features 'tnum=1'"))
         d.set_size_request(LAYOUT["time_width"], -1)
         d.set_halign(Gtk.Align.FILL)
@@ -5996,8 +6006,14 @@ def render_uploads_dashboard(app, tracks=None):
 
         add_btn = Gtk.Button(icon_name="list-add-symbolic", css_classes=["flat", "circular", "history-scroll-btn"])
         add_btn.set_tooltip_text("Add to Playlist")
+        add_btn.set_sensitive(ready)
         add_btn.connect("clicked", lambda _b, tr=t: app.on_add_single_track_to_playlist(tr))
         box.append(add_btn)
+
+        if not ready:
+            row.set_activatable(False)
+            row.set_tooltip_text("TIDAL is still processing this upload")
+            title_lbl.add_css_class("dim-label")
 
         row.set_child(box)
         list_box.append(row)
