@@ -87,14 +87,15 @@ class LevelMonitor(Gtk.DrawingArea):
     _PEAK_ATTACK  = 0.92
     _PEAK_RELEASE = 0.07
 
-    # ---- time-domain ballistics (set_levels polls at ~8 Hz) ----
-    _TD_LEVEL_ALPHA   = 0.45   # bar fill (block RMS)
-    _TD_PEAK_RELEASE  = 0.25   # peak falls toward current block peak
 
     def __init__(self):
         super().__init__()
         # Level bar display state
         self._td_mode = False   # True once set_levels() delivers real dBFS
+        self._td_peak_l = _NEG_INF   # latest raw targets from the PCM tap
+        self._td_rms_l  = _NEG_INF
+        self._td_peak_r = _NEG_INF
+        self._td_rms_r  = _NEG_INF
         self._level_l = _NEG_INF
         self._level_r = _NEG_INF
         self._peak_l  = _NEG_INF
@@ -118,14 +119,13 @@ class LevelMonitor(Gtk.DrawingArea):
     # ------------------------------------------------------------------
 
     def set_levels(self, peak_l, rms_l, peak_r, rms_r):
-        """Update level bars from true time-domain dBFS values (Rust PCM tap).
+        """Store true time-domain dBFS targets from the Rust PCM tap.
 
         peak_*: sample peak of the last 100 ms block; rms_*: block RMS.
-        Preferred over the FFT-derived update() — once this is called, the
-        FFT path stops driving the bars so the dB scale reads true.
+        Values arrive at the ~8 Hz LUFS poll cadence; the per-frame update()
+        tick animates the bars toward them at display frame rate, so the
+        meter stays smooth while reading true.
         """
-        self._td_mode = True
-
         def _clamp(v):
             try:
                 v = float(v)
@@ -133,27 +133,28 @@ class LevelMonitor(Gtk.DrawingArea):
                 return _NEG_INF
             return v if math.isfinite(v) and v > _NEG_INF else _NEG_INF
 
-        rms_l, rms_r = _clamp(rms_l), _clamp(rms_r)
-        peak_l, peak_r = _clamp(peak_l), _clamp(peak_r)
-
-        a = self._TD_LEVEL_ALPHA
-        self._level_l = a * rms_l + (1.0 - a) * self._level_l
-        self._level_r = a * rms_r + (1.0 - a) * self._level_r
-
-        # Peak: jump up instantly, fall gradually (peak-hold feel).
-        rel = self._TD_PEAK_RELEASE
-        self._peak_l = peak_l if peak_l > self._peak_l else rel * peak_l + (1.0 - rel) * self._peak_l
-        self._peak_r = peak_r if peak_r > self._peak_r else rel * peak_r + (1.0 - rel) * self._peak_r
-
-        self.queue_draw()
+        self._td_mode = True
+        self._td_peak_l = _clamp(peak_l)
+        self._td_rms_l  = _clamp(rms_l)
+        self._td_peak_r = _clamp(peak_r)
+        self._td_rms_r  = _clamp(rms_r)
 
     def update(self, left_mags, right_mags):
-        """Update level bars from FFT magnitude arrays (called each frame).
+        """Per-frame bar animation tick (called at viz frame rate).
 
-        Fallback path for engines without the time-domain level tap; inert
-        once set_levels() has delivered real dBFS values.
+        With the time-domain tap active, animates toward the latest true
+        dBFS targets from set_levels(). Otherwise falls back to driving the
+        bars from the FFT magnitude arrays (older engine builds).
         """
         if getattr(self, "_td_mode", False):
+            a = self._LEVEL_ALPHA
+            self._level_l = a * self._td_rms_l + (1.0 - a) * self._level_l
+            self._level_r = a * self._td_rms_r + (1.0 - a) * self._level_r
+            al = self._PEAK_ATTACK if self._td_peak_l > self._peak_l else self._PEAK_RELEASE
+            ar = self._PEAK_ATTACK if self._td_peak_r > self._peak_r else self._PEAK_RELEASE
+            self._peak_l = al * self._td_peak_l + (1.0 - al) * self._peak_l
+            self._peak_r = ar * self._td_peak_r + (1.0 - ar) * self._peak_r
+            self.queue_draw()
             return
         raw_peak_l, raw_mean_l, raw_peak_r, raw_mean_r = _compute_level_metrics(left_mags, right_mags)
 
@@ -186,6 +187,10 @@ class LevelMonitor(Gtk.DrawingArea):
 
     def reset(self):
         self._td_mode = False
+        self._td_peak_l = _NEG_INF
+        self._td_rms_l  = _NEG_INF
+        self._td_peak_r = _NEG_INF
+        self._td_rms_r  = _NEG_INF
         self._level_l = _NEG_INF
         self._level_r = _NEG_INF
         self._peak_l  = _NEG_INF

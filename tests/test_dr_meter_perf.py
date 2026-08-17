@@ -153,8 +153,6 @@ def test_scale_ticks_land_on_true_bar_positions():
 class _MeterShim:
     """LevelMonitor methods bound to a plain object (no Gtk widget needed)."""
 
-    _TD_LEVEL_ALPHA = dr_mod.LevelMonitor._TD_LEVEL_ALPHA
-    _TD_PEAK_RELEASE = dr_mod.LevelMonitor._TD_PEAK_RELEASE
     _LEVEL_ALPHA = dr_mod.LevelMonitor._LEVEL_ALPHA
     _PEAK_ATTACK = dr_mod.LevelMonitor._PEAK_ATTACK
     _PEAK_RELEASE = dr_mod.LevelMonitor._PEAK_RELEASE
@@ -163,6 +161,8 @@ class _MeterShim:
 
     def __init__(self):
         self._td_mode = False
+        self._td_peak_l = self._td_rms_l = dr_mod._NEG_INF
+        self._td_peak_r = self._td_rms_r = dr_mod._NEG_INF
         self._level_l = self._level_r = dr_mod._NEG_INF
         self._peak_l = self._peak_r = dr_mod._NEG_INF
         self.draws = 0
@@ -171,30 +171,53 @@ class _MeterShim:
         self.draws += 1
 
 
-def test_set_levels_drives_bars_and_disables_fft_path():
+def test_update_animates_toward_time_domain_targets_each_frame():
+    m = _MeterShim()
+    m.set_levels(-6.0, -18.0, -3.0, -15.0)
+    assert m._td_mode
+
+    # set_levels only stores targets; the per-frame tick does the animation,
+    # so an 8 Hz poll still yields frame-rate bar motion.
+    assert m._peak_l == dr_mod._NEG_INF
+
+    values = []
+    for _ in range(6):
+        m.update([], [])
+        values.append(m._peak_l)
+
+    # Every frame moves the bar (smooth animation), converging on the target.
+    assert all(b > a for a, b in zip(values, values[1:]))
+    assert abs(values[-1] - (-6.0)) < 1.0
+    assert m.draws == 6
+
+
+def test_update_ignores_fft_data_once_levels_arrive(monkeypatch):
     m = _MeterShim()
     m.set_levels(-6.0, -18.0, -3.0, -15.0)
 
-    assert m._td_mode
-    assert m._peak_l == -6.0 and m._peak_r == -3.0  # instant attack
-    assert m._level_l > dr_mod._NEG_INF
+    def _boom(*_a):
+        raise AssertionError("FFT path must be inert in time-domain mode")
 
-    # FFT update must no longer touch the bars once real levels arrived.
-    before = (m._level_l, m._peak_l)
-    m.update([0.0] * 8, [0.0] * 8)
-    assert (m._level_l, m._peak_l) == before
+    monkeypatch.setattr(dr_mod, "_compute_level_metrics", _boom)
+    m.update([0.0] * 8, [0.0] * 8)  # must not touch the FFT helper
 
 
-def test_set_levels_peak_falls_gradually():
+def test_update_peak_falls_gradually_after_target_drops():
     m = _MeterShim()
     m.set_levels(-6.0, -20.0, -6.0, -20.0)
+    for _ in range(10):
+        m.update([], [])
+    near_top = m._peak_l
     m.set_levels(-30.0, -40.0, -30.0, -40.0)
-    # One release step: below the old peak, above the new block peak.
-    assert -30.0 < m._peak_l < -6.0
+    m.update([], [])
+    # One release step: below the held peak, above the new target.
+    assert -30.0 < m._peak_l < near_top
 
 
 def test_set_levels_clamps_non_finite_input():
     m = _MeterShim()
     m.set_levels(float("-inf"), float("nan"), None, "x")
-    assert m._peak_l == dr_mod._NEG_INF
+    for _ in range(3):
+        m.update([], [])
+    assert m._peak_l <= dr_mod._NEG_INF + 1e-9
     assert m._level_r <= dr_mod._NEG_INF + 1e-9
