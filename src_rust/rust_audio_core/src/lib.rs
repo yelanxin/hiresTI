@@ -1223,7 +1223,7 @@ impl Engine {
         }
 
         // Meter level frames go through the same playback-clock gate so the
-        // bars move at their 20 ms production cadence aligned to what is
+        // bars move at their 16 ms production cadence aligned to what is
         // audible — the decode thread hands them over in slab-sized bursts.
         //
         // On the ALSA-family fallback the "playback" clock IS the decode
@@ -1648,7 +1648,7 @@ pub extern "C" fn rac_get_lufs(
 }
 
 /// Per-channel time-domain meter levels (dBFS): true sample peak and RMS
-/// for L and R, PPM-ballistic on a 20 ms cadence and released against the
+/// for L and R, PPM-ballistic on a 16 ms cadence and released against the
 /// playback clock (see drain_native_transport_events). Separate from
 /// rac_get_lufs so older callers keep their ABI. Values at or below -100
 /// mean silence/unavailable.

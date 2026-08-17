@@ -121,7 +121,7 @@ class LevelMonitor(Gtk.DrawingArea):
     def set_levels(self, peak_l, rms_l, peak_r, rms_r):
         """Store true time-domain dBFS levels from the Rust PCM tap.
 
-        The values are already PPM-ballistic (20 ms sub-blocks in Rust:
+        The values are already PPM-ballistic (16 ms sub-blocks in Rust:
         instant peak attack, 60 dB/s fall, fast-attack RMS), so the UI
         adopts them as-is — smoothing again here would double the
         ballistics and make the meter feel sluggish.

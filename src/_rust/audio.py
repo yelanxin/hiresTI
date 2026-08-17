@@ -1146,8 +1146,8 @@ class _RustAudioCore:
     def get_levels(self):
         """Return (peak_l, rms_l, peak_r, rms_r) in dBFS, or None.
 
-        True time-domain sample peak / RMS per channel over the last 100 ms
-        block, from the Rust LUFS tap. Unavailable values are float('-inf').
+        True time-domain sample peak / RMS per channel over the last 16 ms
+        block, from the Rust LUFS tap. Unavailable values read as silence.
         """
         if (not self.available) or self._closed or self._rac_get_levels is None:
             return None

@@ -123,7 +123,7 @@ pub struct LufsValues {
 /// math stays well-defined; anything at or below this reads as silence.
 pub const LEVEL_DISPLAY_FLOOR_DB: f32 = -100.0;
 
-/// One ~20 ms display sub-block of per-channel meter levels, already
+/// One ~16 ms display sub-block of per-channel meter levels, already
 /// ballistic (instant peak attack, 60 dB/s fall; fast-attack RMS) and
 /// stamped with the track-absolute position of its last sample. The
 /// engine holds these until the playback clock reaches `pos_s`, so the
@@ -147,7 +147,7 @@ pub struct LufsShared {
     pub level_frames: VecDeque<LevelFrame>,
 }
 
-/// Cap on queued display frames (~80 s at 20 ms) — decode normally runs
+/// Cap on queued display frames (~65 s at 16 ms) — decode normally runs
 /// less than a couple of seconds ahead of playback; this is a safety
 /// valve, not a working depth.
 pub const LEVEL_FRAME_QUEUE_CAP: usize = 4096;
@@ -200,13 +200,14 @@ pub(crate) struct LufsState {
     block_power_sum: f64, // sum of sample² across all channels
 
     // Per-channel (L/R) display sub-block accumulators for the meter bars.
-    // ~20 ms so the bars react like a hardware PPM, decoupled from the
+    // ~16 ms (matching the spectrum frame cadence) so the bars react like
+    // a hardware PPM, decoupled from the
     // 100 ms measurement blocks (shrinking those would change LUFS/DR
     // semantics).
     ch_peak: [f64; 2],      // max |sample| per channel in current sub-block
     ch_power_sum: [f64; 2], // sum of sample² per channel
     disp_count: usize,      // frames in the current sub-block
-    disp_target: usize,     // frames per ~20 ms sub-block
+    disp_target: usize,     // frames per ~16 ms sub-block
     // Smoothed display state (ballistics applied per sub-block)
     disp_rms_db: [f32; 2],
     disp_peak_db: [f32; 2],
@@ -253,7 +254,7 @@ impl LufsState {
             ch_peak: [0.0; 2],
             ch_power_sum: [0.0; 2],
             disp_count: 0,
-            disp_target: rate as usize / 50, // 20 ms
+            disp_target: rate as usize * 16 / 1000, // 16 ms
             disp_rms_db: [LEVEL_DISPLAY_FLOOR_DB; 2],
             disp_peak_db: [LEVEL_DISPLAY_FLOOR_DB; 2],
             start_offset_s: 0.0,
@@ -282,7 +283,7 @@ impl LufsState {
         self.filt1 = [BiquadState::default(); MAX_CHANNELS];
         self.filt2 = [BiquadState::default(); MAX_CHANNELS];
         self.block_target = (rate as usize).max(1) / 10;
-        self.disp_target = ((rate as usize).max(1) / 50).max(1);
+        self.disp_target = ((rate as usize).max(1) * 16 / 1000).max(1);
         // Flush the in-progress block so we don't mix old and new rates.
         self.block_sum = 0.0;
         self.block_count = 0;
@@ -355,7 +356,7 @@ impl LufsState {
         self.pending_level_frames.drain(..)
     }
 
-    /// Flush the ~20 ms display sub-block: apply PPM-style ballistics and
+    /// Flush the ~16 ms display sub-block: apply PPM-style ballistics and
     /// publish the per-channel meter levels. Kept separate from
     /// flush_block() so display responsiveness never touches the LUFS/DR
     /// measurement chain.
@@ -377,14 +378,15 @@ impl LufsState {
             } else {
                 LEVEL_DISPLAY_FLOOR_DB
             };
-            // RMS: fast attack, moderate release (per 20 ms step).
-            let alpha = if raw_rms > self.disp_rms_db[c] { 0.6 } else { 0.35 };
+            // RMS: fast attack, moderate release (per 16 ms step; same
+            // time constants as the original 0.6/0.35 per 20 ms).
+            let alpha = if raw_rms > self.disp_rms_db[c] { 0.52 } else { 0.29 };
             self.disp_rms_db[c] += alpha * (raw_rms - self.disp_rms_db[c]);
-            // Peak: instant attack, 1.2 dB per 20 ms fall (= 60 dB/s).
+            // Peak: instant attack, 0.96 dB per 16 ms fall (= 60 dB/s).
             if raw_peak > self.disp_peak_db[c] {
                 self.disp_peak_db[c] = raw_peak;
             } else {
-                self.disp_peak_db[c] = (self.disp_peak_db[c] - 1.2)
+                self.disp_peak_db[c] = (self.disp_peak_db[c] - 0.96)
                     .max(raw_peak)
                     .max(LEVEL_DISPLAY_FLOOR_DB);
             }
@@ -594,11 +596,11 @@ mod tests {
         assert!((f.rms_r + 6.02).abs() < 0.1, "rms_r={}", f.rms_r);
     }
 
-    // 20 ms display cadence with track-absolute position stamps: every
-    // sub-block yields one frame, so slab-granular decoding can no longer
-    // collapse several updates into one.
+    // 16 ms display cadence (matching the spectrum frame cadence) with
+    // track-absolute position stamps: every sub-block yields one frame, so
+    // slab-granular decoding can no longer collapse several updates into one.
     #[test]
-    fn display_frames_are_stamped_at_twenty_ms_cadence() {
+    fn display_frames_are_stamped_at_sixteen_ms_cadence() {
         let mut state = LufsState::new();
         state.update_rate_channels(48_000, 2);
         state.set_start_offset(42.0);
@@ -606,9 +608,9 @@ mod tests {
         feed_blocks(&mut state, &frames);
 
         let stamps: Vec<f64> = state.pending_level_frames.iter().map(|f| f.pos_s).collect();
-        assert_eq!(stamps.len(), 10, "200 ms should yield 10 sub-blocks");
-        assert!((stamps[0] - 42.02).abs() < 1e-9, "first={}", stamps[0]);
-        assert!((stamps[9] - 42.20).abs() < 1e-9, "last={}", stamps[9]);
+        assert_eq!(stamps.len(), 12, "200 ms should yield 12 complete sub-blocks");
+        assert!((stamps[0] - 42.016).abs() < 1e-9, "first={}", stamps[0]);
+        assert!((stamps[11] - 42.192).abs() < 1e-9, "last={}", stamps[11]);
         assert!(stamps.windows(2).all(|w| w[1] > w[0]));
     }
 
@@ -622,11 +624,13 @@ mod tests {
             .collect();
         feed_blocks(&mut state, &loud);
         assert!((state.pending_level_frames.last().unwrap().peak_l - 0.0).abs() < 0.1);
-        // 200 ms of silence = 10 sub-blocks × 1.2 dB → −12 dB.
+        // 100 ms of loud = 6.25 sub-blocks, so the first "silent" sub-block
+        // still contains 192 loud frames and holds the peak at 0 dB; the
+        // remaining 11 pure-silence sub-blocks fall 11 × 0.96 = −10.56 dB.
         let quiet: Vec<(f64, f64)> = (0..9600).map(|_| (0.0, 0.0)).collect();
         feed_blocks(&mut state, &quiet);
         let last = state.pending_level_frames.last().unwrap().peak_l;
-        assert!((last + 12.0).abs() < 0.1, "peak_l={last}");
+        assert!((last + 10.56).abs() < 0.1, "peak_l={last}");
     }
 
     #[test]
@@ -640,7 +644,7 @@ mod tests {
         state.reset();
         assert!(state.pending_level_frames.is_empty());
         feed_blocks(&mut state, &frames);
-        assert!((state.pending_level_frames[0].pos_s - 7.52).abs() < 1e-9);
+        assert!((state.pending_level_frames[0].pos_s - 7.516).abs() < 1e-9);
     }
 
     #[test]
