@@ -3732,7 +3732,11 @@ class RustAudioPlayerAdapter:
                 return
         self._last_seek_issue_ts = now
         self._last_seek_issue_target = self._seek_target_s
-        self._seek_hold_until = time.monotonic() + 0.35
+        # Upper bound on how long get_position() reports the seek target while
+        # the async worker restart catches up. Released early once the engine
+        # position converges on the target; generous enough to cover a DASH
+        # seek that has to re-fetch segments.
+        self._seek_hold_until = time.monotonic() + 1.5
         self._cached_pos_s = self._seek_target_s
         # Seek can restart/rewire spectrum stream; reset visual cursor defensively.
         self._reset_rust_visual_sync_state()
@@ -4113,12 +4117,20 @@ class RustAudioPlayerAdapter:
         self._refresh_rust_cache(force=False)
         p = float(self._cached_pos_s or 0.0)
         d = float(self._cached_dur_s or 0.0)
-        if self._seek_target_s is not None and time.monotonic() < self._seek_hold_until:
+        if self._seek_target_s is not None:
             target = float(self._seek_target_s)
-            # Mask transient 0/rebound frame right after flush seek.
-            if p < max(0.2, target * 0.5):
+            if time.monotonic() < self._seek_hold_until:
+                # Seek is handled asynchronously by the transport worker, so
+                # the engine keeps reporting the pre-seek position for a
+                # moment (longer for DASH sources that re-fetch segments).
+                # Pin the reported position to the target until the engine
+                # converges — in ANY direction; the old rebound-only mask let
+                # backward and short forward seeks show the stale position,
+                # making the progress dot jump back and forth.
+                if abs(p - target) <= 1.0:
+                    self._seek_target_s = None  # converged — hand off seamlessly
+                    return p, d
                 return target, d
-        else:
             self._seek_target_s = None
         return p, d
 
