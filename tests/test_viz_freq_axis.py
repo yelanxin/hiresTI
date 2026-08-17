@@ -83,3 +83,31 @@ def test_split_stereo_axis_keeps_all_ticks_when_wide():
     mod._draw_freq_axis_cairo(cr, width, 18, "Linear", 256, regions=regions)
 
     assert len(cr.tick_xs) == 18
+
+
+def test_linear_temporal_smoothing_reduces_jitter():
+    state = {}
+    first = mod._smooth_linear_bins_temporal(state, "mono", [0.0] * 8)
+    assert first == [0.0] * 8
+    # A full-scale jump only moves the displayed bin by alpha.
+    second = mod._smooth_linear_bins_temporal(state, "mono", [1.0] * 8)
+    assert all(abs(v - mod._LINEAR_TEMPORAL_ALPHA) < 1e-9 for v in second)
+    # Converges toward the target across frames.
+    third = mod._smooth_linear_bins_temporal(state, "mono", [1.0] * 8)
+    assert all(third[i] > second[i] for i in range(8))
+
+
+def test_linear_temporal_smoothing_is_per_channel():
+    state = {}
+    mod._smooth_linear_bins_temporal(state, "left", [1.0] * 4)
+    right = mod._smooth_linear_bins_temporal(state, "right", [0.5] * 4)
+    # First frame for "right" must not be influenced by "left" history.
+    assert right == [0.5] * 4
+
+
+def test_linear_temporal_smoothing_resets_on_length_change():
+    state = {}
+    mod._smooth_linear_bins_temporal(state, "mono", [1.0] * 4)
+    out = mod._smooth_linear_bins_temporal(state, "mono", [0.2] * 8)
+    # Bar-count change: no blend against mismatched history.
+    assert out == [0.2] * 8

@@ -354,6 +354,23 @@ def _resample_linear_values(values, out_count, use_peak=False):
         return out
 
 
+# Temporal smoothing for LINEAR display bins. Linear bars map only a few
+# FFT bins each (exactly one when the display bar count equals the analysis
+# band count), so their frame-to-frame variance is far higher than log bars,
+# which aggregate wide frequency spans — linear looked jittery while log was
+# smooth. A mild EMA (~2-3 frames at 62.5 fps ≈ 35 ms) equalises the
+# perceived stability without visible lag. Log bins are left untouched.
+_LINEAR_TEMPORAL_ALPHA = 0.35
+
+
+def _smooth_linear_bins_temporal(state, key, bins, alpha=_LINEAR_TEMPORAL_ALPHA):
+    prev = state.get(key)
+    if prev is not None and len(prev) == len(bins):
+        bins = [alpha * n + (1.0 - alpha) * p for n, p in zip(bins, prev)]
+    state[key] = bins
+    return bins
+
+
 def _build_linear_spectrum_bins(
     values,
     out_count,
@@ -1395,11 +1412,18 @@ class SpectrumVisualizer(Gtk.DrawingArea):
             except Exception:
                 self._rust_stereo_state_engine = None
 
-    def _map_magnitudes_to_heights(self, magnitudes, use_rust=False, log_rust=False):
+    def _linear_temporal_state(self):
+        state = getattr(self, "_linear_temporal_bins", None)
+        if state is None:
+            state = self._linear_temporal_bins = {}
+        return state
+
+    def _map_magnitudes_to_heights(self, magnitudes, use_rust=False, log_rust=False, channel="mono"):
         with _VIZ_UPDATE_PERF.track("spectrum_map"):
             vals = list(magnitudes or [])
             if not vals:
                 return [0.0] * self.num_bars
+            is_log = self.frequency_scale_name == _FREQ_SCALE_LOG
             rust_out = None
             if use_rust:
                 rust_out = _try_rust_map_spectrum(
@@ -1415,8 +1439,10 @@ class SpectrumVisualizer(Gtk.DrawingArea):
                 if log_rust and not self._logged_rust_path:
                     logger.info("Spectrum preprocessing path: Rust mapper")
                     self._logged_rust_path = True
+                if not is_log:
+                    rust_out = _smooth_linear_bins_temporal(self._linear_temporal_state(), channel, rust_out)
                 return rust_out
-            if self.frequency_scale_name == _FREQ_SCALE_LOG:
+            if is_log:
                 return _build_log_spectrum_bins(
                     _normalize_spectrum_magnitudes(vals),
                     self.num_bars,
@@ -1428,7 +1454,7 @@ class SpectrumVisualizer(Gtk.DrawingArea):
             if (not use_rust or not self._rust_core.available) and not self._logged_python_fallback:
                 logger.info("Spectrum preprocessing path: Python fallback")
                 self._logged_python_fallback = True
-            return _build_linear_spectrum_bins(
+            out = _build_linear_spectrum_bins(
                 vals,
                 self.num_bars,
                 rust_core=self._rust_core if use_rust else None,
@@ -1436,6 +1462,7 @@ class SpectrumVisualizer(Gtk.DrawingArea):
                 db_min=-80.0,
                 db_range=80.0,
             )
+            return _smooth_linear_bins_temporal(self._linear_temporal_state(), channel, out)
 
     def _resample_channel_heights(self, values, out_count):
         vals = list(values or [])
@@ -1496,8 +1523,8 @@ class SpectrumVisualizer(Gtk.DrawingArea):
                 self.target_right_channel_heights = list(new_heights)
                 return
             if stereo_needed and self._rust_stereo_state_engine is not None:
-                left_heights = self._map_magnitudes_to_heights(left_vals, use_rust=False)
-                right_heights = self._map_magnitudes_to_heights(right_vals, use_rust=False)
+                left_heights = self._map_magnitudes_to_heights(left_vals, use_rust=False, channel="left")
+                right_heights = self._map_magnitudes_to_heights(right_vals, use_rust=False, channel="right")
                 self.target_heights = new_heights
                 self.target_left_channel_heights = left_heights
                 self.target_right_channel_heights = right_heights
@@ -1505,8 +1532,8 @@ class SpectrumVisualizer(Gtk.DrawingArea):
                 return
             self.target_heights = new_heights
             if stereo_needed:
-                self.target_left_channel_heights = self._map_magnitudes_to_heights(left_vals, use_rust=False)
-                self.target_right_channel_heights = self._map_magnitudes_to_heights(right_vals, use_rust=False)
+                self.target_left_channel_heights = self._map_magnitudes_to_heights(left_vals, use_rust=False, channel="left")
+                self.target_right_channel_heights = self._map_magnitudes_to_heights(right_vals, use_rust=False, channel="right")
             else:
                 self.target_left_channel_heights = new_heights
                 self.target_right_channel_heights = new_heights
@@ -4259,6 +4286,11 @@ class DotsGLVisualizer(Gtk.GLArea):
                 db_range=80.0,
             )
             if rust_out is not None:
+                if self.frequency_scale_name != _FREQ_SCALE_LOG:
+                    state = getattr(self, "_linear_temporal_bins", None)
+                    if state is None:
+                        state = self._linear_temporal_bins = {}
+                    rust_out = _smooth_linear_bins_temporal(state, "mono", rust_out)
                 new_heights = rust_out
                 if self._rust_state_engine is not None:
                     self._rust_state_engine.set_target(new_heights)
@@ -4284,6 +4316,10 @@ class DotsGLVisualizer(Gtk.GLArea):
                 db_min=-80.0,
                 db_range=80.0,
             )
+            state = getattr(self, "_linear_temporal_bins", None)
+            if state is None:
+                state = self._linear_temporal_bins = {}
+            new_heights = _smooth_linear_bins_temporal(state, "mono", new_heights)
             if self._rust_state_engine is not None:
                 self._rust_state_engine.set_target(new_heights)
             else:
