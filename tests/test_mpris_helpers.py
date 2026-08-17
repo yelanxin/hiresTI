@@ -128,3 +128,51 @@ def test_mpris_volume_setter_is_ignored_while_bit_perfect_is_enabled():
 
     assert app.player._vol == 0.8
     assert app.settings.get("volume") is None
+
+
+def test_sync_position_never_broadcasts_position():
+    app = _make_app()
+    app.player._playing = True
+    app.player._pos = 12.5
+    svc = MPRISService(app)
+    svc._started = True
+
+    emitted = []
+    svc._emit_properties_changed = lambda iface, changed: emitted.append(changed)
+
+    for _ in range(10):
+        svc.sync_position()
+    svc.sync_position(force=True)
+
+    assert emitted == []
+    assert svc._player_property_variant("Position").unpack() == 12_500_000
+
+
+def test_no_sync_path_announces_position():
+    app = _make_app()
+    app.player._playing = True
+    app.player._pos = 12.5
+    svc = MPRISService(app)
+    svc._started = True
+
+    emitted = []
+    svc._emit_properties_changed = lambda iface, changed: emitted.append(changed)
+
+    svc.sync_all(force=True)
+
+    assert emitted
+    assert not any("Position" in changed for changed in emitted)
+
+
+def test_emit_seeked_still_announces_jumps():
+    app = _make_app()
+    svc = MPRISService(app)
+    svc._started = True
+
+    signals = []
+    svc._conn = SimpleNamespace(emit_signal=lambda *args: signals.append(args))
+
+    svc.emit_seeked(12.5)
+
+    assert [args[3] for args in signals] == ["Seeked"]
+    assert signals[0][4].unpack() == (12_500_000,)

@@ -39,8 +39,8 @@ def restart_player_with_url(app, url, pos):
     GLib.timeout_add(700, lambda: app.player.seek(pos))
     if hasattr(app, "_mpris_sync_playback"):
         app._mpris_sync_playback()
-    if hasattr(app, "_mpris_sync_position"):
-        GLib.timeout_add(750, lambda: (app._mpris_sync_position(force=True), False)[1])
+    if hasattr(app, "_mpris_emit_seeked"):
+        GLib.timeout_add(750, lambda: (app._mpris_emit_seeked(pos), False)[1])
 
 
 def load_cover_art(app, cover_id_or_url):

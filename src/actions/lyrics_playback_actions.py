@@ -27,6 +27,9 @@ def _attach_lyric_seek_gesture(row, app, time_point):
             app.player.seek(float(time_point))
         except Exception:
             logger.exception("lyric seek failed")
+            return
+        if hasattr(app, "_mpris_emit_seeked"):
+            app._mpris_emit_seeked(float(time_point))
 
     gesture.connect("released", _on_released)
     row.add_controller(gesture)

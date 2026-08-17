@@ -64,13 +64,7 @@ def _init_paths_and_settings(self):
     self.shuffle_indices = []  # 用来存随机播放的顺序列表
 
 
-def _init_audio_and_data_services(self):
-    self.player = create_audio_engine(
-        on_eos_callback=self.on_next_track,
-        on_tag_callback=self.update_tech_label,
-        on_spectrum_callback=self.on_spectrum_data,
-        on_viz_sync_offset_update=self.on_viz_sync_offset_update,
-    )
+def _wire_player_callbacks(self):
     # When the USB sink becomes ready with hardware volume support,
     # re-check whether volume controls should be unlocked (bit-perfect + hw vol).
     ready_cb = getattr(self, "_on_hw_volume_ready", None)
@@ -79,6 +73,21 @@ def _init_audio_and_data_services(self):
     changed_cb = getattr(self, "_on_hw_volume_changed", None)
     if callable(changed_cb):
         self.player._on_hw_volume_changed_callback = changed_cb
+    # Stall recovery reloads the pipeline and seeks back on its own, so the
+    # jump has to reach MPRIS as a Seeked signal like every other one.
+    seek_cb = getattr(self, "_mpris_emit_seeked", None)
+    if callable(seek_cb):
+        self.player._on_internal_seek_callback = seek_cb
+
+
+def _init_audio_and_data_services(self):
+    self.player = create_audio_engine(
+        on_eos_callback=self.on_next_track,
+        on_tag_callback=self.update_tech_label,
+        on_spectrum_callback=self.on_spectrum_data,
+        on_viz_sync_offset_update=self.on_viz_sync_offset_update,
+    )
+    _wire_player_callbacks(self)
     self._viz_sync_device_key = None
     self._viz_sync_offsets = dict(self.settings.get("viz_sync_device_offsets", {}))
     self._viz_sync_last_saved_ms = int(self.settings.get("viz_sync_offset_ms", 0) or 0)
