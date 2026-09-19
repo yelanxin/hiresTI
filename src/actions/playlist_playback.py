@@ -96,7 +96,7 @@ def start_playlist(app, shuffle=False, start_position=0, track_id=None):
     return True
 
 
-def resolve_for_playback(app, entry, index, request_id):
+def resolve_for_playback(app, entry, index, request_id, from_history=False):
     """Resolve a queue selection off the UI thread; ignore superseded selections."""
     app._pending_playlist_resolution = request_id
 
@@ -118,7 +118,10 @@ def resolve_for_playback(app, entry, index, request_id):
             if error:
                 _notice(app, f"Could not load playlist track: {error}")
                 return False
-            app.play_track(index)
+            # Preserve the Previous-navigation flag across the async hop so
+            # replaying a not-yet-resolved track from the back-stack doesn't
+            # re-record it as a forward step.
+            app.play_track(index, from_history=from_history)
             return False
 
         GLib.idle_add(apply)

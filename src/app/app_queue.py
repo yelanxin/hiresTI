@@ -31,6 +31,8 @@ def _set_play_queue(self, tracks):
     self._playlist_play_request = getattr(self, "_playlist_play_request", 0) + 1
     self.play_queue = list(tracks or [])
     self.shuffle_indices = []
+    # A new queue invalidates the actually-played back-stack.
+    self._play_history = []
     if hasattr(self, "_render_now_playing_queue"):
         GLib.idle_add(lambda: (self._render_now_playing_queue(self._get_active_queue()), False)[1])
     if hasattr(self, "_mpris_sync_metadata"):

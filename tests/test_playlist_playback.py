@@ -64,7 +64,7 @@ def setup(monkeypatch):
     app._get_active_queue = MethodType(app_queue._get_active_queue, app)
     app.get_next_index = lambda direction=1: playback_actions.get_next_index(app, direction)
 
-    def play(index):
+    def play(index, from_history=False):
         app.current_track_index = index
         app._play_request_id += 1
         app.played.append(index)
@@ -376,3 +376,52 @@ def test_external_stop_or_pause_cancels_pending_start(setup, monkeypatch, contro
             service._action_stop()
     flush()
     assert not app.played
+
+
+def _prev_app(play_mode, current, history):
+    """Minimal app for exercising on_prev_track's back-stack logic."""
+    played = []
+    app = SimpleNamespace(
+        current_track_list=list(range(100)),
+        current_track_index=current,
+        play_mode=play_mode,
+        MODE_NORMAL=4, MODE_LOOP=0, MODE_ONE=1, MODE_SHUFFLE=2, MODE_SMART=3,
+        _play_history=list(history),
+        # A position past the restart threshold so Previous steps tracks
+        # instead of rewinding the current one to 0.
+        player=SimpleNamespace(get_position=lambda: (30.0, 240.0), seek=lambda *_a: None),
+    )
+    app.play_track = lambda index, from_history=False: played.append((index, from_history))
+    return app, played
+
+
+def test_previous_in_shuffle_returns_actually_played_track():
+    # Shuffle order != queue order, so a positional current-1 would be wrong;
+    # Previous must replay the track popped from the back-stack.
+    app, played = _prev_app(play_mode=2, current=7, history=[3, 42])
+    playback_actions.on_prev_track(app)
+    assert played == [(42, True)]
+    assert app._play_history == [3]
+
+
+def test_previous_in_shuffle_falls_back_to_positional_when_history_empty():
+    app, played = _prev_app(play_mode=2, current=7, history=[])
+    playback_actions.on_prev_track(app)
+    assert played == [(6, False)]
+
+
+def test_previous_in_normal_mode_stays_positional():
+    # Normal playback order equals queue order; leave it walking the list.
+    app, played = _prev_app(play_mode=4, current=7, history=[3, 42])
+    playback_actions.on_prev_track(app)
+    assert played == [(6, False)]
+    assert app._play_history == [3, 42]
+
+
+def test_previous_skips_stale_history_entries():
+    # Entries equal to the current index (or out of range) are discarded
+    # rather than replaying the current track or crashing.
+    app, played = _prev_app(play_mode=2, current=7, history=[5, 7, 999])
+    playback_actions.on_prev_track(app)
+    assert played == [(5, True)]
+    assert app._play_history == []

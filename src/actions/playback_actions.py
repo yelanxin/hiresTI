@@ -185,6 +185,17 @@ def on_prev_track(app, btn=None):
     app._prev_track_rewind_armed_until = 0.0
     app._prev_track_rewind_armed_index = None
 
+    # In shuffle/smart the queue order isn't the play order, so a positional
+    # `current - 1` returns an arbitrary track. Walk the actually-played
+    # back-stack instead so Previous returns the track just heard.
+    if app.play_mode in [app.MODE_SHUFFLE, app.MODE_SMART]:
+        history = getattr(app, "_play_history", None)
+        while history:
+            target = history.pop()
+            if isinstance(target, int) and 0 <= target < total and target != current:
+                app.play_track(target, from_history=True)
+                return
+
     prev_idx = (current - 1) % total
     if 0 <= prev_idx < total:
         app.play_track(prev_idx)
