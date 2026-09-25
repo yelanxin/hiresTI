@@ -5,6 +5,18 @@ use std::path::Path;
 use std::ptr;
 use std::sync::atomic::Ordering;
 
+// Shadows std's eprintln! for every module below. When the app outlives the
+// terminal it was started from (`hiresti &`, then close the terminal), stderr
+// is a hung-up pty and every write fails with EIO. std's eprintln! panics on
+// write errors, and a panic inside an extern "C" entry point aborts the whole
+// process, so diagnostics must be best-effort instead.
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+
 mod alsa_clock;
 mod alsa_pcm;
 mod dsp;
