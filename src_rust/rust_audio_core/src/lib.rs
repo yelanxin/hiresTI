@@ -1501,10 +1501,29 @@ impl Engine {
     }
 }
 
-fn read_running_alsa_hw_params() -> (Option<i32>, Option<i32>) {
-    let mut out_rate: Option<i32> = None;
-    let mut out_depth: Option<i32> = None;
-    let Ok(cards) = std::fs::read_dir("/proc/asound") else {
+/// Rate and depth of the RUNNING ALSA playback substream this process drives.
+/// /proc/asound lists every card, so the first RUNNING substream may belong to
+/// someone else (e.g. PipeWire on the built-in card) rather than the DAC we
+/// play to. Substreams are matched by `owner_pid`, the TID of the thread that
+/// opened them; native transport opens and drops its ALSA session on the
+/// decode worker, so that thread lives as long as the PCM. With
+/// `allow_foreign` (PipeWire driver, where the daemon owns the card) the first
+/// RUNNING substream is used when none of ours is running.
+fn read_running_alsa_hw_params(allow_foreign: bool) -> (Option<i32>, Option<i32>) {
+    read_running_alsa_hw_params_in(
+        Path::new("/proc/asound"),
+        |tid| Path::new("/proc/self/task").join(tid.to_string()).exists(),
+        allow_foreign,
+    )
+}
+
+fn read_running_alsa_hw_params_in(
+    root: &Path,
+    is_own_thread: impl Fn(u32) -> bool,
+    allow_foreign: bool,
+) -> (Option<i32>, Option<i32>) {
+    let mut foreign: Option<(Option<i32>, Option<i32>)> = None;
+    let Ok(cards) = std::fs::read_dir(root) else {
         return (None, None);
     };
     for c in cards.flatten() {
@@ -1538,26 +1557,45 @@ fn read_running_alsa_hw_params() -> (Option<i32>, Option<i32>) {
                 if !status_txt.to_ascii_uppercase().contains("RUNNING") {
                     continue;
                 }
+                let owner = status_txt.lines().find_map(|ln| {
+                    let rest = ln.trim().strip_prefix("owner_pid")?;
+                    rest.trim_start().strip_prefix(':')?.trim().parse::<u32>().ok()
+                });
+                let is_own = owner.is_some_and(&is_own_thread);
+                if !is_own && (!allow_foreign || foreign.is_some()) {
+                    continue;
+                }
                 let Ok(hw_txt) = std::fs::read_to_string(&hw_path) else {
                     continue;
                 };
-                for ln in hw_txt.lines() {
-                    let t = ln.trim();
-                    if let Some(rest) = t.strip_prefix("format:") {
-                        if let Some(d) = Engine::parse_depth_from_format(rest.trim()) {
-                            out_depth = Some(d);
-                        }
-                    } else if let Some(rest) = t.strip_prefix("rate:") {
-                        let tok = rest.trim().split_whitespace().next().unwrap_or("");
-                        if let Ok(r) = tok.parse::<i32>() {
-                            if r > 0 {
-                                out_rate = Some(r);
-                            }
-                        }
-                    }
+                let params = parse_alsa_hw_params(&hw_txt);
+                if params == (None, None) {
+                    continue;
                 }
-                if out_rate.is_some() || out_depth.is_some() {
-                    return (out_rate, out_depth);
+                if is_own {
+                    return params;
+                }
+                foreign = Some(params);
+            }
+        }
+    }
+    foreign.unwrap_or((None, None))
+}
+
+fn parse_alsa_hw_params(hw_txt: &str) -> (Option<i32>, Option<i32>) {
+    let mut out_rate: Option<i32> = None;
+    let mut out_depth: Option<i32> = None;
+    for ln in hw_txt.lines() {
+        let t = ln.trim();
+        if let Some(rest) = t.strip_prefix("format:") {
+            if let Some(d) = Engine::parse_depth_from_format(rest.trim()) {
+                out_depth = Some(d);
+            }
+        } else if let Some(rest) = t.strip_prefix("rate:") {
+            let tok = rest.trim().split_whitespace().next().unwrap_or("");
+            if let Ok(r) = tok.parse::<i32>() {
+                if r > 0 {
+                    out_rate = Some(r);
                 }
             }
         }
@@ -3446,7 +3484,7 @@ pub extern "C" fn rac_get_runtime_snapshot(ptr: *const Engine) -> *mut c_char {
         return ptr::null_mut();
     };
     let (session_rate, session_depth) = engine.query_output_format();
-    let (hw_rate, hw_depth) = read_running_alsa_hw_params();
+    let (hw_rate, hw_depth) = read_running_alsa_hw_params(driver_is_pipewire(&engine.output_driver));
     let mut s = String::from("{");
     s.push_str("\"output\":{");
     s.push_str(&format!(
@@ -3661,6 +3699,52 @@ mod tests {
                 "HDA Intel PCH (Card 1)".to_string(),
                 Some("hw:1,0".to_string()),
             )]
+        );
+    }
+
+    fn write_running_substream(proc_root: &TempProcRoot, sub: &str, owner: u32, rate: u32) {
+        proc_root.write(
+            &format!("{sub}/status"),
+            &format!("state: RUNNING\nowner_pid   : {owner}\ntrigger_time: 1.0\n"),
+        );
+        proc_root.write(
+            &format!("{sub}/hw_params"),
+            &format!(
+                "access: MMAP_INTERLEAVED\nformat: S32_LE\nsubformat: STD\nchannels: 2\n\
+                 rate: {rate} ({rate}/1)\nperiod_size: 1024\nbuffer_size: 8192\n"
+            ),
+        );
+    }
+
+    #[test]
+    fn alsa_hw_runtime_reports_own_substream_over_other_running_cards() {
+        // PipeWire keeps the built-in card running at 48 kHz while we drive the DAC.
+        let proc_root = TempProcRoot::new("alsa_hw_runtime_own");
+        write_running_substream(&proc_root, "card0/pcm0p/sub0", 5514, 48_000);
+        write_running_substream(&proc_root, "card2/pcm0p/sub0", 1874460, 192_000);
+        let is_own = |tid| tid == 1874460;
+
+        for allow_foreign in [false, true] {
+            assert_eq!(
+                read_running_alsa_hw_params_in(proc_root.path(), is_own, allow_foreign),
+                (Some(192_000), Some(32)),
+            );
+        }
+    }
+
+    #[test]
+    fn alsa_hw_runtime_uses_foreign_substream_only_when_allowed() {
+        let proc_root = TempProcRoot::new("alsa_hw_runtime_foreign");
+        write_running_substream(&proc_root, "card0/pcm0p/sub0", 5514, 48_000);
+        let is_own = |_| false;
+
+        assert_eq!(
+            read_running_alsa_hw_params_in(proc_root.path(), is_own, false),
+            (None, None),
+        );
+        assert_eq!(
+            read_running_alsa_hw_params_in(proc_root.path(), is_own, true),
+            (Some(48_000), Some(32)),
         );
     }
 
