@@ -302,12 +302,41 @@ def test_display_output_depth_falls_back_to_stream_output_depth():
 def test_apply_alsa_hw_runtime_override_prefers_kernel_hw_params_over_stream_container_depth():
     win = _make_window("ALSA", exclusive=False, bit_perfect=False)
     win.player.current_device_id = "hw:2,0"
-    win._get_kernel_hw_runtime = lambda: {"hardware_rate": "44.1kHz", "hardware_depth": "16-bit"}
+    queried = []
+
+    def _kernel_hw_runtime(device_id=""):
+        queried.append(device_id)
+        return {"hardware_rate": "44.1kHz", "hardware_depth": "16-bit"}
+
+    win._get_kernel_hw_runtime = _kernel_hw_runtime
 
     rate, depth = win._apply_alsa_hw_runtime_override("ALSA（mmap）", "hw:2,0", "44.1kHz", "64-bit")
 
     assert rate == "44.1kHz"
     assert depth == "16-bit"
+    assert queried == ["hw:2,0"]
+
+
+def _write_running_substream(proc_root, sub, rate):
+    sub_dir = proc_root / sub
+    sub_dir.mkdir(parents=True)
+    (sub_dir / "status").write_text("state: RUNNING\nowner_pid   : 1234\n")
+    (sub_dir / "hw_params").write_text(
+        f"access: MMAP_INTERLEAVED\nformat: S32_LE\nchannels: 2\nrate: {rate} ({rate}/1)\n"
+    )
+
+
+def test_kernel_hw_runtime_reads_only_the_selected_hw_device(tmp_path):
+    # PipeWire keeps the built-in card running at 48 kHz while the DAC plays 192 kHz.
+    _write_running_substream(tmp_path, "card0/pcm0p/sub0", 48000)
+    _write_running_substream(tmp_path, "card2/pcm0p/sub0", 192000)
+    win = _make_window("ALSA", exclusive=False, bit_perfect=False)
+    win._alsa_proc_root = str(tmp_path)
+
+    assert win._get_kernel_hw_runtime("hw:2,0") == {"hardware_depth": "32-bit", "hardware_rate": "192kHz"}
+    assert win._get_kernel_hw_runtime("hw:1,0") == {}
+    # Without an hw: device (PipeWire fallback) the first RUNNING substream is used.
+    assert win._get_kernel_hw_runtime() == {"hardware_depth": "32-bit", "hardware_rate": "48kHz"}
 
 
 def test_display_latency_prefers_configured_alsa_buffer_time():

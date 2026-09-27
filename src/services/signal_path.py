@@ -606,7 +606,7 @@ class AudioSignalPathWindow(Adw.Window):
             return output_rate, output_depth
         if not dev.startswith("hw:"):
             return output_rate, output_depth
-        hw_runtime = self._get_kernel_hw_runtime()
+        hw_runtime = self._get_kernel_hw_runtime(dev)
         if hw_runtime.get("hardware_rate"):
             output_rate = hw_runtime["hardware_rate"]
         if hw_runtime.get("hardware_depth"):
@@ -1244,14 +1244,22 @@ class AudioSignalPathWindow(Adw.Window):
         self._pw_runtime_cache_ts = now
         return data
 
-    def _get_kernel_hw_runtime(self):
+    def _get_kernel_hw_runtime(self, device_id=""):
         """
         Read active ALSA playback hw_params as a stable fallback.
         Useful when pw-top mapping is unavailable.
+        For an ``hw:N[,M]`` device only that PCM is read: another card (e.g.
+        PipeWire on the built-in one) may be running at a different rate.
+        Otherwise the first RUNNING playback substream of any card is used.
         """
         out = {}
+        proc_root = getattr(self, "_alsa_proc_root", "/proc/asound")
+        pattern = f"{proc_root}/card*/pcm*p/sub*/status"
+        m = re.match(r"hw:(\d+)(?:,(\d+))?$", str(device_id or "").strip())
+        if m:
+            pattern = f"{proc_root}/card{m.group(1)}/pcm{m.group(2) or '0'}p/sub*/status"
         try:
-            for status_path in sorted(glob.glob("/proc/asound/card*/pcm*p/sub*/status")):
+            for status_path in sorted(glob.glob(pattern)):
                 try:
                     with open(status_path, "r", encoding="utf-8", errors="ignore") as f:
                         status_txt = f.read()
