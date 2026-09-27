@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.9.10 - 2026-09-27
+
+Bug-fix release: correct shuffle history, accurate signal-path readout,
+and no more crash after the launching terminal is closed.
+
+### Fixed
+
+- **Previous returns the track that actually played under shuffle (#89).**
+  In shuffle/smart mode the queue order is not the play order, so Previous
+  used to jump to an arbitrary track. Playback now keeps a history of played
+  tracks and Previous walks back through it. Normal and loop modes are
+  unchanged.
+- **Signal path shows the output device's real format (#91).** In
+  bit-perfect/exclusive mode the Audio Signal Path window could report the
+  rate of another running card (e.g. PipeWire on the built-in card at
+  48 kHz) instead of the DAC being played to. Only the display was wrong;
+  playback was bit-perfect. Thanks to @narel.
+- **No crash after closing the launching terminal (#90).** Starting the app
+  in the background from a terminal and then closing that terminal made the
+  audio core abort with SIGABRT on the next track, because a failed stderr
+  write panicked. Diagnostics are now best-effort. Thanks to @narel.
+
 ## 1.9.9 - 2026-09-09
 
 Fix remote playlist playback being limited to the songs loaded by scrolling.
