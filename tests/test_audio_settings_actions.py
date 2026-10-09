@@ -169,6 +169,17 @@ def test_build_usb_permission_install_cmd_targets_requested_usb_device():
     assert 'for _d in /dev/bus/usb/*/*; do setfacl -m "u:$_U:rw" "$_d"' not in cmd
 
 
+def test_usb_udev_rule_sorts_before_seat_late_and_replaces_legacy_file():
+    # systemd applies TAG+="uaccess" in 73-seat-late.rules; later rules are ignored.
+    name = os.path.basename(audio_settings_actions._USB_UDEV_RULE_PATH)
+    assert int(name.split("-", 1)[0]) < 73
+    legacy = audio_settings_actions._USB_UDEV_LEGACY_RULE_PATH
+    cmd = audio_settings_actions._build_usb_permission_install_cmd("/tmp/hiresti.rules", None)
+    assert f"rm -f {legacy}" in cmd
+    script = audio_settings_actions._build_manual_udev_setup_script(None)
+    assert f"sudo rm -f {legacy}" in script
+
+
 def test_build_usb_permission_install_cmd_falls_back_to_audio_class_filter():
     cmd = audio_settings_actions._build_usb_permission_install_cmd("/tmp/hiresti.rules", None)
 

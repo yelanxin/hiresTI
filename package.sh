@@ -241,7 +241,7 @@ mkdir -p "$SYSTEM_ICON_DIR"
 mkdir -p "$UDEV_DIR"
 
 # udev rule
-cat <<'UDEV_EOF' > "$UDEV_DIR/99-hiresti-usb-audio.rules"
+cat <<'UDEV_EOF' > "$UDEV_DIR/70-hiresti-usb-audio.rules"
 # HiresTI USB Rawlink - grant logged-in user access to USB audio devices
 SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ENV{ID_USB_INTERFACES}=="*:01????:*", TAG+="uaccess"
 UDEV_EOF
@@ -525,7 +525,7 @@ udevadm trigger --subsystem-match=usb 2>/dev/null || true
 /usr/bin/$APP_NAME
 /usr/share/applications/$APP_ID.desktop
 /usr/share/icons/*
-/usr/lib/udev/rules.d/99-hiresti-usb-audio.rules
+/usr/lib/udev/rules.d/70-hiresti-usb-audio.rules
 
 %changelog
 * $(date "+%a %b %d %Y") $MAINTAINER - $PKG_VERSION-1

@@ -146,13 +146,16 @@ HiresTI normally installs this rule for you through `pkexec` (it pops up a passw
 To install the rule by hand, run the commands below in a terminal (replace the VID:PID rule with your DAC's if you prefer a device-specific rule), then replug the DAC or re-select it in Output settings:
 
 ```bash
-sudo tee /etc/udev/rules.d/99-hiresti-usb-audio.rules > /dev/null <<'EOF'
+sudo tee /etc/udev/rules.d/70-hiresti-usb-audio.rules > /dev/null <<'EOF'
 # HiresTI USB Rawlink - grant logged-in user access to USB audio devices
 SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ENV{ID_USB_INTERFACES}=="*:01????:*", TAG+="uaccess"
 EOF
+sudo rm -f /etc/udev/rules.d/99-hiresti-usb-audio.rules
 sudo udevadm control --reload-rules
 sudo udevadm trigger --subsystem-match=usb
 ```
+
+The file name must sort before `73-seat-late.rules`: systemd only applies the `uaccess` tag there, so a rule numbered 73 or higher is ignored and access is lost on every replug. HiresTI 1.9.10 and earlier installed it as `99-hiresti-usb-audio.rules`, which never worked; the commands above replace it.
 
 The generic rule above matches any USB Audio Class device. To restrict it to a single DAC, find its `VID:PID` with `lsusb` and add a device-specific line:
 

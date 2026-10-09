@@ -799,7 +799,11 @@ def update_output_status_ui(app):
         app._sync_playback_status_icon()
 
 
-_USB_UDEV_RULE_PATH = "/etc/udev/rules.d/99-hiresti-usb-audio.rules"
+# Must sort before 73-seat-late.rules: systemd only applies TAG+="uaccess"
+# there, so a rule numbered after 73 is silently ignored (issue #92).
+_USB_UDEV_RULE_PATH = "/etc/udev/rules.d/70-hiresti-usb-audio.rules"
+# Pre-1.9.11 location; never took effect.  Removed on (re)install.
+_USB_UDEV_LEGACY_RULE_PATH = "/etc/udev/rules.d/99-hiresti-usb-audio.rules"
 _USB_AUDIO_INTERFACES_GLOB = "*:01????:*"
 _USB_AUDIO_INTERFACES_REGEX = r"^ID_USB_INTERFACES=.*:01[[:xdigit:]]{4}:"
 
@@ -818,7 +822,7 @@ def _build_udev_rule_content(device_id=None):
 
     TAG+="uaccess" grants access to the currently-active logged-in session
     user via systemd-logind; it persists across replugs as long as the rule
-    file is installed.
+    file is installed and numbered before 73-seat-late.rules.
     """
     lines = [
         "# HiresTI USB Rawlink - grant logged-in user access to USB audio devices",
@@ -900,9 +904,11 @@ def _build_usb_audio_acl_script(device_id=None):
 def _build_usb_permission_install_cmd(tmp_path, device_id=None):
     quoted_tmp = shlex.quote(str(tmp_path))
     quoted_rule = shlex.quote(_USB_UDEV_RULE_PATH)
+    quoted_legacy = shlex.quote(_USB_UDEV_LEGACY_RULE_PATH)
     acl_script = _build_usb_audio_acl_script(device_id)
     return (
         f"cp {quoted_tmp} {quoted_rule} "
+        f"&& rm -f {quoted_legacy} "
         f"&& udevadm control --reload-rules "
         f"&& udevadm trigger --subsystem-match=usb "
         f"&& udevadm settle --timeout=3 "
@@ -925,6 +931,7 @@ def _build_manual_udev_setup_script(device_id=None):
         f"sudo tee {_USB_UDEV_RULE_PATH} > /dev/null <<'EOF'",
         rule_content,
         "EOF",
+        f"sudo rm -f {_USB_UDEV_LEGACY_RULE_PATH}",
         "sudo udevadm control --reload-rules",
         "sudo udevadm trigger --subsystem-match=usb",
     ]
