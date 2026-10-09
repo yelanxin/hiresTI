@@ -2787,7 +2787,9 @@ class TidalBackend:
                 return None
             return p[1:] if p.startswith("/") else p
 
-        _EXCLUDED_TABS = {"record labels", "record label", "tidal magazine"}
+        # "Artist Experiences" is a list of image-less links to per-artist
+        # editorial pages, which render as blank placeholder cards.
+        _EXCLUDED_TABS = {"record labels", "record label", "tidal magazine", "artist experiences"}
 
         definitions = []
         seen = set()
