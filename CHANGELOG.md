@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.9.11 - 2026-10-09
+
+USB Rawlink permissions now survive a replug, plus a few UI tweaks.
+
+### Fixed
+
+- **USB Rawlink access no longer lost on replug (#92).** "Fix USB
+  Permissions" installed its udev rule as `99-hiresti-usb-audio.rules`, but
+  systemd only applies the `uaccess` tag in `73-seat-late.rules`, so the rule
+  never took effect. Access only worked until the DAC re-enumerated
+  (replug, suspend/resume, reset). The rule is now installed as
+  `70-hiresti-usb-audio.rules` and the old file is removed. If you clicked
+  Fix USB Permissions before, you will be asked once more. Thanks to
+  @HenryPrzygocki.
+
+### Changed
+
+- **Search moved to the top of the sidebar** instead of the header bar.
+- **Progress bar has a fixed, centred width** instead of stretching across
+  the whole player bar on wide windows.
+- **Moods: "Artist Experiences" tab hidden.** Its entries had no artwork
+  and showed up as blank cards.
+
 ## 1.9.10 - 2026-09-27
 
 Bug-fix release: correct shuffle history, accurate signal-path readout,
