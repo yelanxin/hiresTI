@@ -804,7 +804,8 @@ def build_header(app, container):
     )
     app.search_entry.connect("activate", app.on_search)
     app.search_entry.connect("changed", app.on_search_changed)
-    app.header.set_title_widget(app.search_entry)
+    # Search lives at the top of the sidebar (added in build_body),
+    # not in the header title.
     app.search_suggest_popover = _build_search_suggestions_popover(app)
 
     app.search_entry.connect("activate", lambda _entry: _close_search_suggestions(app))
@@ -1290,6 +1291,18 @@ def build_body(app, container):
     _body_mark("viz-shell-finalized")
 
     app.sidebar_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["sidebar-shell"])
+
+    # Search sits at the very top of the sidebar, above the DISCOVER
+    # section. The entry itself was created during header setup.
+    search_holder = Gtk.Box(
+        orientation=Gtk.Orientation.VERTICAL,
+        margin_start=12, margin_end=12, margin_top=12, margin_bottom=4,
+    )
+    app.search_entry.set_hexpand(True)
+    app.search_entry.set_size_request(-1, -1)
+    search_holder.append(app.search_entry)
+    app.sidebar_box.append(search_holder)
+
     app.nav_list = Gtk.ListBox(css_classes=["navigation-sidebar"], margin_top=10)
     app.nav_list.connect("row-activated", app.on_nav_selected)
 
@@ -1529,9 +1542,11 @@ def build_player_bar(app, container):
     app.timeline_box.append(app.lbl_current_time)
     app.timeline_box.append(app.scale)
     app.timeline_box.append(app.lbl_total_time)
-    app.timeline_box.set_size_request(200, -1)
-    app.timeline_box.set_hexpand(True)
-    app.timeline_box.set_halign(Gtk.Align.FILL)
+    # Fixed, centred width instead of filling the whole centre panel — the
+    # bar stretched edge-to-edge on wide windows and read as too long.
+    app.timeline_box.set_size_request(560, -1)
+    app.timeline_box.set_hexpand(False)
+    app.timeline_box.set_halign(Gtk.Align.CENTER)
     center_box.append(app.timeline_box)
 
     app.tech_box = Gtk.Box(spacing=8, halign=Gtk.Align.CENTER, margin_top=4)
