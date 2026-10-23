@@ -3271,25 +3271,32 @@ class TidalBackend:
         etag = getattr(pl, "_etag", None)
         playlist_session = self.session
 
-        def fetch_track(position):
-            def fetch_page():
+        def fetch_page(offset, limit):
+            def fetch():
                 nonlocal pl, playlist_session
                 if playlist_session is not self.session:
                     pl = self.session.playlist(pid)
                     playlist_session = self.session
-                return list(pl.tracks(limit=1, offset=position) or [])
+                return list(pl.tracks(limit=limit, offset=offset) or [])
 
             page = self._call_with_session_recovery(
-                fetch_page,
+                fetch,
                 context="playlist playback track",
             )
             if etag is not None and getattr(pl, "_etag", None) != etag:
                 raise ValueError("The playlist has changed. Please start it again.")
+            return page
+
+        def fetch_track(position):
+            page = fetch_page(position, 1)
             if len(page) != 1:
                 raise ValueError("The playlist track is unavailable. Please start the playlist again.")
             return page[0]
 
-        return PlaylistQueue(int(total), fetch_track, getattr(pl, "name", "Playlist"), shuffled)
+        return PlaylistQueue(
+            int(total), fetch_track, getattr(pl, "name", "Playlist"), shuffled,
+            fetch_page=fetch_page,
+        )
 
     def get_playlist_tracks_page(self, playlist_or_id, limit=100, offset=0):
         pl = self._resolve_user_playlist(playlist_or_id)

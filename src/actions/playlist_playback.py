@@ -2,6 +2,7 @@
 
 import logging
 import random
+import time
 
 from gi.repository import GLib
 
@@ -88,12 +89,58 @@ def start_playlist(app, shuffle=False, start_position=0, track_id=None):
             }
             app._set_play_queue(entries)
             app.play_track(start_position)
+            hydrate_queue_metadata(app, entries, start_position)
             return False
 
         GLib.idle_add(apply)
 
     submit_daemon(task)
     return True
+
+
+def hydrate_queue_metadata(app, entries, start_position=0):
+    """Fill in queue display metadata page by page, upcoming entries first.
+
+    Playback still resolves each entry on demand; this only replaces the
+    "details pending" placeholders in the queue views (#95).
+    """
+    if not entries:
+        return
+    source = entries[0].source
+    # Queue order (shuffled or not) starting from the playing entry.
+    order = [entry.position for entry in entries[start_position:] + entries[:start_position]]
+
+    def still_queued():
+        return any(
+            isinstance(track, PlaylistQueueTrack) and track.source is source
+            for track in (getattr(app, "play_queue", []) or [])
+        )
+
+    def refresh():
+        if still_queued() and hasattr(app, "_refresh_queue_views"):
+            app._refresh_queue_views()
+        return False
+
+    def task():
+        last_refresh = 0.0
+        pending = False
+        for offset in source.pages_for(order):
+            if not still_queued():
+                return
+            try:
+                added = source.hydrate_page(offset)
+            except Exception as exc:
+                logger.info("Queue metadata page at %d not loaded: %s", offset, exc)
+                break
+            pending = pending or added > 0
+            now = time.monotonic()
+            if pending and now - last_refresh >= 1.5:
+                GLib.idle_add(refresh)
+                last_refresh, pending = now, False
+        if pending:
+            GLib.idle_add(refresh)
+
+    submit_daemon(task)
 
 
 def resolve_for_playback(app, entry, index, request_id, from_history=False):

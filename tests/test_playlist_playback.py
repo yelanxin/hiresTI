@@ -425,3 +425,41 @@ def test_previous_skips_stale_history_entries():
     playback_actions.on_prev_track(app)
     assert played == [(5, True)]
     assert app._play_history == []
+
+
+def test_queue_metadata_is_hydrated_by_page_in_queue_order(setup):
+    app, playlist, workers, flush = setup
+    playlist.num_tracks = 250
+    refreshed = []
+    app._refresh_queue_views = lambda: refreshed.append(True)
+    ui_actions._on_shuffle_album_tracks(app)
+    workers.pop(0)()
+    flush()
+    assert app.play_queue[1].name.endswith("details pending")
+    # Shuffle is mocked as reverse, so the playing entry is position 249.
+    workers.pop(0)()
+    assert playlist.calls == [(1, 249), (100, 200), (100, 100), (100, 0)]
+    flush()
+    assert refreshed
+    assert [entry.name for entry in app.play_queue[:3]] == ["Song 249", "Song 248", "Song 247"]
+    assert all(entry.resolved_track is not None for entry in app.play_queue)
+
+
+def test_queue_hydration_stops_when_queue_replaced(setup):
+    app, playlist, workers, flush = setup
+    playlist.num_tracks = 250
+    ui_actions._on_play_album_tracks(app)
+    workers.pop(0)()
+    flush()
+    app.play_queue = [SimpleNamespace(id="other")]
+    workers.pop(0)()
+    assert playlist.calls == [(1, 0)]
+
+
+def test_queue_hydration_stops_when_playlist_changes():
+    playlist = Playlist(total=250)
+    source = backend_for(playlist).get_playlist_playback_queue(playlist)
+    playlist._etag = "revision-2"
+    with pytest.raises(ValueError, match="playlist has changed"):
+        source.hydrate_page(0)
+    assert source.entries()[0].resolved_track is None
