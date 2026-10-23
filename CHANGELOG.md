@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.9.12 - 2026-10-23
+
+Playlist queue shows every track's title again.
+
+### Fixed
+
+- **Playlist queue no longer shows "details pending" (#95).** Since 1.9.9,
+  playing or shuffling a playlist filled the queue with placeholders like
+  "Track 483 — details pending", and each title only appeared once that
+  track was about to play. Track details are now loaded in the background,
+  100 at a time, starting with the tracks that play next. Thanks to
+  @Michael-A-Phillips.
+
 ## 1.9.11 - 2026-10-09
 
 USB Rawlink permissions now survive a replug, plus a few UI tweaks.
